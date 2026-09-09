@@ -1,0 +1,335 @@
+name: Release
+
+# Builds installers for mac (apple silicon) and windows, then publishes them
+# plus latest.json to the R2 bucket behind https://cleaner.komiq.cc via
+# the publish worker at https://cleaner-publish.komiq.cc.
+# Installed apps poll that URL and offer the update in-app.
+#
+# Trigger: push a tag like v0.1.0 (tag message becomes the release notes),
+# or run manually with workflow_dispatch and type the notes. Prerelease tags
+# such as v1.0.0-beta.1 are ordinary tags here; scripts/ship.sh knows how to
+# order them.
+#
+# Required repo secrets:
+#   TAURI_SIGNING_PRIVATE_KEY  - content of the updater signing key. This is
+#                                the minisign key the updater checks, and has
+#                                nothing to do with Authenticode.
+#   CLEANER_PUBLISH_TOKEN      - bearer token for https://cleaner-publish.komiq.cc
+#
+# Optional repo secrets, for Windows Authenticode signing. Set BOTH or
+# NEITHER. While they are unset the Windows installer is unsigned and every
+# user meets a SmartScreen "Windows protected your PC" warning; setting them
+# turns signing on with no further edit to this file.
+#   WINDOWS_CERTIFICATE          - the .pfx, base64 encoded:
+#                                  certutil -encode certificate.pfx cert.txt
+#   WINDOWS_CERTIFICATE_PASSWORD - the .pfx export password
+#
+# Optional repo *variable* (Settings > Secrets and variables > Actions >
+# Variables), not a secret, because a timestamp server URL is public:
+#   WINDOWS_TIMESTAMP_URL        - RFC 3161 timestamp server. Defaults to
+#                                  http://timestamp.digicert.com. A timestamp
+#                                  is what keeps an installer trusted after
+#                                  the certificate expires, so it is always
+#                                  requested.
+#
+# ## The two Windows installer decisions, and why they are now written down
+#
+# tauri.conf.json is plain JSON and cannot carry a comment, so the reasoning
+# for `bundle.windows` lives here. Both settings were previously absent, which
+# meant the shipped installer's behaviour was a Tauri default nobody had
+# chosen.
+#
+#   nsis.installMode: "currentUser"
+#     Matches the Tauri default, and is right for this application rather than
+#     merely convenient: everything large it needs (the ONNX Runtime, and up
+#     to 460 MB of model weights) is downloaded after installation into the
+#     per-user app data directory, so a machine-wide install would share
+#     nothing worth sharing. It also keeps the installer out of the elevation
+#     prompt, which matters twice over because the in-app updater re-runs this
+#     same installer on every update.
+#
+#   webviewInstallMode: downloadBootstrapper, silent
+#     Also the Tauri default. WebView2 is part of the operating system at the
+#     platform floor below, so on a supported machine the bootstrapper never
+#     runs and the alternatives would only add weight: embedBootstrapper costs
+#     about 1.8 MB and offlineInstaller about 127 MB to cover a Windows that
+#     this application does not support anyway. The cost of the choice is that
+#     a machine that somehow lacks WebView2 needs a network connection at
+#     install time, which it needs on first launch regardless to fetch the
+#     runtime and the weights.
+#
+# ## Windows platform floor
+#
+# There is no Windows counterpart to bundle.macOS.minimumSystemVersion in the
+# Tauri 2 schema, so the floor is recorded here instead. It is **Windows 10
+# version 1803 x64 or newer**, and three separate things imply it:
+#
+#   - WebView2 is part of the operating system from Windows 10 1803 onward.
+#     Below that the NSIS installer would have to fetch and run Microsoft's
+#     bootstrapper for the app to open a window at all.
+#   - The Visual C++ 2015-2022 runtime shipped beside the executable (see the
+#     staging step below) is built by the current Visual Studio toolset, which
+#     Microsoft supports on Windows 10 and later. It also depends on the
+#     Universal CRT, which is an operating system component from Windows 10
+#     and a separate update on anything older.
+#   - ONNX Runtime 1.28, which every model session runs on, is built for
+#     Windows 10 and later.
+#
+# Only x86_64 is built. crates/cleaner-core/src/runtime/package.rs carries a
+# complete win-arm64 package row and it is deliberately unused: no arm64
+# Windows machine has ever run this application, none of the DirectML or
+# WebGPU numbers in the acceleration table were measured on one, and shipping
+# an installer that has never been built is worse than shipping none. The row
+# stays because it is the correct description of the package that would be
+# needed, not because a build is imminent.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: "Release notes shown in the in-app update dialog"
+        required: false
+        default: ""
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: darwin-aarch64
+          # No intel mac: ort-sys ships no prebuilt onnxruntime for
+          # x86_64-apple-darwin, so the target cannot build.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+      - run: npm ci
+
+      # The ONNX Runtime the application downloads on first launch imports
+      # MSVCP140.dll, MSVCP140_1.dll, VCRUNTIME140.dll and VCRUNTIME140_1.dll
+      # in its ordinary import table. A clean Windows has none of them, and
+      # nothing in the download supplies them, so without this step the
+      # application installs and can then do nothing at all: the runtime fails
+      # to load with Windows error 126.
+      #
+      # These are copied into src-tauri/vendor/windows-crt, which
+      # tauri.conf.json bundles with the resource glob "vendor/windows-crt/*"
+      # mapped to "", so each file lands loose in the install directory beside
+      # the executable. That is where it has to be: onnxruntime.dll is opened
+      # by LoadLibraryExW with no LOAD_LIBRARY_SEARCH_* flags, so its own
+      # imports resolve through the standard search order, whose first entry
+      # is the directory the application was loaded from. A subdirectory would
+      # not be searched, and neither would the runtime's own directory that
+      # cleaner-core adds with SetDllDirectoryW.
+      #
+      # bundle.resources is not per-platform, which is why the directory holds
+      # a committed note as well: Tauri treats a glob matching nothing as a
+      # build error, and the macOS build has no DLLs to match.
+      - name: Stage the Visual C++ runtime for app-local deployment
+        if: startsWith(matrix.platform, 'windows-')
+        shell: pwsh
+        run: .github/scripts/stage-vc-runtime.ps1 -Destination src-tauri/vendor/windows-crt
+
+      # Authenticode, gated on the secrets existing. Tauri reads the
+      # certificate thumbprint from tauri.conf.json and from nowhere else - it
+      # has no environment variable for it - so when a certificate is present
+      # the configuration is patched in place for this build only. When it is
+      # absent the build carries on and produces an unsigned installer, which
+      # is what ships today.
+      - name: Import the Windows code-signing certificate
+        if: startsWith(matrix.platform, 'windows-')
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE)) {
+            Write-Host '::warning::No WINDOWS_CERTIFICATE secret. The Windows installer will be UNSIGNED and users will see a SmartScreen warning. Set WINDOWS_CERTIFICATE and WINDOWS_CERTIFICATE_PASSWORD to turn signing on.'
+            exit 0
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            throw 'WINDOWS_CERTIFICATE is set but WINDOWS_CERTIFICATE_PASSWORD is not; set both or neither.'
+          }
+
+          # certutil wants a file, and the decoded .pfx must not outlive the
+          # import: a private key left in the workspace can be picked up by any
+          # later step, including artifact upload.
+          New-Item -ItemType Directory -Force -Path certificate | Out-Null
+          Set-Content -Path certificate/cert.b64 -Value $env:WINDOWS_CERTIFICATE
+          certutil -decode certificate/cert.b64 certificate/certificate.pfx
+          if ($LASTEXITCODE -ne 0) { throw "certutil -decode failed ($LASTEXITCODE); is WINDOWS_CERTIFICATE the base64 of a .pfx?" }
+          $password = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
+          $cert = Import-PfxCertificate -FilePath certificate/certificate.pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          Remove-Item -Recurse -Force certificate
+
+          $timestampUrl = $env:WINDOWS_TIMESTAMP_URL
+          if ([string]::IsNullOrWhiteSpace($timestampUrl)) { $timestampUrl = 'http://timestamp.digicert.com' }
+
+          # Patched rather than committed, so the repository never carries a
+          # thumbprint that only one machine can satisfy and so a fork without
+          # the certificate still builds.
+          $configPath = 'src-tauri/tauri.conf.json'
+          $config = Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json
+          $config.bundle.windows | Add-Member -NotePropertyName certificateThumbprint -NotePropertyValue $cert.Thumbprint -Force
+          $config.bundle.windows | Add-Member -NotePropertyName digestAlgorithm -NotePropertyValue 'sha256' -Force
+          $config.bundle.windows | Add-Member -NotePropertyName timestampUrl -NotePropertyValue $timestampUrl -Force
+          $config | ConvertTo-Json -Depth 32 | Set-Content -LiteralPath $configPath -Encoding utf8
+          Write-Host "Signing with certificate $($cert.Thumbprint), timestamped by $timestampUrl"
+
+      - name: Build app
+        run: npx tauri build --target ${{ matrix.target }}
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+      - name: Collect updater artifacts
+        shell: bash
+        # Renamed to MangaCleaner_<version>_<platform>.<ext>: the platform tag keeps
+        # the two mac architectures from clobbering each other under one R2 key, and
+        # dropping the space in "Manga Cleaner" keeps update URLs unencoded-safe.
+        #
+        # NSIS only on Windows. The msi target used to be built and then left
+        # behind here, paying for a WiX download and build on every release for
+        # an artefact no user could ever reach; it is gone from
+        # tauri.conf.json's bundle targets. The updater's Windows path wants
+        # the NSIS installer in any case.
+        run: |
+          set -euo pipefail
+          # node, not python3: the windows runner's git-bash has no reliable python3.
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          BUNDLE="src-tauri/target/${{ matrix.target }}/release/bundle"
+          OUT="out/${{ matrix.platform }}"
+          PREFIX="MangaCleaner_${VERSION}_${{ matrix.platform }}"
+          mkdir -p "$OUT"
+          case "${{ matrix.platform }}" in
+            darwin-*)
+              SRC=$(ls "$BUNDLE"/macos/*.app.tar.gz)
+              cp "$SRC" "$OUT/$PREFIX.app.tar.gz"
+              cp "$SRC.sig" "$OUT/$PREFIX.app.tar.gz.sig"
+              DMG=$(ls "$BUNDLE"/dmg/*.dmg 2>/dev/null | head -1 || true)
+              [ -n "$DMG" ] && cp "$DMG" "$OUT/$PREFIX.dmg"
+              ;;
+            windows-*)
+              SRC=$(ls "$BUNDLE"/nsis/*-setup.exe)
+              cp "$SRC" "$OUT/$PREFIX-setup.exe"
+              cp "$SRC.sig" "$OUT/$PREFIX-setup.exe.sig"
+              ;;
+          esac
+          ls -la "$OUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: out/${{ matrix.platform }}
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Publish to R2
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Resolve release notes
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            NOTES="${{ github.event.inputs.notes }}"
+          else
+            git fetch --depth=1 origin +refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}
+            NOTES=$(git tag -l --format='%(contents)' "${GITHUB_REF_NAME}")
+          fi
+          # Lightweight tags have no message; don't publish empty notes.
+          [ -n "$NOTES" ] || NOTES="Release ${GITHUB_REF_NAME:-$(date -u +%Y-%m-%d)}"
+          {
+            echo "notes<<NOTES_EOF"
+            echo "$NOTES"
+            echo "NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build latest.json and upload
+        shell: bash
+        # python3 here and not node, unlike the build job: this job runs on
+        # ubuntu-latest, where python3 is the reliable one.
+        env:
+          CLEANER_PUBLISH_TOKEN: ${{ secrets.CLEANER_PUBLISH_TOKEN }}
+          RELEASE_NOTES: ${{ steps.notes.outputs.notes }}
+        run: |
+          set -euo pipefail
+          VERSION=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          if [ "${{ github.event_name }}" = "push" ] && [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match tauri.conf.json version v${VERSION} - bump the version before tagging" >&2
+            exit 1
+          fi
+          BASE_URL="https://cleaner.komiq.cc"
+          echo "== publishing v$VERSION =="
+
+          python3 - "$VERSION" <<'PY'
+          import json, os, sys, glob, datetime
+          version = sys.argv[1]
+          base = "https://cleaner.komiq.cc"
+          platforms = {}
+          uploads = []  # (local, remote)
+          for pdir in sorted(glob.glob("artifacts/*")):
+              platform = os.path.basename(pdir)
+              sigs = glob.glob(pdir + "/*.sig")
+              if not sigs:
+                  sys.exit(f"no signature in {pdir}")
+              sig = sigs[0]
+              artifact = sig[:-4]
+              fname = os.path.basename(artifact)
+              remote = f"releases/v{version}/{fname}"
+              platforms[platform] = {
+                  "signature": open(sig).read().strip(),
+                  "url": f"{base}/{remote}",
+              }
+              uploads.append((artifact, remote))
+              for extra in glob.glob(pdir + "/*.dmg"):
+                  uploads.append((extra, f"releases/v{version}/{os.path.basename(extra)}"))
+          out = {
+              "version": version,
+              "notes": os.environ.get("RELEASE_NOTES", "").strip(),
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": platforms,
+          }
+          json.dump(out, open("latest.json", "w"), indent=2)
+          json.dump([list(u) for u in uploads], open("uploads.json", "w"))
+          print(json.dumps(out, indent=2))
+          PY
+
+          python3 -c "import json; [print(f'{l}\t{r}') for l, r in json.load(open('uploads.json'))]" | while IFS=$'\t' read -r LOCAL REMOTE; do
+            echo "uploading $REMOTE"
+            curl -sSf -X PUT -H "Authorization: Bearer $CLEANER_PUBLISH_TOKEN" -H "Content-Type: application/octet-stream" --data-binary @"$LOCAL" "https://cleaner-publish.komiq.cc/$REMOTE"
+          done
+          echo "uploading latest.json"
+          curl -sSf -X PUT -H "Authorization: Bearer $CLEANER_PUBLISH_TOKEN" -H "Content-Type: application/json" --data-binary @latest.json "https://cleaner-publish.komiq.cc/latest.json"
+          echo "== published: $BASE_URL/latest.json =="

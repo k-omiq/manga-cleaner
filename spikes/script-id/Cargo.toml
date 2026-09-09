@@ -1,0 +1,14 @@
+[package]
+name = "spike-script-id"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# This model must be validated on our own crops before it is trusted: its
+# model card is empty and no accuracy is published anywhere.
+[dependencies]
+cleaner-core = { path = "../../crates/cleaner-core" }
+anyhow.workspace = true
+ort = { workspace = true, features = ["std", "load-dynamic", "api-22"] }

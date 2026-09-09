@@ -1,0 +1,13 @@
+[package]
+name = "spike-detect-page"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Runs the detection stage on a page and draws what it found, because a box
+# list is not evidence that a mask is registered to the page it came from.
+[dependencies]
+cleaner-core = { path = "../../crates/cleaner-core" }
+anyhow.workspace = true

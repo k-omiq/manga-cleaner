@@ -1,0 +1,16 @@
+[package]
+name = "spike-ort-loaddynamic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Phase 0 spike 1: prove `ort` can dlopen an ONNX Runtime fetched after
+# install, from inside a codesigned hardened-runtime app bundle.
+[dependencies]
+# `api-22` sets the floor the loaded runtime must clear (ORT 1.22), which is what
+# `ort` compares against in its dlopen version check. Deliberately below the 1.28
+# we ship, so a user's slightly older runtime is not rejected out of hand.
+ort = { workspace = true, features = ["std", "load-dynamic", "api-22"] }
+anyhow.workspace = true

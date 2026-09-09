@@ -1,0 +1,16 @@
+[package]
+name = "spike-ocr-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# What the gate decides with the rescue reader attached and without it, region
+# by region, on a real page. The point is to see exactly which regions the
+# reader changes an answer for, what it read there, and how Japanese that
+# reading was - because "4% of dialogue lands in review" is a claim about
+# particular boxes on particular pages and has to be readable back to them.
+[dependencies]
+cleaner-core = { path = "../../crates/cleaner-core" }
+anyhow.workspace = true

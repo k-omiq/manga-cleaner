@@ -1,0 +1,18 @@
+{
+  // The public face of https://cleaner.komiq.cc: the landing page from public/,
+  // plus read-only passthrough to the cleaner-updates R2 bucket for latest.json
+  // and releases/v<version>/<file>.
+  //
+  // Deploying this takes the hostname over from the bucket's own R2 custom
+  // domain, so remove that custom domain in the Cloudflare dashboard first
+  // (R2 > cleaner-updates > Settings > Custom Domains). Release URLs do not
+  // change: the worker serves the same keys from the same bucket.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cleaner-site",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-01",
+  "routes": [{ "pattern": "cleaner.komiq.cc", "custom_domain": true }],
+  "assets": { "directory": "./public" },
+  "r2_buckets": [{ "binding": "UPDATES", "bucket_name": "cleaner-updates" }],
+  "observability": { "enabled": true }
+}

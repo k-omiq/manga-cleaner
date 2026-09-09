@@ -1,0 +1,22 @@
+[package]
+name = "spike-clean-page"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The pipeline end to end: detect, balloon, gate, fit, the ladder, composite,
+# export. What it proves is that the parts join up, that the output file is
+# still the source's mode, depth and profile, and - since it began writing
+# annotated images - what the result actually looks like.
+#
+# It depends on the **adapter** and not only on the core, because the escalation
+# loop that turns a route into a rung lives in `src-tauri/src/run.rs` and there
+# is exactly one of it. See the module docs: a spike with a ladder of its own
+# would be a second ladder to keep in step.
+[dependencies]
+cleaner-core = { path = "../../crates/cleaner-core" }
+manga-cleaner = { path = "../../src-tauri" }
+anyhow.workspace = true
+serde_json.workspace = true

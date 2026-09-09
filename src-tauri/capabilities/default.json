@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "What the main window is allowed to ask for. Deliberately short: every capability added here is surface a compromised page could reach.",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:allow-open", "updater:default", "process:default"]
+}

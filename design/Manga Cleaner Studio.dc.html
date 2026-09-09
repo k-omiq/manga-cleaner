@@ -1,0 +1,1225 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics="">
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;height:100%}
+  :root{
+    --bg:#e8e7e3; --sb:#e2e1dc; --panel:#f6f5f2; --panel2:#efeeea; --card:#fbfaf8; --surface:#fcfbf9; --paper:#fefdfb; --art:#e4e2dd; --art2:#dbd9d3;
+    --line:rgba(42,38,32,.08); --line2:rgba(42,38,32,.15);
+    --text:#22211e; --t2:rgba(34,33,30,.66); --t3:rgba(34,33,30,.55);
+    --accent:#2c2b28; --accent-fg:#f8f7f4; --accent-soft:rgba(42,38,32,.075);
+    --tint:rgba(34,33,30,.20); --tintline:rgba(34,33,30,.48); --warn:#8a3f2a;
+    --edge:0 1px 1px rgba(42,38,32,.05), 0 5px 14px rgba(42,38,32,.07);
+    --edge-soft:0 1px 2px rgba(42,38,32,.05);
+  }
+  :root[data-theme="dark"]{
+    --bg:#121313; --sb:#0d0e0e; --panel:#1a1b1c; --panel2:#202122; --card:#1a1b1c; --surface:#212223; --paper:#f6f5f2; --art:#e4e3df; --art2:#dbdad5;
+    --line:rgba(255,255,255,.07); --line2:rgba(255,255,255,.13);
+    --text:#e9e8e5; --t2:rgba(233,232,229,.64); --t3:rgba(233,232,229,.48);
+    --accent:#e9e8e5; --accent-fg:#141514; --accent-soft:rgba(233,232,229,.10);
+    --tint:rgba(246,245,242,.32); --tintline:rgba(255,255,255,.72); --warn:#d98b6a;
+    --edge:0 0 0 1px rgba(255,255,255,.05), 0 6px 20px rgba(0,0,0,.42);
+    --edge-soft:0 0 0 1px rgba(255,255,255,.05);
+  }
+  body{background:var(--bg);color:var(--text);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Hiragino Kaku Gothic ProN","Yu Gothic","Noto Sans JP","Microsoft YaHei",sans-serif;
+    font-size:12.5px;-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums}
+  button,input,select{font:inherit;color:inherit;font-variant-numeric:tabular-nums}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{color:var(--text)}
+  ::selection{background:var(--accent-soft)}
+  input[type=range]{accent-color:var(--accent)}
+  @keyframes mcIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+  @keyframes mcFade{from{opacity:0}to{opacity:1}}
+  @keyframes mcBlink{0%,100%{opacity:1}50%{opacity:.35}}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</helmet>
+
+<div style="height:100vh;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)">
+
+  <sc-if value="{{ isHome }}" hint-placeholder-val="{{ true }}">
+    <div style="height:100vh;overflow-y:auto;overflow-x:hidden;background:var(--bg)">
+      <div style="min-height:100vh;display:flex;flex-direction:column;padding:26px 34px 64px">
+
+        <div style="display:flex;align-items:center;gap:16px;flex:none">
+          <div style="font-size:12.5px;font-weight:600;letter-spacing:.3em">KOMIQ</div>
+          <div style="flex:1"></div>
+          <button style="height:28px;padding:0 12px;border:1px solid transparent;border-radius:7px;background:var(--accent-soft);font-size:11.5px;color:var(--t2);cursor:pointer;white-space:nowrap" onClick="{{ openSettings }}">Settings</button>
+        </div>
+
+        <div style="width:100%">
+
+          <sc-if value="{{ inChapters }}" hint-placeholder-val="{{ false }}">
+            <div style="padding-top:96px">
+              <button style="border:none;background:transparent;padding:0;font-size:11.5px;color:var(--t3);cursor:pointer;letter-spacing:.04em" onClick="{{ backToLibrary }}">← Projects</button>
+              <div style="display:flex;align-items:flex-end;gap:24px;margin-top:22px">
+                <div style="flex:1;min-width:0">
+                  <div style="font-size:27px;font-weight:500;letter-spacing:-.02em;line-height:1.1">{{ openProjectName }}</div>
+                  <div style="font-size:11.5px;color:var(--t3);margin-top:9px">{{ openProjectMeta }}</div>
+                </div>
+                <button style="height:32px;padding:0 15px;border:1px solid transparent;border-radius:8px;background:var(--accent-soft);font-size:12px;color:var(--t2);cursor:pointer;white-space:nowrap" onClick="{{ startChapter }}">New chapter</button>
+              </div>
+              <div style="font-size:10.5px;letter-spacing:.22em;color:var(--t3);margin:56px 0 4px">CHAPTERS</div>
+              <div style="border-top:1px solid var(--line)">
+                <sc-for list="{{ chapterRows }}" as="c" hint-placeholder-count="3">
+                  <div style="{{ c.style }}" onClick="{{ c.open }}">
+                    <div style="{{ c.markStyle }}">{{ c.mark }}</div>
+                    <div style="width:72px;flex:none;font-size:13px">{{ c.num }}</div>
+                    <div style="flex:1;min-width:0">
+                      <div style="font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ c.title }}</div>
+                      <div style="font-size:11px;color:var(--t3);margin-top:4px">{{ c.sub }}</div>
+                    </div>
+                    <div style="width:120px;text-align:right;font-size:11.5px;color:var(--t2);white-space:nowrap">{{ c.chip }}</div>
+                    <div style="width:130px;text-align:right;font-size:11.5px;color:var(--t3);white-space:nowrap">{{ c.cleaned }}</div>
+                    <div style="width:104px;text-align:right;font-size:11.5px;color:var(--t3);white-space:nowrap">{{ c.when }}</div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{ inLibrary }}" hint-placeholder-val="{{ true }}">
+            <div>
+              <div style="display:flex;flex-direction:column;align-items:center;gap:10px;padding:168px 0 152px">
+                <button style="width:212px;height:40px;border:none;border-radius:8px;background:var(--accent);color:var(--accent-fg);font-size:12.5px;font-weight:600;letter-spacing:.02em;cursor:pointer" onClick="{{ startChapter }}">New chapter</button>
+                <button style="width:212px;height:40px;border:1px solid transparent;border-radius:8px;background:var(--accent-soft);color:var(--text);font-size:12.5px;letter-spacing:.02em;cursor:pointer" onClick="{{ startNew }}">New project</button>
+              </div>
+
+              <div style="font-size:10.5px;letter-spacing:.22em;color:var(--t3);margin-bottom:18px">PROJECTS</div>
+              <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:32px 20px">
+                <sc-for list="{{ cards }}" as="c" hint-placeholder-count="4">
+                  <div style="display:flex;flex-direction:column;cursor:pointer" onClick="{{ c.open }}">
+                    <div style="position:relative;aspect-ratio:2/3;background:var(--card);border-radius:3px;box-shadow:var(--edge);overflow:hidden">
+                      <sc-for list="{{ c.panels }}" as="pn" hint-placeholder-count="3">
+                        <div style="{{ pn.style }}"></div>
+                      </sc-for>
+                      <div style="{{ c.chipStyle }}">{{ c.chip }}</div>
+                      <sc-if value="{{ c.resumable }}" hint-placeholder-val="{{ false }}">
+                        <button style="position:absolute;left:8px;right:8px;bottom:8px;height:28px;border:1px solid transparent;border-radius:7px;background:var(--surface);box-shadow:var(--edge-soft);font-size:11px;color:var(--t2);cursor:pointer" onClick="{{ c.resume }}">Continue clean</button>
+                      </sc-if>
+                    </div>
+                    <div style="padding-top:11px;min-width:0">
+                      <div style="font-size:13px;font-weight:500;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ c.name }}</div>
+                      <div style="font-size:11px;color:var(--t3);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ c.chapterLine }}</div>
+                      <div style="font-size:10.5px;color:var(--t3);margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ c.cleaned }} · {{ c.when }}</div>
+                    </div>
+                  </div>
+                </sc-for>
+              </div>
+
+              <sc-if value="{{ noCards }}" hint-placeholder-val="{{ false }}">
+                <div style="padding:52px 0;font-size:12px;color:var(--t3);line-height:1.7">
+                  <div>{{ emptyTitle }}</div>
+                  <div style="margin-top:6px">{{ emptyBody }}</div>
+                </div>
+              </sc-if>
+            </div>
+          </sc-if>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ isEditor }}" hint-placeholder-val="{{ false }}">
+    <div style="position:relative;height:100vh;overflow:hidden;background:var(--bg)">
+
+      <div style="position:absolute;inset:0;overflow:auto;display:flex;align-items:flex-start;justify-content:center;padding:70px 104px 66px" ref="{{ viewRef }}" onScroll="{{ onScroll }}">
+        <div style="display:flex;flex-direction:column;gap:12px;flex:none">
+          <sc-for list="{{ canvasPages }}" as="pg" hint-placeholder-count="1">
+            <div style="{{ pg.style }}">
+              <sc-for list="{{ pg.panels }}" as="p" hint-placeholder-count="4">
+                <div style="{{ p.style }}"></div>
+              </sc-for>
+              <sc-for list="{{ pg.regions }}" as="r" hint-placeholder-count="3">
+                <div style="{{ r.style }}" onClick="{{ r.click }}" title="{{ r.title }}">
+                  <sc-if value="{{ r.showText }}" hint-placeholder-val="{{ true }}">
+                    <div style="{{ r.textStyle }}">{{ r.text }}</div>
+                  </sc-if>
+                  <sc-if value="{{ r.showBadge }}" hint-placeholder-val="{{ false }}">
+                    <div style="{{ r.badgeStyle }}">{{ r.badge }}</div>
+                  </sc-if>
+                </div>
+              </sc-for>
+              <sc-if value="{{ pg.showWipe }}" hint-placeholder-val="{{ false }}">
+                <div style="{{ pg.wipeStyle }}"></div>
+              </sc-if>
+              <div style="{{ pg.tagStyle }}">{{ pg.tag }}</div>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+
+      <div style="position:absolute;left:16px;top:16px;z-index:40;display:flex;align-items:center;gap:8px">
+        <button style="width:30px;height:30px;display:flex;align-items:center;justify-content:center;border:1px solid transparent;background:transparent;border-radius:8px;color:var(--t2);cursor:pointer;background:var(--panel);border-radius:8px;box-shadow:var(--edge);width:34px;height:34px" style-hover="background:var(--accent-soft)" onClick="{{ goHome }}" title="Home - H"><svg style="width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M2.6 7.4 8 3l5.4 4.4"></path><path d="M4.3 6.9v6.3h7.4V6.9"></path></svg></button>
+        <div style="background:var(--panel);border-radius:8px;box-shadow:var(--edge);height:34px;display:flex;align-items:center;gap:10px;padding:0 13px;min-width:0">
+          <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:230px">{{ projectName }}</div>
+          <div style="width:1px;height:14px;background:var(--line)"></div>
+          <div style="font-size:10.5px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:250px">{{ modeLabel }}</div>
+        </div>
+        <div style="background:var(--panel);border-radius:8px;box-shadow:var(--edge);height:34px;display:flex;align-items:center;gap:3px;padding:0 4px">
+          <button style="{{ pagesTogStyle }}" style-hover="background:var(--accent-soft)" onClick="{{ togglePages }}" title="Page list - F"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M3.4 2.8h9.2v10.4H3.4z"></path><path d="M5.8 5.8h4.4M5.8 8h4.4M5.8 10.2h2.8"></path></svg></button>
+          <button style="{{ layersTogStyle }}" style-hover="background:var(--accent-soft)" onClick="{{ toggleLayers }}" title="Layers &amp; review - L"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M8 2.6 13.6 5.7 8 8.8 2.4 5.7z"></path><path d="m2.4 9.4 5.6 3.1 5.6-3.1"></path></svg></button>
+        </div>
+      </div>
+
+      <div style="position:absolute;right:16px;top:16px;z-index:40;display:flex;align-items:center;gap:8px">
+        <div style="background:var(--panel);border-radius:8px;box-shadow:var(--edge);height:34px;display:flex;align-items:center;gap:7px;padding:0 9px">
+          <button style="{{ origStyle }}" style-hover="background:var(--accent-soft)" onPointerDown="{{ holdOn }}" onPointerUp="{{ holdOff }}" onPointerLeave="{{ holdOff }}" title="Hold to see the original - O"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M13.4 8a5.4 5.4 0 1 1-10.8 0 5.4 5.4 0 0 1 10.8 0"></path><path d="M8 2.6a5.4 5.4 0 0 1 0 10.8z" style="fill:currentColor;stroke:none"></path></svg></button>
+          <input type="range" min="0" max="100" step="1" value="{{ wipe }}" onChange="{{ setWipe }}" style="width:92px;height:16px" title="Wipe between original and cleaned">
+          <div style="width:30px;font-size:10px;color:var(--t3);text-align:right;white-space:nowrap">{{ wipeLabel }}</div>
+          <button style="{{ pinStyle }}" style-hover="background:var(--accent-soft)" onClick="{{ togglePin }}" title="Pin the original on - ⇧O"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M5.6 2.8h4.8M8 2.8v4.4"></path><path d="M4.8 7.2h6.4l-1 2.6H5.8z"></path><path d="M8 9.8v3.4"></path></svg></button>
+          <button style="{{ overlayStyle }}" style-hover="background:var(--accent-soft)" onClick="{{ toggleOverlay }}" title="Tint every mask - M"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M2.8 2.8h7.4v7.4H2.8z"></path><path d="M5.8 5.8h7.4v7.4H5.8z"></path></svg></button>
+        </div>
+        <div style="background:var(--panel);border-radius:8px;box-shadow:var(--edge);height:34px;display:flex;align-items:center;gap:4px;padding:0 5px">
+          <button style="width:30px;height:30px;display:flex;align-items:center;justify-content:center;border:1px solid transparent;background:transparent;border-radius:8px;color:var(--t2);cursor:pointer" style-hover="background:var(--accent-soft)" onClick="{{ openSettings }}" title="Settings - ,"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M2.8 4.6h10.4M2.8 11.4h10.4"></path><path d="M7.6 4.6a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0"></path><path d="M11.4 11.4a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0"></path></svg></button>
+          <button style="{{ exportStyle }}" onClick="{{ openExport }}" title="Export - E"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M8 10.2V2.8"></path><path d="m5.3 5.5 2.7-2.7 2.7 2.7"></path><path d="M3.2 10.4v2.8h9.6v-2.8"></path></svg></button>
+        </div>
+      </div>
+
+      <div style="position:absolute;right:16px;top:50%;transform:translateY(-50%);z-index:40;background:var(--panel);border-radius:8px;box-shadow:var(--edge);border-radius:19px;display:flex;flex-direction:column;gap:4px;padding:6px">
+            <button style="{{ railAuto }}" onClick="{{ pickAuto }}" title="Auto clean - 1"><svg style="width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M8 2.4 9.2 6.8 13.6 8 9.2 9.2 8 13.6 6.8 9.2 2.4 8 6.8 6.8z"></path></svg></button>
+            <button style="{{ railBrush }}" onClick="{{ pickBrush }}" title="Brush - 2"><svg style="width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M6.5 9.5 12.2 3.8a1.3 1.3 0 0 1 1.9 1.9L8.4 11.4z"></path><path d="M6.6 9.6c-1.6.6-2.2 1.9-3.4 3.6 2-.4 3.5-.6 4.4-1.6.6-.7.5-1.6-1-2z"></path></svg></button>
+            <button style="{{ railShapes }}" onClick="{{ pickShapes }}" title="Shapes - 3"><svg style="width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M2.6 2.8h6.2v6.2H2.6z"></path><path d="M13.4 10a3.3 3.3 0 1 1-6.6 0 3.3 3.3 0 0 1 6.6 0"></path></svg></button>
+            <button style="{{ railAi }}" onClick="{{ pickAi }}" title="AI mask brush - 4"><svg style="width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M2.8 13.2c1.5-3.5 3.7-5.9 6.6-7.4"></path><path d="M11.6 2.2 12.3 4.2 14.3 4.9 12.3 5.6 11.6 7.6 10.9 5.6 8.9 4.9 10.9 4.2z"></path></svg></button>
+            <button style="{{ railFill }}" onClick="{{ pickFill }}" title="Content-aware fill - 5"><svg style="width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M8 2.6c2.5 3 3.9 5 3.9 6.7a3.9 3.9 0 0 1-7.8 0c0-1.7 1.4-3.7 3.9-6.7z"></path></svg></button>
+            <button style="{{ railClone }}" onClick="{{ pickClone }}" title="Clone / heal - 6"><svg style="width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M10.4 5.6a2.9 2.9 0 1 1-5.8 0 2.9 2.9 0 0 1 5.8 0"></path><path d="M13.4 10.4a2.9 2.9 0 1 1-5.8 0 2.9 2.9 0 0 1 5.8 0"></path></svg></button>
+      </div>
+
+      <div style="position:absolute;left:50%;bottom:18px;transform:translateX(-50%);z-index:40;background:var(--panel);border-radius:8px;box-shadow:var(--edge);height:36px;display:flex;align-items:center;gap:3px;padding:0 6px">
+        <button style="{{ fitStyle }}" style-hover="background:var(--accent-soft)" onClick="{{ zoomFit }}" title="Fit - 0"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M2.8 6V2.8H6M10 2.8h3.2V6M13.2 10v3.2H10M6 13.2H2.8V10"></path></svg></button>
+        <button style="{{ stepStyle }}" style-hover="background:var(--accent-soft)" onClick="{{ zoomOut }}" title="Zoom out - −"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M11.8 7.2a4.4 4.4 0 1 1-8.8 0 4.4 4.4 0 0 1 8.8 0"></path><path d="m10.6 10.6 2.8 2.8"></path><path d="M5.4 7.2h4"></path></svg></button>
+        <button style="{{ zoomLabelStyle }}" onClick="{{ zoom100 }}" title="Actual size - 1:1">{{ zoomLabel }}</button>
+        <button style="{{ stepStyle }}" style-hover="background:var(--accent-soft)" onClick="{{ zoomIn }}" title="Zoom in - +"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M11.8 7.2a4.4 4.4 0 1 1-8.8 0 4.4 4.4 0 0 1 8.8 0"></path><path d="m10.6 10.6 2.8 2.8"></path><path d="M5.4 7.2h4M7.4 5.2v4"></path></svg></button>
+        <div style="width:1px;height:18px;background:var(--line);margin:0 4px"></div>
+        <button style="{{ undoStyle }}" style-hover="background:var(--accent-soft)" onClick="{{ undo }}" title="{{ undoTitle }}"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M2.8 7.4h7.4a3 3 0 0 1 0 6H8"></path><path d="m5.4 4.8-2.6 2.6 2.6 2.6"></path></svg></button>
+        <button style="{{ redoStyle }}" style-hover="background:var(--accent-soft)" onClick="{{ redo }}" title="{{ redoTitle }}"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M13.2 7.4H5.8a3 3 0 0 0 0 6H8"></path><path d="m10.6 4.8 2.6 2.6-2.6 2.6"></path></svg></button>
+      </div>
+
+      <div style="position:absolute;right:16px;bottom:18px;z-index:40;background:var(--panel);border-radius:8px;box-shadow:var(--edge);height:36px;display:flex;align-items:center;gap:3px;padding:0 6px">
+        <span style="display:flex;color:var(--t3);margin:0 3px" title="Regions needing review"><svg style="width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M8 3.2 14 12.4H2z"></path><path d="M8 6.8v2.4M8 10.9h.01"></path></svg></span>
+        <button style="{{ issueStyle }}" style-hover="background:var(--accent-soft)" onClick="{{ prevIssue }}" title="Previous region needing review - P"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="m7.4 3.8-4.2 4.2 4.2 4.2M12.6 3.8 8.4 8l4.2 4.2"></path></svg></button>
+        <div style="min-width:42px;font-size:11px;color:var(--t2);text-align:center;white-space:nowrap">{{ issueLabel }}</div>
+        <button style="{{ issueStyle }}" style-hover="background:var(--accent-soft)" onClick="{{ nextIssue }}" title="Next region needing review - N"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="m8.6 3.8 4.2 4.2-4.2 4.2M3.4 3.8 7.6 8l-4.2 4.2"></path></svg></button>
+        <div style="width:1px;height:18px;background:var(--line);margin:0 4px"></div>
+        <button style="{{ stepStyle }}" style-hover="background:var(--accent-soft)" onClick="{{ prevPage }}" title="{{ prevTitle }}"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="m9.6 3.6-4.4 4.4 4.4 4.4"></path></svg></button>
+        <div style="min-width:48px;font-size:11px;color:var(--t2);text-align:center;white-space:nowrap">{{ pageLabel }}</div>
+        <button style="{{ stepStyle }}" style-hover="background:var(--accent-soft)" onClick="{{ nextPage }}" title="{{ nextTitle }}"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="m6.4 3.6 4.4 4.4-4.4 4.4"></path></svg></button>
+      </div>
+
+      <sc-if value="{{ pagesOpen }}" hint-placeholder-val="{{ true }}">
+        <div style="{{ pagesWinStyle }}" onPointerDown="{{ pagesFocus }}">
+          <div style="display:flex;align-items:center;gap:7px;height:29px;flex:none;padding:0 5px 0 7px;border-bottom:1px solid var(--line);background:transparent;cursor:grab;touch-action:none" onPointerDown="{{ pagesDrag }}">
+            <span style="display:flex;color:var(--t3)"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M4.8 6.2h6.4M4.8 9.8h6.4"></path></svg></span>
+            <div style="flex:0 0 auto;font-size:10px;letter-spacing:.1em;font-weight:600;color:var(--t2);white-space:nowrap">PAGES</div>
+            <div style="flex:1 1 auto;min-width:0;text-align:right;font-size:10.5px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ pagesCount }}</div>
+            <button style="width:21px;height:21px;display:flex;align-items:center;justify-content:center;border:none;background:transparent;border-radius:5px;color:var(--t3);cursor:pointer" onClick="{{ pagesFold }}" title="Collapse"><span style="{{ pagesChevSpin }}"><svg style="width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="m4.6 6.4 3.4 3.4 3.4-3.4"></path></svg></span></button>
+            <button style="width:21px;height:21px;display:flex;align-items:center;justify-content:center;border:none;background:transparent;border-radius:5px;color:var(--t3);cursor:pointer" onClick="{{ pagesClose }}" title="Hide"><svg style="width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="m4.6 4.6 6.8 6.8M11.4 4.6l-6.8 6.8"></path></svg></button>
+          </div>
+          <sc-if value="{{ pagesBody }}" hint-placeholder-val="{{ true }}">
+            <div style="flex:1;min-height:0;display:flex;flex-direction:column">
+              <div style="flex:1;min-height:0;overflow-y:auto;padding:5px 7px 9px">
+                <sc-for list="{{ pageRows }}" as="r" hint-placeholder-count="10">
+                  <div style="{{ r.style }}" onClick="{{ r.pick }}" title="{{ r.title }}">
+                    <div style="{{ r.markStyle }}">{{ r.mark }}</div>
+                    <div style="width:40px;flex:none;font-size:11.5px">{{ r.label }}</div>
+                    <div style="{{ r.barTrack }}"><div style="{{ r.barStyle }}"></div></div>
+                    <div style="{{ r.ratioStyle }}">{{ r.ratio }}</div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+          </sc-if>
+          <sc-if value="{{ pagesBody }}" hint-placeholder-val="{{ true }}">
+            <div style="position:absolute;right:0;bottom:0;width:17px;height:17px;display:flex;align-items:flex-end;justify-content:flex-end;padding:1px;color:var(--t3);cursor:nwse-resize;touch-action:none" onPointerDown="{{ pagesResize }}"><svg style="width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M12.6 7.6 7.6 12.6M12.8 11.4l-1.4 1.4"></path></svg></div>
+          </sc-if>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ layersOpen }}" hint-placeholder-val="{{ true }}">
+        <div style="{{ layersWinStyle }}" onPointerDown="{{ layersFocus }}">
+          <div style="display:flex;align-items:center;gap:7px;height:29px;flex:none;padding:0 5px 0 7px;border-bottom:1px solid var(--line);background:transparent;cursor:grab;touch-action:none" onPointerDown="{{ layersDrag }}">
+            <span style="display:flex;color:var(--t3)"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M4.8 6.2h6.4M4.8 9.8h6.4"></path></svg></span>
+            <div style="flex:0 0 auto;font-size:10px;letter-spacing:.1em;font-weight:600;color:var(--t2);white-space:nowrap">LAYERS</div>
+            <div style="flex:1 1 auto;min-width:0;text-align:right;font-size:10.5px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ maskCount }}</div>
+            <button style="width:21px;height:21px;display:flex;align-items:center;justify-content:center;border:none;background:transparent;border-radius:5px;color:var(--t3);cursor:pointer" onClick="{{ layersFold }}" title="Collapse"><span style="{{ layersChevSpin }}"><svg style="width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="m4.6 6.4 3.4 3.4 3.4-3.4"></path></svg></span></button>
+            <button style="width:21px;height:21px;display:flex;align-items:center;justify-content:center;border:none;background:transparent;border-radius:5px;color:var(--t3);cursor:pointer" onClick="{{ layersClose }}" title="Hide"><svg style="width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="m4.6 4.6 6.8 6.8M11.4 4.6l-6.8 6.8"></path></svg></button>
+          </div>
+          <sc-if value="{{ layersBody }}" hint-placeholder-val="{{ true }}">
+            <div style="flex:1;min-height:0;display:flex;flex-direction:column">
+              <div style="flex:none;padding:8px 9px 7px">
+                <button style="{{ reviewBtnStyle }}" onClick="{{ toggleReview }}" title="Show only regions needing review - R">
+                  <span style="display:flex;align-items:center;gap:7px"><span style="display:flex;color:var(--t3)"><svg style="width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M8 3.2 14 12.4H2z"></path><path d="M8 6.8v2.4M8 10.9h.01"></path></svg></span><span style="white-space:nowrap">Needs review</span></span>
+                  <span style="{{ reviewCountStyle }}">{{ reviewCount }}</span>
+                </button>
+                <sc-if value="{{ isStrip }}" hint-placeholder-val="{{ false }}">
+                  <div style="font-size:10.5px;color:var(--t3);margin-top:7px;line-height:1.4">{{ scopeNote }}</div>
+                </sc-if>
+              </div>
+              <div style="flex:1;min-height:0;overflow-y:auto;padding:0 7px 12px">
+                <sc-for list="{{ maskRows }}" as="m" hint-placeholder-count="4">
+                  <div style="{{ m.style }}">
+                    <div style="display:flex;align-items:center;gap:8px;min-height:26px;cursor:pointer" onClick="{{ m.toggle }}" onMouseEnter="{{ m.hover }}" onMouseLeave="{{ m.unhover }}">
+                      <div style="{{ m.dotStyle }}">{{ m.dot }}</div>
+                      <div style="flex:1;min-width:0">
+                        <div style="font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ m.title }}</div>
+                        <div style="font-size:10.5px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ m.sub }}</div>
+                      </div>
+                      <button style="width:21px;height:21px;display:flex;align-items:center;justify-content:center;border:none;background:transparent;border-radius:5px;color:var(--t3);cursor:pointer" onClick="{{ m.del }}" title="{{ m.delTitle }}"><sc-if value="{{ m.canDel }}" hint-placeholder-val="{{ true }}"><svg style="width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="m4.6 4.6 6.8 6.8M11.4 4.6l-6.8 6.8"></path></svg></sc-if></button>
+                    </div>
+                    <sc-if value="{{ m.open }}" hint-placeholder-val="{{ false }}">
+                      <div style="padding:6px 0 4px 20px;animation:mcFade 140ms ease-out">
+                        <sc-for list="{{ m.facts }}" as="f" hint-placeholder-count="5">
+                          <div style="display:flex;gap:8px;font-size:10.5px;line-height:1.7">
+                            <div style="width:70px;flex:none;color:var(--t3)">{{ f.k }}</div>
+                            <div style="flex:1;color:var(--t2)">{{ f.v }}</div>
+                          </div>
+                        </sc-for>
+                        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:9px">
+                          <sc-for list="{{ m.actions }}" as="a" hint-placeholder-count="3">
+                            <button style="{{ a.style }}" onClick="{{ a.run }}" title="{{ a.title }}">{{ a.label }}</button>
+                          </sc-for>
+                        </div>
+                      </div>
+                    </sc-if>
+                  </div>
+                </sc-for>
+                <sc-if value="{{ maskEmpty }}" hint-placeholder-val="{{ false }}">
+                  <div style="padding:14px 6px;font-size:11px;color:var(--t3);line-height:1.5">{{ maskEmptyText }}</div>
+                </sc-if>
+              </div>
+            </div>
+          </sc-if>
+          <sc-if value="{{ layersBody }}" hint-placeholder-val="{{ true }}">
+            <div style="position:absolute;right:0;bottom:0;width:17px;height:17px;display:flex;align-items:flex-end;justify-content:flex-end;padding:1px;color:var(--t3);cursor:nwse-resize;touch-action:none" onPointerDown="{{ layersResize }}"><svg style="width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M12.6 7.6 7.6 12.6M12.8 11.4l-1.4 1.4"></path></svg></div>
+          </sc-if>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ toolOpen }}" hint-placeholder-val="{{ true }}">
+        <div style="{{ toolWinStyle }}" onPointerDown="{{ toolFocus }}">
+          <div style="display:flex;align-items:center;gap:7px;height:29px;flex:none;padding:0 5px 0 7px;border-bottom:1px solid var(--line);background:transparent;cursor:grab;touch-action:none" onPointerDown="{{ toolDrag }}">
+            <span style="display:flex;color:var(--t3)"><svg style="width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M4.8 6.2h6.4M4.8 9.8h6.4"></path></svg></span>
+            <div style="flex:0 0 auto;font-size:10px;letter-spacing:.1em;font-weight:600;color:var(--t2);white-space:nowrap">{{ toolName }}</div>
+            <div style="flex:1 1 auto;min-width:0;text-align:right;font-size:10.5px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ toolHint }}</div>
+            <button style="width:21px;height:21px;display:flex;align-items:center;justify-content:center;border:none;background:transparent;border-radius:5px;color:var(--t3);cursor:pointer" onClick="{{ toolFold }}" title="Collapse"><span style="{{ toolChevSpin }}"><svg style="width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="m4.6 6.4 3.4 3.4 3.4-3.4"></path></svg></span></button>
+            <button style="width:21px;height:21px;display:flex;align-items:center;justify-content:center;border:none;background:transparent;border-radius:5px;color:var(--t3);cursor:pointer" onClick="{{ toolClose }}" title="Hide"><svg style="width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="m4.6 4.6 6.8 6.8M11.4 4.6l-6.8 6.8"></path></svg></button>
+          </div>
+          <sc-if value="{{ toolBody }}" hint-placeholder-val="{{ true }}">
+            <div style="flex:1;min-height:0;display:flex;flex-direction:column">
+              <div style="flex:1;min-height:0;overflow-y:auto;padding:9px 11px 11px">
+                <sc-if value="{{ toolHasNote }}" hint-placeholder-val="{{ false }}">
+                  <div style="font-size:10.5px;color:var(--t3);line-height:1.5;padding-bottom:9px">{{ toolNote }}</div>
+                </sc-if>
+                <sc-for list="{{ toolParams }}" as="p" hint-placeholder-count="3">
+                  <div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px 8px;min-height:26px">
+                    <div style="flex:1;min-width:64px;font-size:11px;color:var(--t2)">{{ p.label }}</div>
+                    <sc-if value="{{ p.isRange }}" hint-placeholder-val="{{ false }}">
+                      <input type="range" min="{{ p.min }}" max="{{ p.max }}" step="{{ p.step }}" value="{{ p.value }}" onChange="{{ p.set }}" style="width:84px;height:16px">
+                    </sc-if>
+                    <sc-if value="{{ p.isRange }}" hint-placeholder-val="{{ false }}">
+                      <div style="width:36px;text-align:right;font-size:11px;color:var(--t2)">{{ p.display }}</div>
+                    </sc-if>
+                    <sc-if value="{{ p.isSeg }}" hint-placeholder-val="{{ true }}">
+                      <div style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end">
+                        <sc-for list="{{ p.opts }}" as="o" hint-placeholder-count="2">
+                          <button style="{{ o.style }}" onClick="{{ o.pick }}">{{ o.label }}</button>
+                        </sc-for>
+                      </div>
+                    </sc-if>
+                  </div>
+                </sc-for>
+                <sc-if value="{{ toolHasAction }}" hint-placeholder-val="{{ false }}">
+                  <button style="{{ toolActionStyle }}" onClick="{{ toolAction }}">{{ toolActionLabel }}</button>
+                </sc-if>
+              </div>
+              <div style="flex:none;padding:8px 11px;border-top:1px solid var(--line);font-size:10px;color:var(--t3);line-height:1.45">{{ statusLine }}</div>
+            </div>
+          </sc-if>
+          <sc-if value="{{ toolBody }}" hint-placeholder-val="{{ true }}">
+            <div style="position:absolute;right:0;bottom:0;width:17px;height:17px;display:flex;align-items:flex-end;justify-content:flex-end;padding:1px;color:var(--t3);cursor:nwse-resize;touch-action:none" onPointerDown="{{ toolResize }}"><svg style="width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;flex:none"><path d="M12.6 7.6 7.6 12.6M12.8 11.4l-1.4 1.4"></path></svg></div>
+          </sc-if>
+        </div>
+      </sc-if>
+
+    </div>
+  </sc-if>
+
+  <div style="position:fixed;left:14px;bottom:14px;width:230px;display:flex;flex-direction:column;gap:7px;z-index:40">
+    <sc-for list="{{ notices }}" as="n" hint-placeholder-count="0">
+      <div style="{{ n.style }}">
+        <div style="flex:1;min-width:0;font-size:11px;line-height:1.45;color:var(--t2)">{{ n.text }}</div>
+        <button style="border:none;background:transparent;color:var(--t3);cursor:pointer;font-size:12px;padding:0 2px;line-height:1" onClick="{{ n.close }}" title="Dismiss">×</button>
+      </div>
+    </sc-for>
+  </div>
+
+  <sc-if value="{{ hasModal }}" hint-placeholder-val="{{ false }}">
+    <div style="position:fixed;inset:0;z-index:60;background:rgba(10,11,12,.34);display:flex;align-items:center;justify-content:center;animation:mcFade 120ms ease-out" onClick="{{ backdropClose }}">
+      <div style="{{ modalStyle }}">
+        <div style="display:flex;align-items:baseline;gap:10px">
+          <div style="flex:1;font-size:13.5px;font-weight:600">{{ modalTitle }}</div>
+          <div style="font-size:11px;color:var(--t3)">{{ modalMeta }}</div>
+        </div>
+        <sc-if value="{{ modalHasBody }}" hint-placeholder-val="{{ true }}">
+          <div style="font-size:12px;color:var(--t2);line-height:1.6;margin-top:10px">{{ modalBody }}</div>
+        </sc-if>
+
+        <sc-if value="{{ isNew }}" hint-placeholder-val="{{ false }}">
+          <div style="margin-top:16px;display:flex;flex-direction:column;gap:14px">
+            <div>
+              <div style="font-size:11px;color:var(--t3);margin-bottom:6px">Source</div>
+              <div style="display:flex;gap:8px;align-items:center">
+                <button style="height:28px;padding:0 11px;border:1px solid transparent;border-radius:7px;background:var(--accent-soft);font-size:12px;cursor:pointer;white-space:nowrap" onClick="{{ pickFolder }}">Choose folder…</button>
+                <button style="height:28px;padding:0 11px;border:1px solid transparent;border-radius:7px;background:var(--accent-soft);font-size:12px;cursor:pointer;white-space:nowrap" onClick="{{ pickFiles }}">Choose files…</button>
+                <div style="flex:1;font-size:11px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ draftSource }}</div>
+              </div>
+            </div>
+            <div>
+              <div style="font-size:11px;color:var(--t3);margin-bottom:6px">Name</div>
+              <input value="{{ draftName }}" onChange="{{ setDraftName }}" style="width:100%;height:32px;border:1px solid transparent;border-radius:7px;background:var(--panel2);padding:0 11px;font-size:12.5px;outline:none">
+            </div>
+            <div>
+              <div style="font-size:11px;color:var(--t3);margin-bottom:6px">Mode</div>
+              <div style="display:flex;gap:6px">
+                <sc-for list="{{ modeOpts }}" as="o" hint-placeholder-count="2">
+                  <button style="{{ o.style }}" onClick="{{ o.pick }}">{{ o.label }}</button>
+                </sc-for>
+              </div>
+              <div style="font-size:10.5px;color:var(--t3);margin-top:7px;line-height:1.5">Set once, at creation. It cannot be changed later - it decides how pages are handled everywhere in the project.</div>
+            </div>
+          </div>
+        </sc-if>
+
+        <sc-if value="{{ isChapter }}" hint-placeholder-val="{{ false }}">
+          <div style="margin-top:16px;display:flex;flex-direction:column;gap:14px">
+            <div>
+              <div style="font-size:11px;color:var(--t3);margin-bottom:7px">Project</div>
+              <div style="display:flex;gap:6px;flex-wrap:wrap">
+                <sc-for list="{{ projectOpts }}" as="o" hint-placeholder-count="3">
+                  <button style="{{ o.style }}" onClick="{{ o.pick }}">{{ o.label }}</button>
+                </sc-for>
+              </div>
+            </div>
+            <div>
+              <div style="font-size:11px;color:var(--t3);margin-bottom:6px">Chapter title</div>
+              <input value="{{ draftName }}" onChange="{{ setDraftName }}" style="width:100%;height:32px;border:1px solid transparent;border-radius:7px;background:var(--panel2);padding:0 11px;font-size:12.5px;outline:none" />
+            </div>
+            <div style="font-size:10.5px;color:var(--t3);line-height:1.5">{{ chapterNote }}</div>
+          </div>
+        </sc-if>
+
+        <sc-if value="{{ isSettings }}" hint-placeholder-val="{{ false }}">
+          <div style="margin-top:16px;max-height:420px;overflow-y:auto">
+            <sc-for list="{{ settingRows }}" as="s" hint-placeholder-count="4">
+              <div style="display:flex;align-items:center;gap:12px;min-height:32px;border-bottom:1px solid var(--line)">
+                <div style="flex:1;font-size:12px;color:var(--t2)">{{ s.label }}</div>
+                <div style="display:flex;gap:5px">
+                  <sc-for list="{{ s.opts }}" as="o" hint-placeholder-count="2">
+                    <button style="{{ o.style }}" onClick="{{ o.pick }}">{{ o.label }}</button>
+                  </sc-for>
+                </div>
+              </div>
+            </sc-for>
+            <div style="font-size:11px;letter-spacing:.09em;color:var(--t3);font-weight:600;margin:20px 0 8px">SHORTCUTS</div>
+            <div style="display:grid;grid-template-columns:1fr auto 1fr auto;gap:3px 12px">
+              <sc-for list="{{ shortcuts }}" as="k" hint-placeholder-count="12">
+                <div style="font-size:11px;color:var(--t2);white-space:nowrap">{{ k.label }}</div>
+                <div style="font-size:11px;color:var(--text);white-space:nowrap;text-align:right">{{ k.key }}</div>
+              </sc-for>
+            </div>
+          </div>
+        </sc-if>
+
+        <sc-if value="{{ isExport }}" hint-placeholder-val="{{ false }}">
+          <div style="margin-top:16px">
+            <sc-for list="{{ exportRows }}" as="s" hint-placeholder-count="3">
+              <div style="display:flex;align-items:center;gap:12px;min-height:32px;border-bottom:1px solid var(--line)">
+                <div style="flex:1;font-size:12px;color:var(--t2)">{{ s.label }}</div>
+                <div style="display:flex;gap:5px">
+                  <sc-for list="{{ s.opts }}" as="o" hint-placeholder-count="2">
+                    <button style="{{ o.style }}" onClick="{{ o.pick }}">{{ o.label }}</button>
+                  </sc-for>
+                </div>
+              </div>
+            </sc-for>
+            <div style="font-size:11px;color:var(--t3);margin-top:12px;line-height:1.6">{{ exportNote }}</div>
+          </div>
+        </sc-if>
+
+        <sc-if value="{{ isAbout }}" hint-placeholder-val="{{ false }}">
+          <div style="margin-top:14px">
+            <sc-for list="{{ aboutRows }}" as="a" hint-placeholder-count="5">
+              <div style="display:flex;gap:12px;font-size:11.5px;line-height:1.8">
+                <div style="width:110px;flex:none;color:var(--t3)">{{ a.k }}</div>
+                <div style="flex:1;color:var(--t2)">{{ a.v }}</div>
+              </div>
+            </sc-for>
+          </div>
+        </sc-if>
+
+        <div style="display:flex;align-items:center;gap:8px;margin-top:20px">
+          <div style="flex:1;font-size:10.5px;color:var(--t3);line-height:1.4">{{ modalFoot }}</div>
+          <sc-for list="{{ modalButtons }}" as="b" hint-placeholder-count="2">
+            <button style="{{ b.style }}" onClick="{{ b.run }}">{{ b.label }}</button>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1400,&quot;height&quot;:900},&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;dark&quot;,&quot;light&quot;],&quot;default&quot;:&quot;light&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Appearance&quot;},&quot;accent&quot;:{&quot;editor&quot;:&quot;color&quot;,&quot;options&quot;:[&quot;#ececea&quot;,&quot;#5a6e91&quot;,&quot;#3f7a6b&quot;,&quot;#9a6247&quot;,&quot;#7a6796&quot;],&quot;default&quot;:&quot;#5a6e91&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Appearance&quot;},&quot;startView&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;home&quot;,&quot;editor&quot;],&quot;default&quot;:&quot;home&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Demo state&quot;},&quot;emptyRecents&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Demo state&quot;},&quot;rtlDefault&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Demo state&quot;}}">
+class Component extends DCLogic {
+  constructor(p){
+    super(p);
+    this.JP=['なにこれ','まって','ここは…','ちがう','どうして','うそだ','いこう','しまった','だれ？','そんな'];
+    this.SFX=['ゴォォ','ドン','ザッ','バキ','シーン'];
+    this.LAY=[[[6,4,88,27],[6,34,42,30],[52,34,42,30],[6,67,88,29]],[[6,4,42,44],[52,4,42,20],[52,26,42,22],[6,51,88,45]],[[6,4,88,43],[6,50,42,46],[52,50,42,46]]];
+    this.ENG={soft:{engine:'Local · inpaint-s',model:'inpaint-s 1.8',fill:'Match surround'},hard:{engine:'Local · reconstruct-m',model:'reconstruct-m 3.1',fill:'Reconstruct'},cloud:{engine:'Cloud · restore-xl',model:'restore-xl 0.6',fill:'Reconstruct'}};
+    this.projects=this.buildProjects();
+    this.nid=1; this.seq=100;
+    this.viewRef=React.createRef();
+    const vw=(typeof window!=='undefined'?window.innerWidth:1400), vh=(typeof window!=='undefined'?window.innerHeight:900);
+    const ph=Math.max(200,Math.round(vh*0.32));
+    this.state={
+      view:(this.props.startView==='editor')?'editor':'home',
+      theme:this.props.theme||'light', rtl:this.props.rtlDefault!==false, cloudAllowed:true,
+      nav:'home', query:'', sort:'Last opened', openPid:null,
+      pid:'wander', cid:0, pageIdx:0, tool:'auto', drop:'auto', zoom:1, fit:true,
+      orig:false, hold:false, overlay:false, review:false, expand:null, hoverMask:null, sel:null,
+      wipe:100, zTop:10,
+      win:{
+        pages:{x:16,y:62,w:248,h:ph,open:true,fold:false,z:1},
+        layers:{x:16,y:74+ph,w:248,h:Math.max(180,Math.round(vh*0.34)),open:true,fold:false,z:2},
+        tool:{x:Math.max(300,vw-382),y:62,w:306,h:null,open:true,fold:false,z:3}
+      },
+      modal:null, pending:null, draft:{name:'',mode:'Single page',src:''},
+      notices:[], undo:[], redo:[], running:false, runFrom:0, cloudAck:false, fitW:360,
+      exportFmt:'PNG', exportDest:'New folder', exportMasks:'Flattened',
+      recentsOn:this.props.emptyRecents!==true
+    };
+    if(this.props.startView==='editor') this.state.view='editor';
+  }
+
+  measure(){
+    const el=this.viewRef.current;
+    const ch=el?el.clientHeight:(window.innerHeight-78);
+    const cw=el?el.clientWidth:(window.innerWidth-488);
+    const fw=Math.min(cw-224,(ch-152)/1.5);
+    const v=Math.max(180,Math.round(fw));
+    if(Math.abs(v-this.state.fitW)>2) this.setState({fitW:v});
+  }
+  componentDidUpdate(){ this.watch(); }
+  watch(){
+    const el=this.viewRef.current;
+    if(!el||el===this.watched) return;
+    this.watched=el;
+    if(this.ro) this.ro.disconnect();
+    this.ro=new ResizeObserver(()=>this.measure());
+    this.ro.observe(el);
+    this.measure();
+  }
+  componentDidMount(){
+    this.onResize=()=>{this.watch();this.measure();};
+    window.addEventListener('resize',this.onResize);
+    requestAnimationFrame(()=>{this.watch();this.measure();});
+    this.poll=setInterval(()=>{this.watch();},600);
+    this.onKey=(e)=>this.key(e);
+    this.onKeyUp=(e)=>{ if(e.key==='o'||e.key==='O') this.setState({hold:false}); };
+    window.addEventListener('keydown',this.onKey); window.addEventListener('keyup',this.onKeyUp);
+  }
+  componentWillUnmount(){ window.removeEventListener('keydown',this.onKey); window.removeEventListener('keyup',this.onKeyUp); window.removeEventListener('resize',this.onResize); clearInterval(this.timer); clearInterval(this.poll); if(this.ro) this.ro.disconnect(); }
+
+  /* ---------- data ---------- */
+  mkPages(key,count,o){
+    o=o||{};
+    let s=count*97+7; for(let i=0;i<key.length;i++) s=(s*31+key.charCodeAt(i))&0x7fffffff;
+    const rnd=()=>{s=(s*1103515245+12345)&0x7fffffff;return s/0x7fffffff;};
+    const pages=[];
+    for(let n=1;n<=count;n++){
+      const lay=this.LAY[(n-1)%3], regs=[];
+      const cnt=o.noText?0:2+Math.floor(rnd()*3);
+      for(let i=0;i<cnt;i++){
+        const pn=lay[i%lay.length], kr=rnd();
+        const kind=kr<0.66?'bubble':(kr<0.84?'sfx':'outside');
+        const w=kind==='bubble'?15+rnd()*6:12+rnd()*7, h=kind==='bubble'?17+rnd()*7:11+rnd()*6;
+        regs.push({id:'r'+n+'_'+(i+1),x:Math.round(pn[0]+2+rnd()*Math.max(2,pn[2]-w-4)),y:Math.round(pn[1]+2+rnd()*Math.max(2,pn[3]-h-4)),w:Math.round(w),h:Math.round(h),
+          kind,text:kind==='sfx'?this.SFX[Math.floor(rnd()*this.SFX.length)]:this.JP[Math.floor(rnd()*this.JP.length)],
+          masked:false,detected:true,declined:false,review:false,reason:'',lang:false,engine:'',model:'',fill:'',ms:0,cost:0,seq:0,hand:false,mech:''});
+      }
+      pages.push({n,status:o.noText?'done':'idle',regions:regs,note:'',file:(o.prefix||'p')+String(n).padStart(3,'0')+'.'+(o.ext||'png')});
+    }
+    return pages;
+  }
+  chapter(key,n,title,count,fill,o){
+    o=o||{};
+    const pages=this.mkPages(key+'c'+n,count,o);
+    if(fill==='all') pages.forEach((pg,i)=>this.clean(pg,'soft',i*3));
+    if(fill==='part') pages.slice(0,Math.max(1,Math.round(count*0.5))).forEach((pg,i)=>this.clean(pg,'soft',i*3));
+    return {n,title,pages,when:o.when||'-',noText:!!o.noText};
+  }
+  buildProjects(){
+    const P={}, add=(id,name,mode,path,when,starred,chapters,extra)=>{P[id]=Object.assign({id,name,mode,path,when,starred,chapters},extra||{});};
+
+    const c12=this.chapter('wander',12,'Vault of Ash',24,'none',{prefix:'wm',when:'2 h ago'});
+    for(let i=0;i<7;i++) this.clean(c12.pages[i],'soft',i*3);
+    const p3=c12.pages[2];
+    if(p3.regions[0]){p3.regions[0].review=true;p3.regions[0].reason='Reconstructed area';Object.assign(p3.regions[0],this.ENG.hard);}
+    if(p3.regions[1]){p3.regions[1].review=true;p3.regions[1].reason='Unusually large region';p3.regions[1].w=32;p3.regions[1].h=26;}
+    if(p3.regions[2]){p3.regions[2].review=true;p3.regions[2].reason='Cloud request accepted';Object.assign(p3.regions[2],this.ENG.cloud);p3.regions[2].cost=0.004;}
+    const p5=c12.pages[4];
+    if(p5.regions[1]) Object.assign(p5.regions[1],{masked:false,detected:false,engine:'',model:'',fill:'',ms:0,cost:0,seq:0,hand:false,mech:''});
+    const bare=(r)=>Object.assign(r,{masked:false,engine:'',model:'',fill:'',ms:0,cost:0,seq:0,hand:false,mech:''});
+    const p6=c12.pages[5];
+    if(p6.regions[0]){bare(p6.regions[0]);p6.regions[0].review=true;p6.regions[0].lang=true;p6.regions[0].reason='Language check skipped - confidence 0.41';}
+    const p7=c12.pages[6];
+    if(p7.regions[0]){bare(p7.regions[0]);p7.regions[0].declined=true;p7.regions[0].review=true;p7.regions[0].reason='Declined - original text left in place';}
+    if(p7.regions[1]){p7.regions[1].review=true;p7.regions[1].reason='Text outside a speech bubble';p7.regions[1].kind='outside';}
+    c12.pages[8].status='skipped'; c12.pages[8].note='Unreadable - truncated JPEG data';
+    add('wander','Wandering Moon','single','~/scans/wandering-moon','2 h ago',false,
+      [c12,this.chapter('wander',11,'Grey Tide',22,'all',{prefix:'wm',when:'3 days ago'}),this.chapter('wander',10,'Nightfall',20,'all',{prefix:'wm',when:'1 week ago'})],{resume:{ci:0,page:8}});
+
+    add('ember','Emberfall Reborn','single','~/scans/emberfall','yesterday',true,
+      [this.chapter('ember',25,'The Shell Cracks',36,'all',{prefix:'em',when:'yesterday'}),this.chapter('ember',24,'Hatchling',30,'all',{prefix:'em',when:'2 weeks ago'})]);
+
+    add('tsuki','Tsuki to Hane','single','~/scans/tsuki','2 days ago',false,
+      [this.chapter('tsuki',107,'Feather Weight',20,'none',{prefix:'th',when:'2 days ago'}),this.chapter('tsuki',106,'Small Hours',18,'all',{prefix:'th',when:'1 week ago'})]);
+
+    const nine=this.chapter('nine',56,'Ninth Sky',22,'all',{prefix:'ns',when:'3 days ago'});
+    ['Reconstructed area','Unusually large region','Cloud request accepted'].forEach((why,i)=>{
+      const pgx=nine.pages[i*3], r=pgx&&pgx.regions[0]; if(!r) return;
+      r.review=true; r.reason=why; if(i===1){r.w=30;r.h=24;} if(i===2){Object.assign(r,this.ENG.cloud);r.cost=0.004;}
+    });
+    add('nine','Nine Skies','single','~/scans/nine-skies','3 days ago',false,
+      [nine,this.chapter('nine',55,'Eighth Sky',24,'all',{prefix:'ns',when:'2 weeks ago'})]);
+
+    add('neon','Neon Alley','longstrip','~/downloads/neon-alley','4 days ago',false,
+      [this.chapter('neon',4,'Rain Check',6,'part',{prefix:'na',ext:'webp',when:'4 days ago'}),this.chapter('neon',3,'Signal Lost',6,'all',{prefix:'na',ext:'webp',when:'3 weeks ago'})],{convert:'WebP'});
+
+    add('yoake','Yoake photobook','single','~/scans/yoake','last week',false,
+      [this.chapter('yoake',1,'Full set',48,'none',{prefix:'yo',noText:true,when:'last week'})]);
+
+    add('backup','Old scan backup','single','~/scans/_backup','2 months ago',false,
+      [this.chapter('backup',1,'Assorted',12,'all',{prefix:'ob',when:'2 months ago'})],{trashed:true});
+
+    return P;
+  }
+  clean(pg,tier,bias){
+    const e=this.ENG[tier]||this.ENG.soft;
+    pg.regions.forEach((r,i)=>{ if(!r.detected) return;
+      r.masked=true; r.engine=e.engine; r.model=e.model; r.fill=e.fill; r.ms=120+((bias+i*37)%700); r.seq=(this.seq=(this.seq||100)+1); });
+    pg.status='done';
+  }
+
+  /* ---------- helpers ---------- */
+  proj(){ return this.projects[this.state.pid]; }
+  chap(){ const p=this.proj(); return p.chapters[Math.min(this.state.cid||0,p.chapters.length-1)]; }
+  pages(){ return this.chap().pages; }
+  page(){ const ps=this.pages(); return ps[Math.min(this.state.pageIdx,ps.length-1)]; }
+  chapStatus(c){
+    const done=c.pages.filter(x=>x.status==='done').length, rev=c.pages.reduce((a,x)=>a+x.regions.filter(r=>r.review).length,0);
+    if(done===0) return 'Not started';
+    if(done<c.pages.length) return 'In progress';
+    return rev?'Review':'Completed';
+  }
+  projStats(p){
+    let pages=0,done=0,rev=0;
+    p.chapters.forEach(c=>{pages+=c.pages.length;done+=c.pages.filter(x=>x.status==='done').length;rev+=c.pages.reduce((a,x)=>a+x.regions.filter(r=>r.review).length,0);});
+    return {pages,done,rev};
+  }
+  origShown(){ return this.state.orig||this.state.hold; }
+  isStrip(){ return this.proj().mode==='longstrip'; }
+  reviewList(pg){ return pg.regions.filter(r=>r.review); }
+  snap(label){
+    const s=JSON.stringify(this.pages());
+    this.setState(st=>({undo:[...st.undo.slice(-24),{s,label,pid:this.state.pid,cid:this.state.cid||0}],redo:[]}));
+  }
+  notice(text){
+    const id=this.nid++;
+    this.setState(st=>({notices:[...st.notices,{id,text}]}));
+    setTimeout(()=>this.setState(st=>({notices:st.notices.filter(n=>n.id!==id)})),6500);
+  }
+  openChapter(id,ci,run){
+    const p=this.projects[id], ch=p.chapters[ci||0];
+    const firstIdle=ch.pages.findIndex(x=>x.status==='idle');
+    this.setState({view:'editor',pid:id,cid:ci||0,pageIdx:run&&firstIdle>=0?firstIdle:0,review:false,expand:null,sel:null,undo:[],redo:[],modal:p.convert?'convert':null,tool:'auto',drop:'auto'});
+    if(ch.noText) setTimeout(()=>this.notice('0 regions across '+ch.pages.length+' pages - nothing to clean.'),450);
+    const skipped=ch.pages.find(x=>x.status==='skipped');
+    if(skipped) setTimeout(()=>this.notice('1 file skipped: '+skipped.file+' - unreadable, truncated JPEG data.'),700);
+    if(run) setTimeout(()=>this.startRun('project'),420);
+  }
+
+  /* ---------- floating windows ---------- */
+  setWin(id,patch){ this.setState(s=>{const w=Object.assign({},s.win); w[id]=Object.assign({},w[id],patch); return {win:w};}); }
+  raise(id){ this.setState(s=>{ if(s.win[id].z===s.zTop) return null; const z=s.zTop+1, w=Object.assign({},s.win); w[id]=Object.assign({},w[id],{z}); return {zTop:z,win:w}; }); }
+  foldWin(id){ this.setWin(id,{fold:!this.state.win[id].fold}); }
+  toggleWin(id){ const open=!this.state.win[id].open; this.setWin(id,{open}); if(open) this.raise(id); }
+  openWin(id){ if(!this.state.win[id].open) this.setWin(id,{open:true}); this.raise(id); }
+  pickTool(id){ this.setState({tool:id,drop:id}); this.openWin('tool'); }
+  drag(id,e,mode){
+    if(e.button) return;
+    e.preventDefault(); if(mode==='size') e.stopPropagation();
+    const w=this.state.win[id], sx=e.clientX, sy=e.clientY;
+    const box=e.currentTarget.closest?e.currentTarget.closest('div'):null;
+    const oh=w.h||(mode==='size'&&e.currentTarget.parentNode?e.currentTarget.parentNode.offsetHeight:260);
+    this.raise(id);
+    const move=(ev)=>{
+      if(mode==='size'){
+        this.setWin(id,{w:Math.max(198,Math.min(560,w.w+ev.clientX-sx)),h:Math.max(120,Math.min(window.innerHeight-30,oh+ev.clientY-sy))});
+      } else {
+        this.setWin(id,{
+          x:Math.max(-(w.w-84),Math.min(window.innerWidth-84,w.x+ev.clientX-sx)),
+          y:Math.max(4,Math.min(window.innerHeight-38,w.y+ev.clientY-sy))
+        });
+      }
+    };
+    const up=()=>{ window.removeEventListener('pointermove',move); window.removeEventListener('pointerup',up); document.body.style.userSelect=''; };
+    document.body.style.userSelect='none';
+    window.addEventListener('pointermove',move); window.addEventListener('pointerup',up);
+  }
+
+  /* ---------- run ---------- */
+  startRun(scope){
+    if(this.state.running) return;
+    this.snap('Auto clean');
+    const pl=this.pages();
+    const queue=scope==='page'?[this.state.pageIdx]:pl.map((x,i)=>i).filter(i=>pl[i].status==='idle');
+    if(!queue.length){ this.notice('Nothing to clean in this scope.'); return; }
+    this.setState({running:true,drop:'auto',tool:'auto'});
+    let k=0;
+    const tier=this.state.ceiling==='Local + cloud'?'hard':'soft';
+    const step=()=>{
+      if(k>=queue.length){ clearInterval(this.timer); this.setState({running:false}); this.notice('Auto clean finished - '+queue.length+' page'+(queue.length===1?'':'s')+' cleaned.'); return; }
+      const i=queue[k];
+      pl[i].status='running';
+      this.setState({pageIdx:i});
+      setTimeout(()=>{
+        if(!this.state.running) return;
+        this.clean(pl[i],tier,i*5);
+        if(i%5===3 && pl[i].regions[0]){ const r=pl[i].regions[0]; r.review=true; r.reason='Reconstructed area'; Object.assign(r,this.ENG.hard); }
+        this.forceUpdate();
+      },230);
+      k++;
+    };
+    step(); this.timer=setInterval(step,420);
+  }
+  cancelRun(){ clearInterval(this.timer); this.pages().forEach(x=>{ if(x.status==='running') x.status='idle'; }); this.setState({running:false}); this.notice('Auto clean cancelled. Cleaned pages are kept.'); }
+
+  /* ---------- tool application ---------- */
+  applyRegion(r){
+    const t=this.state.tool, pg=this.page();
+    if(t==='auto'){ this.startRun('page'); return; }
+    this.setState({sel:r.id});
+    if(t==='fill'){
+      const engine=this.state.fillEngine||'Local';
+      if(engine==='Cloud'){
+        if(!this.state.cloudAllowed){ this.notice('Cloud engines are blocked in Settings. Nothing was sent.'); return; }
+        if(!this.state.cloudAck){ this.setState({modal:'disclose',pending:{r:r.id}}); return; }
+        this.setState({modal:'cost',pending:{r:r.id}}); return;
+      }
+    }
+    this.snap('Apply '+t);
+    if(t==='ai'){
+      const mech=r.detected?'Snapped to detection':'Fallback - glyph search';
+      Object.assign(r,{masked:true,engine:'AI mask brush',model:'mc-detect 2.4',fill:'Match surround',ms:180+Math.round(Math.random()*260),seq:++this.seq,hand:true,mech,detected:true,review:false,reason:''});
+      this.notice('AI mask brush: '+mech.toLowerCase()+'. Mask extended to complete the last character.');
+    } else if(t==='fill'){
+      const mode=this.state.fillMode||'Match surround';
+      Object.assign(r,{masked:true,engine:'Content-aware fill',model:mode==='Reconstruct'?'reconstruct-m 3.1':'inpaint-s 1.8',fill:mode,ms:140+Math.round(Math.random()*300),seq:++this.seq,hand:true});
+      if(mode==='Reconstruct'){ r.review=true; r.reason='Reconstructed area'; }
+      if(r.declined){ r.declined=false; r.review=false; r.reason=''; }
+    } else {
+      const names={brush:'Brush',shapes:'Shapes',clone:'Clone / heal'};
+      Object.assign(r,{masked:true,engine:names[t]||'Hand',model:'-',fill:t==='clone'?(this.state.cMode||'Heal'):'Match surround',ms:0,seq:++this.seq,hand:true,detected:true});
+      if(r.declined){ r.declined=false; r.review=false; r.reason=''; }
+    }
+    if(pg.status==='idle') pg.status='done';
+    this.forceUpdate();
+  }
+  confirmCloud(){
+    const id=this.state.pending&&this.state.pending.r, pg=this.page();
+    const r=pg.regions.find(x=>x.id===id);
+    this.setState({modal:null,pending:null,cloudAck:true});
+    if(!r) return;
+    this.snap('Cloud fill');
+    if(r.kind==='outside'){
+      Object.assign(r,{masked:false,engine:'',model:'',fill:'',ms:0,cost:0,seq:0,hand:false,mech:'',review:true,reason:'Cloud request rejected'});
+      this.notice('Cloud request rejected by the provider. Original text left in place.');
+    } else {
+      Object.assign(r,{masked:true,engine:this.ENG.cloud.engine,model:this.ENG.cloud.model,fill:'Reconstruct',ms:820+Math.round(Math.random()*600),cost:0.004,seq:++this.seq,hand:true,review:true,reason:'Cloud request accepted',declined:false});
+      this.notice('Cloud region returned in 1.1 s · $0.004 billed.');
+    }
+    this.forceUpdate();
+  }
+  delMask(r){
+    this.snap('Delete mask');
+    Object.assign(r,{masked:false,engine:'',model:'',fill:'',ms:0,cost:0,seq:0,hand:false,mech:''});
+    if(r.reason==='Cloud request accepted'||r.reason==='Reconstructed area'){ r.review=false; r.reason=''; }
+    this.setState({expand:null}); this.notice('Mask deleted - the original text under it is back.');
+    this.forceUpdate();
+  }
+  rerun(r,kind){
+    this.snap('Re-run region');
+    if(kind==='stronger'){ Object.assign(r,this.ENG.hard); r.ms=520+Math.round(Math.random()*400); r.review=true; r.reason='Reconstructed area'; this.notice('Region re-run one step stronger - reconstruct-m 3.1.'); }
+    if(kind==='simpler'){ Object.assign(r,this.ENG.soft); r.ms=90+Math.round(Math.random()*120); r.review=false; r.reason=''; r.cost=0; this.notice('Region re-run one step simpler - inpaint-s 1.8.'); }
+    if(kind==='fill'){ const order=['Match surround','Reconstruct','Solid']; r.fill=order[(order.indexOf(r.fill)+1)%3]; this.notice('Fill mode → '+r.fill+'.'); }
+    if(kind==='reopen'){ const back={'Brush':'brush','Shapes':'shapes','AI mask brush':'ai','Content-aware fill':'fill','Clone / heal':'clone'}[r.engine]||'fill';
+      this.setState({tool:back,drop:back,expand:null,sel:r.id}); this.notice('Mask kept, reopened in '+(r.engine||'Content-aware fill')+'.'); }
+    r.seq=++this.seq; this.forceUpdate();
+  }
+  cleanAnyway(r){
+    this.snap('Clean anyway');
+    Object.assign(r,{masked:true,engine:this.ENG.soft.engine,model:this.ENG.soft.model,fill:'Match surround',ms:210,seq:++this.seq,review:false,reason:'',lang:false});
+    this.notice('Cleaned despite the language check.'); this.forceUpdate();
+  }
+  jump(r){
+    const i=this.pages().findIndex(pg=>pg.regions.some(x=>x.id===r.id));
+    if(i>=0) this.goPage(i);
+    this.setState({sel:r.id,overlay:true});
+  }
+  goPage(i){
+    const n=Math.max(0,Math.min(this.pages().length-1,i));
+    this.setState({pageIdx:n,expand:null});
+    if(this.isStrip()&&this.viewRef.current){ const el=this.viewRef.current; const kids=el.firstChild&&el.firstChild.children; if(kids&&kids[n]) el.scrollTop=kids[n].offsetTop-el.offsetTop-14; }
+  }
+  onScroll(){
+    if(!this.isStrip()||!this.viewRef.current) return;
+    const el=this.viewRef.current, kids=el.firstChild&&el.firstChild.children; if(!kids) return;
+    let idx=0; for(let i=0;i<kids.length;i++){ if(kids[i].offsetTop-el.offsetTop-el.scrollTop<el.clientHeight*0.45) idx=i; }
+    if(idx!==this.state.pageIdx) this.setState({pageIdx:idx});
+  }
+  issues(){ const out=[]; this.pages().forEach((pg,i)=>pg.regions.forEach(r=>{ if(r.review) out.push({i,r}); })); return out; }
+  stepIssue(d){
+    const all=this.issues(); if(!all.length){ this.notice('No regions need review.'); return; }
+    const cur=all.findIndex(x=>x.r.id===this.state.sel);
+    const nx=all[((cur<0?(d>0?-1:0):cur)+d+all.length*2)%all.length];
+    this.goPage(nx.i); this.setState({sel:nx.r.id,overlay:true,review:true});
+  }
+  undoDo(){
+    const st=this.state; if(!st.undo.length) return;
+    const last=st.undo[st.undo.length-1], ch=this.projects[last.pid].chapters[last.cid||0];
+    const now=JSON.stringify(ch.pages);
+    ch.pages=JSON.parse(last.s);
+    this.setState({undo:st.undo.slice(0,-1),redo:[...st.redo,{s:now,label:last.label,pid:last.pid,cid:last.cid||0}],expand:null});
+    this.notice('Undo - '+last.label.toLowerCase()+'.');
+  }
+  redoDo(){
+    const st=this.state; if(!st.redo.length) return;
+    const nx=st.redo[st.redo.length-1], ch=this.projects[nx.pid].chapters[nx.cid||0];
+    const now=JSON.stringify(ch.pages);
+    ch.pages=JSON.parse(nx.s);
+    this.setState({redo:st.redo.slice(0,-1),undo:[...st.undo,{s:now,label:nx.label,pid:nx.pid,cid:nx.cid||0}],expand:null});
+  }
+  key(e){
+    if(e.metaKey||e.ctrlKey) return;
+    const k=e.key;
+    if(k==='Escape'){ this.setState({modal:null,pending:null,drop:null}); return; }
+    if(this.state.modal) return;
+    if(this.state.view!=='editor'){ if(k==='n') this.setState({modal:'new'}); return; }
+    const tools=['auto','brush','shapes','ai','fill','clone'];
+    if('123456'.includes(k)){ const t=tools[+k-1]; this.setState({tool:t,drop:t}); e.preventDefault(); return; }
+    if(k==='o'){ this.setState({hold:true}); return; }
+    if(k==='O'){ this.setState(s=>({orig:!s.orig})); return; }
+    if(k==='m'||k==='M'){ this.setState(s=>({overlay:!s.overlay})); return; }
+    if(k==='r'||k==='R'){ this.setState(s=>({review:!s.review})); return; }
+    if(k==='f'||k==='F'){ this.toggleWin('pages'); return; }
+    if(k==='l'||k==='L'){ this.toggleWin('layers'); return; }
+    if(k==='t'||k==='T'){ this.toggleWin('tool'); return; }
+    if(k==='e'||k==='E'){ this.setState({modal:'export'}); return; }
+    if(k===','){ this.setState({modal:'settings'}); return; }
+    if(k==='h'||k==='H'){ this.setState({view:'home'}); return; }
+    if(k==='u'){ this.undoDo(); return; }
+    if(k==='U'){ this.redoDo(); return; }
+    if(k==='n'||k==='N'){ this.stepIssue(1); return; }
+    if(k==='p'||k==='P'){ this.stepIssue(-1); return; }
+    if(k==='0'){ this.setState({zoom:1,fit:true}); return; }
+    if(k==='+'||k==='='){ this.setState(s=>({zoom:Math.min(2.4,s.zoom+0.15),fit:false})); return; }
+    if(k==='-'){ this.setState(s=>({zoom:Math.max(0.4,s.zoom-0.15),fit:false})); return; }
+    if(k==='ArrowLeft'||k==='['){ this.goPage(this.state.pageIdx-1); return; }
+    if(k==='ArrowRight'||k===']'){ this.goPage(this.state.pageIdx+1); return; }
+  }
+
+  /* ---------- style kits ---------- */
+  btn(active,size){
+    const h=size||26;
+    return 'height:'+h+'px;padding:0 10px;border-radius:5px;font-size:'+(h<24?11:12)+'px;cursor:pointer;white-space:nowrap;transition:background 140ms ease-out;'+
+      (active?'border:1px solid transparent;background:var(--accent);color:var(--accent-fg);font-weight:600;':'border:1px solid transparent;background:var(--accent-soft);color:var(--t2);');
+  }
+  chip(active){
+    return 'height:23px;padding:0 9px;border-radius:6px;font-size:11px;cursor:pointer;white-space:nowrap;transition:background 140ms ease-out;'+
+      (active?'border:1px solid transparent;background:var(--accent);color:var(--accent-fg);font-weight:600;':'border:1px solid transparent;background:var(--accent-soft);color:var(--t3);');
+  }
+  ibtn(active,size){ const h=size||30;
+    return 'width:'+h+'px;height:'+h+'px;display:flex;align-items:center;justify-content:center;border:1px solid transparent;border-radius:8px;cursor:pointer;transition:background 140ms ease-out;'+
+      (active?'background:var(--accent);color:var(--accent-fg);':'background:transparent;color:var(--t2);'); }
+  small(){ return 'height:23px;padding:0 9px;border-radius:6px;font-size:11px;cursor:pointer;border:1px solid transparent;background:var(--accent-soft);color:var(--t2);white-space:nowrap;'; }
+  nav(){ return 'height:23px;flex:none;padding:0 7px;border-radius:6px;font-size:11px;cursor:pointer;border:1px solid transparent;background:var(--accent-soft);color:var(--t2);white-space:nowrap;'; }
+
+  /* ---------- render values ---------- */
+  renderVals(){
+    const S=this, s=this.state;
+    if(typeof document!=='undefined'){
+      document.documentElement.setAttribute('data-theme',s.theme);
+      const acc=this.props.accent;
+      if(acc && acc!=='#ececea'){
+        const hex=acc.replace('#','');
+        const n=hex.length===3?hex.split('').map(c=>c+c).join(''):hex;
+        const rgb=[0,2,4].map(i=>parseInt(n.slice(i,i+2),16)/255);
+        const lin=rgb.map(v=>v<=0.03928?v/12.92:Math.pow((v+0.055)/1.055,2.4));
+        const L=0.2126*lin[0]+0.7152*lin[1]+0.0722*lin[2];
+        document.documentElement.style.setProperty('--accent',acc);
+        document.documentElement.style.setProperty('--accent-fg',L>0.42?'#141514':'#f8f7f4');
+        const rgb255=[0,2,4].map(i=>parseInt(n.slice(i,i+2),16));
+        document.documentElement.style.setProperty('--accent-soft','rgba('+rgb255.join(',')+','+(s.theme==='dark'?0.16:0.11)+')');
+      } else {
+        document.documentElement.style.removeProperty('--accent');
+        document.documentElement.style.removeProperty('--accent-fg');
+        document.documentElement.style.removeProperty('--accent-soft');
+      }
+    }
+    const V={ isHome:s.view==='home', isEditor:s.view==='editor', viewRef:this.viewRef, onScroll:()=>this.onScroll() };
+
+    /* HOME */
+    const all=Object.keys(this.projects).map(k=>this.projects[k]);
+    const live=s.recentsOn?all.filter(x=>!x.trashed):[];
+    const rowStyle='display:flex;align-items:center;gap:20px;padding:18px 6px;border-bottom:1px solid var(--line);cursor:pointer';
+
+    const openP=s.openPid?this.projects[s.openPid]:null;
+    V.inChapters=!!openP; V.inLibrary=!openP;
+    V.backToLibrary=()=>this.setState({openPid:null});
+    if(openP){
+      const st2=this.projStats(openP);
+      V.openProjectName=openP.name;
+      V.openProjectMeta=openP.chapters.length+(openP.chapters.length===1?' chapter · ':' chapters · ')+st2.pages+' pages · '+(openP.mode==='longstrip'?'longstrip':'single page')+' · '+openP.path;
+      V.chapterRows=openP.chapters.map((c,ci)=>{
+        const done=c.pages.filter(x=>x.status==='done').length, rev=c.pages.reduce((a,x)=>a+x.regions.filter(r=>r.review).length,0);
+        const stt=this.chapStatus(c);
+        return {key:c.n,num:'Ch. '+c.n,title:c.title,mark:stt==='Completed'?'✓':stt==='Not started'?'·':stt==='Review'?'△':'●',
+          markStyle:'width:14px;flex:none;text-align:center;font-size:11.5px;color:'+(stt==='Not started'?'var(--t3)':'var(--t2)'),
+          sub:c.pages.length+' pages'+(rev?' · '+rev+' need review':''),
+          chip:stt, cleaned:done+' / '+c.pages.length+' cleaned', when:c.when,
+          style:rowStyle, open:()=>this.openChapter(openP.id,ci)};
+      });
+    } else { V.openProjectName=''; V.openProjectMeta=''; V.chapterRows=[]; }
+
+    V.cards=live.map((x,i)=>{
+      const q=this.projStats(x), latest=x.chapters[0], stt=this.chapStatus(latest);
+      const interrupted=!!x.resume&&stt==='In progress';
+      const lay=this.LAY[i%3];
+      const panels=lay.map((b,j)=>({key:j,style:'position:absolute;left:'+b[0]+'%;top:'+b[1]+'%;width:'+b[2]+'%;height:'+b[3]+'%;background:'+((i+j)%2?'var(--art)':'var(--art2)')+''}));
+      return {key:x.id,name:x.name,panels,
+        chapterLine:x.chapters.length+(x.chapters.length===1?' chapter · ':' chapters · latest ')+'Ch. '+latest.n+' · '+latest.title,
+        chip:stt, chipStyle:'position:absolute;top:8px;left:8px;padding:3px 7px;border-radius:5px;font-size:10px;color:var(--t2);background:var(--surface);box-shadow:var(--edge-soft);white-space:nowrap',
+        cleaned:q.done+' / '+q.pages+' cleaned', when:x.when,
+        resumable:interrupted, resume:(e)=>{e.stopPropagation();this.openChapter(x.id,x.resume.ci,true);},
+        open:()=>this.setState({openPid:x.id})};
+    });
+    V.noCards=!live.length;
+    V.emptyTitle='No projects yet.';
+    V.emptyBody='Start a project from a folder of pages. Mode - single page or longstrip - is chosen once, at creation, and applies to every chapter in it.';
+
+    V.startNew=()=>this.setState({modal:'new',draft:{name:'',mode:'Single page',src:''}});
+    V.startChapter=()=>this.setState({modal:'chapter',draft:{name:'',mode:'Single page',src:'',pid:s.openPid||live[0].id}});
+    V.openDialog=()=>{ this.setState({modal:'open'}); };
+    V.openAbout=()=>this.setState({modal:'about'});
+    V.toggleTheme=()=>this.setState(x=>({theme:x.theme==='dark'?'light':'dark'}));
+    V.themeLabel=s.theme==='dark'?'Light theme':'Dark theme';
+
+    /* EDITOR */
+    const p=this.proj(), ch=this.chap(), pgs=ch.pages, pg=this.page(), strip=this.isStrip();
+    V.projectName=p.name+' · Ch. '+ch.n;
+    V.modeLabel=ch.title+' · '+(strip?'longstrip':'single page')+' · '+(s.rtl?'right-to-left':'left-to-right');
+    V.goHome=()=>this.setState({view:'home',review:false,openPid:p.id});
+    V.origStyle=this.ibtn(this.origShown()); V.pinStyle=this.ibtn(s.orig&&!s.hold);
+    V.exportStyle=this.ibtn(true);
+    V.wipe=s.wipe; V.wipeLabel=s.wipe>=100?'clean':s.wipe<=0?'orig':s.wipe+'%';
+    V.setWipe=(e)=>this.setState({wipe:+e.target.value});
+    V.holdOn=()=>this.setState({hold:true}); V.holdOff=()=>this.setState({hold:false});
+    V.togglePin=()=>this.setState(x=>({orig:!x.orig}));
+    V.overlayStyle=this.ibtn(s.overlay); V.toggleOverlay=()=>this.setState(x=>({overlay:!x.overlay}));
+    V.openSettings=()=>this.setState({modal:'settings'}); V.openExport=()=>this.setState({modal:'export'});
+    V.isStrip=strip;
+
+    const doneN=pgs.filter(x=>x.status==='done').length;
+    V.pagesCount=doneN+' / '+pgs.length;
+    V.pageRows=pgs.map((x,i)=>{
+      const rev=x.regions.filter(r=>r.review).length, act=i===s.pageIdx;
+      const N=x.regions.length, nOk=x.regions.filter(r=>r.masked&&!r.review).length;
+      const pct=N?Math.round(nOk/N*100):(x.status==='done'?100:0);
+      const mark=x.status==='running'?'●':x.status==='done'?'✓':x.status==='skipped'?'!':'·';
+      const title=x.status==='skipped'?x.note:x.status==='done'?(rev?rev+' region'+(rev>1?'s':'')+' need review':'cleaned'):x.status==='running'?'cleaning now':'not cleaned';
+      return {key:x.n,label:(strip?'pos ':'p. ')+String(x.n).padStart(2,'0'),mark,badge:rev?String(rev):'',title:x.file+' - '+title,
+        markStyle:'width:14px;text-align:center;font-size:'+(x.status==='running'?'10px':'12px')+';color:'+(x.status==='skipped'?'var(--warn)':x.status==='running'?'var(--accent)':x.status==='done'?'var(--text)':'var(--t3)')+';'+(x.status==='running'?'animation:mcBlink 900ms ease-in-out infinite;':''),
+        ratio:N?(nOk+' / '+N):'-',
+        ratioStyle:'min-width:38px;text-align:right;font-size:10.5px;white-space:nowrap;color:'+(rev?'var(--text)':N&&nOk===N?'var(--t2)':'var(--t3)'),
+        barTrack:'flex:1;min-width:24px;height:4px;border-radius:2px;background:var(--line);overflow:hidden',
+        barStyle:'height:100%;width:'+pct+'%;border-radius:2px;transition:width 220ms ease-out;background:'+(x.status==='skipped'?'var(--warn)':rev?'var(--tint)':'var(--accent)'),
+        style:'display:flex;align-items:center;gap:6px;height:25px;padding:0 8px;border-radius:5px;cursor:pointer;'+(act?'background:var(--accent-soft);':'')+(act?'':'color:var(--t2);'),
+        pick:()=>this.goPage(i)};
+    });
+
+    /* masks / review panel */
+    const scoped=strip?[pgs[s.pageIdx],pgs[Math.min(pgs.length-1,s.pageIdx+1)]].filter((v,i,a)=>a.indexOf(v)===i):[pg];
+    V.scopeNote='Scoped to the viewport - positions '+scoped.map(x=>String(x.n).padStart(2,'0')).join('–')+'.';
+    const allRegions=[]; scoped.forEach(x=>x.regions.forEach(r=>allRegions.push(r)));
+    const revAll=allRegions.filter(r=>r.review);
+    V.reviewCount=String(revAll.length);
+    V.reviewBtnStyle='width:100%;display:flex;align-items:center;justify-content:space-between;gap:8px;height:26px;padding:0 9px;border-radius:5px;cursor:pointer;font-size:11.5px;'+(s.review?'border:1px solid transparent;background:var(--accent);color:var(--accent-fg);font-weight:600;':'border:1px solid transparent;background:var(--accent-soft);color:var(--t2);');
+    V.reviewCountStyle='font-size:11px;color:'+(revAll.length?'var(--text)':'var(--t3)');
+    V.toggleReview=()=>this.setState(x=>({review:!x.review,expand:null}));
+
+    const list=s.review?revAll.slice().sort((a,b)=>b.seq-a.seq):allRegions.filter(r=>r.masked).sort((a,b)=>b.seq-a.seq);
+    V.maskCount=s.review?revAll.length+' flagged':allRegions.filter(r=>r.masked).length+' applied';
+    V.maskEmpty=!list.length;
+    V.maskEmptyText=s.review?'Nothing on this page needs review.':(ch.noText?'No text was detected on this page.':'No masks on this page yet. Auto clean, or draw one with any tool.');
+    V.maskRows=list.map(r=>{
+      const open=s.expand===r.id, hand=r.hand;
+      const facts=[];
+      if(r.masked){
+        facts.push({k:'Engine',v:r.engine||'-'},{k:'Model',v:r.model||'-'},{k:'Fill mode',v:r.fill||'-'},{k:'Elapsed',v:r.ms?r.ms+' ms':'instant'});
+        if(r.cost) facts.push({k:'Cost',v:'$'+r.cost.toFixed(3)+' · cloud'});
+        if(r.mech) facts.push({k:'Mechanism',v:r.mech});
+        facts.push({k:'Origin',v:hand?'drawn by hand':'automatic pass'});
+      } else {
+        facts.push({k:'Applied',v:'nothing - the original text is untouched'});
+        facts.push({k:'Detected',v:r.detected?'yes, by the auto pass':'no, missed by the auto pass'});
+      }
+      if(r.reason) facts.push({k:'Flagged',v:r.reason});
+      const acts=[];
+      if(r.masked){
+        acts.push({key:'a',label:'Stronger',title:'Re-run one step stronger',style:this.small(),run:(e)=>{e.stopPropagation();this.rerun(r,'stronger');}});
+        acts.push({key:'b',label:'Simpler',title:'Re-run one step simpler',style:this.small(),run:(e)=>{e.stopPropagation();this.rerun(r,'simpler');}});
+        acts.push({key:'c',label:'Fill: '+(r.fill||'-'),title:'Cycle fill mode',style:this.small(),run:(e)=>{e.stopPropagation();this.rerun(r,'fill');}});
+        acts.push({key:'d',label:'Reopen in tool',title:'Back into the tool that made it, mask intact',style:this.small(),run:(e)=>{e.stopPropagation();this.rerun(r,'reopen');}});
+      }
+      if(r.lang) acts.push({key:'e',label:'Clean anyway',title:'Ignore the language check',style:this.btn(true,22),run:(e)=>{e.stopPropagation();this.cleanAnyway(r);}});
+      if(!r.masked) acts.push({key:'f',label:'Show on page',title:'Select this region',style:this.small(),run:(e)=>{e.stopPropagation();this.jump(r);}});
+      return {key:r.id,open,facts,actions:acts,
+        title:r.masked?(r.engine||'Mask'):(r.declined?'Declined region':r.lang?'Skipped by language check':'Needs review'),
+        sub:s.review?r.reason:(r.fill||'-')+(r.cost?' · $'+r.cost.toFixed(3):'')+(hand?' · hand':''),
+        dot:r.declined?'!':r.review?'△':'▪', dotStyle:'width:14px;text-align:center;font-size:11px;color:'+(r.declined?'var(--warn)':r.review?'var(--t2)':'var(--t3)'),
+        canDel:!!r.masked, delGlyph:'', delTitle:r.masked?'Delete mask - restores the original text':'',
+        del:(e)=>{e.stopPropagation(); if(r.masked) this.delMask(r);},
+        toggle:()=>this.setState(x=>({expand:x.expand===r.id?null:r.id,sel:r.id})),
+        hover:()=>this.setState({hoverMask:r.id}), unhover:()=>this.setState({hoverMask:null}),
+        style:'border-radius:6px;padding:2px 6px;margin-bottom:2px;'+((s.hoverMask===r.id||s.sel===r.id)?'background:var(--panel);':'')};
+    });
+
+    /* canvas */
+    const NAT=620, w=Math.round(s.fitW*s.zoom);
+    const cpages=(strip?pgs:[pg]).map((x,i)=>{
+      const lay=this.LAY[(x.n-1)%3];
+      const panels=lay.map((b,j)=>({key:j,style:'position:absolute;left:'+b[0]+'%;top:'+b[1]+'%;width:'+b[2]+'%;height:'+b[3]+'%;background:'+((x.n+j)%2?'var(--art)':'var(--art2)')+';border-radius:1px'}));
+      const regions=x.regions.map(r=>{
+        const shown=r.masked&&!this.origShown()&&(r.x+r.w/2)<=s.wipe;
+        const round=r.kind==='bubble'?'border-radius:50%;':'border-radius:2px;';
+        let st='position:absolute;left:'+r.x+'%;top:'+r.y+'%;width:'+r.w+'%;height:'+r.h+'%;display:flex;align-items:center;justify-content:center;transition:background 140ms ease-out;'+round;
+        st+= s.tool?'cursor:crosshair;':'cursor:default;';
+        if(shown){ st+= s.overlay?'background:var(--tint);outline:1px solid var(--tintline);':'background:transparent;'; }
+        else { st+= r.kind==='bubble'?'background:#fff;border:1px solid rgba(30,28,24,.45);':'background:rgba(255,255,255,.92);'; }
+        if(r.declined) st+='outline:1.5px dashed var(--warn);outline-offset:2px;';
+        else if(r.review&&(s.overlay||s.review)) st+='outline:1.5px dotted rgba(20,22,24,.55);outline-offset:2px;';
+        if(s.sel===r.id||s.hoverMask===r.id) st+='box-shadow:0 0 0 2px var(--accent);';
+        return {key:r.id,style:st,showText:!shown,text:r.text,
+          textStyle:'writing-mode:vertical-rl;font-size:'+Math.max(8,Math.round(11*s.zoom))+'px;line-height:1.15;letter-spacing:.05em;color:#111;font-weight:'+(r.kind==='sfx'?'700':'500')+';max-height:88%;overflow:hidden',
+          showBadge:r.declined||(r.review&&s.review),
+          badge:r.declined?'!':'△',
+          badgeStyle:'position:absolute;top:-9px;right:-9px;width:15px;height:15px;border-radius:3px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;background:var(--paper);border:1px solid '+(r.declined?'var(--warn)':'rgba(20,22,24,.5)')+';color:'+(r.declined?'var(--warn)':'#111'),
+          title:(r.masked?(r.engine+' · '+r.fill+(r.ms?' · '+r.ms+' ms':'')):r.declined?'Declined - original text left in place':r.detected?'Uncleaned region':'Not detected by the auto pass')+(r.reason?' · '+r.reason:''),
+          click:()=>this.applyRegion(r)};
+      });
+      return {key:x.n,panels,regions,
+        showWipe:s.wipe<100&&!this.origShown(),
+        wipeStyle:'position:absolute;top:0;bottom:0;left:'+s.wipe+'%;width:1px;background:rgba(20,22,24,.45);box-shadow:0 0 0 1px rgba(255,255,255,.35);pointer-events:none',
+        style:'position:relative;flex:none;width:'+w+'px;aspect-ratio:2/3;background:var(--paper);box-shadow:0 1px 2px rgba(20,18,14,.10), 0 10px 30px rgba(20,18,14,.14);'+(strip&&i===s.pageIdx?'outline:2px solid var(--accent);outline-offset:2px;':''),
+        tag:x.file+(x.status==='skipped'?' · skipped':''),
+        tagStyle:'position:absolute;left:6px;bottom:5px;font-size:'+Math.max(8,Math.round(9*s.zoom))+'px;letter-spacing:.04em;color:rgba(20,22,24,.42);font-family:ui-monospace,SFMono-Regular,Menlo,monospace'};
+    });
+    V.canvasPages=cpages;
+
+    /* bottom bar */
+    V.fitStyle=this.ibtn(s.fit,28); V.stepStyle=this.ibtn(false,28); V.issueStyle=this.ibtn(false,28);
+    V.zoomLabelStyle='min-width:44px;height:26px;padding:0 4px;border:1px solid transparent;border-radius:7px;background:transparent;font-size:11px;color:var(--t2);cursor:pointer;white-space:nowrap';
+    V.zoomFit=()=>this.setState({zoom:1,fit:true}); V.zoom100=()=>this.setState({zoom:NAT/s.fitW,fit:false});
+    V.zoomIn=()=>this.setState(x=>({zoom:Math.min(3.2,x.zoom+0.15),fit:false}));
+    V.zoomOut=()=>this.setState(x=>({zoom:Math.max(0.4,x.zoom-0.15),fit:false}));
+    V.zoomLabel=s.fit?'fit':Math.round(w/NAT*100)+'%';
+    V.undoStyle=this.ibtn(false,28)+(s.undo.length?'':'opacity:.35;'); V.redoStyle=this.ibtn(false,28)+(s.redo.length?'':'opacity:.35;');
+    V.undo=()=>this.undoDo(); V.redo=()=>this.redoDo();
+    V.undoTitle=s.undo.length?'Undo '+s.undo[s.undo.length-1].label+' - U':'Nothing to undo';
+    V.redoTitle=s.redo.length?'Redo - shift U':'Nothing to redo';
+    V.prevPage=()=>this.goPage(s.pageIdx-1); V.nextPage=()=>this.goPage(s.pageIdx+1);
+    V.prevTitle=(s.rtl?'Next in reading order':'Previous page')+' - ←';
+    V.nextTitle=(s.rtl?'Previous in reading order':'Next page')+' - →';
+    V.pageLabel=String(pg.n).padStart(2,'0')+' / '+pgs.length;
+    const iss=this.issues(); const ci=iss.findIndex(x=>x.r.id===s.sel);
+    V.issueLabel=iss.length?(ci>=0?ci+1:'–')+' / '+iss.length:'0 / 0';
+    V.prevIssue=()=>this.stepIssue(-1); V.nextIssue=()=>this.stepIssue(1);
+
+    /* tools */
+    const seg=(label,val,opts,setter)=>({key:label,label,isSeg:true,isRange:false,opts:opts.map(o=>({key:o,label:o,style:this.chip(val===o),pick:()=>{const st={};st[setter]=o;this.setState(st);}}))});
+    const rng=(label,val,min,max,step,setter,unit)=>({key:label,label,isRange:true,isSeg:false,min,max,step,value:val,display:val+(unit||''),
+      set:(e)=>{const st={};st[setter]=+e.target.value;this.setState(st);}});
+    const defs=[
+      {id:'auto',name:'Auto clean',key:'1',note:'The whole automatic pipeline - detect, mask, fill.',
+        params:[seg('Scope',s.scope||'Page',['Page','Project'],'scope'),seg('Engine ceiling',s.ceiling||'Local',['Local','Local + cloud'],'ceiling')],
+        action:true},
+      {id:'brush',name:'Brush',key:'2',params:[rng('Size',s.bSize||28,4,120,2,'bSize','px'),rng('Hardness',s.bHard||70,0,100,5,'bHard','%'),rng('Spacing',s.bSpace||12,1,50,1,'bSpace','%'),seg('Mode',s.bMode||'Add',['Add','Erase'],'bMode')]},
+      {id:'shapes',name:'Shapes',key:'3',params:[seg('Shape',s.shape||'Rect',['Rect','Ellipse','Lasso','Polygon'],'shape'),rng('Feather',s.feather||2,0,20,1,'feather','px')]},
+      {id:'ai',name:'AI mask brush',key:'4',note:'A rough stroke snaps to the text underneath. Where nothing was detected it finds the glyphs itself, and extends past the stroke rather than leave half a character.',
+        params:[rng('Snap strength',s.snap||70,0,100,5,'snap','%'),seg('Show confidence',s.showConf===false?'Off':'On',['On','Off'],'showConfS'),seg('Fallback',s.fallback===false?'Off':'On',['On','Off'],'fallbackS')]},
+      {id:'fill',name:'Content-aware fill',key:'5',note:'Fills any existing mask. Match surround samples the paper; reconstruct regenerates screentone and art; solid uses a picked colour.',
+        params:[seg('Fill mode',s.fillMode||'Match surround',['Match surround','Reconstruct','Solid'],'fillMode'),seg('Engine',s.fillEngine||'Local',['Local','Cloud'],'fillEngine')]},
+      {id:'clone',name:'Clone / heal',key:'6',params:[rng('Size',s.cSize||32,4,120,2,'cSize','px'),rng('Hardness',s.cHard||60,0,100,5,'cHard','%'),seg('Alignment',s.cAlign||'Aligned',['Aligned','Non-aligned'],'cAlign'),seg('Mode',s.cMode||'Heal',['Clone','Heal'],'cMode')]}
+    ];
+    V.tools=defs.map(d=>{
+      const act=s.tool===d.id, open=s.drop===d.id;
+      return {key:d.id,name:d.name,key2:d.key,params:d.params,open,note:d.note||'',hasNote:!!d.note,
+        keyStyle:'width:15px;text-align:center;font-size:10.5px;color:'+(act?'var(--text)':'var(--t3)'),
+        style:'border-radius:6px;padding:0 8px 0 6px;margin-bottom:2px;'+(act?'background:var(--panel2);border:1px solid var(--line2);':'border:1px solid transparent;'),
+        chev:open?'▴':'▾', chevStyle:'border:none;background:transparent;color:var(--t3);font-size:10px;cursor:pointer;padding:2px 3px',
+        pick:()=>this.setState({tool:d.id,drop:d.id}),
+        toggle:(e)=>{e.stopPropagation();this.setState(x=>({drop:x.drop===d.id?null:d.id,tool:d.id}));},
+        hasAction:!!d.action,
+        actionLabel:s.running?'Cancel run':(s.scope==='Project'?'Run on project':'Run on page'),
+        actionStyle:'width:100%;margin-top:9px;'+this.btn(!s.running,26),
+        action:()=>{ s.running?this.cancelRun():this.startRun((s.scope||'Page').toLowerCase()==='project'?'project':'page'); }};
+    });
+    V.tools.forEach(t=>{t.key=t.key2;});
+    V.toolHint=({auto:'⏎ to run',brush:'drag on page',shapes:'drag on page',ai:'stroke over text',fill:'click a mask',clone:'alt-click source'})[s.tool]||'';
+    V.statusLine=s.running?'Cleaning - page '+(pg.n)+'. Cancel from Auto clean.':'Click a region on the page to apply '+(defs.find(d=>d.id===s.tool)||{}).name+'. Autosave on.';
+
+    /* floating windows */
+    const WN=s.win;
+    const shell=(id)=>{
+      const w=WN[id];
+      let st='position:absolute;left:'+w.x+'px;top:'+w.y+'px;width:'+w.w+'px;z-index:'+(20+w.z)+';display:flex;flex-direction:column;background:var(--panel);border-radius:8px;box-shadow:var(--edge);overflow:hidden;animation:mcIn 150ms ease-out;';
+      if(!w.fold) st+=(w.h?'height:'+w.h+'px;':'max-height:64vh;');
+      return st;
+    };
+    ['pages','layers','tool'].forEach(id=>{
+      const w=WN[id];
+      V[id+'Open']=w.open; V[id+'Body']=!w.fold; V[id+'WinStyle']=shell(id);
+      V[id+'ChevSpin']='display:flex;transition:transform 160ms ease-out;'+(w.fold?'transform:rotate(180deg);':'');
+      V[id+'Drag']=(e)=>this.drag(id,e,'move');
+      V[id+'Resize']=(e)=>this.drag(id,e,'size');
+      V[id+'Focus']=()=>this.raise(id);
+      V[id+'Fold']=(e)=>{e.stopPropagation();this.foldWin(id);};
+      V[id+'Close']=(e)=>{e.stopPropagation();this.setWin(id,{open:false});};
+    });
+    V.pagesTogStyle=this.ibtn(WN.pages.open); V.layersTogStyle=this.ibtn(WN.layers.open);
+    V.togglePages=()=>this.toggleWin('pages'); V.toggleLayers=()=>this.toggleWin('layers');
+
+    /* tool rail + tool options window */
+    const railIds={Auto:'auto',Brush:'brush',Shapes:'shapes',Ai:'ai',Fill:'fill',Clone:'clone'};
+    Object.keys(railIds).forEach(k=>{
+      const id=railIds[k];
+      V['rail'+k]=this.ibtn(s.tool===id,34);
+      V['pick'+k]=()=>this.pickTool(id);
+    });
+    const cur=defs.find(d=>d.id===s.tool)||defs[0];
+    V.toolName=cur.name.toUpperCase(); V.toolNote=cur.note||''; V.toolHasNote=!!cur.note; V.toolParams=cur.params;
+    V.toolHasAction=!!cur.action;
+    V.toolActionLabel=s.running?'Cancel run':((s.scope||'Page')==='Project'?'Run on project':'Run on page');
+    V.toolActionStyle='width:100%;margin-top:11px;'+this.btn(!s.running,28);
+    V.toolAction=()=>{ s.running?this.cancelRun():this.startRun((s.scope||'Page').toLowerCase()==='project'?'project':'page'); };
+
+    /* notices */
+    V.notices=s.notices.map(n=>({key:n.id,text:n.text,
+      style:'display:flex;gap:8px;align-items:flex-start;padding:9px 10px;border-radius:7px;background:var(--surface);box-shadow:var(--edge);animation:mcIn 160ms ease-out',
+      close:()=>this.setState(x=>({notices:x.notices.filter(m=>m.id!==n.id)}))}));
+
+    /* modals */
+    const M=s.modal;
+    V.hasModal=!!M; V.isNew=M==='new'; V.isSettings=M==='settings'; V.isExport=M==='export'; V.isAbout=M==='about'; V.isChapter=M==='chapter';
+    const dpid=s.draft.pid||(live[0]&&live[0].id);
+    const dproj=dpid?this.projects[dpid]:null;
+    V.projectOpts=live.map(x=>({key:x.id,label:x.name,style:this.chip(dpid===x.id),pick:()=>this.setState({draft:Object.assign({},s.draft,{pid:x.id})})}));
+    V.chapterNote=dproj?('Pages are added as '+(dproj.mode==='longstrip'?'longstrip positions':'single pages')+', following the project. Next number: Ch. '+(Math.max.apply(null,dproj.chapters.map(c=>c.n))+1)+'.'):'';
+    V.modalStyle='width:'+(M==='settings'?'520px':M==='export'?'460px':M==='about'?'460px':M==='new'?'440px':'400px')+';max-width:92vw;background:var(--surface);border-radius:10px;box-shadow:var(--edge),0 26px 64px rgba(20,18,14,.22);padding:20px;animation:mcIn 160ms ease-out';
+    V.backdropClose=(e)=>{ if(e.target===e.currentTarget) this.setState({modal:null,pending:null}); };
+    const close=()=>this.setState({modal:null,pending:null});
+    const T={
+      new:{title:'New project',meta:'',body:'',foot:'Mode is permanent.'},
+      chapter:{title:'New chapter',meta:'',body:'',foot:''},
+      open:{title:'Open project',meta:'',body:'Choose a .mcproj file. Projects keep their mode, mask history and pending review set.',foot:''},
+      about:{title:'Manga Cleaner',meta:'0.9.3',body:'',foot:''},
+      settings:{title:'Settings',meta:'',body:'',foot:'Every string here is externalised for translation, errors included.'},
+      openp:{title:'Open project',meta:'',body:'',foot:''},
+      export:{title:'Export',meta:pgs.length+' pages · Ch. '+ch.n,body:'',foot:''},
+      convert:{title:'Convert to an editable format?',meta:'',body:'This chapter holds '+pgs.length+' WebP files. They will be converted to PNG for editing. Originals are left untouched.',foot:''},
+      disclose:{title:'This sends part of your page to a third party',meta:'first cloud request',body:'A bounded crop around the region - including the surrounding image content, not just the text - is transmitted to the cloud provider, processed there, and returned. Nothing else about the page or project is sent. Local engines never leave this machine.',foot:'Asked once per session.'},
+      cost:{title:'Send one region to the cloud',meta:'',body:'Cloud reconstruct · 1 region · estimated $0.004. Billed on return; rejected requests are not billed.',foot:''},
+      overwrite:{title:'Refusing to overwrite the source',meta:'',body:'Export would replace files in '+p.path+'. Cleaned pages must be written somewhere else.',foot:''}
+    }[M]||{title:'',meta:'',body:'',foot:''};
+    V.modalTitle=T.title; V.modalMeta=T.meta; V.modalBody=T.body; V.modalHasBody=!!T.body; V.modalFoot=T.foot;
+    V.draftName=s.draft.name; V.draftSource=s.draft.src||'nothing chosen';
+    V.setDraftName=(e)=>this.setState({draft:Object.assign({},s.draft,{name:e.target.value})});
+    V.pickFolder=()=>this.setState({draft:Object.assign({},s.draft,{src:'~/scans/hoshi-no-ko/ch04 · 18 files',name:s.draft.name||'Hoshi no Ko ch04'})});
+    V.pickFiles=()=>this.setState({draft:Object.assign({},s.draft,{src:'6 files selected',name:s.draft.name||'Untitled selection'})});
+    V.modeOpts=['Single page','Longstrip'].map(m=>({key:m,label:m,style:this.btn(s.draft.mode===m,28),pick:()=>this.setState({draft:Object.assign({},s.draft,{mode:m})})}));
+
+    const segRow=(label,val,opts,fn)=>({key:label,label,opts:opts.map(o=>({key:o,label:o,style:this.chip(val===o),pick:()=>fn(o)}))});
+    V.settingRows=[
+      segRow('Theme',s.theme==='dark'?'Dark':'Light',['Light','Dark'],o=>this.setState({theme:o.toLowerCase()})),
+      segRow('Page order',s.rtl?'Right to left':'Left to right',['Right to left','Left to right'],o=>this.setState({rtl:o==='Right to left'})),
+      segRow('Cloud engines',s.cloudAllowed?'Allowed':'Blocked',['Allowed','Blocked'],o=>this.setState({cloudAllowed:o==='Allowed'})),
+      segRow('Original view',s.orig?'Pinned':'Hold only',['Hold only','Pinned'],o=>this.setState({orig:o==='Pinned'}))
+    ];
+    V.shortcuts=[['Auto clean','1'],['Brush','2'],['Shapes','3'],['AI mask brush','4'],['Content-aware fill','5'],['Clone / heal','6'],['Hold original','O'],['Pin original','⇧O'],['Masks overlay','M'],['Needs review','R'],['Undo / redo','U / ⇧U'],['Fit / zoom','0 / + −'],['Page back / forward','← / →'],['Prev / next issue','P / N'],['Export','E'],['Settings',','],['Page list','F'],['Layers & review','L'],['Tool options','T']].map(k=>({key:k[0],label:k[0],key2:k[1]}));
+    V.shortcuts.forEach(k=>{k.key=k.key2;});
+    V.exportRows=[
+      segRow('Format',s.exportFmt,['PNG','JPEG','CBZ'],o=>this.setState({exportFmt:o})),
+      segRow('Destination',s.exportDest,['New folder','Source folder'],o=>{ if(o==='Source folder'){ this.setState({modal:'overwrite'}); } else this.setState({exportDest:o}); }),
+      segRow('Masks',s.exportMasks,['Flattened','Separate layer'],o=>this.setState({exportMasks:o}))
+    ];
+    V.exportNote='Masks drawn by hand and masks made automatically export identically. '+this.issues().length+' region'+(this.issues().length===1?'':'s')+' still flagged for review - they export as they are now.';
+    V.aboutRows=[{k:'Built by',v:'Kanna Studio · original work, no publisher affiliation'},{k:'Licence',v:'GPL-3.0'},{k:'Source',v:'git.example/kanna/manga-cleaner'},
+      {k:'Models',v:'mc-detect 2.4 · inpaint-s 1.8 · reconstruct-m 3.1 (bundled, local)'},{k:'Cloud',v:'restore-xl 0.6 · opt-in per request · crops retained 24 h by the provider'},
+      {k:'Typefaces',v:'the platform UI face, with system CJK fallback'}];
+
+    const primary=(label,run)=>({key:'p',label,style:this.btn(true,28),run});
+    const ghost=(label,run)=>({key:'g',label,style:this.btn(false,28),run});
+    let btns=[ghost('Close',close)];
+    if(M==='new') btns=[ghost('Cancel',close),primary('Create project',()=>{
+      const name=s.draft.name||'Untitled project', mode=s.draft.mode==='Longstrip'?'longstrip':'single';
+      const id='new'+Object.keys(this.projects).length;
+      const ch1=this.chapter(id,1,'Chapter 1',mode==='longstrip'?6:18,'none',{prefix:'nw',when:'just now'});
+      this.projects[id]={id,name,mode,path:s.draft.src||'~/scans/untitled',when:'just now',starred:false,chapters:[ch1]};
+      this.setState({modal:null,openPid:id,nav:'all'});
+      this.notice('Project created - '+(mode==='longstrip'?'longstrip':'single page')+' mode is now fixed for every chapter.');
+    })];
+    if(M==='chapter') btns=[ghost('Cancel',close),primary('Add chapter',()=>{
+      const pr=this.projects[dpid]; if(!pr) return close();
+      const n=Math.max.apply(null,pr.chapters.map(c=>c.n))+1;
+      const c=this.chapter(pr.id,n,s.draft.name||'Untitled chapter',pr.mode==='longstrip'?6:18,'none',{prefix:'nc',when:'just now'});
+      pr.chapters.unshift(c);
+      this.setState({modal:null,openPid:pr.id});
+      this.notice('Ch. '+n+' added to '+pr.name+'.');
+    })];
+    if(M==='open') btns=[ghost('Cancel',close),primary('Open Wandering Moon',()=>{this.setState({modal:null,openPid:'wander'});})];
+    if(M==='convert') btns=[ghost('Cancel',()=>{this.setState({modal:null,view:'home'});}),primary('Convert '+pgs.length+' files',()=>{close();this.notice('Converted '+pgs.length+' files to PNG. Originals kept.');})];
+    if(M==='disclose') btns=[ghost('Cancel',close),primary('I understand - continue',()=>{ this.setState({cloudAck:true,modal:'cost'}); })];
+    if(M==='cost') btns=[ghost('Cancel',close),primary('Send · $0.004',()=>this.confirmCloud())];
+    if(M==='overwrite') btns=[primary('Choose another folder',()=>{this.setState({modal:'export',exportDest:'New folder'});})];
+    if(M==='export') btns=[ghost('Cancel',close),primary('Export '+s.exportFmt,()=>{close();this.notice('Exported '+pgs.length+' pages as '+s.exportFmt+' to ~/exports/'+p.id+'-ch'+ch.n+'.');})];
+    if(M==='settings') btns=[primary('Done',close)];
+    if(M==='about') btns=[primary('Close',close)];
+    V.modalButtons=btns.map((b,i)=>Object.assign({},b,{key:'b'+i}));
+    return V;
+  }
+}
+
+</script>
+</body>
+</html>
