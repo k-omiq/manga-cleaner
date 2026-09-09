@@ -1,0 +1,58 @@
+[package]
+name = "cleaner-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# `api-22` is the compatibility floor the loaded runtime must clear, not the
+# version we ship (1.28). Deliberately low so a user's existing runtime is
+# usable.
+ort = { workspace = true, features = [
+  "std", "load-dynamic", "api-22",
+  # Selected at runtime, not at build time - see `accel`.
+  "coreml", "directml", "cuda", "tensorrt", "rocm", "openvino", "webgpu", "xnnpack",
+] }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Pure Rust image I/O. libvips was reversed because `spngload.c` destroys
+# the palette at load, which is the exact fidelity the choice was made for.
+png = "0.18"
+tiff = "0.11"
+# The formats a page *arrives* in and never leaves in - see `image::foreign`.
+# Four codecs and nothing else: `default-features = false` keeps out the
+# encoders, the format guessing and the whole `imageops` surface, none of which
+# this crate wants, and keeps the build pure Rust, which is what was settled
+# when libvips was reversed. AVIF and HEIC are absent for that reason and not
+# by oversight.
+image = { version = "0.25", default-features = false, features = [
+  "jpeg", "webp", "gif", "bmp",
+] }
+# `static` so no extra dylib ships. Used for the managed colour conversions, and
+# to build the test fixtures' profiles.
+lcms2 = { version = "6", features = ["static"] }
+# sha256 is the identity of every source, mask and model.
+sha2 = "0.10"
+# The CBZ container's per-entry checksum. Already in the tree - `png` and `tiff`
+# both depend on it - so this names a crate the build already compiles rather
+# than adding one. The workspace has no zip writer of any kind, and a stored
+# archive needs a CRC-32 and nothing else; see `export::cbz`.
+crc32fast = "1"
+# The sidecar's loopback token, and nothing else. `/dev/urandom` was the whole
+# of `sidecar::client::read_random` and it hard-blocked Windows; this is the
+# one dependency that answers on all three platforms - `BCryptGenRandom`,
+# `getrandom(2)` and `getentropy` behind one call - and it is already in the
+# lockfile several times over, so it names a crate the build compiles anyway.
+getrandom = "0.3"
+
+# `GlobalMemoryStatusEx`, for `memory`, and `SetDllDirectoryW`, for
+# `runtime::load` to put the downloaded directory on the search path the WebGPU
+# plugin's own libraries are found through. Target-gated, so nothing but a
+# Windows build compiles it. Already in the lockfile at this major.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation", "Win32_System_LibraryLoader"] }

@@ -1,0 +1,18 @@
+[package]
+name = "spike-strip-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Phase 2's memory criterion, as far as a harness in this repository can
+# honestly go: a synthetic long chapter through the survey, the per-segment
+# detection, the per-box decode windows and the raw planar patch cache, with the
+# three sessions held for the whole run.
+#
+# What it measures is buffer sizes and scheduling. What it cannot measure is the
+# criterion, which names a webtoon chapter - see the module docs.
+[dependencies]
+cleaner-core = { path = "../../crates/cleaner-core" }
+anyhow.workspace = true

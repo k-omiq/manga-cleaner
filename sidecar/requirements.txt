@@ -1,0 +1,6 @@
+# Manga Cleaner Rung 3a Sidecar Dependencies
+#
+# Pinned to mflux 0.18.1 as required by the manga-cleaner architecture.
+# Pillow provides image decoding and raster manipulation for crop transfers.
+mflux==0.18.1
+Pillow>=10.0.0

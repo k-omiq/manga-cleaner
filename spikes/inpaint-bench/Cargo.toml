@@ -1,0 +1,13 @@
+[package]
+name = "spike-inpaint-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# What a session costs to hold, and what a batch of regions costs to run.
+[dependencies]
+cleaner-core = { path = "../../crates/cleaner-core" }
+anyhow.workspace = true
+ort = { workspace = true, features = ["std", "load-dynamic", "api-22"] }

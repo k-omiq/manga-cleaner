@@ -1,0 +1,46 @@
+# Rust / Tauri
+target/
+src-tauri/target/
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Downloaded model weights and native runtimes (never commit)
+models/
+runtimes/
+
+# Session caches and job scratch
+*.mtclean.d/
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Superpowers / SDD scratch
+.superpowers/
+
+# Cargo workspace lock is committed; per-crate build output is not
+Cargo.lock.orig
+
+# Tauri generated
+src-tauri/gen/
+
+# The rung 3a sidecar's Python environment and its weights. The application
+# ships no Python, so this is user-installed, absent by default, and never
+# committed - the same rule the model weights above follow.
+# The sidecar's source under sidecar/ *is* committed; only its environment,
+# its weights, its bytecode and its editable-install metadata are not.
+.sidecar-venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# nested clone of gecallidryas/freeditor (own git repo)
+freeditor/
+
+# Local agent tooling config. Never committed.
+.claude/

@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "spikes/*", "src-tauri"]
+
+[workspace.package]
+version = "1.0.0-beta.1"
+edition = "2021"
+license = "GPL-3.0-only"
+rust-version = "1.82"
+
+[workspace.dependencies]
+# Every execution provider we might select is compiled in. With `load-dynamic`
+# these features only build the registration structs - whether a provider is
+# actually *usable* is a property of the ONNX Runtime binary that gets loaded at
+# runtime, which is what `cleaner_core::accel` queries.
+ort = { version = "=2.0.0-rc.13", default-features = false }
+anyhow = "1"
+thiserror = "2"
+# The `.mtclean` job manifest is JSON, and the seam
+# is JSON too. One version across the workspace so the core and the adapter
+# cannot disagree about how a `Provenance` is written.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

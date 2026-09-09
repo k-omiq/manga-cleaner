@@ -1,0 +1,13 @@
+{
+  // Publish proxy for the updater bucket. GitHub Actions PUTs release files
+  // here with a bearer token; the bucket itself is served read-only at
+  // https://cleaner.komiq.cc by its R2 custom domain. This exists so the CI
+  // secret is a token we mint ourselves rather than a Cloudflare API token.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cleaner-publish",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-01",
+  "routes": [{ "pattern": "cleaner-publish.komiq.cc", "custom_domain": true }],
+  "r2_buckets": [{ "binding": "UPDATES", "bucket_name": "cleaner-updates" }],
+  "observability": { "enabled": true }
+}

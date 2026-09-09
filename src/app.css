@@ -1,0 +1,158 @@
+/* ---------------------------------------------------------------------------
+   Design tokens - verbatim from design/Manga Cleaner Studio.dc.html.
+   These values are the contract. Do not "improve" them.
+   Every colour in the app is a var(--token) from this block.
+   --------------------------------------------------------------------------- */
+
+:root {
+  --bg:#e8e7e3; --sb:#e2e1dc; --panel:#f6f5f2; --panel2:#efeeea;
+  --card:#fbfaf8; --surface:#fcfbf9; --paper:#fefdfb;
+  --art:#e4e2dd; --art2:#dbd9d3;
+  --line:rgba(42,38,32,.08); --line2:rgba(42,38,32,.15);
+  --text:#22211e; --t2:rgba(34,33,30,.66); --t3:rgba(34,33,30,.55);
+  --accent:#2c2b28; --accent-fg:#f8f7f4; --accent-soft:rgba(42,38,32,.075);
+  --tint:rgba(34,33,30,.20); --tintline:rgba(34,33,30,.48); --warn:#8a3f2a;
+  --edge:0 1px 1px rgba(42,38,32,.05), 0 5px 14px rgba(42,38,32,.07);
+  --edge-soft:0 1px 2px rgba(42,38,32,.05);
+}
+:root[data-theme="dark"] {
+  --bg:#121313; --sb:#0d0e0e; --panel:#1a1b1c; --panel2:#202122;
+  --card:#1a1b1c; --surface:#212223; --paper:#f6f5f2;
+  --art:#e4e3df; --art2:#dbdad5;
+  --line:rgba(255,255,255,.07); --line2:rgba(255,255,255,.13);
+  --text:#e9e8e5; --t2:rgba(233,232,229,.64); --t3:rgba(233,232,229,.48);
+  --accent:#e9e8e5; --accent-fg:#141514; --accent-soft:rgba(233,232,229,.10);
+  --tint:rgba(246,245,242,.32); --tintline:rgba(255,255,255,.72); --warn:#d98b6a;
+  --edge:0 0 0 1px rgba(255,255,255,.05), 0 6px 20px rgba(0,0,0,.42);
+  --edge-soft:0 0 0 1px rgba(255,255,255,.05);
+}
+
+/* ---------------------------------------------------------------------------
+   Scale tokens. Radii and spacing are taken from the prototype's component
+   metrics; prefer these over raw px wherever a token exists.
+   --------------------------------------------------------------------------- */
+
+:root {
+  /* radii */
+  --r-xs:3px;      /* cover art */
+  --r-sm:5px;      /* button, page row */
+  --r-chip:6px;    /* chip, segmented option, mask row */
+  --r-md:7px;      /* notice */
+  --r-lg:8px;      /* icon button */
+  --r-xl:10px;     /* modal */
+  --r-pill:999px;
+
+  /* spacing */
+  --s-1:4px; --s-2:6px; --s-3:8px; --s-4:11px; --s-5:14px; --s-6:20px;
+  --s-7:26px; --s-8:34px;
+
+  /* Dialog scrim and lift. Both are theme-independent by design - the scrim
+     darkens either field, and the lift stacks on the themed --edge. They live
+     here because app.css is the only place a literal colour is allowed. */
+  --scrim: rgba(10,11,12,.34);
+  --modal-lift: var(--edge), 0 26px 64px rgba(20,18,14,.22);
+
+  /* The canvas page. --paper is light in BOTH themes, so everything the app
+     draws on top of a page needs ink that does not invert with the theme:
+     --accent is near-white in dark and would vanish on the sheet. The values
+     are the design file's own (canvas block, renderVals()), with two
+     deliberate departures - noted on --page-ink and --page-mark; they live
+     here because app.css is the only place a literal colour is allowed. */
+  --page-shadow: 0 1px 2px rgba(20,18,14,.10), 0 10px 30px rgba(20,18,14,.14);
+  /* The design file's on-page ink. It is a *glyph* colour now - the badge's
+     letter, the draft readout's digits - because near-black is unreadable on
+     the thing this application is for: manga art is mostly black, and a #111
+     mark drawn over it disappears exactly where the work is. */
+  --page-ink:   #111;
+  /* Everything the app draws *over* the artwork and takes away again: region
+     outlines, the draft shape and path, the clone source ring, the brush
+     cursor's footprint, and the focus and selection rings on the sheet (the
+     design draws those in --accent, which is near-white in dark and vanishes
+     on --paper). Sky blue because it belongs to no artwork: nothing on the
+     page is ever this colour, so a mark in it reads as the app's and not as
+     part of the drawing, and unlike near-black it survives the black ink it
+     is drawn over.
+
+     Sky 600 rather than Sky 500: a mark is a non-text graphic and owes 3:1
+     against what it sits on (WCAG 1.4.11), and Sky 500's #0ea5e9 measures
+     only 2.73:1 on --paper. #0284c7 is the darkest shade that still reads as
+     sky blue rather than as ink or navy, and it clears the bar on both
+     papers: 4.03:1 on the light theme's #fefdfb, 3.76:1 on the dark theme's
+     #f6f5f2. Against pure black ink it is 5.13:1. */
+  --page-mark:      #0284c7;             /* the line colour of every mark */
+  --page-mark-line: rgba(2,132,199,.9);  /* the draft shape's outline */
+  --page-mark-tint: rgba(2,132,199,.18); /* its fill, and the swept wash */
+  /* The halo under a heavier mark. --page-halo is white, which is what a
+     near-black outline needed; the blue already carries itself on black, so
+     the halo's job is now the other ground - a dark rim, for pale artwork. */
+  --page-mark-halo: rgba(8,47,73,.45);
+  /* The review outline (.55) and the review badge's border (.5). One token for
+     two values the design file writes 5% apart on the same marker. */
+  --page-line:  rgba(20,22,24,.55);
+  --page-divider: rgba(20,22,24,.45);  /* the wipe divider - its own value */
+  --page-warn:  #8a3f2a;               /* the declined marker - light --warn, both themes */
+  --page-halo:  rgba(255,255,255,.35); /* the wipe divider's light side */
+
+  /* motion - 120–200ms ease-out, killed under prefers-reduced-motion */
+  --dur-fast:120ms; --dur:160ms; --dur-slow:200ms;
+  --ease:cubic-bezier(.2,.7,.3,1);
+
+  color-scheme: light;
+}
+:root[data-theme="dark"] { color-scheme: dark; }
+
+/* ---------------------------------------------------------------------------
+   Reset and base
+   --------------------------------------------------------------------------- */
+
+* { box-sizing: border-box }
+html, body { margin: 0; padding: 0; height: 100% }
+#app { height: 100% }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto,
+    "Hiragino Kaku Gothic ProN", "Yu Gothic", "Noto Sans JP",
+    "Microsoft YaHei", sans-serif;
+  font-size: 12.5px;
+  -webkit-font-smoothing: antialiased;
+  font-variant-numeric: tabular-nums;
+}
+
+button, input, select, textarea {
+  font: inherit;
+  color: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+a { color: var(--accent); text-decoration: none }
+a:hover { color: var(--text) }
+
+::selection { background: var(--accent-soft) }
+
+input[type=range] { accent-color: var(--accent) }
+
+/* One global focus style. Nothing overrides it away. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: inherit;
+}
+:focus:not(:focus-visible) { outline: none }
+
+/* ---------------------------------------------------------------------------
+   Motion
+   --------------------------------------------------------------------------- */
+
+@keyframes mcIn   { from{opacity:0;transform:translateY(5px)} to{opacity:1;transform:none} }
+@keyframes mcFade { from{opacity:0} to{opacity:1} }
+@keyframes mcBlink{ 0%,100%{opacity:1} 50%{opacity:.35} }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}

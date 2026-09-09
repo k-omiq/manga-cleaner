@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manga Cleaner - remove Japanese text from manga pages, locally</title>
+<meta name="description" content="A desktop app that detects speech bubbles and free text, keeps only the Japanese ones, and cleans each region on your own machine. No account, no upload, no Python.">
+<link rel="icon" href="/icon.png">
+<link rel="canonical" href="https://cleaner.komiq.cc/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Komiq">
+<meta property="og:title" content="Manga Cleaner">
+<meta property="og:description" content="Remove Japanese text from manga and webtoon pages, locally.">
+<meta property="og:url" content="https://cleaner.komiq.cc/">
+<meta property="og:image" content="https://cleaner.komiq.cc/icon.png">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+  /* Tokens are the application's own, from src/app.css. Do not "improve" them. */
+  :root{
+    --bg:#e8e7e3; --panel:#f6f5f2; --card:#fbfaf8; --surface:#fcfbf9;
+    --line:rgba(42,38,32,.08); --line2:rgba(42,38,32,.15);
+    --text:#22211e; --t2:rgba(34,33,30,.66); --t3:rgba(34,33,30,.55);
+    --accent:#2c2b28; --accent-fg:#f8f7f4; --accent-soft:rgba(42,38,32,.075);
+    --warn:#8a3f2a;
+    --edge:0 1px 1px rgba(42,38,32,.05), 0 5px 14px rgba(42,38,32,.07);
+    --edge-soft:0 1px 2px rgba(42,38,32,.05);
+    --r-sm:5px; --r-chip:6px; --r-lg:8px; --r-xl:10px; --r-pill:999px;
+    --dur:160ms; --ease:cubic-bezier(.2,.7,.3,1);
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#121313; --panel:#1a1b1c; --card:#1a1b1c; --surface:#212223;
+      --line:rgba(255,255,255,.07); --line2:rgba(255,255,255,.13);
+      --text:#e9e8e5; --t2:rgba(233,232,229,.64); --t3:rgba(233,232,229,.48);
+      --accent:#e9e8e5; --accent-fg:#141514; --accent-soft:rgba(233,232,229,.10);
+      --warn:#d98b6a;
+      --edge:0 0 0 1px rgba(255,255,255,.05), 0 6px 20px rgba(0,0,0,.42);
+      --edge-soft:0 0 0 1px rgba(255,255,255,.05);
+      color-scheme: dark;
+    }
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Hiragino Kaku Gothic ProN","Yu Gothic","Noto Sans JP","Microsoft YaHei",sans-serif;
+    font-size:14px; line-height:1.65; -webkit-font-smoothing:antialiased;
+    font-variant-numeric:tabular-nums;
+  }
+  a{color:var(--text); text-decoration:none; border-bottom:1px solid var(--line2)}
+  a:hover{border-bottom-color:currentColor}
+  :focus-visible{outline:2px solid var(--text); outline-offset:3px; border-radius:2px}
+  ::selection{background:var(--accent-soft)}
+  img,video{max-width:100%; display:block}
+
+  .wrap{max-width:940px; margin:0 auto; padding:0 24px}
+  .eyebrow{font-size:10.5px; letter-spacing:.22em; color:var(--t3); text-transform:uppercase}
+
+  /* ---- masthead ---- */
+  header{padding:26px 0}
+  .bar{display:flex; align-items:center; gap:16px}
+  .word{font-size:12.5px; font-weight:600; letter-spacing:.3em; border:0}
+  .bar nav{margin-left:auto; display:flex; gap:18px; font-size:12px; color:var(--t2)}
+  .bar nav a{color:var(--t2); border:0}
+  .bar nav a:hover{color:var(--text)}
+
+  /* ---- hero ---- */
+  .hero{padding:96px 0 8px; max-width:660px}
+  h1{
+    margin:14px 0 0; font-size:clamp(30px,5.2vw,46px); font-weight:500;
+    letter-spacing:-.025em; line-height:1.12;
+  }
+  .lede{margin:20px 0 0; font-size:15.5px; color:var(--t2); max-width:56ch}
+
+  .beta{
+    display:inline-block; margin-top:26px; padding:3px 9px; border-radius:var(--r-pill);
+    background:var(--accent-soft); color:var(--t2); font-size:11px; letter-spacing:.04em;
+  }
+
+  /* ---- download ---- */
+  .get{display:flex; flex-wrap:wrap; gap:10px; margin-top:30px}
+  .btn{
+    display:inline-flex; align-items:center; gap:9px; height:42px; padding:0 18px;
+    border:1px solid transparent; border-radius:var(--r-lg); cursor:pointer;
+    font-size:13px; font-weight:500; letter-spacing:.01em; white-space:nowrap;
+    transition:opacity var(--dur) var(--ease), background var(--dur) var(--ease);
+  }
+  .btn.primary{background:var(--accent); color:var(--accent-fg)}
+  .btn.ghost{background:var(--accent-soft); color:var(--text)}
+  .btn:hover{opacity:.86}
+  .btn svg{width:15px; height:15px; flex:none}
+  .btn .size{font-weight:400; opacity:.62; font-size:11.5px}
+  .meta{margin-top:14px; font-size:11.5px; color:var(--t3)}
+  .meta a{color:var(--t3)}
+
+  /* ---- demo ---- */
+  .demo{margin:76px 0 0}
+  figure{margin:0}
+  .frame{
+    border-radius:var(--r-xl); overflow:hidden; background:var(--card);
+    box-shadow:var(--edge); border:1px solid var(--line);
+  }
+  figcaption{margin-top:14px; font-size:12px; color:var(--t3); max-width:70ch}
+
+  /* ---- sections ---- */
+  section{padding:76px 0 0}
+  h2{margin:0 0 26px; font-size:10.5px; letter-spacing:.22em; color:var(--t3); font-weight:500; text-transform:uppercase}
+  .prose{max-width:66ch; color:var(--t2); font-size:14px}
+  .prose strong{color:var(--text); font-weight:500}
+
+  .grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(238px,1fr)); gap:1px; background:var(--line); border:1px solid var(--line); border-radius:var(--r-xl); overflow:hidden}
+  .cell{background:var(--surface); padding:20px 20px 22px}
+  .cell h3{margin:0 0 7px; font-size:13px; font-weight:600; letter-spacing:-.005em}
+  .cell p{margin:0; font-size:12.5px; color:var(--t2); line-height:1.6}
+
+  table{width:100%; border-collapse:collapse; font-size:12.5px}
+  th,td{text-align:left; padding:11px 14px 11px 0; border-bottom:1px solid var(--line); vertical-align:top}
+  th{font-weight:500; color:var(--t3); font-size:10.5px; letter-spacing:.14em; text-transform:uppercase}
+  td.note{color:var(--t2)}
+
+  .callout{
+    margin-top:26px; padding:16px 18px; border-radius:var(--r-lg);
+    background:var(--accent-soft); font-size:12.5px; color:var(--t2); max-width:70ch;
+  }
+  .callout strong{color:var(--text); font-weight:600}
+
+  /* ---- footer ---- */
+  footer{margin-top:96px; padding:26px 0 64px; border-top:1px solid var(--line)}
+  .foot{display:flex; flex-wrap:wrap; gap:18px; align-items:center; font-size:11.5px; color:var(--t3)}
+  .foot a{color:var(--t3); border:0}
+  .foot a:hover{color:var(--text)}
+  .foot .spacer{flex:1}
+
+  @media (max-width:620px){
+    .hero{padding-top:56px}
+    .btn{width:100%; justify-content:center}
+    .bar nav{gap:14px}
+  }
+  @media (prefers-reduced-motion:reduce){*{animation:none!important; transition:none!important}}
+</style>
+</head>
+<body>
+
+<header class="wrap">
+  <div class="bar">
+    <a class="word" href="/">KOMIQ</a>
+    <nav>
+      <a href="#features">Features</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/k-omiq/manga-cleaner">Source</a>
+      <a href="https://ko-fi.com/komiq">Support</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="wrap hero">
+    <div class="eyebrow">Manga Cleaner</div>
+    <h1>Remove Japanese text from manga pages, on your own machine.</h1>
+    <p class="lede">
+      It finds speech bubbles and free text, keeps only the Japanese ones, fits masks at
+      native resolution, and cleans each region with the lightest engine that can do the
+      job. No account, no upload, no Python.
+    </p>
+    <div class="beta" id="beta">Version 1.0.0-beta.1</div>
+
+    <div class="get" id="get">
+      <a class="btn primary" id="dl-mac" href="https://github.com/k-omiq/manga-cleaner/releases">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16.4 12.7c0-2.4 2-3.6 2.1-3.6-1.1-1.7-2.9-1.9-3.5-1.9-1.5-.2-2.9.9-3.7.9-.8 0-1.9-.9-3.1-.8-1.6 0-3.1.9-3.9 2.4-1.7 2.9-.4 7.2 1.2 9.6.8 1.1 1.8 2.4 3 2.4 1.2 0 1.7-.8 3.1-.8 1.5 0 1.9.8 3.1.7 1.3 0 2.1-1.2 2.9-2.3.9-1.3 1.3-2.6 1.3-2.7-.1 0-2.5-1-2.5-3.9zM14 4.9c.7-.8 1.1-1.9 1-3-1 0-2.2.7-2.9 1.5-.6.7-1.2 1.8-1 2.9 1.1.1 2.2-.6 2.9-1.4z"/></svg>
+        <span>Download for macOS</span><span class="size">Apple Silicon</span>
+      </a>
+      <a class="btn ghost" id="dl-win" href="https://github.com/k-omiq/manga-cleaner/releases">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 5.5l7.2-1v7.1H3V5.5zm8.4-1.2L21 3v8.6h-9.6V4.3zM3 12.8h7.2v7.1L3 18.5v-5.7zm8.4 0H21V21l-9.6-1.3v-6.9z"/></svg>
+        <span>Download for Windows</span><span class="size">x64</span>
+      </a>
+    </div>
+    <p class="meta" id="meta">
+      Free and open source, GPL-3.0.
+      <a href="https://github.com/k-omiq/manga-cleaner">Read the source on GitHub</a>.
+    </p>
+  </div>
+
+  <div class="wrap demo">
+    <figure>
+      <div class="frame">
+        <video id="demo" src="/media/engine-choice.mp4" muted loop playsinline autoplay
+               preload="metadata" aria-label="Re-running a cleaned region with a different engine"></video>
+      </div>
+      <figcaption>
+        Use the lightest engine that does the job. Planar fill handles text on flat paper,
+        denoise fill handles tight masks on noisy scans, and manga-LaMa takes over when
+        there is screentone or line art behind the text. Any region can be re-run with a
+        different engine from the layer menu.
+      </figcaption>
+    </figure>
+  </div>
+
+  <section class="wrap" id="features">
+    <h2>What it does</h2>
+    <div class="grid">
+      <div class="cell">
+        <h3>Automatic pipeline</h3>
+        <p>Detect, gate to Japanese script, fit masks, route to an engine, clean, composite. One pass per page.</p>
+      </div>
+      <div class="cell">
+        <h3>Six manual tools</h3>
+        <p>Auto Clean, Brush, Shapes, AI Mask Brush, Content-Aware Fill, and Clone / Heal, for anything the pass missed.</p>
+      </div>
+      <div class="cell">
+        <h3>Every region is a layer</h3>
+        <p>Each clean records its engine, parameters, and timing. Re-run it, delete it, undo it. Nothing is baked in.</p>
+      </div>
+      <div class="cell">
+        <h3>Long-strip webtoons</h3>
+        <p>Virtual stitching, content-minimum splitting, and bounded-memory streaming across joins.</p>
+      </div>
+      <div class="cell">
+        <h3>Pixel-exact export</h3>
+        <p>Untouched pixels stay bit-identical. Colour mode, bit depth, ICC profile, and metadata carry through.</p>
+      </div>
+      <div class="cell">
+        <h3>Formats that survive</h3>
+        <p>PNG, TIFF, and layered PSD per page, a mask file beside each page on request, or a chapter as CBZ.</p>
+      </div>
+      <div class="cell">
+        <h3>Runs on your hardware</h3>
+        <p>Providers are picked per model from real detection and benchmarks, and can be overridden in Settings.</p>
+      </div>
+      <div class="cell">
+        <h3>Nothing leaves the machine</h3>
+        <p>No account and no upload. Model weights are fetched once, verified by SHA-256, and then used offline.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="wrap" id="install">
+    <h2>Install</h2>
+    <div class="prose">
+      <p>
+        Download the installer above: a <strong>.dmg</strong> for macOS on Apple Silicon, a
+        <strong>-setup.exe</strong> for Windows x64. Both are built and signed by the release
+        workflow, and the app updates itself from cryptographically signed manifests.
+      </p>
+      <p>
+        Model weights and the inference runtime are not bundled, which keeps the installer small
+        and respects weight provenance. On first launch the app offers to download the ONNX Runtime
+        (about 32 MB on macOS, about 200 MB on Windows) plus the five required model weights
+        (about 317 MB in total). Anything you decline can be fetched later from
+        <strong>Settings &rsaquo; Models</strong>. An optional Japanese text reader (about 460 MB)
+        can be added there too: it recovers roughly 5% of balloons the script gate cannot read.
+      </p>
+    </div>
+
+    <table>
+      <thead>
+        <tr><th>Platform</th><th>Status</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>macOS, Apple Silicon</td><td class="note">Supported and measured. GPU inference through WebGPU and CoreML.</td></tr>
+        <tr><td>Windows x64</td><td class="note">Supported. DirectML by default, with optional CUDA and TensorRT. Not yet measured on physical hardware.</td></tr>
+        <tr><td>Linux x64</td><td class="note">Build from source. A WebGPU path exists but has not been run on real hardware.</td></tr>
+        <tr><td>macOS, Intel</td><td class="note">Unsupported. ONNX Runtime 1.28 publishes no build for that architecture.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <strong>This is a beta.</strong> The pipeline runs a page end to end and the export contract
+      is asserted by tests, but manga-LaMa can still leave faint marks inside a bubble, quality
+      metrics need tuning on outline-heavy regions, and Windows and Linux figures are unmeasured.
+      Keep your originals. Report anything you find on
+      <a href="https://github.com/k-omiq/manga-cleaner/issues">GitHub</a>.
+    </div>
+  </section>
+
+  <section class="wrap">
+    <h2>Build from source</h2>
+    <div class="prose">
+      <p>
+        You need a stable Rust toolchain, Node.js 20 or newer, and the Tauri 2 system dependencies
+        for your platform. The repository README carries the full sequence: install dependencies,
+        fetch the runtime, fetch the pinned weights, then <strong>npx tauri build</strong>.
+      </p>
+      <p>
+        Manga Cleaner is released under the GPL-3.0-only licence, which follows from
+        <em>comic_text_detector</em>, the model that supplies the per-pixel text masks.
+        Complete corresponding source lives at
+        <a href="https://github.com/k-omiq/manga-cleaner">github.com/k-omiq/manga-cleaner</a>.
+      </p>
+    </div>
+  </section>
+</main>
+
+<footer class="wrap">
+  <div class="foot">
+    <span>Komiq</span>
+    <span class="spacer"></span>
+    <a href="https://github.com/k-omiq/manga-cleaner">GitHub</a>
+    <a href="https://ko-fi.com/komiq">Ko-fi</a>
+    <a href="/latest.json">latest.json</a>
+    <a href="https://github.com/k-omiq/manga-cleaner/blob/main/LICENSE">GPL-3.0-only</a>
+  </div>
+</footer>
+
+<script>
+  // Download links are derived from latest.json, the same manifest the installed
+  // app polls for updates. The file names match the release workflow's rename
+  // step: MangaCleaner_<version>_<platform>.<ext>. If the manifest cannot be
+  // read the buttons keep their GitHub releases fallback href.
+  (async () => {
+    const mac = document.getElementById("dl-mac");
+    const win = document.getElementById("dl-win");
+    try {
+      const res = await fetch("/latest.json", { cache: "no-cache" });
+      if (!res.ok) return;
+      const m = await res.json();
+      if (!m || typeof m.version !== "string") return;
+      const v = m.version;
+      const base = "/releases/v" + v + "/MangaCleaner_" + v + "_";
+      mac.href = base + "darwin-aarch64.dmg";
+      win.href = base + "windows-x86_64-setup.exe";
+      document.getElementById("beta").textContent = "Version " + v;
+      if (m.pub_date) {
+        const d = new Date(m.pub_date);
+        if (!isNaN(d)) {
+          document.getElementById("beta").textContent =
+            "Version " + v + " · " + d.toISOString().slice(0, 10);
+        }
+      }
+    } catch {
+      /* keep the fallback hrefs */
+    }
+  })();
+
+  // The demo loops on its own, which is motion nobody asked for. Under a
+  // reduced-motion preference it holds on its first frame and gains controls,
+  // so it is still watchable on purpose.
+  (() => {
+    const v = document.getElementById("demo");
+    if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    v.autoplay = false;
+    v.loop = false;
+    v.controls = true;
+    v.pause();
+  })();
+
+  // Put the visitor's own platform first. Order only; both buttons stay.
+  (() => {
+    const ua = navigator.userAgent;
+    if (!/Windows/i.test(ua)) return;
+    const get = document.getElementById("get");
+    const mac = document.getElementById("dl-mac");
+    const win = document.getElementById("dl-win");
+    get.insertBefore(win, mac);
+    win.classList.replace("ghost", "primary");
+    mac.classList.replace("primary", "ghost");
+  })();
+</script>
+
+</body>
+</html>

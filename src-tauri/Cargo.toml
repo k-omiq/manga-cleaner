@@ -1,0 +1,73 @@
+[package]
+name = "manga-cleaner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Remove Japanese text from manga pages without touching anything else"
+
+[lib]
+# `staticlib`/`cdylib` are what a mobile target would link; `rlib` is what the
+# integration tests use. Kept as Tauri scaffolds it even though only desktop
+# ships, because dropping them is a change to make when mobile is ruled out in
+# writing, not silently here.
+name = "manga_cleaner_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+cleaner-core = { path = "../crates/cleaner-core" }
+tauri = { version = "2", features = [] }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+# `tile::TileError` maps a failure to an HTTP status, so its variants have to
+# stay distinguishable rather than collapsing into one `anyhow::Error`.
+thiserror.workspace = true
+# Only for the build string in diagnostics; every session lives in cleaner-core.
+ort = { workspace = true, features = ["std", "load-dynamic", "api-22"] }
+# The in-app model downloader (`weights.rs`). `blocking` because
+# every download runs on a thread of its own and streams straight to disk;
+# nothing here belongs on the invoke handler's runtime. No TLS feature is named:
+# reqwest 0.13's default is rustls and `tauri-plugin-updater` already puts this
+# exact version in the graph, so the downloader adds a feature rather than a
+# dependency tree.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+# The pinned digests, verified from the bytes as they are written.
+sha2 = "0.10"
+# Unpacking the ONNX Runtime archive: a `.tgz` on macOS and Linux, a `.nupkg`
+# (which is a zip) on Windows. Both are already in the lockfile - the updater
+# plugin unpacks its own artefacts with them.
+tar = "0.4"
+flate2 = "1"
+zip = { version = "4", default-features = false, features = ["deflate"] }
+tauri-plugin-dialog = "2.7.1"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+
+# The Hugging Face token, in the operating system's own credential store rather
+# than in `settings.json`. `keyring` 3 compiles no platform
+# backend unless one is named, so each platform names its own below and a
+# platform that names none - or a machine whose store will not answer - falls
+# back to the settings file at runtime, which is what `weights::read_token`
+# decides.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+# Two stores, because a Linux desktop has the Secret Service and a headless
+# Linux box has only the kernel keyring. `crypto-rust` is what encrypts the
+# Secret Service session; the alternative pulls in OpenSSL.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust", "linux-native"] }
+
+# Test-only. The library's own tests build a folder of real JPEGs to prove that
+# a chapter can be created from one; the crate itself never encodes an image in
+# a format it does not export (`cleaner_core::image::foreign`).
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
