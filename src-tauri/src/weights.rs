@@ -2859,7 +2859,14 @@ mod tests {
         .expect("scripts/fetch-models.sh is readable");
 
         // `fetch <name> \` + `<sha> \` + `<url>`, continuations joined.
-        let joined = script.replace("\\\n", " ");
+        //
+        // Line endings are normalised first. A Windows checkout has
+        // `core.autocrlf` on by default, so every line of a committed shell
+        // script arrives ending `\r\n`; without this the continuation joins
+        // nothing, each line stands alone, and the parse fails on a `fetch`
+        // line carrying one field instead of three. That is a test reading a
+        // file rather than a fact about the repository, so it is fixed here.
+        let joined = script.replace("\r\n", "\n").replace("\\\n", " ");
         let mut found: Vec<(String, String, String)> = Vec::new();
         for line in joined.lines() {
             let line = line.trim();

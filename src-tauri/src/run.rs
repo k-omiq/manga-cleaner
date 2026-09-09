@@ -1438,9 +1438,22 @@ fn open_gate(models: &Path, preference: Preference) -> Result<ScriptGate, String
 /// The digest is taken **before** the session, so the 207 MB read and the
 /// 510 MB session are not resident at the same moment. It is the only place a
 /// run reads the weights itself, and it happens once.
+///
+/// **Weights that are not there end the attempt here**, rather than at the
+/// session builder that would also have refused them. The wasted work is the
+/// smaller half of the reason. The larger one is that
+/// [`cleaner_core::accel::open_session`] asks the ONNX Runtime which providers
+/// it carries before it opens any file, and on a machine where the runtime
+/// itself has never been loaded that question does not return an error - `ort`
+/// panics inside its own accessor. A run loads the runtime before it reaches
+/// this function and gives up if it cannot, so nothing in the application can
+/// arrive here in that state; a test asserting what a machine with no weights
+/// does can, and the answer it is asserting is the `None` below.
 fn open_inpainter(models: &Path, preference: Preference) -> Option<Held<lama::Inpainter>> {
     let model = models.join(INPAINTER);
-    let model_sha256 = std::fs::read(&model).ok().map(|bytes| sha256_hex(&bytes));
+    // Read and digested in one expression so the 207 MB is dropped at the end
+    // of it, which is the property the paragraph above is about.
+    let model_sha256 = Some(std::fs::read(&model).ok().map(|bytes| sha256_hex(&bytes))?);
     let inpainter = lama::Inpainter::open(&model, preference).ok()?;
     let provider = format!("{:?}", inpainter.selection().accelerator).to_lowercase();
     Some(Held { inpainter, provider, model_sha256 })
