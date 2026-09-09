@@ -114,7 +114,7 @@ fn dominant_script(scores: &[f32], classes: usize, labels: &[String]) -> (String
         previous = best;
     }
 
-    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     let tally = counts
         .iter()
         .take(4)

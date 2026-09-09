@@ -60,12 +60,13 @@ pub fn onnx_runtime(app: &tauri::AppHandle) -> ComponentStatus {
             name: "onnxruntime",
             available: false,
             detail: Some(err.to_string()),
-            // The three cases are told apart because their remedies are: clear
-            // an extended attribute, re-sign the application, or download the
-            // runtime again.
+            // The four cases are told apart because their remedies are: clear
+            // an extended attribute, re-sign the application, install a library
+            // the runtime imports, or download the runtime again.
             reason_key: Some(match err {
                 LoadError::Quarantined { .. } => "diagnostics.runtime.quarantined",
                 LoadError::Refused { .. } => "diagnostics.runtime.refused",
+                LoadError::MissingDependency { .. } => "diagnostics.runtime.missingDependency",
                 _ => "diagnostics.runtime.unloadable",
             }),
         },

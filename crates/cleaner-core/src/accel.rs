@@ -35,12 +35,28 @@
 //! ## Windows: one GPU provider for all three vendors, and CUDA beside it
 //!
 //! DirectML is Direct3D 12, so **NVIDIA, AMD and Intel all reach it through the
-//! same download** - there is no per-vendor package to pick and no vendor
+//! same download** - there is no per-vendor package to pick and no *vendor*
 //! runtime for the user to install. It also has the `DFT` kernel, so the
 //! inpainter is on the GPU there exactly as it is on a Mac. That is why
 //! [`crate::runtime::package::Flavour::DirectMl`] is the Windows default and why
 //! this module needs nothing vendor-specific to make a Windows machine as busy
 //! as an Apple one.
+//!
+//! **There is one user-side install after all, and it is not a vendor's.**
+//! Parsing the PE import directory of the shipped
+//! `runtimes/packages/.dml/runtimes/win-x64/native/onnxruntime.dll`, its regular
+//! imports include `MSVCP140.dll`, `MSVCP140_1.dll`, `VCRUNTIME140.dll` and
+//! `VCRUNTIME140_1.dll` - the Visual C++ 2015-2022 Redistributable, which no
+//! package [`crate::runtime::package`] downloads carries. Regular imports, so a
+//! machine without it fails at load rather than at the first inference. That is
+//! a dependency of the *runtime binary*, not of DirectML and not of a vendor:
+//! the CUDA flavour has the same one. So the sentence above is about vendors
+//! and stops there - what is true is that nothing **per vendor** has to be
+//! installed for the GPU path, and the one thing that does have to be installed
+//! is named with its own remedy rather than reported as a broken download, by
+//! [`crate::runtime::LoadError::MissingDependency`]. Whether a Windows machine
+//! that lacks it is common is not something this repository can say; it has
+//! never run there.
 //!
 //! CUDA is offered as a **second flavour and never as the default**, and the
 //! reason is this file's own rule rather than a preference. The two Windows
@@ -161,6 +177,29 @@
 //! this module is exactly where it would be made again - the table above is
 //! an Apple M5, and a Windows machine with a discrete GPU will order these
 //! differently. `spike-onnx-probe --ep <name>` is what produces it.
+//!
+//! Two named gaps, both about DirectML's device check
+//! ([`Accelerator::publishes_devices`], [`device_present`]):
+//!
+//! - **That DirectML publishes devices at all is read, not run.** The evidence
+//!   is the `DmlEpFactory` internal execution-provider factory in the shipped
+//!   Windows binary, plus the measured fact that on the macOS runtime the
+//!   equivalent factories - `CpuEpFactory` and `WebGpuEpFactory` - are exactly
+//!   the two providers `Environment::devices` reports on this M5. Nobody has
+//!   watched `GetEpDevices` return a DirectML device.
+//! - **That a machine with no Direct3D 12 adapter yields an empty DirectML
+//!   device list has never been observed.** It is the behaviour the check
+//!   relies on, and the direction it fails in is the mild one: a runtime that
+//!   lists a device DirectML cannot really use leaves the old behaviour intact,
+//!   which is a failed session build and a fall back to the CPU. What would be
+//!   costly is the other direction - a working Direct3D 12 machine whose
+//!   adapter is missing from the list - and the guard in [`device_present`] is
+//!   there for it: a device list with no CPU device in it is treated as a list
+//!   this process could not read, and declines nothing.
+//!
+//! Neither can be closed from here. Both close the first time this is run on a
+//! Windows machine with `spike-onnx-probe`, which is where the row for
+//! DirectML in the table above comes from too.
 
 use std::path::{Path, PathBuf};
 
@@ -274,10 +313,41 @@ impl Accelerator {
         if self.needs_cuda_runtime() && !cuda_runtime_present() {
             return Err(Unavailable::MissingDependency);
         }
-        if self.is_plugin() && !plugin_device_present(self) {
+        if self.publishes_devices() && !device_present(self) {
             return Err(Unavailable::NoDevice);
         }
         Ok(())
+    }
+
+    /// Whether the loaded runtime publishes an `OrtEpDevice` for this provider,
+    /// which is what makes [`device_present`] a question worth asking about it
+    /// at all.
+    ///
+    /// Two providers do. **A registered plugin does by construction** - it
+    /// reaches the process through that same API, and there is no other way to
+    /// hand it to a session ([`Dispatch::Device`]).
+    ///
+    /// **DirectML does because the shipped Windows binary carries an internal
+    /// factory for it.** Read off
+    /// `runtimes/packages/.dml/runtimes/win-x64/native/onnxruntime.dll`: the
+    /// internal execution-provider factory classes named in its RTTI are
+    /// `CpuEpFactory` and `DmlEpFactory`, and an internal factory is what
+    /// publishes devices through `GetEpDevices`. `ort` adds nothing of its own
+    /// on top - `Environment::devices` is a forward to that call
+    /// (`ort/src/environment.rs:240-249`) - and its own documentation for
+    /// `Device::ep_vendor` gives `"Microsoft"` for DirectML devices as the
+    /// example, which is that list being described by the crate that reads it.
+    ///
+    /// The same reading on the macOS runtime this repository measures on names
+    /// `CpuEpFactory` and `WebGpuEpFactory` and no CoreML one, and the device
+    /// list on this M5 is exactly `CPUExecutionProvider` and
+    /// `WebGpuExecutionProvider` - CoreML is absent from it although
+    /// [`Accelerator::in_runtime`] answers `true` for CoreML on that build. So
+    /// this is a list of the providers that *publish devices*, not a list of the
+    /// providers that *work*, and asking it about CoreML would take the
+    /// measured detector winner away from every Mac.
+    fn publishes_devices(self) -> bool {
+        self.is_plugin() || self == Accelerator::DirectMl
     }
 
     /// Whether this provider reaches the process as a **plugin library**
@@ -347,17 +417,46 @@ enum Dispatch {
     Device(&'static str),
 }
 
-/// Whether the runtime discovered a device for a plugin provider.
+/// Whether the runtime discovered a device for a provider that publishes them
+/// ([`Accelerator::publishes_devices`]).
 ///
-/// A plugin registers whether or not it finds hardware; it is the device list
-/// that says. The WebGPU plugin with no adapter is a Linux machine without the
-/// Vulkan loader or a Windows machine without a working GPU driver, and both
-/// are a remedy the user applies rather than a download this application
-/// offers.
-fn plugin_device_present(accelerator: Accelerator) -> bool {
-    ort::environment::Environment::current()
-        .map(|env| env.devices().any(|device| device.ep().ok() == Some(accelerator.ort_name())))
-        .unwrap_or(false)
+/// A provider is registered whether or not it finds hardware; it is the device
+/// list that says. The WebGPU plugin with no adapter is a Linux machine without
+/// the Vulkan loader or a Windows machine without a working GPU driver.
+/// DirectML with no device is a machine with no Direct3D 12 adapter - an old
+/// GPU, a virtual machine, a remote session - and before this asked, those
+/// machines were routed to DirectML for both the detector and the inpainter and
+/// found out by having each session build fail. Both are a remedy the user
+/// applies to their machine rather than a download this application offers.
+///
+/// **A device list this process could not read denies nothing.** `ort` swallows
+/// an error from `GetEpDevices` and hands back an empty iterator
+/// (`ort/src/environment.rs:243-244`, on the grounds that a minimal build does
+/// not support the call), so an empty list is two different answers - no
+/// devices, or no answer - and only one of them is grounds for declining a
+/// provider. Every shipped runtime read so far carries `CpuEpFactory`, and the
+/// device list measured on this machine contains `CPUExecutionProvider`, so a
+/// list with no CPU device in it is a list that was not produced. That case
+/// answers `true` and lets the session build decide, which is the older
+/// behaviour and the one this file's own rule prefers: a check that gets it
+/// wrong takes a working provider away.
+fn device_present(accelerator: Accelerator) -> bool {
+    let Ok(env) = ort::environment::Environment::current() else {
+        return true;
+    };
+    listed_or_unreadable(env.devices().filter_map(|device| device.ep().ok()), accelerator.ort_name())
+}
+
+/// The rule [`device_present`] applies to whatever the runtime listed. Split out
+/// so the arithmetic can be tested without a loaded runtime, which is the half
+/// of it that is not about hardware.
+fn listed_or_unreadable<'a>(listed: impl IntoIterator<Item = &'a str>, wanted: &str) -> bool {
+    let (mut found, mut cpu) = (false, false);
+    for name in listed {
+        found |= name == wanted;
+        cpu |= name == Accelerator::Cpu.ort_name();
+    }
+    found || !cpu
 }
 
 /// Why a provider this build knows how to name cannot be used on this machine.
@@ -372,7 +471,8 @@ pub enum Unavailable {
     /// install for it - the CUDA runtime, cuDNN. An install, not a download.
     MissingDependency,
     /// It is registered and found no device to run on. A driver - on Linux,
-    /// the Vulkan loader the WebGPU plugin opens adapters through.
+    /// the Vulkan loader the WebGPU plugin opens adapters through; on Windows,
+    /// a machine with no Direct3D 12 adapter for DirectML to sit on.
     NoDevice,
 }
 
@@ -938,6 +1038,50 @@ mod tests {
 
     const ALL: [Accelerator; 4] =
         [Accelerator::CoreMl, Accelerator::DirectMl, Accelerator::Cuda, Accelerator::WebGpu];
+
+    /// The device list answers three ways, not two, and the third is the one
+    /// that keeps this check from costing anybody a provider: a list with no
+    /// CPU device in it is a list nobody produced - `ort` returns an empty
+    /// iterator when `GetEpDevices` fails - and it declines nothing.
+    ///
+    /// The two device names below are the ones measured on this machine, off
+    /// the shipped 1.28 macOS runtime.
+    #[test]
+    fn an_unreadable_device_list_declines_nothing() {
+        let measured = ["CPUExecutionProvider", "WebGpuExecutionProvider"];
+        assert!(listed_or_unreadable(measured, Accelerator::WebGpu.ort_name()));
+        // Present, readable, and DirectML is genuinely not in it. This is the
+        // answer a Windows machine with no Direct3D 12 adapter should give.
+        assert!(!listed_or_unreadable(measured, Accelerator::DirectMl.ort_name()));
+        // Nothing at all: `GetEpDevices` was not answered, so nothing is known
+        // and nothing is refused.
+        assert!(listed_or_unreadable([], Accelerator::DirectMl.ort_name()));
+    }
+
+    /// Only providers that publish `OrtEpDevice`s are asked about them. CoreML
+    /// is the case that proves it matters: it is in the macOS build and it is
+    /// the measured detector winner, and it is **not** in that runtime's device
+    /// list, so a device check applied to it would decline the fastest provider
+    /// on the only platform anybody has measured.
+    #[test]
+    fn the_device_check_is_asked_only_of_providers_that_publish_devices() {
+        assert!(Accelerator::DirectMl.publishes_devices());
+        for quiet in [
+            Accelerator::Cpu,
+            Accelerator::CoreMl,
+            Accelerator::Cuda,
+            Accelerator::TensorRt,
+            Accelerator::Rocm,
+            Accelerator::OpenVino,
+            Accelerator::Xnnpack,
+        ] {
+            assert!(!quiet.publishes_devices(), "{quiet:?}");
+        }
+        // WebGPU's answer is a property of the process rather than of the
+        // provider: it publishes devices when it arrived as a registered
+        // plugin, and this build has registered none.
+        assert_eq!(Accelerator::WebGpu.publishes_devices(), Accelerator::WebGpu.is_plugin());
+    }
 
     #[test]
     fn only_three_providers_implement_the_operator_lama_needs() {

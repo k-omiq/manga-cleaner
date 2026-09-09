@@ -1043,56 +1043,124 @@ export function createMockBackend(options = {}) {
      * The accelerator setting, on a machine the mock does not have.
      *
      * A **fixed** answer, and deliberately the honest shape of one: the mock
-     * has no ONNX Runtime to ask, so it reports the machine this project was
-     * measured on - an Apple one, WebGPU for the inpainter, CoreML for the
-     * detector, the CPU for the small models - rather than inventing a
-     * machine's worth of availability. Every provider the real backend can name
-     * is a row, so a panel written against this one is written against the real
-     * shape. No `delay`, for `listLoadedModels`'s reason.
+     * has no ONNX Runtime to ask, so rather than inventing a machine's worth of
+     * availability it reports one particular machine in full. Every provider
+     * the real backend can name is a row, so a panel written against this one
+     * is written against the real shape. No `delay`, for `listLoadedModels`'s
+     * reason.
+     *
+     * **The machine is a Windows one, and that is the whole point of the
+     * choice.** It used to be the Apple machine this project was measured on,
+     * where nothing is unmeasured, nothing is declined and no provider is
+     * forced - so `noteKey` and `declinedKey` were null on every row and the
+     * two branches of the Acceleration panel that render them could not be seen
+     * at all. Those branches are where every Windows behaviour lives, this
+     * repository cannot execute on Windows, and a browser run against this mock
+     * is therefore the only place the behaviour can be looked at before it
+     * ships. So the machine here has:
+     *
+     *   - **DirectML, forced and unmeasured.** The timings are Apple's; on
+     *     Direct3D the choice rests on how the provider works rather than on
+     *     anything anyone timed, which is exactly what `accel.chosen.unmeasured`
+     *     says and what `measured: false` on every row here means.
+     *   - **CUDA in the build and not on the machine.** A different remedy from
+     *     "not in this runtime" - an install rather than a download - and the
+     *     picker's disabled entries are the only place a user reads it.
+     *   - **A provider refused for want of memory, with the two figures.** The
+     *     inpainter wants more than this machine has room for, so the forced
+     *     provider is declined and it lands on the CPU. The byte counts travel
+     *     beside the key, and the panel formats them.
+     *   - **A provider refused for being the wrong shape.** The language
+     *     checker would be split across DirectML and run slower, so it is
+     *     declined too - a decline with a reason and no figures, which is the
+     *     other half of that branch.
      */
     async listAccelerators() {
+      // id, available, measured, active, reasonKey when it is not available.
+      // Nothing is measured: the timing table was taken on Apple silicon and
+      // this machine is not that.
       const providers = [
-        ['cpu', true, false, true],
-        ['coreml', true, true, true],
-        ['directml', false, false, false],
-        ['cuda', false, false, false],
-        ['tensorrt', false, false, false],
-        ['rocm', false, false, false],
-        ['openvino', false, false, false],
-        ['webgpu', true, true, true],
-        ['xnnpack', false, false, false],
+        ['cpu', true, false, true, null],
+        ['coreml', false, false, false, 'accel.declined.unavailable'],
+        ['directml', true, false, true, null],
+        // In this runtime build, and NVIDIA's own parts are not installed.
+        ['cuda', false, false, false, 'accel.declined.missingRuntime'],
+        ['tensorrt', false, false, false, 'accel.declined.unavailable'],
+        ['rocm', false, false, false, 'accel.declined.unavailable'],
+        ['openvino', false, false, false, 'accel.declined.unavailable'],
+        // Loaded, usable, and not what this platform's placements pick.
+        ['webgpu', true, false, false, null],
+        ['xnnpack', false, false, false, 'accel.declined.unavailable'],
       ]
+      // A user who went looking for the graphics card, which is what makes the
+      // declines below reachable: a decline is a *forced* provider not being
+      // used, and `auto` forces nothing.
+      const preference = 'directml'
       return {
-        preference: 'auto',
-        providers: providers.map(([id, available, measured, active]) => ({
+        preference,
+        providers: providers.map(([id, available, measured, active, reasonKey]) => ({
           id,
           labelKey: `accel.${id}`,
           available,
-          reasonKey: available ? null : 'accel.declined.unavailable',
+          reasonKey,
           measured,
           active,
-          selected: false,
+          selected: id === preference,
         })),
         models: [
-          ['models.kind.textDetector', 'coreml'],
-          ['models.kind.balloonDetector', 'cpu'],
-          ['models.kind.scriptGate', 'cpu'],
-          ['models.kind.inpainter', 'webgpu'],
-          // The rescue reader. On the CPU because CoreML builds both its
-          // graphs and is still the wrong answer - see `accel::OCR`. It is
+          ['models.kind.textDetector', 'directml', 'accel.chosen.unmeasured'],
+          ['models.kind.balloonDetector', 'directml', 'accel.chosen.unmeasured'],
+          // Declined for its shape rather than for the machine's size: a
+          // provider with no kernel for one of the graph's operators splits the
+          // model instead of failing, and the split runs slower than the CPU
+          // does whole.
+          [
+            'models.kind.scriptGate',
+            'cpu',
+            null,
+            'accel.declined.partitioned',
+            'directml',
+            null,
+            null,
+          ],
+          // The memory decline, with the two figures the sentence cannot carry.
+          // 5.62 GB is what this rung was measured to need; 3 GB is what this
+          // machine had room for.
+          [
+            'models.kind.inpainter',
+            'cpu',
+            'accel.chosen.unmeasured',
+            'accel.declined.memory',
+            'directml',
+            6_034_997_248,
+            3_221_225_472,
+          ],
+          // The rescue reader. On the CPU wherever it runs - a graphics
+          // provider builds both its graphs and is still the wrong answer, see
+          // `accel::OCR` - so it is not a decline and carries no note. It is
           // listed whether or not the weights are installed, because the panel
           // answers "where would each model run", not "what is loaded".
           ['models.kind.ocr', 'cpu'],
-        ].map(([modelKey, id]) => ({
-          modelKey,
-          acceleratorId: id,
-          labelKey: `accel.${id}`,
-          noteKey: null,
-          declinedKey: null,
-          declinedId: null,
-          neededBytes: null,
-          roomBytes: null,
-        })),
+        ].map(
+          ([
+            modelKey,
+            id,
+            noteKey = null,
+            declinedKey = null,
+            declinedId = null,
+            neededBytes = null,
+            roomBytes = null,
+          ]) => ({
+            modelKey,
+            acceleratorId: id,
+            labelKey: `accel.${id}`,
+            noteKey,
+            declinedKey,
+            declinedId,
+            neededBytes,
+            roomBytes,
+          }),
+        ),
       }
     },
 

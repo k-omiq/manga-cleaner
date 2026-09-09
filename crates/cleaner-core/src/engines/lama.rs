@@ -280,6 +280,21 @@ impl Inpainter {
         self.lease.spent()
     }
 
+    /// Give this session up for good, because it has failed in a way another
+    /// run on it cannot survive - a reset adapter reported as device-removed.
+    /// [`crate::registry::Lease::poison`] states what that costs and why it is
+    /// not the same signal as an unload the user asked for.
+    ///
+    /// It is the third way rung 2 can go away and the only involuntary one:
+    /// the ladder surrenders a session under memory pressure, `spent` gives an
+    /// idle one back, and this drops one whose device is gone. Like the idle
+    /// case and unlike the ladder's, a later run may open another - the machine
+    /// is not short of anything, and the next session is built on whatever the
+    /// driver came back as.
+    pub fn poison(&self) {
+        self.lease.poison();
+    }
+
     /// Where the session landed and why - straight into
     /// [`crate::patch::Provenance::execution_provider`].
     pub fn selection(&self) -> &Selection {

@@ -531,6 +531,28 @@ Windows or Linux, and a one-machine number is never written as though it were ge
   resource-request event on the host UI thread and pauses page load: a maintainer benchmark
   measured about 5 ms on macOS against about 200 ms on Windows for 10 MB, roughly 50 MB/s, with
   no range or streaming responses, so responses must be whole tiles.
+- **The Windows runtime imports the Visual C++ runtime outright, and nothing shipped it.**
+  Parsing the PE import directory of the shipped
+  `runtimes/packages/.dml/runtimes/win-x64/native/onnxruntime.dll`, its regular imports are
+  `MSVCP140.dll`, `MSVCP140_1.dll`, `VCRUNTIME140.dll` and `VCRUNTIME140_1.dll` beside
+  `KERNEL32`, `ADVAPI32`, `SETUPAPI`, `dbghelp` and ten `api-ms-win-crt-*` names. Regular and not
+  delay-loaded, so they resolve when the library is mapped and their absence fails the load
+  outright. The ten `api-ms-win-crt-*` names are the universal CRT and are part of Windows 10, so
+  only the four `140` names are a user's problem. They are in neither NuGet package, the
+  installer bundled WebView2 and not them, and a machine without the redistributable could
+  therefore do nothing at all: `LoadLibraryExW` fails with 126 and the interface called it
+  `unloadable`, a sentence with no remedy in it. Fixed twice over - the libraries are staged
+  beside the executable from the build host's own Visual Studio redist folder, and the loader
+  reports a missing dependency as its own case so that a machine the staging missed is told what
+  to install.
+- **App-local is the right place for them because of how `ort` opens the runtime.** It calls
+  `libloading::Library::new`, which is `LoadLibraryExW(path, NULL, 0)` with no
+  `LOAD_LIBRARY_SEARCH_*` flags, so the runtime's own imports resolve through the standard search
+  order, whose first entry is the directory the application loaded from. Tauri puts bundled
+  resources in that same directory on Windows, verified by running `tauri_utils`'s own
+  `ResourcePaths` rather than read out of the documentation. The trade is real and is not free:
+  an app-local copy gets no Windows Update servicing, so a CRT security fix ships as a release of
+  this application.
 - **Two operational traps around the runtime download.** A quarantined copy is refused outright
   and loads once the attribute is cleared, which a browser download sets and a library download
   does not; and the dylib's own load command names a versioned filename, so a copy saved under
@@ -603,6 +625,13 @@ Windows or Linux, and a one-machine number is never written as though it were ge
   because it is 28 MB. "No export work" was wrong too: the published file is a pipeline.
 - **"WebGPU ships in the stock runtime build on every platform."** True of the one build
   measured, written in the same session as a warning against generalising a one-platform figure.
+- **"`libloading` opens the runtime with `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR`, so `DirectML.dll`
+  is found beside it."** It does not: `libloading` 0.9.0's `Library::new` is
+  `load_with_flags(filename, 0)`, flags zero. What actually resolved `DirectML.dll` was the
+  `SetDllDirectoryW` call added for the WebGPU plugin, working by accident on a delay-loaded
+  import. A comment naming the wrong mechanism is worse than none, because the call it depends on
+  reads as removable. The dependency is now stated, and the library is pinned by absolute path so
+  that resolution no longer rests on who owns the one directory slot `SetDllDirectoryW` holds.
 - **"A 1600×2400 page is not downscaled at all."** It is scaled by 2.34 into a fixed 1024².
 - **"The box classes are bubble, text bubble and free text."** Two language classes; the three
   names belonged to a different model.
@@ -643,6 +672,18 @@ Windows or Linux, and a one-machine number is never written as though it were ge
   unmeasured candidate, reported as such, with no measured peak, so the memory gate never fires
   on one. The same holds for custom-protocol throughput there: no number is offered and the tile
   constant stays provisional, because measuring it on a Mac would reproduce a recorded error.
+- **The Windows repairs of this round are all arguments, not runs.** Each is sourced from a
+  binary or a vendored crate rather than from a machine, and each names the observation it rests
+  on: that bundled resources land in the executable's directory and are therefore first in the
+  loader's search order, so the staged Visual C++ libraries are found; that `LoadLibraryExW`
+  answers 126 for a present file whose own imports are missing, which is what separates a missing
+  dependency from a missing runtime; that `GetEpDevices` lists a DirectML device on a build whose
+  RTTI carries `DmlEpFactory`, which is what lets DirectML be declined on a machine with no
+  Direct3D 12 adapter instead of failing a session build to find out; that a mapped DLL may be
+  renamed within its directory although it may not be deleted, which is what makes a runtime
+  replaceable after the first install; and that `SetNamedSecurityInfoW` narrows the settings
+  file's DACL. The first CI run on `windows-latest` is what tests the compile half. Nothing tests
+  the rest but a Windows machine.
 - **The WebGPU plugin on the two platforms it was added for.** Direct3D 12 on Windows and Vulkan
   on Linux, where the only measurement is Metal's: every automatic GPU choice off macOS is
   reported as unmeasured, and a forced WebGPU is still gated against a peak taken on a different

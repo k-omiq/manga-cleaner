@@ -23,9 +23,17 @@
  * Every call here therefore carries the page's status as well - forward from
  * the adapter, and backward in each half of the snapshot pair, so undo is
  * symmetric with the edit it reverses.
+ *
+ * **A rejection is reported, never dropped.** The two calls here that run an
+ * engine can fault, and a rejected promise that nothing catches is a control
+ * the user pressed and watched do nothing. Both go through
+ * `reportRegionEditFailure`, which is also what `toolapply.svelte.js` uses, so
+ * a failed edit says the same thing whichever control started it.
  */
 
 import { getBackend } from '../api/backend.js'
+import { hasKey } from '../i18n/index.js'
+import { notify } from '../state/app.svelte.js'
 import {
   applyRegionDelta,
   applyRegionState,
@@ -52,6 +60,46 @@ function snapshot(region) {
     region: /** @type {any} */ ($state.snapshot(region)),
     pageStatus: pageStatusOf(region.id),
   }
+}
+
+/**
+ * Report a region edit the backend rejected, and answer `false` so the caller
+ * reads it as "nothing changed" like every other refusal here.
+ *
+ * **A rejection used to be a click that did nothing.** These calls run an
+ * engine, and an engine can fault: the promise rejected, no caller was catching
+ * it, there is no `unhandledrejection` handler in the application, and so the
+ * only trace of a failed edit was a line in a console the user does not have
+ * open. The region is untouched either way - that half was always true - but a
+ * user cannot tell "untouched" from "ignored my click" without being told.
+ *
+ * Two shapes come back and both are handled. The backend names a fault it can
+ * attribute with a catalogue key - `decline.reason.engineFault` is the one this
+ * was written for - and that key is rendered as the reason. Anything else is
+ * text: a library's own words, a disk that would not write, and on Windows an
+ * ONNX Runtime string with a stack in it. None of that goes on screen; it goes
+ * to the console, and the reader gets `decline.reason.unknown` plus the
+ * sentence that says the region is exactly as it was.
+ *
+ * The key is checked against the catalogue **and** required to be a decline
+ * reason. A bare `hasKey` would let the backend put any string in the app into
+ * this sentence, which is a rejection choosing what the interface says.
+ *
+ * @param {unknown} error
+ * @returns {false}
+ */
+export function reportRegionEditFailure(error) {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  const named = message.startsWith('decline.reason.') && hasKey(message)
+  // Logged whichever shape it is: a key is a summary, and the detail behind it
+  // is what anyone debugging the machine actually needs.
+  console.error('a region edit was rejected', error)
+  notify({
+    key: 'notice.mask.rerunFailed',
+    params: { reasonKey: named ? message : 'decline.reason.unknown' },
+    tone: 'warn',
+  })
+  return false
 }
 
 /**
@@ -172,7 +220,13 @@ async function restoreRegionThroughSeam(regionId, state) {
 export async function rerunMask(region, kind, engine) {
   if (!region.mask) return false
   const before = snapshot(region)
-  const result = await getBackend().rerunMask({ maskId: region.mask.id, kind, engine })
+  /** @type {any} */
+  let result
+  try {
+    result = await getBackend().rerunMask({ maskId: region.mask.id, kind, engine })
+  } catch (error) {
+    return reportRegionEditFailure(error)
+  }
   if (!result) return false
   replaceRegion(result.region, result.pageStatus)
 
@@ -218,7 +272,13 @@ export async function cleanAnyway(region) {
     region.gateSkipCause === 'outside-bubble'
       ? (params.outsideEngine ?? 'lama')
       : (params.bubbleEngine ?? 'fill')
-  const result = await getBackend().cleanAnyway({ regionId: region.id, engine })
+  /** @type {any} */
+  let result
+  try {
+    result = await getBackend().cleanAnyway({ regionId: region.id, engine })
+  } catch (error) {
+    return reportRegionEditFailure(error)
+  }
   if (!result) return false
   replaceRegion(result.region, result.pageStatus)
   recordEdit('masks.command.cleanAnyway', region.id, before, {

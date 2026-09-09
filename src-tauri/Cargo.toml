@@ -59,6 +59,35 @@ keyring = { version = "3", features = ["apple-native"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
+# Two Windows facts this crate cannot get from `std`, both of which were being
+# guessed at or skipped before.
+#
+# `GetDiskFreeSpaceExW` is the free-space preflight the runtime download makes:
+# the CUDA archives are 365-455 MB and unpack to more again, and a transfer that
+# runs the volume dry halfway through leaves a `.part`, a wiped staging
+# directory and no explanation. It answers what the *caller* may write, which is
+# the figure a quota-limited account actually has.
+#
+# The security entry points are what gives `settings.json` a DACL. The mode bits
+# `restrict` sets on unix mean nothing here, and that file holds the Hugging
+# Face token on a machine whose Credential Manager will not answer.
+#
+# `windows-sys` rather than a wrapper crate, and 0.61 rather than a newer major,
+# because the lockfile already carries exactly that version through the graph
+# `tauri` and `keyring` bring in: this adds an entry point, not a dependency
+# tree. The bindings are declarations only - there is no code in them to audit.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
+# `statvfs`, for the same free-space preflight on macOS and Linux. Already in
+# the lockfile several times over; naming it here is what makes it callable.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Two stores, because a Linux desktop has the Secret Service and a headless
 # Linux box has only the kernel keyring. `crypto-rust` is what encrypts the

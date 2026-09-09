@@ -268,6 +268,21 @@ impl ScriptGate {
         self.osd.spent() || self.ocr.as_ref().is_some_and(|ocr| ocr.spent())
     }
 
+    /// Give this gate's sessions up for good, because one of them has failed in
+    /// a way another run cannot survive - a reset adapter reported as
+    /// device-removed. [`crate::registry::Lease::poison`] states what that
+    /// costs and why it is not the same signal as an unload the user asked for.
+    ///
+    /// Only the identifier is poisoned, and the rescue reader needs no poison of
+    /// its own: [`ScriptGate::spent`] is an `or` over both, so a poisoned
+    /// identifier is already this gate answering `true`, and the reader is
+    /// opened inside the gate and released with it rather than parked
+    /// separately. A device that took one of them down took both, and the gate
+    /// is what the caller gives back.
+    pub fn poison(&self) {
+        self.osd.poison();
+    }
+
     /// Decide one region.
     ///
     /// `detected` comes from outside: §3 scopes the gate by whether the text

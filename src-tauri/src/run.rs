@@ -96,7 +96,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use cleaner_core::accel::Preference;
+use cleaner_core::accel::{self, Preference};
 use cleaner_core::detect::{Detector, build_regions_separated};
 use cleaner_core::engines::{denoise, fill, lama};
 use cleaner_core::fit::{self, EdgeMap, Route};
@@ -622,6 +622,150 @@ pub trait Cleaner: Send {
         ceiling: Engine,
         context: &PageContext,
     ) -> Result<PageOutcome, String>;
+
+    /// The model fault the last [`Cleaner::clean_page`] failed on, when it
+    /// failed on a model rather than on the page.
+    ///
+    /// Asked for here rather than carried out through the error, because the
+    /// error is a `String` and the two things a run has to say about a fault -
+    /// which model gave up, and which provider it was running on - are
+    /// catalogue keys that no string can be parsed back into. Widening the
+    /// error type would reach the test stub and `spikes/clean-page` for a fact
+    /// neither of them has; a defaulted accessor reaches only the
+    /// implementation that has one.
+    ///
+    /// `None` after a failed page means the page failed for its own reasons -
+    /// it could not be read, or it could not be decoded - and the run reports
+    /// it with the count alone.
+    fn last_fault(&self) -> Option<EngineFault> {
+        None
+    }
+}
+
+/// What a page failed on when it failed on a **model** rather than on the page.
+///
+/// Windows is the machine this exists for. A Direct3D device can be reset by
+/// the driver's watchdog in the middle of an inference - two seconds is the
+/// default patience - and ONNX Runtime reports the reset as a device removed or
+/// a device hung; the same session can also simply run out of VRAM. None of the
+/// three is recoverable on the session it happened to, so the only honest thing
+/// a run can say afterwards is what faulted and where it was running. Nothing
+/// in this repository has ever been executed on Windows, which is the reason
+/// the sentence is built from two keys rather than from a message: the keys are
+/// facts this process holds, and the message would be a guess.
+#[derive(Clone, Debug)]
+pub struct EngineFault {
+    /// [`cleaner_core::accel::ModelProfile::label_key`] - a `models.kind.*`
+    /// key, the same one the loaded-models tab names this model under.
+    pub model_key: &'static str,
+    /// [`cleaner_core::accel::Accelerator::label_key`] - an `accel.*` key.
+    pub accel_key: &'static str,
+    /// ONNX Runtime's own words for it. **Never shown to the user**: it is not
+    /// a catalogue key, so no seam can translate it, and the sentence the user
+    /// reads is built from the two keys above instead. It is carried so the
+    /// detail is not lost - [`walk`] writes it to stderr beside the notice,
+    /// which is where this crate already puts diagnostic text a user cannot act
+    /// on ([`open_gate`] does the same for a reader that will not open).
+    pub detail: String,
+}
+
+/// The two things this file needs from an ONNX session after one of its **run**
+/// calls has failed.
+///
+/// An open failure is a different thing and is already handled elsewhere:
+/// [`cleaner_core::accel::open_session`] falls back to the CPU, and a session
+/// that will not build at all leaves its rung unavailable and says so. This is
+/// for the session that built, ran, and then died - the case where keeping it
+/// is worse than never having had it, because once a Direct3D device is lost
+/// every later run on that session fails too.
+pub(crate) trait Faulted {
+    /// [`cleaner_core::registry::Lease::poison`], through whichever engine
+    /// holds the lease.
+    ///
+    /// From here on the row reads spent, and **that is the whole disposal
+    /// mechanism**: [`OnDemand::release_if_spent`] and
+    /// [`Rung2::release_if_spent`] drop the session at the next region
+    /// boundary, [`residency::checkin`] refuses to park it, and
+    /// [`residency::checkout`] refuses to hand it out. It is the same path a
+    /// session the user closed from the loaded-models tab already takes, which
+    /// is why a fault needs no machinery of its own.
+    fn poison_session(&self);
+
+    /// Where this session was running, as the key the interface names the
+    /// accelerator under.
+    fn accel_key(&self) -> &'static str;
+}
+
+impl Faulted for Detector {
+    fn poison_session(&self) {
+        Detector::poison(self);
+    }
+
+    fn accel_key(&self) -> &'static str {
+        self.selection().accelerator.label_key()
+    }
+}
+
+impl Faulted for cleaner_core::balloon::BalloonDetector {
+    fn poison_session(&self) {
+        cleaner_core::balloon::BalloonDetector::poison(self);
+    }
+
+    fn accel_key(&self) -> &'static str {
+        self.selection().accelerator.label_key()
+    }
+}
+
+impl Faulted for ScriptGate {
+    fn poison_session(&self) {
+        ScriptGate::poison(self);
+    }
+
+    fn accel_key(&self) -> &'static str {
+        self.selection().accelerator.label_key()
+    }
+}
+
+impl Faulted for lama::Inpainter {
+    fn poison_session(&self) {
+        lama::Inpainter::poison(self);
+    }
+
+    fn accel_key(&self) -> &'static str {
+        self.selection().accelerator.label_key()
+    }
+}
+
+/// One run call on a session, with everything that has to happen when it fails.
+///
+/// Three steps, and every one of them used to be missing. The session is
+/// **poisoned**, so nothing later in this run - or in any later run, or in a
+/// hand edit between two of them - is handed the dead one. The fault is
+/// **recorded**, so the run loop can name the model and the provider in a
+/// notice instead of leaving the user with a silent count. And the diagnostic
+/// text is **passed on**, so the page still fails with something a developer
+/// can read.
+///
+/// `slot` arrives as a borrow of the pipeline's field rather than through
+/// `&mut self` because `session` is itself borrowed out of the pipeline: the
+/// two are different fields, and taking them separately is what lets each call
+/// site stay three lines.
+fn ran<T, E: std::fmt::Display>(
+    result: Result<T, E>,
+    session: &dyn Faulted,
+    profile: &accel::ModelProfile,
+    slot: &mut Option<EngineFault>,
+) -> Result<T, String> {
+    result.map_err(|error| {
+        session.poison_session();
+        let detail = error.to_string();
+        *slot = Some(EngineFault {
+            model_key: profile.label_key,
+            accel_key: session.accel_key(),
+            detail: detail.clone(),
+        });
+        detail
+    })
 }
 
 /* ------------------------------------------------------------------ */
@@ -783,6 +927,11 @@ pub struct Pipeline {
     /// window's row said otherwise, and a property of the run for the same
     /// reason `picks` is.
     outside: OutsideText,
+    /// What the last page failed on, when it failed on a model. Cleared at the
+    /// top of every [`Cleaner::clean_page`] so that it answers for the page the
+    /// run loop is asking about and not for one three pages ago, and read back
+    /// through [`Cleaner::last_fault`].
+    fault: Option<EngineFault>,
 }
 
 /// A session borrowed the first time something needs it and handed back to
@@ -1020,6 +1169,20 @@ impl Rung2 {
         }
         spent
     }
+
+    /// Where the held session is running, as the key the interface names the
+    /// accelerator under.
+    ///
+    /// **It opens nothing.** The only caller asks after a run call on this
+    /// session has already failed, so the state is `Held` by construction; the
+    /// other arms exist because the enum has them, and the CPU is the answer
+    /// that claims the least on a path nothing can reach.
+    pub(crate) fn accel_key(&self) -> &'static str {
+        match &self.state {
+            Session::Held(held) => held.inpainter.accel_key(),
+            _ => accel::Accelerator::Cpu.label_key(),
+        }
+    }
 }
 
 impl Drop for Rung2 {
@@ -1186,6 +1349,7 @@ impl Pipeline {
             ladder: memory::Ladder::new(),
             picks: None,
             outside: OutsideText::Review,
+            fault: None,
         })
     }
 
@@ -1314,14 +1478,25 @@ impl Cleaner for Pipeline {
         ceiling: Engine,
         context: &PageContext,
     ) -> Result<PageOutcome, String> {
+        // Whatever the last page faulted on is the last page's. `last_fault` is
+        // read straight after a failed `clean_page` and must answer for that
+        // page only, so the slot is emptied before anything can fill it.
+        self.fault = None;
         let page = decode(bytes).map_err(|e| e.to_string())?;
         // A page begins by giving back whatever the last one finished with.
         // The first thing a run does is therefore to open what it needs and
         // nothing else, and a run that has been asked for a model back gets no
         // further than one page holding it.
         self.reap();
-        let balloons =
-            self.balloons.get()?.detect(&page).map_err(|e| e.to_string())?;
+        // **Every run call below goes through [`ran`].** The failure it exists
+        // for is a session that ran once and then died - a Windows driver
+        // watchdog resetting the device mid-inference is the shape of it - and
+        // the two things that were missing are the same at all four sites: the
+        // dead session was kept and handed to the next page, and the error text
+        // was dropped on the floor.
+        let session = self.balloons.get()?;
+        let boxes = session.detect(&page);
+        let balloons = ran(boxes, &*session, &accel::BALLOON, &mut self.fault)?;
 
         // Page-level statistics, measured once and handed to every region.
         // **Per page and not per segment**, because the noise floor is one of
@@ -1363,7 +1538,9 @@ impl Cleaner for Pipeline {
                 &cropped
             };
 
-            let detection = self.detector.get()?.detect(crop).map_err(|e| e.to_string())?;
+            let session = self.detector.get()?;
+            let output = session.detect(crop);
+            let detection = ran(output, &*session, &accel::DETECTOR, &mut self.fault)?;
             let mut regions = build_regions_separated(detection.boxes.clone(), crop.width, crop.height, |a, b| {
                 cleaner_core::balloon::merge_crosses_a_balloon(crop, &detection.segmentation, a, b)
             });
@@ -1446,11 +1623,11 @@ impl Cleaner for Pipeline {
 
                 let detected = cleaner_core::balloon::detected(on_page, &balloons);
                 let inside = detected.inside();
-                let verdict = self
-                    .gate
-                    .get()?
-                    .judge(crop, &detection.segmentation, region, detected, self.outside)
-                    .map_err(|e| e.to_string())?;
+                let outside = self.outside;
+                let session = self.gate.get()?;
+                let judged =
+                    session.judge(crop, &detection.segmentation, region, detected, outside);
+                let verdict = ran(judged, &*session, &accel::SCRIPT_ID, &mut self.fault)?;
                 if !verdict.cleans() {
                     if let Some(reason) = verdict.reason_key() {
                         outcome.regions.push(RegionOutcome::Untouched {
@@ -1500,14 +1677,29 @@ impl Cleaner for Pipeline {
                 // apart by.
                 let pick = self.picks.map(|picks| picks.for_region(inside));
 
-                let attempt = clean_region(
-                    &mut self.rung2,
-                    crop,
-                    &fitted,
-                    ceiling,
-                    pick,
-                    noise,
-                )?;
+                let attempt =
+                    match clean_region(&mut self.rung2, crop, &fitted, ceiling, pick, noise) {
+                        Ok(attempt) => attempt,
+                        // **The one thing the ladder can fail on is rung 2's
+                        // own run call.** Every rung below it is arithmetic
+                        // over the page's pixels and cannot fault, every rung
+                        // above it is refused before it is reached, and every
+                        // other outcome - a refusal, a quality decline, an
+                        // empty ladder - comes back as `Declined`. So an `Err`
+                        // here names LaMa without having to be told.
+                        // [`render_rung`] has already poisoned the session;
+                        // what is left is to say which model it was and where
+                        // it was running, which is a question only this side
+                        // can answer.
+                        Err(detail) => {
+                            self.fault = Some(EngineFault {
+                                model_key: accel::LAMA.label_key,
+                                accel_key: self.rung2.accel_key(),
+                                detail: detail.clone(),
+                            });
+                            return Err(detail);
+                        }
+                    };
                 let (made, verdict) = match attempt {
                     Attempt::Declined(reason) => {
                         // §6: a declined region is **left exactly as it was**
@@ -1576,6 +1768,10 @@ impl Cleaner for Pipeline {
             previous = found;
         }
         Ok(outcome)
+    }
+
+    fn last_fault(&self) -> Option<EngineFault> {
+        self.fault.clone()
     }
 }
 
@@ -1728,7 +1924,11 @@ pub(crate) fn render_rung(
             let Some(held) = rung2.held() else {
                 return Ok(Rendered::Refused("decline.reason.rungUnavailable"));
             };
-            match held.inpainter.render(crop, fitted) {
+            // Bound rather than matched on directly, because the arms below
+            // need the session again and a scrutinee's borrow of it would still
+            // be alive there.
+            let rendered = held.inpainter.render(crop, fitted);
+            match rendered {
                 Ok(rendered) => Ok(Rendered::Made(Box::new(Made {
                     engine,
                     mask: rendered.mask,
@@ -1742,7 +1942,28 @@ pub(crate) fn render_rung(
                 Err(lama::Error::Declined(declined)) => {
                     Ok(Rendered::Refused(declined.reason_key()))
                 }
-                Err(lama::Error::Run(fault)) => Err(fault),
+                // **The session does not survive this, so it is not kept.** A
+                // decline above is the model answering; this is the model
+                // failing to answer, and on Windows the cause is usually one
+                // the session cannot come back from - the driver watchdog reset
+                // the device mid-inference, or the device ran out of memory.
+                // Once a Direct3D device is lost every later run on that
+                // session fails too, so a run that held on to it would carry
+                // one fault into every remaining page, every later run and
+                // every hand edit until the idle grace expired. Poisoning hands
+                // it to the disposal path that already exists - see
+                // [`Faulted::poison_session`] - and the next region that wants
+                // a rung 2 opens a fresh one.
+                //
+                // It is done **here** rather than at the two call sites because
+                // this is the only place that knows the failure was a run and
+                // not a decline. Naming the model for the notice is the callers'
+                // half of it, in [`Cleaner::clean_page`] and in
+                // [`crate::region`].
+                Err(lama::Error::Run(fault)) => {
+                    held.inpainter.poison_session();
+                    Err(fault)
+                }
             }
         }
         // Rung 3a and rung 4, neither of which an automatic run can reach.
@@ -2339,6 +2560,14 @@ fn walk(
 ) {
     let summary = &mut progress.summary;
     let mut open: Option<(PathBuf, JobLock, Job, JobStrip)> = None;
+    /* Which model faults this run has already told the user about, by the pair
+     * of keys the notice is built from. A dead device fails *every* page of the
+     * chapter, and three hundred copies of one sentence on the notice stack is
+     * not three hundred pieces of information - it is one, said in a way that
+     * buries everything else the run had to say. The stderr line below is not
+     * deduplicated for the opposite reason: it names the page, so each one is a
+     * different fact. */
+    let mut announced: HashSet<(&'static str, &'static str)> = HashSet::new();
 
     for entry in entries {
         if cancel.load(Ordering::SeqCst) {
@@ -2392,11 +2621,40 @@ fn walk(
             segments: &geometry.survey.segments,
             placement: entry.page_index,
         };
-        let outcome = match bytes
-            .and_then(|bytes| cleaner.clean_page(&page_id, &bytes, ceiling, &context))
-        {
+        // Bound before the match rather than matched on directly, because the
+        // failure arm asks the cleaner a second question and the closure above
+        // would still be holding it.
+        let cleaned = bytes.and_then(|bytes| cleaner.clean_page(&page_id, &bytes, ceiling, &context));
+        let outcome = match cleaned {
             Ok(outcome) => outcome,
-            Err(_) => {
+            Err(detail) => {
+                // **The error is not thrown away any more.** It used to be
+                // discarded here - never logged, never emitted, never stored -
+                // and the consequence was at the far end of the run: every page
+                // failing left `regions_cleaned` at zero, and [`report`] read
+                // that as an empty chapter and told the user there was no text
+                // to clean. A dead GPU reported itself as a quiet page.
+                //
+                // Two things go out instead. The raw text goes to stderr, named
+                // by page, because it is ONNX Runtime's own words and no
+                // catalogue key can carry them across the seam. And a fault the
+                // pipeline could attribute becomes a notice built from the two
+                // keys it *can* carry - which model, and which provider - so
+                // the user reads a sentence about their hardware rather than a
+                // provider string they cannot act on.
+                eprintln!("manga-cleaner: {page_id} could not be cleaned: {detail}");
+                if let Some(fault) = cleaner.last_fault() {
+                    if announced.insert((fault.model_key, fault.accel_key)) {
+                        emit(events::notice_event(
+                            "notice.run.engineFault",
+                            serde_json::json!({
+                                "modelKey": fault.model_key,
+                                "accelKey": fault.accel_key,
+                            }),
+                            "warn",
+                        ));
+                    }
+                }
                 fail_page(emit, run_id, entry, &page_id, job, summary);
                 progress.in_flight = None;
                 continue;
@@ -2716,6 +2974,7 @@ pub(crate) fn start(
                 LoadError::NotFound { .. } => "diagnostics.runtime.missing",
                 LoadError::Quarantined { .. } => "diagnostics.runtime.quarantined",
                 LoadError::Refused { .. } => "diagnostics.runtime.refused",
+                LoadError::MissingDependency { .. } => "diagnostics.runtime.missingDependency",
                 _ => "diagnostics.runtime.unloadable",
             },
             serde_json::json!({}),
@@ -2868,16 +3127,27 @@ impl Drop for Release {
 /// so that the notice a run ends on is one of the things the scheduler's tests
 /// can see. In the window the sink is `events::emit`, which is where it went
 /// before.
+/// **A run that failed pages never reports an empty result.** The branch used
+/// to be `regions_cleaned == 0`, and every page of a run failing leaves that at
+/// zero - so the closing word on a chapter no page of which could be cleaned
+/// was "no text found, nothing to clean", which is the field saying the
+/// opposite of what happened. It is the same class of lie the region writer's
+/// `failed_here` was fixed for, one scope further out: a counter that reads
+/// zero because nothing was found and a counter that reads zero because
+/// everything broke are different runs, and `errored` is what tells them apart.
+///
+/// The two are **not** exclusive. A chapter can clean forty pages and fail
+/// four, and a user told only the first half would go looking for the four
+/// pages in review, where they are not. So the success notice goes out on its
+/// own terms and the failure notice goes out after it, last, because the stack
+/// reads bottom-up and the thing that needs acting on should not be the thing
+/// that scrolls away.
 fn report(summary: &Summary, emit: &dyn Fn(Event)) {
     if summary.reason == "cancelled" {
         emit(events::notice_event("notice.run.cancelled", serde_json::json!({}), "warn"));
-    } else if summary.regions_cleaned == 0 {
-        emit(events::notice_event(
-            "notice.chapter.emptyResult",
-            serde_json::json!({ "regions": 0, "pages": summary.pages_cleaned }),
-            "warn",
-        ));
-    } else {
+        return;
+    }
+    if summary.regions_cleaned > 0 {
         emit(events::notice_event(
             "notice.run.finished",
             serde_json::json!({
@@ -2885,6 +3155,21 @@ fn report(summary: &Summary, emit: &dyn Fn(Event)) {
                 "regions": summary.regions_cleaned,
             }),
             "info",
+        ));
+    } else if summary.errored == 0 {
+        // Nothing cleaned and nothing broken, which is the one reading of a
+        // zero this key was ever true for.
+        emit(events::notice_event(
+            "notice.chapter.emptyResult",
+            serde_json::json!({ "regions": 0, "pages": summary.pages_cleaned }),
+            "warn",
+        ));
+    }
+    if summary.errored > 0 {
+        emit(events::notice_event(
+            "notice.run.pagesFailed",
+            serde_json::json!({ "pages": summary.errored }),
+            "warn",
         ));
     }
 }

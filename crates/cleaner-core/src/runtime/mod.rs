@@ -17,6 +17,13 @@
 //!   operating system's message for that is nothing like the message for a
 //!   missing file. [`LoadError`] separates the two so the interface can say
 //!   which one happened.
+//! - **The Windows runtime is not self-contained either**, and this is not a
+//!   signing problem. The shipped `onnxruntime.dll` imports the Visual C++
+//!   runtime as a regular import, which is a component the *user* installs;
+//!   the loader's answer for its absence is the same numeric code as for a
+//!   missing runtime, so [`LoadError::MissingDependency`] is told apart from
+//!   [`LoadError::NotFound`] by whether the file is on disk. That variant's own
+//!   documentation says what was read out of the binary.
 //!
 //! ## The WebGPU plugin
 //!
@@ -87,6 +94,31 @@ pub enum LoadError {
     #[error("the ONNX Runtime at {path} was refused by the system: {detail}")]
     Refused { path: PathBuf, detail: String },
 
+    /// The file is there, and the loader refused it because a library **it**
+    /// imports is not on the machine. The remedy is an install the user
+    /// performs, and it is neither a re-download nor a re-sign.
+    ///
+    /// On Windows this is the Visual C++ runtime. Parsing the PE import
+    /// directory of the shipped
+    /// `runtimes/packages/.dml/runtimes/win-x64/native/onnxruntime.dll`, its
+    /// regular imports are `MSVCP140.dll`, `MSVCP140_1.dll`,
+    /// `VCRUNTIME140.dll` and `VCRUNTIME140_1.dll` alongside `KERNEL32`,
+    /// `ADVAPI32`, `SETUPAPI`, `dbghelp` and ten `api-ms-win-crt-*` names.
+    /// Regular, not delay-loaded: they are resolved when the library is mapped,
+    /// so their absence fails the load outright rather than the first call. The
+    /// four `140` names are the Visual C++ 2015-2022 x64 Redistributable; the
+    /// `api-ms-win-crt-*` ones beside them are the universal CRT and are part
+    /// of Windows 10 and later, which is why only the first four are a user's
+    /// problem. Nothing in the NuGet packages [`package`] downloads carries
+    /// them, and nothing here downloads them separately.
+    ///
+    /// Kept out of [`LoadError::Failed`] because a generic "could not be
+    /// loaded" sends a user to re-download a runtime that is already correct,
+    /// and out of [`LoadError::NotFound`] because the runtime is on disk. The
+    /// interface names it `diagnostics.runtime.missingDependency`.
+    #[error("the ONNX Runtime at {path} is missing a library it depends on: {detail}")]
+    MissingDependency { path: PathBuf, detail: String },
+
     #[error("the ONNX Runtime at {path} could not be loaded: {detail}")]
     Failed { path: PathBuf, detail: String },
 }
@@ -153,11 +185,22 @@ pub fn load(path: &Path) -> Result<(), LoadError> {
     }
     ort::init_from(path)
         .map_err(|e| {
-            // `ort` and `libloading` both flatten `dlerror` to "dlopen failed",
-            // so the text that distinguishes a quarantined runtime from an
-            // unsigned one is only available by asking `dlerror` again.
-            let detail = dlerror_for(path).unwrap_or_else(|| e.to_string());
-            classify(path, &detail)
+            // Neither crate will hand over what the loader actually said.
+            // `libloading` 0.9.0 does carry it - a `dlerror` string, or a
+            // Windows code in `Error::LoadLibraryExW { source: WindowsError }` -
+            // but `WindowsError`'s field is `pub(crate)`
+            // (`libloading-0.9.0/src/error.rs:29`), so the number is reachable
+            // only through that type's `Display`; and `ort`'s own `LoadError`
+            // has an empty `impl core::error::Error` (`ort/src/lib.rs:118`), so
+            // its `source()` is `None` and its `Display` prints
+            // `libloading::Error`'s, which is the bare "dlopen failed" or
+            // "LoadLibraryExW failed" with the source dropped
+            // (`libloading-0.9.0/src/error.rs:136` and `:142`). So the loader is
+            // asked again, which is also the only way to get the text that
+            // separates a quarantined runtime from an unsigned one.
+            let report = loader_report(path);
+            let detail = report.detail.unwrap_or_else(|| e.to_string());
+            classify(path, &detail, report.os_error)
         })?
         .with_name("manga-cleaner")
         .commit();
@@ -211,18 +254,54 @@ fn register_webgpu_plugin(runtime: &Path) -> Plugin {
     }
 }
 
-/// Put the runtime's directory on the loader's search path.
+/// Put the runtime's directory on the loader's search path, and pin the one
+/// library that has to be found through it.
 ///
-/// Windows only, and for the libraries the runtime loads *by name* rather
-/// than the one this module opens by path: `libloading` finds `DirectML.dll`
-/// beside `onnxruntime.dll` because it opens that file with
-/// `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR`, but the WebGPU plugin is opened by
-/// ONNX Runtime itself, and `dxcompiler.dll` and `dxil.dll` by the plugin, and
-/// neither of those searches the directory it came from. `SetDllDirectoryW`
-/// adds one directory to every subsequent `LoadLibrary` in the process, which
-/// is the one the download unpacked into. Unix loaders resolve a library's
-/// own dependencies through `ldconfig` and `LD_LIBRARY_PATH`, which is where
-/// `libvulkan.so.1` lives, so nothing is needed there.
+/// Windows only, and for the libraries that are resolved **by name** rather
+/// than the one this module opens by path. An earlier version of this comment
+/// said `libloading` finds `DirectML.dll` beside `onnxruntime.dll` because it
+/// opens the runtime with `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR`. That is not the
+/// mechanism, and neither half of it survives reading:
+///
+/// - **No search flag is passed.** `ort` 2.0.0-rc.13 opens the runtime with
+///   `libloading::Library::new` (`ort/src/lib.rs:136`), and libloading 0.9.0's
+///   Windows `new` is `load_with_flags(filename, 0)`
+///   (`libloading-0.9.0/src/os/windows/mod.rs:69-70`). Zero: none of the
+///   `LOAD_LIBRARY_SEARCH_*` flags is set, so the open adds the runtime's own
+///   directory to nothing.
+/// - **`DirectML.dll` is not resolved at load anyway.** Parsing the shipped
+///   `onnxruntime.dll`'s PE data directories, `DirectML.dll`, `d3d12.dll` and
+///   `dxgi.dll` are the *entire* delay-import table and appear nowhere in the
+///   regular one. A delay-loaded import is resolved by the delay-load helper on
+///   the first call into it, through an ordinary `LoadLibrary` against the
+///   process search path - long after the flags of the open that mapped the
+///   runtime have stopped mattering.
+///
+/// So what resolves DirectML is this function and nothing else.
+/// `SetDllDirectoryW` inserts one directory into the search order of every
+/// later `LoadLibrary` in the process: DirectML's, and the WebGPU plugin's
+/// `dxcompiler.dll` and `dxil.dll`, which are opened by the plugin rather than
+/// by anything that knows where the plugin came from. **It is load-bearing for
+/// the DirectML flavour and not only for the plugin.** Deleted as plugin-only
+/// cleanup, the DirectML build loses its provider on the first inference rather
+/// than at load, where nothing would connect the two.
+///
+/// `SetDllDirectoryW` holds exactly **one** directory per process, and any
+/// later caller anywhere in it silently replaces the entry. So the directory is
+/// set *and* the library whose loss would be unrecoverable is opened
+/// immediately, by absolute path, and never freed. A module already in the
+/// process's loaded list is what `LoadLibrary` resolves a bare name to before
+/// it searches any directory, so pinning `DirectML.dll` makes the delay-load
+/// resolution independent of who owns the directory slot by then.
+/// `ort::util::preload_dylib` is that call - it exists for this, and shipping
+/// `DirectML.dll` beside the application is the example in its own
+/// documentation. Where there is no `DirectML.dll` beside the runtime, which is
+/// every non-DirectML flavour, nothing is pinned and nothing is reported: a
+/// CUDA build without a DirectML is not a failure.
+///
+/// Unix loaders resolve a library's own dependencies through `ldconfig` and
+/// `LD_LIBRARY_PATH`, which is where `libvulkan.so.1` lives, so nothing is
+/// needed there.
 #[cfg(windows)]
 fn add_library_directory(dir: &Path) {
     use std::os::windows::ffi::OsStrExt;
@@ -232,25 +311,85 @@ fn add_library_directory(dir: &Path) {
     unsafe {
         windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW(wide.as_ptr());
     }
+    let directml = dir.join(DIRECTML_NAME);
+    if directml.exists() {
+        // Ignored deliberately. A pin that fails leaves the delay-load helper
+        // to search for the name later exactly as it does today: this call
+        // hardens that path, it does not replace it, and a runtime is still a
+        // runtime without it.
+        let _ = ort::util::preload_dylib(&directml);
+    }
 }
+
+/// The DirectML library the Windows default flavour is unpacked beside, named
+/// as `Microsoft.AI.DirectML` 1.15.4 spells it in `bin/x64-win` and as
+/// `onnxruntime.dll`'s delay-import table spells it. See
+/// [`add_library_directory`], which pins it, and [`package::Package`]'s
+/// `companions` for how it gets there.
+#[cfg(windows)]
+const DIRECTML_NAME: &str = "DirectML.dll";
 
 #[cfg(not(windows))]
 fn add_library_directory(_dir: &Path) {}
 
+/// Windows' `ERROR_MOD_NOT_FOUND`. 126, read off `windows-sys` 0.61.2's
+/// `Win32::Foundation::ERROR_MOD_NOT_FOUND`; written out rather than imported
+/// because this crate enables that crate's `Win32_System_LibraryLoader` and
+/// `Win32_System_SystemInformation` features and not `Win32_Foundation`.
+///
+/// The loader returns it for **two** different things: a file it could not
+/// find, and a file it found whose own imports it could not resolve. They are
+/// told apart by the only thing that separates them, which is whether the file
+/// is there - [`find`] has already answered [`LoadError::NotFound`] for a path
+/// that is not on disk, and [`classify`] looks again rather than trusting that
+/// nothing moved in between.
+///
+/// `ERROR_PROC_NOT_FOUND` (127) is deliberately not folded in. It is a
+/// dependency that is present and too old, whose remedy is an upgrade rather
+/// than an install, and nothing here has seen one; a case nobody has observed
+/// is better reported as [`LoadError::Failed`] with the system's own sentence
+/// on it than as a remedy this module guessed at.
+const ERROR_MOD_NOT_FOUND: i32 = 126;
+
 /// Attach a remedy to the loader's message.
-fn classify(path: &Path, detail: &str) -> LoadError {
+///
+/// `detail` is the platform's own sentence and `os_error` its numeric code
+/// where it has one, both from [`loader_report`]. macOS is classified on the
+/// text because the two refusals that matter there differ only in wording;
+/// Windows is classified on the code, because the wording is localised and the
+/// code is not.
+fn classify(path: &Path, detail: &str, os_error: Option<i32>) -> LoadError {
     let detail = detail.to_owned();
     if detail.contains("disallowed by system policy") {
         LoadError::Quarantined { path: path.to_path_buf() }
     } else if detail.contains("Team ID") || detail.contains("code signature") {
         LoadError::Refused { path: path.to_path_buf(), detail }
+    } else if os_error == Some(ERROR_MOD_NOT_FOUND) && path.exists() {
+        LoadError::MissingDependency { path: path.to_path_buf(), detail }
     } else {
         LoadError::Failed { path: path.to_path_buf(), detail }
     }
 }
 
+/// What the loader said, asked a second time.
+///
+/// The load has already failed by the time one of these is built, so opening
+/// the same file again re-runs the same refusal and reads the answer out of the
+/// platform rather than out of an error type that dropped it - see [`load`] for
+/// which types drop what.
+#[derive(Default)]
+struct LoaderReport {
+    /// The operating system's own sentence about the failure.
+    detail: Option<String>,
+    /// The platform's numeric code, where the platform has one. Windows does.
+    /// `dlerror` does not, and `errno` after a failed `dlopen` is not defined
+    /// to carry the reason, so the Unix side leaves this `None` rather than
+    /// reporting a number that means nothing.
+    os_error: Option<i32>,
+}
+
 #[cfg(unix)]
-fn dlerror_for(path: &Path) -> Option<String> {
+fn loader_report(path: &Path) -> LoaderReport {
     use std::ffi::{CStr, CString};
 
     const RTLD_LAZY: std::os::raw::c_int = 0x1;
@@ -263,11 +402,13 @@ fn dlerror_for(path: &Path) -> Option<String> {
         fn dlerror() -> *const std::os::raw::c_char;
     }
 
-    let c_path = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
-    unsafe {
+    let Ok(c_path) = CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return LoaderReport::default();
+    };
+    let detail = unsafe {
         dlerror();
         if !dlopen(c_path.as_ptr(), RTLD_LAZY | RTLD_LOCAL).is_null() {
-            return None;
+            return LoaderReport::default();
         }
         let err = dlerror();
         if err.is_null() {
@@ -275,12 +416,37 @@ fn dlerror_for(path: &Path) -> Option<String> {
         } else {
             Some(CStr::from_ptr(err).to_string_lossy().into_owned())
         }
-    }
+    };
+    LoaderReport { detail, os_error: None }
 }
 
-#[cfg(not(unix))]
-fn dlerror_for(_path: &Path) -> Option<String> {
-    None
+#[cfg(windows)]
+fn loader_report(path: &Path) -> LoaderReport {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // Flags zero and no `hFile`, which is what `libloading::Library::new`
+    // passes (`libloading-0.9.0/src/os/windows/mod.rs:69-70`), so this repeats
+    // the search `ort` just ran rather than a more forgiving one.
+    let module = unsafe {
+        windows_sys::Win32::System::LibraryLoader::LoadLibraryExW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if !module.is_null() {
+        return LoaderReport::default();
+    }
+    // Read before anything else can run: the thread's last-error is whatever
+    // the most recent call that sets it left behind.
+    let error = std::io::Error::last_os_error();
+    LoaderReport { detail: Some(error.to_string()), os_error: error.raw_os_error() }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn loader_report(_path: &Path) -> LoaderReport {
+    LoaderReport::default()
 }
 
 #[cfg(test)]
@@ -334,13 +500,52 @@ mod tests {
     fn the_quarantine_refusal_is_told_apart_from_a_signing_refusal() {
         let path = Path::new("/nonexistent/libonnxruntime.dylib");
         assert!(matches!(
-            classify(path, "library load disallowed by system policy"),
+            classify(path, "library load disallowed by system policy", None),
             LoadError::Quarantined { .. }
         ));
         assert!(matches!(
-            classify(path, "have different Team IDs"),
+            classify(path, "have different Team IDs", None),
             LoadError::Refused { .. }
         ));
-        assert!(matches!(classify(path, "no such file"), LoadError::Failed { .. }));
+        assert!(matches!(classify(path, "no such file", None), LoadError::Failed { .. }));
+    }
+
+    /// Windows' 126 means two different things and the file on disk is what
+    /// separates them: a runtime that is not there is [`LoadError::NotFound`]
+    /// by way of [`find`], and one that is there and still answers 126 is a
+    /// runtime whose own imports could not be resolved.
+    ///
+    /// Written against a file this test creates rather than against the shipped
+    /// runtime, because the branch under test is `path.exists()` and nothing
+    /// else - the code is supplied, not produced, since this repository has
+    /// never executed on Windows and cannot make a real 126 happen.
+    #[test]
+    fn a_present_file_that_answers_mod_not_found_is_a_missing_dependency() {
+        let absent = Path::new("/no/such/directory/onnxruntime.dll");
+        assert!(
+            matches!(
+                classify(absent, "The specified module could not be found.", Some(ERROR_MOD_NOT_FOUND)),
+                LoadError::Failed { .. }
+            ),
+            "a file that is not on disk was reported as a missing dependency"
+        );
+
+        let dir = std::env::temp_dir().join(format!("mc-runtime-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("onnxruntime.dll");
+        std::fs::write(&present, b"not a PE file").unwrap();
+        assert!(matches!(
+            classify(&present, "The specified module could not be found.", Some(ERROR_MOD_NOT_FOUND)),
+            LoadError::MissingDependency { .. }
+        ));
+
+        // Any other code on the same present file stays generic: 127 is a
+        // dependency that is there and too old, and this module does not claim
+        // to know that remedy.
+        assert!(matches!(
+            classify(&present, "The specified procedure could not be found.", Some(127)),
+            LoadError::Failed { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

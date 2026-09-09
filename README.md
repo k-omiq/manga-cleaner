@@ -27,7 +27,9 @@ The rule is simple: use the lightest engine that does the job. Planar fill handl
 
 ## Install
 
-Download the installer from [cleaner.komiq.cc](https://cleaner.komiq.cc): a `.dmg` for macOS on Apple Silicon, a `-setup.exe` for Windows x64. Both are built and signed by the release workflow, and the app updates itself from cryptographically signed manifests.
+Download the installer from [cleaner.komiq.cc](https://cleaner.komiq.cc): a `.dmg` for macOS on Apple Silicon, a `-setup.exe` for Windows x64. Both are built by the release workflow, and the app updates itself from cryptographically signed manifests. The Windows installer is not yet Authenticode-signed, so SmartScreen warns the first time it is run; the release workflow signs it automatically as soon as a certificate is configured.
+
+Windows needs 10 version 1803 x64 or later, which is what WebView2, the Visual C++ 2015-2022 runtime and ONNX Runtime 1.28 each require on their own. The Visual C++ runtime is not something to install: the four libraries the ONNX Runtime imports outright ship beside the executable, where the loader finds them first.
 
 Model weights and the runtime are not bundled, which keeps the installer small and respects weight provenance. On first launch the app offers to download the ONNX Runtime (about 32 MB on macOS, about 200 MB on Windows) plus the five required model weights (about 317 MB in total). Anything declined or missed can be fetched later from **Settings › Models**. An optional Japanese text reader (about 460 MB, three files) can be added from the same panel: it recovers roughly 5% of speech balloons that the script gate cannot read and would otherwise go to review uncleaned, and nothing else depends on it. For offline setups, place the verified files in the application's `models/` directory instead.
 

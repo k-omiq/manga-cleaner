@@ -258,6 +258,14 @@ export const en = {
     accel: {
       label: 'Graphics acceleration',
       auto: 'Automatic',
+      // The picker with nothing in it. `listAccelerators` is the engine runtime
+      // being asked what this machine can run a model on, so a rejection is
+      // almost always the runtime itself failing to load - and the runtime's
+      // own row under Models is already where the reason for that is written.
+      // This sentence sends the reader there rather than restating it, because
+      // two explanations of one fault are two things that can disagree.
+      unreadable:
+        'The accelerator list could not be read, so only Automatic is offered. It comes from the engine runtime, so the reason for this will be on the runtime’s row under Models.',
     },
     // Which modifier is held while clicking the page to set where Clone / heal
     // reads from. The *caps* are not here: `⌥` and `Alt` are the keys' own
@@ -797,6 +805,16 @@ export const en = {
       // that rung. Distinct from the four above, each of which is something an
       // engine decided after looking.
       rungUnavailable: 'the engine this region needs was not available',
+      // The engine was asked, it started, and then it stopped answering: an
+      // ONNX session that built and ran and died under it, which on Windows is
+      // usually the graphics driver being reset out from under the run. Said
+      // as a fact about the model rather than about the region, because the
+      // region is fine and the next attempt on a fresh session may well work.
+      // The remedy is not here: it is `notice.run.engineFault`, which names
+      // the model and the provider and says what to change. Until this key
+      // existed the edit rejected with ONNX Runtime's own string, which no
+      // catalogue lookup catches, so the click did nothing visible at all.
+      engineFault: 'the model stopped answering',
       // Rung 3a's four. None of them
       // is a fact about the region - they are all facts about the machine or
       // the process, which is what separates them from the six above and why
@@ -836,6 +854,17 @@ export const en = {
       // Almost absence, and deliberately not silent like absence: this is a
       // user who installed the sidecar and is one download away from the rung.
       sidecarWeights: 'the FLUX sidecar is installed and has no model weights yet',
+      // The one entry in this group the core never chooses: the interface does,
+      // when a region edit is rejected with something that is not a key at all.
+      // The backend answers most failures with one of the reasons above, and it
+      // can still reject with a sentence of its own - a disk that would not
+      // write, a library's own words - and putting that on screen is how a
+      // reader ends up looking at an ONNX Runtime stack trace in a notice. This
+      // says the true and useful part instead, and the sentence around it says
+      // the region is untouched, which is the half that matters. The raw text
+      // is not lost: it goes to the console, where the other unreadable
+      // diagnostics go.
+      unknown: 'the engine failed for a reason this build does not recognise',
     },
   },
   // Why a file did not make it into a chapter. The
@@ -868,13 +897,24 @@ export const en = {
   /* ================================================================== */
   /* diagnostics - why the ONNX Runtime is not usable                    */
   /* ================================================================== */
-  // Four states, told apart because their remedies are: download it, clear an
-  // extended attribute, re-sign the application, replace the file.
+  // Five states, told apart because their remedies are: download it, clear an
+  // extended attribute, re-sign the application, install a Microsoft
+  // redistributable, replace the file.
   diagnostics: {
     runtime: {
       missing: 'The ONNX Runtime was not found',
       quarantined: 'The ONNX Runtime is quarantined, so the system refused to load it',
       refused: 'The system refused to load the ONNX Runtime into this application',
+      // Windows, and the one of the five that is not about our file at all: the
+      // `onnxruntime.dll` we ship imports `MSVCP140.dll`, `MSVCP140_1.dll`,
+      // `VCRUNTIME140.dll` and `VCRUNTIME140_1.dll`, which arrive with the
+      // Microsoft redistributable and with nothing else. Without it the load
+      // fails with Windows error 126, which read as `unloadable` until now -
+      // and that sent the reader to download our file again, when our file was
+      // never the thing that was wrong. The product is named in full because
+      // the full name is what has to be searched for to fix this.
+      missingDependency:
+        'The Microsoft Visual C++ 2015-2022 Redistributable (x64) is not installed, so the ONNX Runtime cannot load. Install it from Microsoft and start Manga Cleaner again',
       unloadable: 'The ONNX Runtime could not be loaded',
     },
   },
@@ -1416,6 +1456,50 @@ export const en = {
       // reader: before Settings › Models existed, this was a rejected promise
       // the interface had nowhere to put.
       modelsMissing: 'The models are not installed. Download them in Settings › Models.',
+      // Pages the run **could not** clean, counted separately from the pages it
+      // cleaned, and said even when the number is every page in the chapter.
+      // That last case is why this exists: a run where every page failed
+      // cleaned no regions, and a zero there used to close the run on
+      // `notice.chapter.emptyResult` - "No text found across 0 pages" - which
+      // is a dead engine filing a report about the artwork. The pages are left
+      // queued rather than marked cleaned, so the sentence says so: nothing has
+      // to be undone before running again.
+      pagesFailed: {
+        select: 'pages',
+        one: '1 page could not be cleaned. It is still queued.',
+        other: '{pages} pages could not be cleaned. They are still queued.',
+      },
+      // A model that built, ran, and then stopped answering. Both parameters
+      // are keys, resolved before they are interpolated: `models.kind.*` names
+      // the model in the words the loaded-models tab uses, and `accel.*` names
+      // the provider. Neither is assembled here.
+      //
+      // The three sentences are three different things the reader needs, in the
+      // order they need them: what happened, that it is not permanent, and what
+      // to change if it is. On Windows the usual cause is the graphics driver's
+      // watchdog resetting the card mid-inference, which poisons the session -
+      // so every later run in the same session fails too unless the model is
+      // dropped, and that is what "unloaded" is reporting.
+      engineFault:
+        'The {modelKey} stopped answering on {accelKey}, so it was unloaded. The next run builds it again. If it keeps happening, choose CPU in Settings › Acceleration.',
+    },
+
+    // Downloading or replacing the engine runtime itself. Both of these are
+    // refusals rather than failures - nothing was half-written - and both name
+    // the one thing that would make the press work.
+    runtime: {
+      // Windows will not let a file that is mapped into a running process be
+      // replaced, and the runtime is mapped as soon as anything asks what this
+      // machine can accelerate. So the remedy is not "try again": it is a
+      // restart, and then the download before anything loads it again.
+      inUse:
+        'The engine runtime is loaded, and a file in use cannot be replaced. Quit Manga Cleaner, open it again, and download the runtime before you clean anything.',
+      // Both figures are byte counts and both are formatted here rather than by
+      // whoever counted them, for `models.value.size`'s reason: a size is read,
+      // not translated. Saying both is the point - "not enough space" alone
+      // leaves the reader guessing how much to clear.
+      noSpace:
+        'There is not enough free disk space for that download: {needed:memory} needed, {free:memory} free. Free some space and press Download again.',
     },
     chapter: {
       emptyResult: 'No text found across {pages} pages. Nothing to clean.',

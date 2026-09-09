@@ -2393,6 +2393,7 @@ dependencies = [
  "flate2",
  "image",
  "keyring",
+ "libc",
  "ort",
  "reqwest",
  "serde",
@@ -2405,6 +2406,7 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-updater",
  "thiserror 2.0.20",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

@@ -109,7 +109,7 @@
   import { closeModal, modalWidth } from '../state/app.svelte.js'
   import { getBackend } from '../api/backend.js'
   import { chooseFolder } from '../api/folder.js'
-  import { CATALOGUES, LOCALE, t } from '../i18n/index.js'
+  import { CATALOGUES, LOCALE, hasKey, t } from '../i18n/index.js'
   import { capabilities, loadCapabilities } from '../state/capabilities.svelte.js'
   import {
     backendSettingsPatch,
@@ -340,6 +340,46 @@
     if (installed && sha256Ok === false) return { key: 'settings.models.status.mismatch' }
     if (installed) return { key: 'settings.models.status.installed' }
     return { key: 'settings.models.status.missing' }
+  }
+
+  /**
+   * What a refused row actually says.
+   *
+   * Two shapes arrive here as one string. A refusal the backend has a sentence
+   * for answers as a catalogue key with its figures beside it, in the grammar
+   * `key name=value ...` with decimal values - `notice.runtime.noSpace
+   * needed=253000000 free=1200000`, and `notice.runtime.inUse` with no figures
+   * at all. Everything else answers with whatever the failure itself said,
+   * which is what this row showed for every failure before the two Windows
+   * refusals existed. The byte counts travel as data rather than inside the
+   * sentence because a byte count is not translatable; `{needed:memory}` in the
+   * catalogue is what turns them into something a person reads.
+   *
+   * Only `notice.runtime.*` is honoured, and deliberately: a rejection free to
+   * name any key in the catalogue would be the backend choosing what the
+   * interface says. It is the same restriction `reportRegionEditFailure`
+   * applies to `decline.reason.*` for a region edit, for the same reason.
+   *
+   * @param {string} id
+   * @returns {string}
+   */
+  function failureText(id) {
+    const message = String(failures[id] ?? '')
+    if (!message) return ''
+    const [key, ...pairs] = message.split(' ')
+    if (!key.startsWith('notice.runtime.') || !hasKey(key)) return message
+    /** @type {Record<string, number>} */
+    const params = {}
+    for (const pair of pairs) {
+      const at = pair.indexOf('=')
+      // A malformed pair is dropped rather than shown: the sentence it belongs
+      // to renders without that figure, which is a worse sentence and not a
+      // wrong one.
+      if (at <= 0) continue
+      const value = Number(pair.slice(at + 1))
+      if (Number.isFinite(value)) params[pair.slice(0, at)] = value
+    }
+    return t(key, params)
   }
 
   /**
@@ -640,15 +680,86 @@
   /** @type {import('../api/backend.js').Accelerators|null} */
   let accelerators = $state(null)
 
+  /**
+   * Whether the last `listAccelerators` was **rejected**, as against not having
+   * been asked for yet. `accelerators === null` cannot tell those two apart,
+   * and the difference is the whole of what this panel has to say: a list not
+   * yet asked for draws nothing, a list that was refused has to explain why
+   * Automatic is the only thing on offer.
+   */
+  let accelFailure = $state(false)
+
   async function refreshAccelerators() {
     try {
       accelerators = await getBackend().listAccelerators()
-    } catch {
+      accelFailure = false
+    } catch (error) {
+      // Caught and dropped until now, which on the machine this matters most on
+      // said nothing at all: a Windows install whose ONNX Runtime will not load
+      // - the missing Microsoft redistributable - answers nothing here, and the
+      // picker collapsed to a bare Automatic with no explanation beside it. The
+      // *reason* is the runtime's own and is reported on the runtime's row; the
+      // panel's share is that the list is missing and where the reason is.
+      console.error('listAccelerators was rejected', error)
       accelerators = null
+      accelFailure = true
     }
   }
 
-  onMount(refreshAccelerators)
+  /**
+   * Asked for when the Acceleration panel is first shown, not when the dialog
+   * mounts.
+   *
+   * The list is the loaded runtime answering, so asking for it maps the
+   * runtime's library into this process - and Windows will not replace a file
+   * that is mapped, which is exactly what Settings › Models' Download has to
+   * do. Opening Settings to fetch a runtime must not be the thing that makes
+   * the fetch impossible, so the question waits until the panel that shows the
+   * answer is actually looked at.
+   */
+  let accelAsked = false
+  $effect(() => {
+    if (active !== 'acceleration' || accelAsked) return
+    accelAsked = true
+    refreshAccelerators()
+  })
+
+  /**
+   * Whether `Automatic` is itself a guess.
+   *
+   * It is, when the setting in force puts models on providers and not one of
+   * those has ever been timed on this kind of machine - which is every Windows
+   * GPU today. `active` is the backend saying which providers the current
+   * setting actually uses, and this is what it is for.
+   *
+   * Asked **only while Automatic is the setting in force**, which is what the
+   * absence of a `selected` provider means. `active` describes the current
+   * placement, so under a forced provider it says nothing about what Automatic
+   * would have done, and reading it there would put a caveat on a choice
+   * nobody had made. An empty list says nothing either: no rows is not
+   * evidence of anything.
+   */
+  const autoUnmeasured = $derived.by(() => {
+    const providers = accelerators?.providers ?? []
+    if (providers.some((provider) => provider.selected)) return false
+    const inUse = providers.filter((provider) => provider.active)
+    return inUse.length > 0 && inUse.every((provider) => !provider.measured)
+  })
+
+  /**
+   * Which option the picker shows as the current one.
+   *
+   * `selected` is the backend's own reading of the stored preference, so once
+   * the list has been read it is the better answer than the session copy - the
+   * two differ whenever a stored value was not one the backend kept. Before the
+   * list has been read there is nothing to compare against, and the session's
+   * value is all there is.
+   */
+  const acceleratorValue = $derived(
+    accelerators
+      ? (accelerators.providers.find((provider) => provider.selected)?.id ?? 'auto')
+      : session.accelerator,
+  )
 
   /**
    * `Automatic`, then every provider the runtime reports - the unusable ones
@@ -658,14 +769,32 @@
    * disabled: a user looking for CUDA and finding no entry at all concludes the
    * application does not support it, where a disabled entry saying "it needs
    * CUDA and cuDNN installed on this machine" is an instruction.
+   *
+   * `note` is one field for two different things, because the option has one
+   * line to say either in: why a provider cannot be picked, or - for one that
+   * can - that picking it rests on how the provider works rather than on a
+   * timing taken here. The second half is `measured`, which crossed the wire
+   * from the start and was read by nothing, so every Windows choice was offered
+   * as though it had been measured.
    */
   const acceleratorOptions = $derived([
-    { id: 'auto', label: t('settings.accel.auto'), disabled: false, title: undefined },
+    {
+      id: 'auto',
+      label: t('settings.accel.auto'),
+      disabled: false,
+      note: autoUnmeasured ? t('accel.chosen.unmeasured') : undefined,
+    },
     ...(accelerators?.providers ?? []).map((provider) => ({
       id: provider.id,
       label: t(provider.labelKey),
       disabled: !provider.available,
-      title: provider.reasonKey ? t(provider.reasonKey) : undefined,
+      note: !provider.available
+        ? provider.reasonKey
+          ? t(provider.reasonKey)
+          : undefined
+        : provider.measured
+          ? undefined
+          : t('accel.chosen.unmeasured'),
     })),
   ])
 
@@ -1073,7 +1202,7 @@
                     · {t('settings.models.status.readOnly')}{/if}
                 </span>
                 {#if failures[model.id]}
-                  <span class="row-error">{failures[model.id]}</span>
+                  <span class="row-error">{failureText(model.id)}</span>
                 {/if}
                 {#if notes[model.id]}
                   <span class="row-error">{t(notes[model.id])}</span>
@@ -1143,7 +1272,7 @@
                 {/if}
               </span>
               {#if failures[RUNTIME_ID]}
-                <span class="row-error">{failures[RUNTIME_ID]}</span>
+                <span class="row-error">{failureText(RUNTIME_ID)}</span>
               {/if}
               {#if notes[RUNTIME_ID]}
                 <span class="row-error">{t(notes[RUNTIME_ID])}</span>
@@ -1308,18 +1437,26 @@
           <select
             id="settings-accelerator"
             class="sidecar-model-select"
-            value={session.accelerator}
+            value={acceleratorValue}
             onchange={(e) =>
               chooseAccelerator(/** @type {HTMLSelectElement} */ (e.currentTarget).value)}
           >
+            <!-- The note is on the option's face, not only in its tooltip: a
+                 caveat a pointer has to hover to find is one a keyboard user
+                 never sees, and this one is the difference between a measured
+                 choice and a guess. -->
             {#each acceleratorOptions as option (option.id)}
-              <option value={option.id} disabled={option.disabled} title={option.title}>
-                {option.label}{option.disabled && option.title ? `: ${option.title}` : ''}
+              <option value={option.id} disabled={option.disabled} title={option.note}>
+                {option.label}{option.note ? `: ${option.note}` : ''}
               </option>
             {/each}
           </select>
         {/snippet}
       </Field>
+
+      {#if accelFailure}
+        <p class="note">{t('settings.accel.unreadable')}</p>
+      {/if}
 
       {#if accelerators && accelerators.models.length > 0}
         <ul class="rows">

@@ -3,6 +3,7 @@
 # workflow on GitHub Actions, and verifies the published manifest.
 #
 #   ./scripts/ship.sh 0.2.0 "Fixed the drag flinch, faster exports"
+#   ./scripts/ship.sh 1.0.0-beta.2 "Second beta"
 #   ./scripts/ship.sh 0.2.0 "notes" --dry-run   # stop before pushing anything
 #
 # Steps it performs:
@@ -27,7 +28,10 @@ BASE_URL="https://cleaner.komiq.cc"
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
 
-[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "usage: ship.sh X.Y.Z \"notes\" [--dry-run] (got '${VERSION}')"
+# X.Y.Z, optionally with a semver prerelease tail: this project shipped its
+# first beta as 1.0.0-beta.1, and a pattern that only accepted three numbers
+# meant the repository could not ship its own current version.
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || fail "usage: ship.sh X.Y.Z[-prerelease] \"notes\" [--dry-run] (got '${VERSION}')"
 [ -n "$NOTES" ] || fail "release notes required; users see them in the update dialog"
 
 echo "== preflight =="
@@ -41,11 +45,42 @@ git fetch -q origin main
 git rev-parse "v$VERSION" >/dev/null 2>&1 && fail "tag v$VERSION already exists"
 
 CURRENT=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
-python3 -c "
-import sys
-def key(v): return [int(x) for x in v.split('.')]
-sys.exit(0 if key('$VERSION') > key('$CURRENT') else 1)
-" || fail "version $VERSION is not greater than current $CURRENT"
+# Semver 2.0.0 precedence, not `int(x) for x in v.split('.')`: the current
+# version is 1.0.0-beta.1 and that raises ValueError, so before this no
+# prerelease could be shipped and no release could follow one.
+#
+# The versions arrive through the environment rather than being interpolated
+# into the source, so a version string can never be read as Python.
+NEW_VERSION="$VERSION" CURRENT_VERSION="$CURRENT" python3 <<'PY' || fail "version $VERSION is not greater than current $CURRENT"
+import os, sys
+
+def key(version):
+    """A tuple that sorts by semver precedence.
+
+    Build metadata (anything after '+') is dropped first and from the whole
+    string, which is what the specification says: it takes no part in
+    precedence, and it can appear on a version that has no prerelease at all.
+    """
+    core, _, prerelease = version.split('+', 1)[0].partition('-')
+    major, minor, patch = (int(part) for part in core.split('.'))
+    if not prerelease:
+        # A release outranks every prerelease of the same core version, so the
+        # release sorts above with 1 and the prereleases below with 0.
+        return (major, minor, patch, 1, ())
+    identifiers = []
+    for identifier in prerelease.split('.'):
+        if identifier.isdigit():
+            # Numeric identifiers compare numerically and always rank below
+            # alphanumeric ones, hence the leading 0 against the leading 1.
+            identifiers.append((0, int(identifier), ''))
+        else:
+            identifiers.append((1, 0, identifier))
+    # A shorter identifier list ranks below a longer one that shares its
+    # prefix, which is what comparing the tuples already does.
+    return (major, minor, patch, 0, tuple(identifiers))
+
+sys.exit(0 if key(os.environ['NEW_VERSION']) > key(os.environ['CURRENT_VERSION']) else 1)
+PY
 
 # One fetch, then grep the string: `gh | grep -q` under pipefail dies of
 # SIGPIPE whenever the match is not the last line grep reads.
@@ -53,6 +88,15 @@ SECRETS=$(gh secret list --repo "$REPO")
 for s in TAURI_SIGNING_PRIVATE_KEY CLEANER_PUBLISH_TOKEN; do
   grep -q "^$s" <<<"$SECRETS" || fail "repo secret $s missing"
 done
+# Authenticode is optional and the release does not fail without it, so this
+# reports rather than blocks. It is worth saying out loud every time: an
+# unsigned installer means every Windows user meets a SmartScreen warning
+# before they meet the application.
+if grep -q "^WINDOWS_CERTIFICATE" <<<"$SECRETS"; then
+  echo "windows installer: signed (WINDOWS_CERTIFICATE is set)"
+else
+  echo "windows installer: UNSIGNED - users will see a SmartScreen warning. Set the WINDOWS_CERTIFICATE and WINDOWS_CERTIFICATE_PASSWORD repo secrets to sign."
+fi
 echo "preflight ok: $CURRENT -> $VERSION"
 
 echo "== bump version =="
@@ -125,6 +169,9 @@ want = sys.argv[1]
 assert m.get("version") == want, f"manifest has {m.get('version')}, expected {want}"
 plats = sorted(m.get("platforms", {}).keys())
 print(f"published v{want} with platforms: {', '.join(plats)}")
+# The two platforms release.yml builds. windows-aarch64 is deliberately not
+# here: runtime::package carries the win-arm64 row, nothing builds it, and an
+# arm64 entry in the manifest would offer an installer that does not exist.
 missing = {"darwin-aarch64", "windows-x86_64"} - set(plats)
 if missing:
     print(f"WARNING: missing platforms: {', '.join(sorted(missing))}", file=sys.stderr)

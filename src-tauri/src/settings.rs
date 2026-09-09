@@ -156,11 +156,21 @@ pub fn write(app: &tauri::AppHandle, mut patch: Value) -> Result<Value, String> 
 /// with the process umask - 0644 on a typical Linux box, which is a secret
 /// every account on the machine can read.
 ///
-/// The mode is narrowed unconditionally rather than only when a token is
-/// present: a file that is 0600 sometimes is a file whose permissions say
+/// The permissions are narrowed unconditionally rather than only when a token
+/// is present: a file that is 0600 sometimes is a file whose permissions say
 /// something about its contents, and settings are small and rarely written, so
-/// there is nothing to save by being clever. Not on Windows, where the bits do
-/// not mean this and the ACL that does is not `Permissions`' to set.
+/// there is nothing to save by being clever.
+///
+/// **A failure to narrow is only fatal when there is something to protect.**
+/// Narrowing is still attempted every time - that is the paragraph above - but
+/// on unix a `chmod` of a file this process has just created does not fail, and
+/// on Windows [`restrict`] can fail for a reason that is about the volume
+/// rather than about this file: an exFAT stick or a redirected profile share
+/// carries no ACLs at all, and `SetNamedSecurityInfoW` says so. Refusing to
+/// save the theme on such a machine would trade a secret nobody stored for a
+/// settings dialog that does not work. So the refusal is reported when the
+/// snapshot going to disk actually carries the token, and swallowed when it
+/// does not.
 fn write_file(path: &std::path::Path, value: &Value) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
@@ -170,10 +180,20 @@ fn write_file(path: &std::path::Path, value: &Value) -> Result<(), String> {
     // experience for someone who has been using the application for a year.
     let bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
     cleaner_core::project::buffers::write_atomic(path, &bytes).map_err(|e| e.to_string())?;
-    restrict(path)
+    let holds_secret = value.get(crate::weights::TOKEN_SETTING).is_some();
+    match restrict(path) {
+        Ok(()) => Ok(()),
+        Err(err) if holds_secret => Err(err),
+        Err(_) => Ok(()),
+    }
 }
 
-/// Narrow a file to its owner. A no-op where the mode bits do not decide.
+/// Narrow a file to its owner.
+///
+/// There are two arms and no third one. A platform that is neither `unix` nor
+/// `windows` fails to compile here, which is the failure to want: the arm that
+/// used to catch everything else was `Ok(())`, and a silent success is how a
+/// secret ends up in a world-readable file with nothing to show for it.
 #[cfg(unix)]
 fn restrict(path: &std::path::Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
@@ -181,8 +201,122 @@ fn restrict(path: &std::path::Path) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-#[cfg(not(unix))]
-fn restrict(_path: &std::path::Path) -> Result<(), String> {
+/// The same on Windows, where the mode bits do not decide and a DACL does.
+///
+/// This used to be `Ok(())` - a silent no-op in front of a file that holds the
+/// Hugging Face token whenever the Credential Manager will not answer, which is
+/// what `weights::read_token`'s fallback is for. The exposure that left is
+/// narrower than it looks and is worth stating exactly, because it is what this
+/// function is measured against:
+///
+/// - `%APPDATA%` under the user's profile already inherits an ACL naming that
+///   user, SYSTEM and the local Administrators group, so a second *standard*
+///   account on the same machine could never read it. That was true before this
+///   existed and is not what changed.
+/// - What could read it was anything running as an administrator or as SYSTEM,
+///   and - the case that matters - anything at all that runs **as the user**,
+///   because inheritance grants the whole account rather than this application.
+///   A token in a file is a token every process the user starts can read.
+///
+/// A protected DACL with one access-allowed entry closes the first of those and
+/// narrows nothing about the second: no file permission can, on any of the three
+/// platforms, which is exactly why the token belongs in the credential store and
+/// why this file is the fallback rather than the design. What it does buy is the
+/// same statement `0600` makes on unix - the permissions on this file say
+/// something about its contents - and it takes SYSTEM and Administrators off the
+/// list, which is the difference between a secret an elevated process can read
+/// and one it has to take ownership of first.
+///
+/// `PROTECTED_DACL_SECURITY_INFORMATION` is the half that does the work: without
+/// it the inherited entries are merged back in and the new one changes nothing.
+#[cfg(windows)]
+fn restrict(path: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW,
+        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetTokenInformation, NO_INHERITANCE,
+        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let failed = |what: &str, err: std::io::Error| format!("{}: {what}: {err}", path.display());
+
+    // Every `W` entry point wants a wide, NUL-terminated string, and a `Path`
+    // is not one.
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+
+    // SAFETY: each call below is checked before its output is read, the token
+    // handle is closed on both paths out of the pair of `GetTokenInformation`
+    // calls, and the SID handed to `SetEntriesInAclW` points into `buffer`,
+    // which outlives the ACL that is built from it.
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(failed("OpenProcessToken", std::io::Error::last_os_error()));
+        }
+        // Twice, because only the first call knows how long a SID is. The first
+        // is expected to fail with `ERROR_INSUFFICIENT_BUFFER`; what is read
+        // from it is the length, not the status.
+        let mut len = 0u32;
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
+        if len == 0 {
+            CloseHandle(token);
+            return Err(failed("GetTokenInformation", std::io::Error::last_os_error()));
+        }
+        let mut buffer = vec![0u8; len as usize];
+        let read = GetTokenInformation(token, TokenUser, buffer.as_mut_ptr().cast(), len, &mut len);
+        let last = std::io::Error::last_os_error();
+        CloseHandle(token);
+        if read == 0 {
+            return Err(failed("GetTokenInformation", last));
+        }
+
+        let user: *const TOKEN_USER = buffer.as_ptr().cast();
+        let access = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_ALL_ACCESS,
+            grfAccessMode: SET_ACCESS,
+            // A file inherits nothing to anything, so the flag says so rather
+            // than leaving a container-shaped entry on a leaf.
+            grfInheritance: NO_INHERITANCE,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_USER,
+                ptstrName: (*user).User.Sid.cast(),
+            },
+        };
+
+        // `oldacl` is null rather than the file's current ACL: this is a
+        // replacement, and merging the inherited entries back in is the one
+        // thing that would make the whole call pointless.
+        let mut acl: *mut ACL = std::ptr::null_mut();
+        let built = SetEntriesInAclW(1, &access, std::ptr::null(), &mut acl);
+        if built != ERROR_SUCCESS {
+            return Err(failed("SetEntriesInAclW", std::io::Error::from_raw_os_error(built as i32)));
+        }
+        let set = SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl,
+            std::ptr::null(),
+        );
+        LocalFree(acl.cast());
+        if set != ERROR_SUCCESS {
+            return Err(failed(
+                "SetNamedSecurityInfoW",
+                std::io::Error::from_raw_os_error(set as i32),
+            ));
+        }
+    }
     Ok(())
 }
 

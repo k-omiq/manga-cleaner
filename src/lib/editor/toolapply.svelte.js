@@ -25,6 +25,10 @@ import {
   select,
 } from '../state/editor.svelte.js'
 import { applyWithConfirmations, cloudRefused } from './cloudflow.svelte.js'
+// The reporter lives beside the actions it was written for, and this module
+// already follows that one for everything else it does; a second copy of the
+// same three lines is a second sentence a failed edit could start saying.
+import { reportRegionEditFailure } from './maskactions.svelte.js'
 import { paintParamsOf } from './paint.js'
 
 /**
@@ -82,17 +86,31 @@ export async function applyActiveToolToRegion(regionId, extraParams) {
   const before = snapshot(region)
   select(regionId)
 
-  const result = await applyWithConfirmations(
-    (next) =>
-      getBackend().applyTool({
-        tool,
-        params: next,
-        chapterId: chapter.id,
-        pageIndex: editor.pageIndex,
-        regionId,
-      }),
-    params,
-  )
+  // Every caller of this function fires it and walks away - a region click does
+  // not await it, and neither does the gesture that lands on an existing
+  // region - so a rejection here reached nothing at all: no handler, no notice,
+  // and no `unhandledrejection` listener in the application to catch it last.
+  // A tool that faulted was a click that did nothing. It is reported through
+  // the same reporter the Layers row's own controls use, and the answer is
+  // `false`, which is what this function already says for every other way of
+  // changing nothing.
+  /** @type {any} */
+  let result
+  try {
+    result = await applyWithConfirmations(
+      (next) =>
+        getBackend().applyTool({
+          tool,
+          params: next,
+          chapterId: chapter.id,
+          pageIndex: editor.pageIndex,
+          regionId,
+        }),
+      params,
+    )
+  } catch (error) {
+    return reportRegionEditFailure(error)
+  }
 
   switch (result.status) {
     case 'applied': {

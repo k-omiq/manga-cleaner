@@ -126,6 +126,35 @@
 //! differs from the choice. The file list is the other half: switching
 //! build removes whatever the previous stamp named that the new archive did not
 //! bring, so no foreign library is left beside the one that will be loaded.
+//!
+//! ## Replacing a runtime on Windows
+//!
+//! Everything above was written and measured on macOS, and one of its
+//! assumptions is false on Windows: that a file can be deleted while something
+//! has it open. It cannot, and **the file in question is always open**. `ort`
+//! loads `onnxruntime.dll` through `libloading` and keeps it in a `OnceLock`
+//! for the life of the process; `models::list_accelerators` calls
+//! `cleaner_core::runtime::load`; and `list_accelerators` is what fills in the
+//! settings dialog the Download, flavour-switch and Delete buttons live in. So
+//! the library is mapped before any of those buttons can be pressed, the first
+//! install worked and every replacement after it failed with a sharing
+//! violation.
+//!
+//! Windows will, however, **rename** a mapped file to another name in the same
+//! directory - the mapping is to the file, not to the name. That asymmetry is
+//! the whole fix: [`clear_target`] renames what it cannot delete to
+//! `<name>.old-<n>`, the new library moves into the name that was freed, and
+//! [`sweep_replaced`] deletes the aside copy from a later session that never
+//! mapped it. A refusal to do even that is [`NOTICE_IN_USE`], which is a
+//! sentence the user can act on rather than an `os error 32`.
+//!
+//! Two other things about that platform, in the same place because they were
+//! found together. A Windows package is three artefacts and used to report as
+//! three downloads under one id ([`Portion`]). And its archives unpack to far
+//! more than they transfer - `onnxruntime.pdb` alone is about 408 MB behind a
+//! 12 MB download - so the volume is asked first ([`room_to_install`],
+//! [`unpacked_bytes`]) and the files nothing can load are not written at all
+//! ([`is_loadable`]).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -345,6 +374,185 @@ fn writable_runtime_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app_data(app)
         .map(|dir| dir.join("runtimes"))
         .ok_or_else(|| "no application data directory on this machine".to_owned())
+}
+
+/* ------------------------------------------------------------------ */
+/* Refusals the interface can translate                                */
+/* ------------------------------------------------------------------ */
+
+/// Two failures of a runtime install are the user's to act on rather than a
+/// developer's to read, so they cross the seam as keys.
+///
+/// **They travel as strings because that is the only channel there is.**
+/// `download_runtime` answers `Result<DownloadStart, String>` and everything it
+/// does afterwards reaches the interface as `Event::ModelProgress`'s
+/// `error: Option<String>`; the interface already reads one of those strings as
+/// a sentinel rather than as a sentence - `'cancelled'` - so this is that
+/// arrangement written down rather than a new one.
+///
+/// The grammar is one line and the adapter's whole job:
+///
+/// ```text
+/// <key>
+/// <key> <name>=<value> <name>=<value> …
+/// ```
+///
+/// The first whitespace-separated field is the i18n key. Every field after it is
+/// `name=value`, and the values are decimal byte counts - **numbers are not
+/// translatable, so they travel beside the key rather than inside it**, which is
+/// the arrangement `accel.declined.memory` already has with `neededBytes` and
+/// `roomBytes`. An error whose first field is not a known key is a diagnostic
+/// and is shown as it is, which is what every other failure here still is.
+///
+/// Only Windows can raise this one, and only Windows compiles the code that
+/// does. The key is still declared on every platform: it is the seam's
+/// vocabulary rather than one target's, and a constant that exists in one build
+/// and not another is a contract the two builds disagree about. Being unused on
+/// the platforms that cannot reach it is what that costs.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const NOTICE_IN_USE: &str = "notice.runtime.inUse";
+
+/// See [`NOTICE_IN_USE`]. Carries `needed` and `free`.
+pub const NOTICE_NO_SPACE: &str = "notice.runtime.noSpace";
+
+/// The refusal a preflight writes, with the two figures the sentence needs.
+fn no_space(needed: u64, free: u64) -> String {
+    format!("{NOTICE_NO_SPACE} needed={needed} free={free}")
+}
+
+/// How many bytes the volume holding `path` will still take.
+///
+/// `None` is **this machine would not say**, and every caller reads it as
+/// permission to go ahead: a download refused on ignorance is worse than one
+/// that runs out of disk, because the second at least fails with the reason
+/// attached.
+///
+/// The path need not exist. `<app_data>/runtimes` is created by the first
+/// download, and the question is about the volume rather than the directory, so
+/// the nearest ancestor that does exist is what is asked about.
+fn free_space(path: &Path) -> Option<u64> {
+    let mut candidate = path;
+    loop {
+        if candidate.exists() {
+            return free_on(candidate);
+        }
+        candidate = candidate.parent()?;
+    }
+}
+
+/// `f_bavail`, not `f_bfree`: the blocks a filesystem reserves for root are not
+/// space this process can spend, and counting them is how a preflight passes and
+/// the write fails anyway.
+#[cfg(unix)]
+fn free_on(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `stat` is written by `statvfs` and read only where it answered 0.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(name.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    // `f_frsize` is the fragment size the counts are in; a filesystem that
+    // leaves it zero is answering in `f_bsize` instead.
+    let block = if stat.f_frsize > 0 { stat.f_frsize } else { stat.f_bsize };
+    // Written as casts rather than as `u64::from`, because `fsblkcnt_t` is 32
+    // bits on macOS and 64 on Linux: a conversion that compiles on one is a
+    // `useless_conversion` on the other, and a cast that is a no-op on one is
+    // the widening on the other. The lint is silenced rather than the two
+    // platforms given two spellings.
+    #[allow(clippy::unnecessary_cast)]
+    let free = (stat.f_bavail as u64).checked_mul(block as u64);
+    free
+}
+
+/// `lpFreeBytesAvailableToCaller`, which is the figure a quota-limited account
+/// actually has rather than the one the volume has.
+#[cfg(windows)]
+fn free_on(dir: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut free = 0u64;
+    // SAFETY: `wide` is NUL-terminated and outlives the call; `free` is written
+    // only when the call answers non-zero, which is what is checked.
+    let answered = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (answered != 0).then_some(free)
+}
+
+/// Refuse a download the volume cannot hold, and say by how much.
+///
+/// `needed == 0` and a machine that will not answer both go through: see
+/// [`free_space`].
+fn ensure_room(dir: &Path, needed: u64) -> Result<(), String> {
+    if needed == 0 {
+        return Ok(());
+    }
+    let Some(free) = free_space(dir) else { return Ok(()) };
+    if free >= needed {
+        return Ok(());
+    }
+    Err(no_space(needed, free))
+}
+
+/// What a runtime install needs on the volume before any of the bytes are here.
+///
+/// **The size the row advertises is the download, and the download is not what
+/// this costs.** An install holds the archives in `.downloads` *and* their
+/// unpacked contents in `.staging` at the same time - the archive is deleted
+/// only after its own unpack - so the peak is the transfer plus what comes out
+/// of it, against a picker that puts "455 MB" in front of the person choosing.
+///
+/// Only the first half is knowable here: what an archive unpacks to is in the
+/// archive, and the archive is what is about to be fetched. So this is `2 x` the
+/// transfer, and it is a **floor rather than a bound** - stated plainly because
+/// a reader deserves to know which it is. The exact figure is checked again,
+/// from the zip's own central directory, immediately before each unpack; see
+/// [`unpacked_bytes`], which is where the 408 MB `onnxruntime.pdb` that started
+/// this was found.
+fn room_to_install(to_fetch: u64) -> u64 {
+    to_fetch.saturating_mul(2)
+}
+
+/// How many bytes [`unpack`] will write out of this archive, read from the
+/// archive's own table of contents.
+///
+/// A zip - which is every Windows artefact, and the WebGPU plugin on Linux -
+/// carries an uncompressed length per entry in its central directory, so this
+/// is exact and costs a seek rather than an inflate. Only the entries that will
+/// actually be written are counted, which is what makes it exact rather than
+/// merely conservative.
+///
+/// A `.tgz` answers `None`. Its sizes live in headers interleaved with the data,
+/// so reading them means inflating the whole archive - minutes, to learn
+/// something the caller then uses to decide whether to spend seconds. macOS and
+/// Linux get no check, which is the platform where the archive is 32 MB and the
+/// failure was never seen.
+fn unpacked_bytes(archive: &Path, library_dir: &str) -> Option<u64> {
+    if !is_zip(archive) {
+        return None;
+    }
+    let file = std::fs::File::open(archive).ok()?;
+    let mut zip = zip::ZipArchive::new(file).ok()?;
+    let mut total = 0u64;
+    for index in 0..zip.len() {
+        let entry = zip.by_index(index).ok()?;
+        if !entry.is_file() {
+            continue;
+        }
+        let path = entry.name().replace('\\', "/");
+        let Some(name) = under(&path, library_dir) else { continue };
+        if !is_loadable(name) {
+            continue;
+        }
+        total = total.saturating_add(entry.size());
+    }
+    Some(total)
 }
 
 /// Where a weight actually is, and whether this module may delete it.
@@ -765,6 +973,12 @@ fn runtime_row(app: &tauri::AppHandle, data: Option<&Path>) -> RuntimeRow {
     use cleaner_core::runtime::{self, package};
 
     let writable = data.map(|dir| dir.join("runtimes"));
+    // The one call that already reads this directory is where the aside copies
+    // a previous session could not delete are collected. See [`sweep_replaced`]
+    // for why they exist and why a later launch is when they go.
+    if let Some(dir) = writable.as_deref() {
+        sweep_replaced(dir);
+    }
     let found = runtime::find(data).ok();
     let read_only = match (&found, &writable) {
         (Some(path), Some(dir)) => path.parent() != Some(dir.as_path()),
@@ -1000,6 +1214,7 @@ pub fn download_model(app: tauri::AppHandle, id: String) -> Result<DownloadStart
             model.id,
             &auth,
             &cancel,
+            Portion::ALONE,
         );
         if let Ok(path) = &result {
             record_verified(model.id, true);
@@ -1109,6 +1324,12 @@ pub fn discard_partial(app: tauri::AppHandle, id: String) -> Result<bool, String
 /// [`cleaner_core::runtime::search_paths`] looks. A package with companions  - 
 /// `DirectML.dll`, the WebGPU plugin - has every artefact land in that same
 /// directory, which is where the loader expects the plugin.
+///
+/// Two things happen before any of that, and both are about a Windows machine
+/// rather than this one: the volume is asked whether it can hold the install
+/// ([`room_to_install`], and again exactly per archive at [`unpacked_bytes`]),
+/// and the artefacts are counted so that a package of three reports as one
+/// download ([`Portion`]).
 #[tauri::command]
 pub fn download_runtime(app: tauri::AppHandle) -> Result<DownloadStart, String> {
     use cleaner_core::runtime::package;
@@ -1144,6 +1365,15 @@ pub fn download_runtime(app: tauri::AppHandle) -> Result<DownloadStart, String> 
         let result = (|| -> Result<(), String> {
             let _ = std::fs::remove_dir_all(&staging);
             std::fs::create_dir_all(&staging).map_err(|e| format!("{}: {e}", staging.display()))?;
+
+            // **What this attempt has to fetch, decided before it fetches any
+            // of it.** The free-space preflight below needs the figure, and so
+            // does the progress bar: `already_fetched` is a digest of up to
+            // 202 MB and is paid once either way, so it is paid here where two
+            // things can read the answer instead of inside the loop where one
+            // could.
+            let mut planned = Vec::new();
+            let mut to_fetch = 0u64;
             for artefact in host.artefacts() {
                 let name = artefact.url.rsplit('/').next().unwrap_or("runtime-archive");
                 let archive = downloads.join(name);
@@ -1152,7 +1382,25 @@ pub fn download_runtime(app: tauri::AppHandle) -> Result<DownloadStart, String> 
                 // and it already succeeded - what failed was the unpack, which
                 // is a full disk or a permission and is usually over by the
                 // next press. Verifying 202 MB is seconds; fetching it is not.
-                if !already_fetched(&archive, artefact.sha256) {
+                let have = already_fetched(&archive, artefact.sha256);
+                if !have {
+                    to_fetch += artefact.bytes;
+                }
+                planned.push((artefact, archive, have));
+            }
+            ensure_room(&dir, room_to_install(to_fetch))?;
+
+            // **One download, whichever way it is packaged.** A Windows runtime
+            // is three artefacts - 12 MB, then 202 MB, then 39 MB - and
+            // reporting each of them from zero under one id drew the bar
+            // restarting twice with no total anybody could read. Every report
+            // now counts the whole, and an artefact that was already on disk
+            // contributes its bytes to `done` without a report of its own: the
+            // next one's first event carries them.
+            let whole = Some(host.bytes());
+            let mut done = 0u64;
+            for (artefact, archive, have) in planned {
+                if !have {
                     fetch_verified(
                         artefact.url,
                         artefact.sha256,
@@ -1160,13 +1408,16 @@ pub fn download_runtime(app: tauri::AppHandle) -> Result<DownloadStart, String> 
                         RUNTIME_ID,
                         &auth,
                         &cancel,
+                        Portion { before: done, whole },
                     )?;
                 }
+                ensure_room(&staging, unpacked_bytes(&archive, artefact.library_dir).unwrap_or(0))?;
                 unpack(&archive, artefact.library_dir, &staging)?;
                 // The archive is not kept once it *is* unpacked: it is up to
                 // 202 MB of which one library is used, and nothing re-reads it.
                 // Its `.part` is already gone - the rename consumed it.
                 let _ = std::fs::remove_file(&archive);
+                done += artefact.bytes;
             }
             // The move, the sweep of the previous build's leftovers and the new
             // record, in the one order a crash between them can survive.
@@ -1190,6 +1441,12 @@ pub fn download_runtime(app: tauri::AppHandle) -> Result<DownloadStart, String> 
 /// runtime row carries `readOnly` too - a library found beside the executable
 /// or through `ORT_DYLIB_PATH` is a developer's or an installer's - and the
 /// press has to be able to say so.
+///
+/// What "remove" costs differs by platform and [`remove_installed`] is where
+/// that lives: on Windows the library this press is aimed at is mapped into
+/// this process by the time the dialog offering the press is open, so it is
+/// renamed out of the way rather than deleted, and the disk comes back a launch
+/// later.
 #[tauri::command]
 pub fn delete_runtime(app: tauri::AppHandle) -> Result<DeleteOutcome, String> {
     let dir = writable_runtime_dir(&app)?;
@@ -1198,7 +1455,7 @@ pub fn delete_runtime(app: tauri::AppHandle) -> Result<DeleteOutcome, String> {
     match plan_delete_runtime(found.as_deref(), &dir, is_downloading(RUNTIME_ID)) {
         Err(outcome) => Ok(outcome),
         Ok(()) => {
-            std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            remove_installed(&dir)?;
             Ok(DeleteOutcome::Deleted)
         }
     }
@@ -1681,6 +1938,31 @@ pub fn authorize(url: &str) -> bool {
     host == "huggingface.co" || host.ends_with(".huggingface.co")
 }
 
+/// One artefact's place in the download the user is watching.
+///
+/// A weight is one file and is its own whole download. A runtime is not: the
+/// Windows package is the ONNX Runtime build, `DirectML.dll` and the WebGPU
+/// plugin, three transfers under one id, and reporting each of them from zero
+/// drew a bar that restarted twice and never said how much there was in total.
+/// This is what turns three reports into one - see [`download_runtime`], which
+/// is the only caller that fills it in.
+#[derive(Clone, Copy)]
+struct Portion {
+    /// Bytes of the same download that were finished before this artefact
+    /// started, added to every report this one makes.
+    before: u64,
+    /// The whole download's size, from the catalogue. `None` where there is
+    /// only one artefact, whose total the response's own `Content-Length`
+    /// answers better - it is the byte count actually arriving, resume
+    /// included.
+    whole: Option<u64>,
+}
+
+impl Portion {
+    /// A download of one artefact, which is every weight.
+    const ALONE: Portion = Portion { before: 0, whole: None };
+}
+
 fn emit(id: &str, downloaded: u64, total: Option<u64>, done: bool, error: Option<String>) {
     events::emit(&events::Event::ModelProgress {
         id: id.to_owned(),
@@ -1923,26 +2205,55 @@ fn forget_installed(dir: &Path) {
 /// Move a downloaded build into place and leave the directory describing
 /// itself, in the order a crash can survive.
 ///
-/// The order is the whole of this function. The stamp is **removed before
-/// anything moves** and written after everything has: a power cut, a full disk
-/// or a failed `rename` in between then leaves no record, and no record is
-/// [`read_installed`]'s *unknown* - the row says nothing about which build is
-/// installed. Writing the new stamp last but removing the old one late would
-/// leave the previous build's flavour beside the new libraries, and the row
-/// would then state the wrong one confidently, which is worse than silence
-/// and is the exact failure this exists to end.
+/// The order is the whole of this function, and it is **nothing is written down
+/// until the move has actually happened**. The record follows the directory; it
+/// never runs ahead of it.
 ///
-/// `move_in` is passed rather than called inline so that the ordering can be
-/// tested against a failure that never has to happen on a real disk.
+/// This used to remove the stamp *before* calling the move, so that a crash in
+/// between left [`read_installed`]'s *unknown* rather than the previous build's
+/// flavour beside the new libraries. That reasoning was about a power cut, and
+/// the failure that actually happens is not a power cut: on Windows the move is
+/// refused outright, every time, because the library being replaced is mapped
+/// into this process (see [`clear_target`]). Clearing the stamp first meant
+/// every refused flavour switch left the row reading *unknown* about a runtime
+/// that was still installed, still working and still exactly what the stamp had
+/// said it was a second earlier - a record destroyed to describe a change that
+/// did not take place.
+///
+/// So the three outcomes are told apart, and [`MoveFailed::moved`] is what tells
+/// them apart:
+///
+/// - **The move succeeded.** The difference against the previous stamp is swept
+///   and the new stamp is written. As before.
+/// - **The move failed having moved nothing.** The directory is untouched, so
+///   the previous stamp is still a true description of it and it stays. This is
+///   the Windows case and it is the common one.
+/// - **The move failed part way.** The directory is now a mixture that no stamp
+///   describes, and the record is removed: *unknown* is the honest answer to a
+///   question that no longer has a true one. The price is the same one the old
+///   ordering paid on every failure - the attempt after it has no previous
+///   stamp to take a difference against, so it sweeps nothing and whatever the
+///   mixture held stays.
+///
+/// `move_in` is passed rather than called inline so that all three can be
+/// tested against failures that never have to happen on a real disk.
 fn install_stamped(
     dir: &Path,
     flavour: &str,
     version: &str,
-    move_in: impl FnOnce() -> Result<Vec<String>, String>,
+    move_in: impl FnOnce() -> Result<Vec<String>, MoveFailed>,
 ) -> Result<(), String> {
     let previous = read_installed(dir);
+    let brought = match move_in() {
+        Ok(brought) => brought,
+        Err(failed) => {
+            if !failed.moved.is_empty() {
+                forget_installed(dir);
+            }
+            return Err(failed.error);
+        }
+    };
     forget_installed(dir);
-    let brought = move_in()?;
     // **The difference, not the directory.** Emptying `<app_data>/runtimes`
     // before the move would trade a leftover `DirectML.dll` for a window in
     // which a failed download has removed a working runtime; the previous stamp
@@ -2076,6 +2387,7 @@ fn fetch_verified(
     id: &str,
     auth: &str,
     cancel: &AtomicBool,
+    portion: Portion,
 ) -> Result<PathBuf, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
@@ -2113,7 +2425,13 @@ fn fetch_verified(
         // and the token is in the request.
         return Err(format!("{} answered {}", host_of(url), status));
     }
-    let total = resume_total(plan, response.content_length());
+    // The bar reports the whole download, and this artefact is a part of it:
+    // `whole` where the catalogue knows the sum, and the response's own answer
+    // where it does not. `before` is added to the counter rather than to the
+    // total, so a three-artefact runtime reads as one bar that only goes up.
+    let total = portion
+        .whole
+        .or_else(|| resume_total(plan, response.content_length()).map(|t| t + portion.before));
 
     let (mut file, mut hasher, mut downloaded) = match plan {
         Resume::Continue(offset) => {
@@ -2137,7 +2455,7 @@ fn fetch_verified(
 
     // The first event carries the resumed prefix, so a bar picking a download
     // back up starts where it left off rather than jumping from zero.
-    emit(id, downloaded, total, false, None);
+    emit(id, portion.before + downloaded, total, false, None);
     loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = file.sync_all();
@@ -2168,7 +2486,7 @@ fn fetch_verified(
         // blocks at 256 KiB and the channel is the same one a run's events use.
         if since_report >= 4 << 20 {
             since_report = 0;
-            emit(id, downloaded, total, false, None);
+            emit(id, portion.before + downloaded, total, false, None);
         }
     }
     file.sync_all().map_err(|e| format!("{}: {e}", part.display()))?;
@@ -2180,7 +2498,7 @@ fn fetch_verified(
         return Err(format!("digest mismatch: expected {sha256}, got {got}"));
     }
     std::fs::rename(&part, path).map_err(|e| format!("{}: {e}", path.display()))?;
-    emit(id, downloaded, total, false, None);
+    emit(id, portion.before + downloaded, total, false, None);
     Ok(path.to_path_buf())
 }
 
@@ -2191,32 +2509,204 @@ fn host_of(url: &str) -> String {
         .unwrap_or_else(|| "the server".to_owned())
 }
 
+/* ------------------------------------------------------------------ */
+/* Replacing a library the process is holding open                     */
+/* ------------------------------------------------------------------ */
+
+/// The suffix a file that could not be deleted is renamed to, and the digits
+/// that make one aside copy different from the next.
+///
+/// A recognisable shape rather than a random name, because [`sweep_replaced`]
+/// reads it back and deletes what it matches out of a directory the user is
+/// invited to populate by hand.
+const REPLACED_SUFFIX: &str = ".old-";
+
+/// Whether a name in the runtime directory is one of those aside copies.
+///
+/// Pure, and deliberately strict: `onnxruntime.dll.old-0` is swept and
+/// `notes.old-copy`, `.old-1` and `onnxruntime.dll.old-` are not. A sweep that
+/// matched on `.old` alone would delete a file somebody put there.
+fn is_replaced_aside(name: &str) -> bool {
+    match name.rsplit_once(REPLACED_SUFFIX) {
+        Some((head, digits)) => {
+            !head.is_empty() && !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// Delete the aside copies a previous session could not.
+///
+/// **Best effort, and silent.** The copy this session renamed aside is still
+/// mapped into this process and will refuse again; the one a *previous* session
+/// left is not mapped into this one and goes. That is the whole design: the
+/// disk comes back one launch later, and nothing about it is worth a message.
+///
+/// Called where the runtime directory is next read - [`runtime_row`], which
+/// every open of the Settings dialog reaches - rather than at startup, because
+/// startup is the one moment the application is not thinking about runtimes.
+fn sweep_replaced(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_replaced_aside(name) {
+            continue;
+        }
+        if entry.file_type().map(|kind| kind.is_file()).unwrap_or(false) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Rename a file out of the way, under the first free `<name>.old-<n>`.
+///
+/// **Windows will not delete a file that is mapped into a process, and it will
+/// rename one.** That asymmetry is the whole fix: `ort` loads
+/// `onnxruntime.dll` through `libloading` and keeps it in a `OnceLock` for the
+/// life of the process, and `models::list_accelerators` calls
+/// `cleaner_core::runtime::load` - so the library is mapped the moment the
+/// Settings dialog opens, which is the same dialog the Download, flavour-switch
+/// and Delete buttons are in. A rename to a new name in the same directory is
+/// permitted on a mapped file because the mapping is to the file, not to the
+/// name.
+///
+/// A hundred is not a limit anybody reaches: an aside copy only survives until
+/// the next launch sweeps it, so the count is the number of replacements in one
+/// session.
+#[cfg(windows)]
+fn rename_aside(target: &Path) -> Result<(), String> {
+    for n in 0..100u32 {
+        let mut name = target.file_name().unwrap_or_default().to_os_string();
+        name.push(format!("{REPLACED_SUFFIX}{n}"));
+        let aside = target.with_file_name(&name);
+        if aside.exists() {
+            continue;
+        }
+        if std::fs::rename(target, &aside).is_ok() {
+            // The disk is wanted back now where that is allowed, and on the
+            // next launch where it is not. A failure here is the ordinary case
+            // rather than a surprise: the bytes are still mapped.
+            let _ = std::fs::remove_file(&aside);
+            return Ok(());
+        }
+    }
+    Err(NOTICE_IN_USE.to_owned())
+}
+
+/// Make `target` free for a `rename` onto it.
+///
+/// Unix unlinks it: a library another process still has open survives under no
+/// name at all, which is why this was never a problem here and why the simpler
+/// path stays.
+#[cfg(unix)]
+fn clear_target(target: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(target) {
+        Err(_) => Ok(()),
+        Ok(meta) if meta.is_dir() => {
+            std::fs::remove_dir_all(target).map_err(|e| format!("{}: {e}", target.display()))
+        }
+        Ok(_) => std::fs::remove_file(target).map_err(|e| format!("{}: {e}", target.display())),
+    }
+}
+
+/// The same on Windows, where a delete of a mapped library is refused with a
+/// sharing violation and [`rename_aside`] is what is left.
+///
+/// The delete is still tried first: it is one call, it succeeds whenever the
+/// library is not loaded, and it leaves the directory holding exactly what it
+/// should. Only its failure reaches for the aside copy - and only the aside
+/// copy's failure is [`NOTICE_IN_USE`], because at that point Windows has
+/// refused both of the two things that can free a name.
+#[cfg(windows)]
+fn clear_target(target: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(target) {
+        Err(_) => Ok(()),
+        Ok(meta) if meta.is_dir() => {
+            std::fs::remove_dir_all(target).map_err(|e| format!("{}: {e}", target.display()))
+        }
+        Ok(_) => match std::fs::remove_file(target) {
+            Ok(()) => Ok(()),
+            Err(_) => rename_aside(target),
+        },
+    }
+}
+
+/// What a move that did not finish left behind.
+///
+/// `moved` is the reason this is a struct rather than a `String`: whether
+/// *anything* landed decides what [`install_stamped`] may say about the
+/// directory afterwards, and only the move knows.
+struct MoveFailed {
+    /// The names that were in place when the failure happened. **Empty is the
+    /// common case**, and it is the Windows one: the first target is
+    /// `onnxruntime.dll`, the process is holding it, and nothing has moved.
+    moved: Vec<String>,
+    error: String,
+}
+
 /// Move every entry out of the staging directory and into `dir`, and answer
 /// with the names that were moved.
 ///
-/// If a target already exists (from a previous install or partial download),
-/// remove it first so that `rename` succeeds across platforms without
-/// `EEXIST` or `ENOTEMPTY`.
+/// A target that already exists is cleared first so that `rename` succeeds
+/// across platforms without `EEXIST` or `ENOTEMPTY` - see [`clear_target`],
+/// which is where the platforms differ.
 ///
 /// The names are the install's own record of what this archive brought, which
 /// is what [`InstalledRuntime`] is written from and what the *next* install
-/// takes its difference against.
-fn move_staged(staging: &Path, dir: &Path) -> Result<Vec<String>, String> {
+/// takes its difference against. A name is recorded **after** its rename rather
+/// than before: the list is read back as a statement about the directory, and a
+/// half-finished move that claimed a file it never wrote is the wrong half of
+/// that statement.
+fn move_staged(staging: &Path, dir: &Path) -> Result<Vec<String>, MoveFailed> {
     let mut moved = Vec::new();
+    match move_each(staging, dir, &mut moved) {
+        Ok(()) => Ok(moved),
+        Err(error) => Err(MoveFailed { moved, error }),
+    }
+}
+
+fn move_each(staging: &Path, dir: &Path, moved: &mut Vec<String>) -> Result<(), String> {
     for entry in std::fs::read_dir(staging).map_err(|e| format!("{}: {e}", staging.display()))? {
         let entry = entry.map_err(|e| e.to_string())?;
         let target = dir.join(entry.file_name());
-        moved.push(entry.file_name().to_string_lossy().into_owned());
-        if let Ok(meta) = std::fs::symlink_metadata(&target) {
-            if meta.is_dir() {
-                std::fs::remove_dir_all(&target).map_err(|e| format!("{}: {e}", target.display()))?;
-            } else {
-                std::fs::remove_file(&target).map_err(|e| format!("{}: {e}", target.display()))?;
-            }
-        }
+        clear_target(&target)?;
         std::fs::rename(entry.path(), &target).map_err(|e| format!("{}: {e}", target.display()))?;
+        moved.push(entry.file_name().to_string_lossy().into_owned());
     }
-    Ok(moved)
+    Ok(())
+}
+
+/// Remove an installed runtime, or as much of it as the platform allows.
+///
+/// Unix takes the tree and is done.
+#[cfg(unix)]
+fn remove_installed(dir: &Path) -> Result<(), String> {
+    std::fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))
+}
+
+/// The same on Windows, where `remove_dir_all` fails outright on a directory
+/// holding a mapped `onnxruntime.dll` - which is every directory this press is
+/// aimed at, because opening Settings is what mapped it.
+///
+/// So the tree is walked instead, and each library that will not be deleted is
+/// renamed aside. **That is the uninstall the user asked for**: `runtime::find`
+/// looks for one name, the name is gone, the row says nothing is installed and
+/// the next Download lands cleanly. What is not immediate is the disk, which
+/// comes back when [`sweep_replaced`] runs in a session that never loaded those
+/// bytes. `.staging` and `.downloads` hold no mapped file and go the ordinary
+/// way.
+#[cfg(windows)]
+fn remove_installed(dir: &Path) -> Result<(), String> {
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        clear_target(&entry.path())?;
+    }
+    // Declines while the aside copies are still there, which is the honest
+    // outcome and not an error: the directory is empty of everything that
+    // makes a runtime.
+    let _ = std::fs::remove_dir(dir);
+    Ok(())
 }
 
 /// Unpack the files directly under `library_dir` into `dest`, flat.
@@ -2228,15 +2718,57 @@ fn move_staged(staging: &Path, dir: &Path) -> Result<Vec<String>, String> {
 ///
 /// Only that one directory: an ONNX Runtime archive carries headers, licences
 /// and - on Windows - eight architectures of `DirectML.dll`, none of which this
-/// application loads.
+/// application loads. And only the files inside it that something *can* load:
+/// see [`is_loadable`], which is 408 MB of the Windows install.
 fn unpack(archive: &Path, library_dir: &str, dest: &Path) -> Result<(), String> {
-    let name = archive.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase());
-    let is_tar = name.as_deref().map(|n| n.ends_with(".tgz") || n.ends_with(".tar.gz")).unwrap_or(false);
-    if is_tar {
-        unpack_tar(archive, library_dir, dest)
-    } else {
+    if is_zip(archive) {
         unpack_zip(archive, library_dir, dest)
+    } else {
+        unpack_tar(archive, library_dir, dest)
     }
+}
+
+/// Which of the two readers an archive gets, by name.
+///
+/// A `.nupkg` and a GitHub `.zip` are both zips and everything else this
+/// catalogue names is a gzipped tar. Split out of [`unpack`] because
+/// [`unpacked_bytes`] asks the same question for a different reason and two
+/// spellings of it would be two things to keep equal.
+fn is_zip(archive: &Path) -> bool {
+    let Some(name) = archive.file_name() else { return false };
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    !(name.ends_with(".tgz") || name.ends_with(".tar.gz"))
+}
+
+/// Whether a file inside the archive's library directory is one this
+/// application will ever open.
+///
+/// **`.pdb` and `.lib` are skipped, and the reason is that nothing can load
+/// them.** The stock `win-x64` package carries `onnxruntime.pdb` at about
+/// 408 MB uncompressed beside a 12 MB download, which is most of the staging
+/// space a Windows install needs and all of the surprise in it.
+///
+/// What was checked before skipping them, because "nothing loads it" is a claim
+/// and not an assumption:
+///
+/// - The runtime is reached by name and by name only. `ort` is built with
+///   `load-dynamic` (`src-tauri/Cargo.toml`), so `runtime::load` hands
+///   `ort::init_from` a path to `runtime::DYLIB_NAME` and `libloading` opens
+///   that one file. The OS loader resolves a DLL's imports from other DLLs; it
+///   has never read a `.pdb`, which is a debugger's file, or a `.lib`, which is
+///   an import library consumed at link time by a build that is not happening
+///   on the user's machine.
+/// - Nothing in this repository names either extension beside the runtime. The
+///   only `.lib` that appears anywhere is `cudart64_12.lib`, in `accel.rs`'s
+///   tests, where it is an example of a name `accel::is_cudart` must *not*
+///   match: that probe requires `.dll`.
+///
+/// A crash dump off a released build is symbolised from the symbol server the
+/// package came from rather than from a file beside the library, so nothing is
+/// lost that was being used.
+fn is_loadable(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    !(name.ends_with(".pdb") || name.ends_with(".lib"))
 }
 
 /// Whether an archive entry is a file directly inside `library_dir`, and what
@@ -2265,6 +2797,9 @@ fn unpack_tar(archive: &Path, library_dir: &str, dest: &Path) -> Result<(), Stri
         }
         let path = entry.path().map_err(|e| e.to_string())?.to_string_lossy().into_owned();
         let Some(name) = under(&path, library_dir) else { continue };
+        if !is_loadable(name) {
+            continue;
+        }
         let out = dest.join(name);
         // A symlink is how `libonnxruntime.dylib` points at
         // `libonnxruntime.1.28.0.dylib`; `unpack_in` honours it, and the
@@ -2289,6 +2824,9 @@ fn unpack_zip(archive: &Path, library_dir: &str, dest: &Path) -> Result<(), Stri
         }
         let path = entry.name().replace('\\', "/");
         let Some(name) = under(&path, library_dir) else { continue };
+        if !is_loadable(name) {
+            continue;
+        }
         let out = dest.join(name);
         let mut sink =
             std::fs::File::create(&out).map_err(|e| format!("{}: {e}", out.display()))?;
@@ -3584,7 +4122,7 @@ mod tests {
         let (url, server) = serve_once(body.clone(), Ranges::Honour);
         let (seen, sink) = watching("resume-test");
         let cancel = AtomicBool::new(false);
-        let result = fetch_verified(&url, &pin, &path, "resume-test", "", &cancel);
+        let result = fetch_verified(&url, &pin, &path, "resume-test", "", &cancel, Portion::ALONE);
         events::unregister(sink);
         let _ = server.join();
 
@@ -3615,7 +4153,7 @@ mod tests {
 
         let (url, server) = serve_once(body.clone(), Ranges::Ignore);
         let cancel = AtomicBool::new(false);
-        let result = fetch_verified(&url, &pin, &path, "restart-test", "", &cancel);
+        let result = fetch_verified(&url, &pin, &path, "restart-test", "", &cancel, Portion::ALONE);
         let _ = server.join();
 
         assert!(result.is_ok(), "{result:?}");
@@ -3642,7 +4180,7 @@ mod tests {
 
         let (url, server) = serve_once(body.clone(), Ranges::Lie);
         let cancel = AtomicBool::new(false);
-        let result = fetch_verified(&url, &pin, &path, "liar-test", "", &cancel);
+        let result = fetch_verified(&url, &pin, &path, "liar-test", "", &cancel, Portion::ALONE);
         let _ = server.join();
 
         assert!(result.is_ok(), "{result:?}");
@@ -3676,7 +4214,7 @@ mod tests {
 
         let (url, server) = serve_once(body.clone(), Ranges::Honour);
         let cancel = AtomicBool::new(false);
-        let result = fetch_verified(&url, &pin, &path, "repin-test", "", &cancel);
+        let result = fetch_verified(&url, &pin, &path, "repin-test", "", &cancel, Portion::ALONE);
         let _ = server.join();
 
         assert!(result.is_ok(), "{result:?}");
@@ -3700,7 +4238,7 @@ mod tests {
 
         let (url, server) = serve_once(body.clone(), Ranges::Honour);
         let cancel = AtomicBool::new(true);
-        let result = fetch_verified(&url, &pin, &path, "cancel-test", "", &cancel);
+        let result = fetch_verified(&url, &pin, &path, "cancel-test", "", &cancel, Portion::ALONE);
         let _ = server.join();
 
         assert_eq!(result.unwrap_err(), "cancelled");
@@ -3724,7 +4262,7 @@ mod tests {
 
         let (url, server) = serve_once(body, Ranges::Honour);
         let cancel = AtomicBool::new(false);
-        let result = fetch_verified(&url, &pinned, &path, "mismatch-test", "", &cancel);
+        let result = fetch_verified(&url, &pinned, &path, "mismatch-test", "", &cancel, Portion::ALONE);
         let _ = server.join();
 
         let error = result.unwrap_err();
@@ -3755,8 +4293,10 @@ mod tests {
         std::fs::write(staging.join("libonnxruntime.dylib"), b"new-version").unwrap();
         std::fs::write(staging.join("DirectML.dll"), b"new-directml-binary").unwrap();
 
-        let mut moved = move_staged(&staging, &dir)
-            .expect("move_staged succeeds over existing files and directories");
+        let mut moved = match move_staged(&staging, &dir) {
+            Ok(moved) => moved,
+            Err(failed) => panic!("move_staged over existing entries: {}", failed.error),
+        };
 
         assert_eq!(std::fs::read(dir.join("libonnxruntime.dylib")).unwrap(), b"new-version");
         assert_eq!(std::fs::read(dir.join("DirectML.dll")).unwrap(), b"new-directml-binary");
@@ -4015,30 +4555,55 @@ mod tests {
         assert_eq!(foreign_files(&tampered, &["onnxruntime.dll".to_owned()]), ["DirectML.dll"]);
     }
 
-    /// **The record is removed before the directory changes and written after,
-    /// so a crash between them says *unknown* rather than the wrong build.**
+    /// **A record is destroyed only by a move that actually changed the
+    /// directory it describes.**
     ///
-    /// The failure this pins is not hypothetical arithmetic: the stamp is what
-    /// the row states confidently, and a move that fails halfway with the
-    /// previous build's record still beside the new libraries is the
-    /// original complaint with an extra step. Driven by a `move_in` that fails,
-    /// which is a full disk or a locked file and is not otherwise reachable.
+    /// The ordering this replaces removed the stamp *before* calling the move,
+    /// so that a crash in between said `unknown` rather than named a build that
+    /// was not there. The failure that happens is not a crash. On Windows the
+    /// move is refused outright and refused first - the library being replaced
+    /// is `onnxruntime.dll`, this process has it mapped, and nothing moves - so
+    /// every refused flavour switch left the row reading `unknown` about a
+    /// runtime that was installed, working, and exactly what the stamp had said
+    /// it was a second earlier. Three outcomes, told apart by what the move
+    /// managed to move.
     #[test]
-    fn a_failed_install_leaves_no_record_rather_than_the_previous_builds() {
+    fn a_record_survives_a_move_that_moved_nothing_and_not_one_that_moved_something() {
         let dir = std::env::temp_dir().join(format!("mc-restamp-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("DirectML.dll"), b"the previous build's companion").unwrap();
-        write_installed(
-            &dir,
-            &InstalledRuntime {
-                flavour: "directml".to_owned(),
-                version: "1.24.4".to_owned(),
-                files: vec!["onnxruntime.dll".to_owned(), "DirectML.dll".to_owned()],
-            },
-        );
+        let directml = InstalledRuntime {
+            flavour: "directml".to_owned(),
+            version: "1.24.4".to_owned(),
+            files: vec!["onnxruntime.dll".to_owned(), "DirectML.dll".to_owned()],
+        };
+        write_installed(&dir, &directml);
 
-        let failed = install_stamped(&dir, "cuda12", "1.28.0", || Err("no space left".to_owned()));
-        assert_eq!(failed.unwrap_err(), "no space left");
+        // One: the move was refused before it touched anything. The directory
+        // is what it was, so the record of it is still true and stays.
+        let refused = install_stamped(&dir, "cuda12", "1.28.0", || {
+            Err(MoveFailed { moved: Vec::new(), error: NOTICE_IN_USE.to_owned() })
+        });
+        assert_eq!(refused.unwrap_err(), NOTICE_IN_USE);
+        assert_eq!(
+            read_installed(&dir).as_ref(),
+            Some(&directml),
+            "a switch that could not start did not uninstall what is here"
+        );
+        assert!(dir.join("DirectML.dll").exists(), "and nothing was swept");
+
+        // Two: the move failed part way. No stamp describes a directory that is
+        // half of one build and half of another, so there is no true answer and
+        // the record says so.
+        let partial = install_stamped(&dir, "cuda12", "1.28.0", || {
+            std::fs::write(dir.join("onnxruntime.dll"), b"the CUDA build").unwrap();
+            Err(MoveFailed {
+                moved: vec!["onnxruntime.dll".to_owned()],
+                error: "no space left".to_owned(),
+            })
+        });
+        assert_eq!(partial.unwrap_err(), "no space left");
         assert_eq!(read_installed(&dir), None, "unknown, rather than a build that is not there");
         assert!(
             dir.join("DirectML.dll").exists(),
@@ -4047,11 +4612,10 @@ mod tests {
 
         // The next press does succeed, and it writes the record - but it sweeps
         // nothing, because the record it would have taken the difference
-        // against is the one the failure had to remove. That is the price of
-        // *unknown rather than wrong* and it is stated here rather than left to
-        // be discovered: a failed install forfeits the sweep on the attempt
-        // after it, and the leftover is what the directory looked like before
-        // that row existed.
+        // against is the one the half-finished move had to remove. That is the
+        // price of *unknown rather than wrong* and it is stated here rather
+        // than left to be discovered: an install that fails part way forfeits
+        // the sweep on the attempt after it.
         install_stamped(&dir, "cuda12", "1.28.0", || {
             // What a real `move_staged` would have left in the directory, so
             // the sweep below has something it could remove.
@@ -4067,8 +4631,9 @@ mod tests {
         assert_eq!(stamp.files.len(), 2);
         assert!(dir.join("DirectML.dll").exists(), "nothing recorded it, so nothing swept it");
 
-        // And with a record to compare against, the same call does sweep: the
-        // ordering costs the difference only across a failure.
+        // Three: with a record to compare against, the same call does sweep.
+        // The ordering costs the difference only across a move that broke off
+        // half way.
         install_stamped(&dir, "directml", "1.24.4", || {
             std::fs::write(dir.join("onnxruntime.dll"), b"the DirectML build").unwrap();
             Ok(vec!["onnxruntime.dll".to_owned(), "DirectML.dll".to_owned()])
@@ -4085,5 +4650,291 @@ mod tests {
         assert_eq!(read_installed(&dir).unwrap().flavour, "directml");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /* -------------------------------------------------------------- */
+    /* Windows: replacing a library the process is holding open        */
+    /* -------------------------------------------------------------- */
+
+    /// **The aside copy is recognised by its name, and by a name nothing else
+    /// wears.**
+    ///
+    /// `<app_data>/runtimes` is a directory a user is invited to open, and this
+    /// sweep is a `remove_file` driven by what it finds there. A rule that
+    /// matched `.old` alone would delete somebody's notes; the digits are what
+    /// make the shape this module's own.
+    #[test]
+    fn an_aside_copy_is_recognised_by_its_name_and_nothing_else_is() {
+        assert!(is_replaced_aside("onnxruntime.dll.old-0"));
+        assert!(is_replaced_aside("onnxruntime.dll.old-17"));
+        assert!(is_replaced_aside("libonnxruntime.1.28.0.dylib.old-3"));
+        for kept in [
+            "onnxruntime.dll",
+            "DirectML.dll",
+            ".installed.json",
+            "notes.old-copy",
+            "onnxruntime.dll.old-",
+            "onnxruntime.dll.old-1x",
+            ".old-1",
+            "old-1",
+        ] {
+            assert!(!is_replaced_aside(kept), "{kept}");
+        }
+
+        let dir = std::env::temp_dir().join(format!("mc-aside-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["onnxruntime.dll", "onnxruntime.dll.old-0", "onnxruntime.dll.old-1", "notes.old-copy"] {
+            std::fs::write(dir.join(name), b"bytes").unwrap();
+        }
+        sweep_replaced(&dir);
+        assert!(dir.join("onnxruntime.dll").exists(), "the installed runtime is not an aside copy");
+        assert!(dir.join("notes.old-copy").exists(), "and neither is a file somebody put there");
+        assert!(!dir.join("onnxruntime.dll.old-0").exists());
+        assert!(!dir.join("onnxruntime.dll.old-1").exists());
+
+        // A directory wearing the name is left alone: the sweep unlinks files,
+        // and recursing would make it a sweep that can empty something it did
+        // not create.
+        std::fs::create_dir_all(dir.join("stuff.old-2")).unwrap();
+        sweep_replaced(&dir);
+        assert!(dir.join("stuff.old-2").is_dir());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /* -------------------------------------------------------------- */
+    /* What an install costs the volume                               */
+    /* -------------------------------------------------------------- */
+
+    /// **A refusal is a key first and its numbers beside it.**
+    ///
+    /// Bytes are not translatable, so they travel as data rather than inside a
+    /// sentence - the arrangement `accel.declined.memory` already has with
+    /// `neededBytes` and `roomBytes`. The grammar is the adapter's whole job
+    /// and it is pinned here rather than described only in prose.
+    #[test]
+    fn a_refusal_names_a_key_first_and_carries_its_numbers_beside_it() {
+        let refusal = no_space(3_000, 1_200);
+        let mut fields = refusal.split(' ');
+        assert_eq!(fields.next(), Some(NOTICE_NO_SPACE));
+        assert_eq!(fields.next(), Some("needed=3000"));
+        assert_eq!(fields.next(), Some("free=1200"));
+        assert_eq!(fields.next(), None);
+
+        // The other one is the whole of itself: there is nothing to say about
+        // a mapped library except which remedy it needs.
+        assert_eq!(NOTICE_IN_USE.split(' ').count(), 1);
+        for key in [NOTICE_IN_USE, NOTICE_NO_SPACE] {
+            assert!(key.starts_with("notice.runtime."), "{key}");
+        }
+    }
+
+    /// The preflight asks for the transfer **and** for room to unpack it, and
+    /// says out loud that the second half is a floor rather than a bound.
+    #[test]
+    fn the_preflight_counts_the_unpack_as_well_as_the_download() {
+        assert_eq!(room_to_install(0), 0, "nothing to fetch asks for nothing");
+        // The win-x64 CUDA 12 archive, which is the largest thing this
+        // catalogue names.
+        assert_eq!(room_to_install(455_344_532), 910_689_064);
+        assert_eq!(room_to_install(u64::MAX), u64::MAX, "and it does not wrap");
+
+        // Nothing needed passes whatever the volume says, and a demand no
+        // volume can meet comes back as the key with both figures on it.
+        assert_eq!(ensure_room(&std::env::temp_dir(), 0), Ok(()));
+        let refused =
+            ensure_room(&std::env::temp_dir(), u64::MAX).expect_err("no volume holds u64::MAX");
+        assert!(refused.starts_with(NOTICE_NO_SPACE), "{refused}");
+        assert!(refused.contains(&format!("needed={}", u64::MAX)), "{refused}");
+
+        // The volume is asked about even when the directory is not there yet:
+        // `<app_data>/runtimes` is created by the first download, and the
+        // question was never about the directory.
+        let absent = std::env::temp_dir().join("mc-no-such-dir").join("runtimes").join(".downloads");
+        assert!(!absent.exists());
+        assert!(free_space(&absent).is_some(), "the nearest existing ancestor answers");
+    }
+
+    /// **`.pdb` and `.lib` are not unpacked, and the size check knows it.**
+    ///
+    /// The stock `win-x64` package is a 12 MB download carrying about 408 MB of
+    /// `onnxruntime.pdb`, which was most of the staging space a Windows install
+    /// needed and all of the surprise in it. Nothing loads either extension -
+    /// the reasoning and what was checked is on [`is_loadable`] - so neither is
+    /// written and neither is counted.
+    #[test]
+    fn debug_symbols_and_import_libraries_are_neither_unpacked_nor_counted() {
+        assert!(is_loadable("onnxruntime.dll"));
+        assert!(is_loadable("libonnxruntime.1.28.0.dylib"));
+        assert!(is_loadable("onnxruntime_providers_webgpu.dll"));
+        for skipped in ["onnxruntime.pdb", "onnxruntime.lib", "ONNXRUNTIME.PDB", "DirectML.Lib"] {
+            assert!(!is_loadable(skipped), "{skipped}");
+        }
+
+        let dir = std::env::temp_dir().join(format!("mc-pdb-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let dest = dir.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let archive = dir.join("package.nupkg");
+
+        let native = "runtimes/win-x64/native";
+        let entries: Vec<(String, &[u8])> = vec![
+            (format!("{native}/onnxruntime.dll"), b"a runtime".as_slice()),
+            (format!("{native}/onnxruntime.pdb"), b"four hundred megabytes of symbols".as_slice()),
+            (format!("{native}/onnxruntime.lib"), b"an import library".as_slice()),
+            (format!("{native}/nested/x.dll"), b"not directly inside".as_slice()),
+            ("build/native/onnxruntime.props".to_owned(), b"a different directory".as_slice()),
+        ];
+        let file = std::fs::File::create(&archive).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in &entries {
+            zip.start_file(name.as_str(), stored).unwrap();
+            std::io::Write::write_all(&mut zip, body).unwrap();
+        }
+        zip.finish().unwrap();
+
+        // Exactly the one file that will be written, and exactly its length.
+        assert_eq!(unpacked_bytes(&archive, native), Some(b"a runtime".len() as u64));
+        // A `.tgz` cannot be asked without inflating it, and says so.
+        assert_eq!(unpacked_bytes(&dir.join("runtime.tgz"), native), None);
+
+        unpack(&archive, native, &dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("onnxruntime.dll")).unwrap(), b"a runtime");
+        for absent in ["onnxruntime.pdb", "onnxruntime.lib", "x.dll", "nested", "onnxruntime.props"] {
+            assert!(!dest.join(absent).exists(), "{absent}");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A package of three artefacts is one download.**
+    ///
+    /// A Windows runtime is the ONNX Runtime build, `DirectML.dll` and the
+    /// WebGPU plugin - 12 MB, then 202 MB, then 39 MB - under one id, and each
+    /// of them used to report from zero with its own total. The bar restarted
+    /// twice and never said how much there was. Every report now counts the
+    /// whole and only goes up.
+    #[test]
+    fn a_package_of_several_artefacts_reports_one_download() {
+        let dir = std::env::temp_dir().join(format!("mc-portion-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("second.bin");
+        let body: Vec<u8> = (0..30_000u32).map(|i| (i % 91) as u8).collect();
+        let pin = digest_of(&body);
+
+        let (url, server) = serve_once(body.clone(), Ranges::Honour);
+        let (seen, sink) = watching("portion-test");
+        let cancel = AtomicBool::new(false);
+        // The second artefact of a 50,000-byte package whose first one is
+        // already here.
+        let result = fetch_verified(
+            &url,
+            &pin,
+            &path,
+            "portion-test",
+            "",
+            &cancel,
+            Portion { before: 12_000, whole: Some(50_000) },
+        );
+        events::unregister(sink);
+        let _ = server.join();
+        assert_eq!(result.as_deref(), Ok(path.as_path()));
+
+        let progress = seen.lock().unwrap().clone();
+        assert_eq!(
+            progress.first().copied(),
+            Some((12_000, Some(50_000))),
+            "the first report starts where the package had got to, not at zero"
+        );
+        assert_eq!(
+            progress.last().copied(),
+            Some((42_000, Some(50_000))),
+            "and the last one is what the package has done, not what this artefact has"
+        );
+        assert!(
+            progress.iter().all(|(_, total)| *total == Some(50_000)),
+            "the total is the package's, not the response's: {progress:?}"
+        );
+        assert!(
+            progress.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "a bar that only goes up: {progress:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The runtime script and the runtime table are ten copies of a digest
+    /// with nothing keeping them equal.**
+    ///
+    /// `scripts/fetch-runtime.sh` says it mirrors
+    /// `crates/cleaner-core/src/runtime/package.rs` and that the table is the
+    /// authority, and until now that was a sentence in a comment. A digest that
+    /// drifts in one of the two is a download verified against the wrong number
+    /// on whichever side is not being read, which is worse than not verifying
+    /// at all. The same relationship - and the same test -
+    /// `the_script_and_the_table_agree` gives `fetch-models.sh` and [`MODELS`].
+    ///
+    /// Matched by URL rather than line by line, because the two are not the
+    /// same shape: the script resolves `$arch` and `$1` at run time, so one of
+    /// its lines is several of the table's rows - the DirectML package is
+    /// `win-x64` and `win-arm64`, and the WebGPU plugin is four platforms.
+    /// The URL is what both sides agree is the artefact's name.
+    #[test]
+    fn the_runtime_script_and_the_package_table_agree() {
+        use cleaner_core::runtime::package;
+
+        let script = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/fetch-runtime.sh"),
+        )
+        .expect("scripts/fetch-runtime.sh is readable");
+
+        // An artefact in the script is `name|sha256|url|library_dir`, and the
+        // digest is what identifies the field: 64 hex characters followed by an
+        // `https://` URL. Read that way rather than by unpicking the shell
+        // quoting, which is what the fields are wrapped in and is not what the
+        // fields are.
+        let mut found: Vec<(String, String)> = Vec::new();
+        for line in script.lines() {
+            let fields: Vec<&str> = line.split('|').collect();
+            for pair in fields.windows(2) {
+                let (sha, url) = (pair[0], pair[1]);
+                if sha.len() == 64
+                    && sha.chars().all(|c| c.is_ascii_hexdigit())
+                    && url.starts_with("https://")
+                {
+                    found.push((url.to_owned(), sha.to_owned()));
+                }
+            }
+        }
+        assert!(!found.is_empty(), "no artefacts were read out of the script");
+
+        let mut table: HashMap<&str, &str> = HashMap::new();
+        for package in package::PACKAGES {
+            for artefact in package.artefacts() {
+                if let Some(already) = table.insert(artefact.url, artefact.sha256) {
+                    assert_eq!(
+                        already, artefact.sha256,
+                        "{}: two rows of the table pin it differently",
+                        artefact.url
+                    );
+                }
+            }
+        }
+
+        for (url, sha) in &found {
+            let pinned = table
+                .get(url.as_str())
+                .unwrap_or_else(|| panic!("the table names no artefact at {url}"));
+            assert_eq!(*pinned, sha.as_str(), "{url}: the script's digest is not the table's");
+        }
+        for url in table.keys() {
+            assert!(
+                found.iter().any(|(seen, _)| seen == url),
+                "the script fetches nothing from {url}"
+            );
+        }
     }
 }

@@ -95,6 +95,14 @@ impl Osd {
         self.lease.spent()
     }
 
+    /// Give this session up for good, because it has failed in a way another
+    /// run on it cannot survive - a reset adapter reported as device-removed.
+    /// [`crate::registry::Lease::poison`] states what that costs and why it is
+    /// not the same signal as an unload the user asked for.
+    pub fn poison(&self) {
+        self.lease.poison();
+    }
+
     /// Identify one line. `None` means the model said nothing usable - too
     /// narrow to run, or every timestep was blank.
     pub fn identify(

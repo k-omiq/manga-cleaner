@@ -168,7 +168,13 @@
   function onRegionClick(regionId) {
     select(regionId)
     if (editor.tool === 'contentAwareFill') {
-      applyActiveToolToRegion(regionId)
+      // Started and not awaited, and `void` says so on purpose: a click handler
+      // has nothing to do with the answer, and the outline and the selection
+      // are already correct whichever way the apply goes. What made this safe
+      // is that `applyActiveToolToRegion` now reports its own failures and
+      // settles rather than rejecting - an unawaited promise that can reject is
+      // a failure with nowhere to land, which is exactly what this line was.
+      void applyActiveToolToRegion(regionId)
     }
   }
 

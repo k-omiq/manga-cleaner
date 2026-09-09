@@ -595,7 +595,28 @@ impl Bench {
     /// detections ([`cleaner_core::detect::detect_page`]).
     fn text_under(&mut self, page: &Raster, box_: Rect, source: &str) -> Option<(Mask, f32)> {
         let detector = self.detector()?;
-        let detection = cleaner_core::detect::detect_page(detector, source, page).ok()?;
+        let detection = match cleaner_core::detect::detect_page(detector, source, page) {
+            Ok(detection) => detection,
+            // The answer to a failed detection is the same as the answer to an
+            // empty one, and it is the paragraph above: the caller treats the
+            // rectangle as the mask. The *session* is a different matter.
+            // `Inference` is the detector having built, run, and then failed,
+            // which on Windows is usually a graphics adapter that has been
+            // reset and will fail every later call the same way. Poisoning it
+            // here is what makes the next click open a fresh one instead of
+            // being handed the dead one, and it is the same treatment
+            // [`engine_fault`] documents for the rungs. The other two variants
+            // are not the session's fault - a model that would not load, or one
+            // whose outputs did not match the pinned contract - so they are
+            // left alone.
+            Err(error) => {
+                if matches!(error, cleaner_core::detect::DetectError::Inference(_)) {
+                    detector.poison();
+                }
+                eprintln!("manga-cleaner: the detector failed under a region edit: {error}");
+                return None;
+            }
+        };
         let regions = build_regions_separated(detection.boxes.clone(), page.width, page.height, |a, b| {
             cleaner_core::balloon::merge_crosses_a_balloon(page, &detection.segmentation, a, b)
         });
@@ -725,6 +746,30 @@ fn flux_reason(error: ModelError) -> &'static str {
     }
 }
 
+/// The key an **ONNX** rung's run fault is refused under, and the one place the
+/// raw text of it goes.
+///
+/// [`flux_reason`]'s counterpart for the rungs this process runs itself, and it
+/// answers a different key on purpose. Rung 3a's child is a thing that comes
+/// and goes - it is spawned, it is killed under memory pressure, it may not be
+/// installed - so a sidecar that would not answer is honestly reported as a
+/// rung that was not available. An ONNX session that built, ran, and then died
+/// is a different statement: the rung *is* on this machine, and something
+/// underneath it failed. On Windows the usual cause is one the session cannot
+/// come back from, which is why [`run::render_rung`] has already poisoned it by
+/// the time this is called - the next edit opens a fresh session rather than
+/// being handed the dead one.
+///
+/// What used to happen instead was nothing the user could read: the fault was
+/// propagated with `?` and the Tauri command rejected with ONNX Runtime's own
+/// string, which is not a catalogue key, so the click did not visibly do
+/// anything at all. The string is not lost - it goes to stderr, which is where
+/// this crate already puts diagnostic text a user cannot act on.
+fn engine_fault(detail: &str) -> &'static str {
+    eprintln!("manga-cleaner: a model faulted during a region edit: {detail}");
+    "decline.reason.engineFault"
+}
+
 /// How many pixels two rectangles share.
 fn overlap(a: Rect, b: Rect) -> u64 {
     let w = (a.right().min(b.right()) - a.x.max(b.x)).max(0) as u64;
@@ -842,16 +887,10 @@ fn edit(app: &tauri::AppHandle, located: &Located, plan: Plan) -> Result<Outcome
                     .ok()
                     .and_then(|s| s.get("engineCeiling").and_then(|v| v.as_str()).map(str::to_owned));
                 let ceiling = run::effective_ceiling(None, stored.as_deref());
-                match run::clean_region(
-                    &mut bench.rung2,
-                    &page,
-                    &fitted,
-                    ceiling,
-                    pick,
-                    noise,
-                )? {
-                    run::Attempt::Cleaned(made, verdict) => (*made, verdict),
-                    run::Attempt::Declined(reason) => return Ok(Outcome::Refused(reason)),
+                match run::clean_region(&mut bench.rung2, &page, &fitted, ceiling, pick, noise) {
+                    Ok(run::Attempt::Cleaned(made, verdict)) => (*made, verdict),
+                    Ok(run::Attempt::Declined(reason)) => return Ok(Outcome::Refused(reason)),
+                    Err(detail) => return Ok(Outcome::Refused(engine_fault(&detail))),
                 }
             }
             Choice::Exact(Engine::Flux) => match bench.flux(&page, &fitted) {
@@ -859,9 +898,10 @@ fn edit(app: &tauri::AppHandle, located: &Located, plan: Plan) -> Result<Outcome
                 Err(reason) => return Ok(Outcome::Refused(reason)),
             },
             Choice::Exact(engine) => {
-                match run::render_rung(&mut bench.rung2, engine, &page, &fitted, noise)? {
-                    run::Rendered::Refused(reason) => return Ok(Outcome::Refused(reason)),
-                    run::Rendered::Made(made) => {
+                match run::render_rung(&mut bench.rung2, engine, &page, &fitted, noise) {
+                    Err(detail) => return Ok(Outcome::Refused(engine_fault(&detail))),
+                    Ok(run::Rendered::Refused(reason)) => return Ok(Outcome::Refused(reason)),
+                    Ok(run::Rendered::Made(made)) => {
                         let verdict = quality::assess(&page, &made.mask, &made.pixels, noise);
                         (*made, verdict)
                     }

@@ -1,0 +1,45 @@
+Microsoft Visual C++ runtime, deployed app-local
+================================================
+
+On a Windows install this file sits in the application directory next to
+Manga Cleaner.exe, together with the Microsoft Visual C++ 2015-2022 runtime
+libraries: MSVCP140.dll, MSVCP140_1.dll, VCRUNTIME140.dll, VCRUNTIME140_1.dll
+and the rest of the CRT redistributable set.
+
+Why they are here. The ONNX Runtime the application downloads on first launch
+(runtimes/.../onnxruntime.dll) imports those four libraries in its ordinary,
+non-delay-loaded import table. They are not part of the NuGet package that is
+downloaded, and they are not part of a clean Windows installation: they arrive
+with the "Visual C++ 2015-2022 Redistributable", which a machine that has never
+had a Visual Studio compiled application on it does not have. Without them
+LoadLibrary fails with Windows error 126 and nothing in the application can
+run, because every model session goes through that library.
+
+Rather than ask the user to install the redistributable, or run Microsoft's
+bootstrapper from an installer hook (which needs a network connection and
+administrator rights the per-user install deliberately does not take), the
+build copies the redistributable files into the application directory.
+Microsoft's Visual Studio distributable code terms permit exactly this
+"app-local" deployment, and the files are taken from the Redist tree of the
+Visual Studio installation on the build machine.
+
+Why the application directory and not somewhere tidier. onnxruntime.dll is
+opened by `libloading::Library::new`, which calls LoadLibraryExW with no
+LOAD_LIBRARY_SEARCH_* flags, so its imports are resolved through the standard
+search order. The first entry in that order is the directory the application
+was loaded from, ahead of both the directory added by SetDllDirectoryW (which
+crates/cleaner-core/src/runtime/mod.rs adds for DirectML and the WebGPU
+plugin) and System32. A subdirectory beside the executable is not searched at
+all, so these files have to be loose in the application directory.
+
+What it costs. About 3 MB of installer, and the copies here do not receive
+Windows Update servicing the way a machine-wide redistributable does. A CRT
+security fix therefore reaches users through a new Manga Cleaner release
+rather than through Windows Update.
+
+Why this file exists at all. bundle.resources in tauri.conf.json is not
+per-platform, and Tauri treats a glob that matches nothing as a build error.
+The DLLs are staged into this directory by the Windows build only, so on a
+macOS build this note is the only thing the glob matches, and it keeps that
+build working. On macOS it ends up unused inside Manga Cleaner.app/Contents/
+Resources.

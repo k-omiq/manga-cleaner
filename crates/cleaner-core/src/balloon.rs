@@ -171,6 +171,14 @@ impl BalloonDetector {
         self.lease.spent()
     }
 
+    /// Give this session up for good, because it has failed in a way another
+    /// run on it cannot survive - a reset adapter reported as device-removed.
+    /// [`crate::registry::Lease::poison`] states what that costs and why it is
+    /// not the same signal as an unload the user asked for.
+    pub fn poison(&self) {
+        self.lease.poison();
+    }
+
     pub fn detect(&mut self, page: &Raster) -> Result<Vec<BalloonBox>, BalloonError> {
         self.lease.touch();
         // `preprocessor_config.json`: resize to 640×640, `do_rescale` with

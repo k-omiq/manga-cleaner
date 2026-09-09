@@ -1,8 +1,18 @@
 name: CI
 
-# Lightweight gate: frontend build plus Rust check/clippy. Deliberately skips
-# the heavy ML model downloads - this proves the two surfaces build, not that
-# detection/inpainting runs (that needs the model weights + a real desktop app).
+# Lightweight gate: frontend build plus Rust check/clippy/test on both shipped
+# platforms. Deliberately skips the heavy ML model downloads and the ONNX
+# Runtime download - this proves the surfaces build and that the logic tests
+# pass, not that detection/inpainting runs (that needs the model weights + a
+# real desktop app). The Rust suites are written to skip, loudly, when the
+# weights or the runtime are absent, which is the state of every runner here.
+#
+# Windows is a first-class job rather than something a tagged release finds
+# out about. Several `#[cfg(windows)]` paths exist - `GlobalMemoryStatusEx` in
+# crates/cleaner-core/src/memory.rs, `SetDllDirectoryW` in
+# crates/cleaner-core/src/runtime/mod.rs - and before this job they were first
+# compiled during a release build, at which point the only remedy on offer was
+# to delete the tag and start again.
 
 on:
   push:
@@ -30,7 +40,7 @@ jobs:
       - run: npx vite build
 
   rust:
-    name: Rust (check + clippy)
+    name: Rust (check + clippy + test, linux)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -65,3 +75,48 @@ jobs:
         run: cargo check --workspace --exclude spike-strip-memory
       - name: cargo clippy (deny warnings)
         run: cargo clippy -p cleaner-core -p manga-cleaner --no-deps --all-targets -- -D warnings
+      # The same invocation README.md gives a developer, so a green CI and a
+      # green checkout mean the same thing. `--test-threads=1` is there because
+      # two WebGPU sessions initialised from two threads abort the test binary
+      # on macOS; on a runner with no ONNX Runtime downloaded no session is
+      # ever built, so the flag costs only wall time here and is kept for
+      # parity rather than removed and later missed.
+      - name: cargo test
+        run: cargo test --workspace --exclude spike-strip-memory -- --test-threads=1
+
+  rust-windows:
+    name: Rust (check + clippy + test, windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+      # Same caching pattern as the Linux job, with a key of its own so the
+      # two do not fight over one cache entry.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: x86_64-pc-windows-msvc
+      # `--target` is redundant on an x64 runner and named anyway: it keeps the
+      # job honest about which triple it covers if the hosted image ever
+      # changes architecture underneath it.
+      - name: cargo check
+        run: cargo check --workspace --exclude spike-strip-memory --target x86_64-pc-windows-msvc
+      - name: cargo clippy (deny warnings)
+        run: cargo clippy -p cleaner-core -p manga-cleaner --no-deps --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace --exclude spike-strip-memory --target x86_64-pc-windows-msvc -- --test-threads=1
+      # The release build copies the Visual C++ 2015-2022 runtime out of the
+      # Visual Studio redistributable tree and ships it beside the executable,
+      # because the downloaded ONNX Runtime imports it and a clean Windows does
+      # not have it. That tree's location is a property of the runner image, so
+      # it is checked here on every pull request. Without this, a runner image
+      # that moved the files would be discovered during a tagged release, which
+      # is the failure mode this whole job exists to remove.
+      - name: Visual C++ redistributable is where the release build expects it
+        shell: pwsh
+        run: .github/scripts/stage-vc-runtime.ps1 -VerifyOnly

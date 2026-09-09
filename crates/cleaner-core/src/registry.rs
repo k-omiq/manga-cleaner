@@ -21,6 +21,12 @@
 //!   opens it again on the next region; that is stated in the interface rather
 //!   than hidden, because a button that silently degrades the rest of a
 //!   chapter is worse than one that frees memory now and pays for it later.
+//! - **A poison is neither a request nor a kill.** [`Lease::poison`] says the
+//!   session behind a row is dead - a GPU that was reset under it, not a person
+//!   asking for the memory back - and it sets a flag of its own rather than
+//!   borrowing the unload one, because the two are answers to different
+//!   questions and only one of them belongs in the interface's "unloading"
+//!   column. Its own documentation says why.
 //!
 //! ## The size is an estimate, and says which kind
 //!
@@ -214,6 +220,10 @@ struct Entry {
     device: Device,
     used: Instant,
     unload: bool,
+    /// The session this row describes has failed in a way it cannot come back
+    /// from. Set by [`Lease::poison`] and never cleared - see there for why it
+    /// is not the `unload` flag.
+    poisoned: bool,
 }
 
 fn table() -> MutexGuard<'static, Vec<Entry>> {
@@ -247,6 +257,7 @@ pub fn register(kind: Kind, footprint: Footprint, device: Device) -> Lease {
         device,
         used: Instant::now(),
         unload: false,
+        poisoned: false,
     });
     Lease { id }
 }
@@ -279,14 +290,53 @@ impl Lease {
     }
 
     /// Whether the owner should give this session back at its next safe point:
-    /// somebody asked, or nothing has wanted it for this kind's own
-    /// [`Kind::idle_grace`].
+    /// somebody asked, the session was poisoned, or nothing has wanted it for
+    /// this kind's own [`Kind::idle_grace`].
     pub fn spent(&self) -> bool {
         let table = table();
         let Some(entry) = table.iter().find(|entry| entry.id == self.id) else {
             return false;
         };
-        entry.unload || entry.used.elapsed() >= entry.kind.idle_grace()
+        entry.unload || entry.poisoned || entry.used.elapsed() >= entry.kind.idle_grace()
+    }
+
+    /// Mark this row's session **unusable**, permanently: [`Lease::spent`]
+    /// answers `true` from here on and never stops.
+    ///
+    /// The caller is a run that has just watched an inference fail with a
+    /// device-removed status. On Windows the display driver's watchdog resets
+    /// the adapter when one operation does not return inside its timeout - two
+    /// seconds by default - and every session that was live across that reset
+    /// is dead with it: the next run on the same session fails the same way,
+    /// and the failure is a property of the device rather than of the model or
+    /// the page, so retrying it is a loop. Without this the faulted session is
+    /// checked back into [`crate::residency`] at the end of the run and handed
+    /// to the next one, which then fails for a reason it did not cause.
+    ///
+    /// **That timeout is Windows' documented behaviour and not a measurement.**
+    /// Nothing in this repository has ever executed on Windows; what is
+    /// implemented here does not depend on the number, only on the rule that a
+    /// session which has once reported the device gone is not run again.
+    ///
+    /// It sets a **second flag** rather than reusing `unload`, and the two are
+    /// not the same thing. `unload` is a request from a person: it reaches the
+    /// interface as [`Loaded::unload_requested`], which the loaded-models tab
+    /// draws as an unload in progress beside the button that was pressed. A
+    /// reset adapter is nobody's request, and a row that lit that state on its
+    /// own would be the tab reporting an action the user did not take. What the
+    /// two do share is the only thing they need to: [`Lease::spent`] is `true`
+    /// for either, so every path that already gives a spent session back - the
+    /// owner's own check between regions, and [`crate::residency`]'s checkin,
+    /// checkout and sweep - drops a poisoned session with no new path added for
+    /// it.
+    ///
+    /// There is no un-poison. A row is a session, and the session behind a
+    /// poisoned row is one this process will not run again; the next open is a
+    /// new session under a new row.
+    pub fn poison(&self) {
+        if let Some(entry) = table().iter_mut().find(|entry| entry.id == self.id) {
+            entry.poisoned = true;
+        }
     }
 
     /// What this row is. [`crate::residency`] reads it to sweep by kind.
@@ -440,6 +490,30 @@ mod tests {
         // The row is still there: the session is still loaded until its owner
         // reaches a point where dropping it is safe.
         assert!(loaded().iter().any(|row| row.id == lease.id() && row.unload_requested));
+    }
+
+    /// A poison is permanent, and it is **not** an unload request: the row goes
+    /// on saying nobody asked for it back, because nobody did. The interface
+    /// draws `unload_requested` as an unload the user started, and a session
+    /// whose device was reset under it did not start one.
+    #[test]
+    fn a_poisoned_row_is_spent_for_good_without_claiming_a_user_asked() {
+        let lease = register(
+            Kind::BalloonDetector,
+            Footprint::measured(94),
+            Device::accelerator(crate::accel::Accelerator::Cpu),
+        );
+        assert!(!lease.spent(), "a fresh session is not spent");
+
+        lease.poison();
+        assert!(lease.spent(), "the owner was not told to give the session back");
+        assert!(!lease.unload_requested(), "a poison was reported as a user's unload");
+        assert!(loaded().iter().any(|row| row.id == lease.id() && !row.unload_requested));
+
+        // Permanent: touching a session is what un-spends an idle one, and it
+        // does not un-spend this.
+        lease.touch();
+        assert!(lease.spent(), "a poison wore off");
     }
 
     /// A missing file is a row with an unknown size, not a missing row.
