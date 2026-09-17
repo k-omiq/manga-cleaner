@@ -1987,7 +1987,7 @@ fn a_run_id_cannot_collide_with_the_mocks() {
 /// webview for the whole of it.
 #[test]
 fn every_command_is_async_and_so_never_runs_on_the_invoke_handlers_thread() {
-    fn check<A, B, C, D, E, F, G, H, R: std::future::Future>(_: fn(A, B, C, D, E, F, G, H) -> R) {}
+    fn check<A, B, C, D, E, F, G, H, I, R: std::future::Future>(_: fn(A, B, C, D, E, F, G, H, I) -> R) {}
     fn check1<A, R: std::future::Future>(_: fn(A) -> R) {}
     fn check3<A, B, C, R: std::future::Future>(_: fn(A, B, C) -> R) {}
     check(run_clean);
@@ -2020,6 +2020,59 @@ fn the_run_handle_is_serialised_in_the_names_the_seam_declares() {
             .unwrap();
     assert!(nothing["runId"].is_null());
     assert_eq!(nothing["pages"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn parse_color_hex_parses_valid_hex_and_rejects_invalid() {
+    assert_eq!(parse_color_hex(Some("#ffffff")), Some([255, 255, 255]));
+    assert_eq!(parse_color_hex(Some("ffffff")), Some([255, 255, 255]));
+    assert_eq!(parse_color_hex(Some("#000000")), Some([0, 0, 0]));
+    assert_eq!(parse_color_hex(Some("#ff8020")), Some([255, 128, 32]));
+    assert_eq!(parse_color_hex(Some("#123")), None);
+    assert_eq!(parse_color_hex(Some("invalid")), None);
+    assert_eq!(parse_color_hex(Some("ééé")), None);
+    assert_eq!(parse_color_hex(None), None);
+}
+
+#[test]
+fn clean_region_with_solid_color_paints_chosen_color() {
+    let page = gray_page(|_, _| 255);
+    let fitted = fitted_over(&page, Rect::new(40, 40, 20, 20));
+    let mut rung2 = no_rung_two();
+    let attempt = clean_region_with_color(
+        &mut rung2,
+        &page,
+        &fitted,
+        Engine::Fill,
+        Some(EnginePick::Fill),
+        fit::page_noise_sigma(&page),
+        // Deliberately unlike the white surrounding paper: an explicit solid
+        // colour must not be rejected and escalated away by quality scoring.
+        Some([0, 0, 0]),
+    )
+    .expect("clean_region_with_color");
+    match attempt {
+        Attempt::Cleaned(made, _) => {
+            assert_eq!(made.engine, Engine::Fill);
+            let bounds = made.mask.bounds;
+            let painted = (bounds.y..bounds.bottom())
+                .find_map(|y| {
+                    (bounds.x..bounds.right())
+                        .find(|&x| made.mask.contains(x, y))
+                        .map(|x| (x, y))
+                })
+                .expect("the fitted mask contains a pixel");
+            assert_eq!(
+                made.pixels.sample(
+                    (painted.0 - bounds.x) as u32,
+                    (painted.1 - bounds.y) as u32,
+                    0,
+                ),
+                0,
+            );
+        }
+        Attempt::Declined(reason) => panic!("clean_region_with_color was declined: {reason}"),
+    }
 }
 
 /// The model search order, which is the one thing about the weights this

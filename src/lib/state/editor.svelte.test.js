@@ -397,16 +397,33 @@ describe('a run over pages the window is not holding', () => {
     expect(page.reviewCount).toBe(1)
     expect(editor.chapter.review.map((entry) => entry.id)).toEqual(['c'])
   })
+
+  it('keeps brush and shape choices when another chapter opens in this app session', async () => {
+    const previous = structuredClone(editor.toolParams)
+    try {
+      editor.toolParams.brush.hardness = 35
+      editor.toolParams.brush.color = '#123456'
+      editor.toolParams.shapes.feather = 7
+      editor.toolParams.shapes.color = '#abcdef'
+
+      await openEditorChapter('pr1', 'another-chapter')
+
+      expect(editor.toolParams.brush).toMatchObject({ hardness: 35, color: '#123456' })
+      expect(editor.toolParams.shapes).toMatchObject({ feather: 7, color: '#abcdef' })
+    } finally {
+      editor.toolParams = previous
+    }
+  })
 })
 
 describe('tool parameters defaults', () => {
   it('initializes brush with color, opacity, and flow', () => {
     expect(editor.toolParams.brush).toMatchObject({
       size: 28,
-      hardness: 70,
+      hardness: 100,
       spacing: 12,
       mode: 'paint',
-      color: '#000000',
+      color: '#ffffff',
       opacity: 100,
       flow: 100,
     })
@@ -420,6 +437,21 @@ describe('tool parameters defaults', () => {
       flow: 100,
       alignment: 'aligned',
       mode: 'heal',
+    })
+  })
+
+  it('initializes shapes with white color and feather 0', () => {
+    expect(editor.toolParams.shapes).toMatchObject({
+      shape: 'rect',
+      mode: 'fill',
+      color: '#ffffff',
+      feather: 0,
+    })
+  })
+
+  it('initializes autoClean with bubbleColor #ffffff', () => {
+    expect(editor.toolParams.autoClean).toMatchObject({
+      bubbleColor: '#ffffff',
     })
   })
 })

@@ -1258,6 +1258,7 @@ export const en = {
     param: {
       scope: 'Scope',
       bubbleText: 'Speech bubble text',
+      bubbleColor: 'Bubble fill color',
       outsideText: 'Text outside bubbles',
       // Whether Auto clean touches text outside bubbles at all. The row above
       // names the engine; this one is the opt-in the pipeline design always described
@@ -1268,18 +1269,6 @@ export const en = {
       spacing: 'Spacing',
       mode: 'Mode',
       color: 'Color',
-      // The hex field beside the swatch. It is a second way into the same
-      // value rather than a second value, so it takes the row's own label as
-      // its accessible name and adds only what makes it different - a
-      // colour picker and a text field on one row must not both be called
-      // "Color" to a screen reader.
-      colorHex: 'Color, hex value',
-      // Shown under the hex field while what is in it is not a colour and
-      // could not become one - `zzz`, or `#ab` on the way to `#abc`. It says
-      // what is wrong and nothing else: the swatch beside it still shows the
-      // colour in force, so nothing has been lost and there is nothing to
-      // undo.
-      colorHexInvalid: 'Not a color: use 3 or 6 hex digits',
       opacity: 'Opacity',
       flow: 'Flow',
       shape: 'Shape',
@@ -1294,10 +1283,21 @@ export const en = {
       cleanWith: 'Clean with',
       alignment: 'Alignment',
     },
+    color: {
+      hue: 'Hue',
+      saturation: 'Saturation',
+      brightness: 'Brightness',
+      red: 'Red',
+      green: 'Green',
+      blue: 'Blue',
+      hex: 'Hex',
+      area: 'Color area',
+      areaValue: 'Saturation {saturation}%, brightness {brightness}%',
+    },
     // Controls in the tool bar that are not a parameter of the tool.
     //
     // *Adjustments* is the button that opens the popover holding every slider
-    // but Size, and the colour's hex field beside them: a bar has room for the
+    // but Size: a bar has room for the
     // one control a hand reaches for constantly and not for six, and the rest
     // are a press away rather than gone.
     //

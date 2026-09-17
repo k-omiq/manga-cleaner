@@ -310,6 +310,7 @@ export function createMockBackend(options = {}) {
     bubbleEngine,
     outsideEngine,
     outsideBubbles,
+    bubbleColor,
   }) => {
     if (runner.isRunning()) return { runId: runner.activeRunId(), pages: [], alreadyRunning: true }
     unloadedModels.clear()
@@ -324,6 +325,7 @@ export function createMockBackend(options = {}) {
       bubbleEngine,
       outsideEngine,
       outsideBubbles,
+      bubbleColor,
     })
   }
 
@@ -798,6 +800,7 @@ export function createMockBackend(options = {}) {
       bubbleEngine,
       outsideEngine,
       outsideBubbles,
+      bubbleColor,
     }) {
       await delay(timing.method)
       return startRun({
@@ -808,6 +811,7 @@ export function createMockBackend(options = {}) {
         bubbleEngine,
         outsideEngine,
         outsideBubbles,
+        bubbleColor,
       })
     },
 

@@ -91,17 +91,23 @@ export const ZOOM_STEP = 0.15
  */
 function defaultToolParams() {
   return {
-    autoClean: { scope: 'page', bubbleEngine: 'fill', outsideEngine: 'lama', outsideBubbles: 'review' },
+    autoClean: {
+      scope: 'page',
+      bubbleEngine: 'fill',
+      bubbleColor: '#ffffff',
+      outsideEngine: 'lama',
+      outsideBubbles: 'review',
+    },
     // `mode` is pinned to `paint` and has no control: the brush lays down a
     // colour and nothing else (`tools.js`). It stays in the record because it
     // is the field the seam reads to tell a paint stroke from a mask stroke
     // (`paint.js#paintParamsOf`, `region.rs#paint_plan`).
     brush: {
       size: 28,
-      hardness: 70,
+      hardness: 100,
       spacing: 12,
       mode: 'paint',
-      color: '#000000',
+      color: '#ffffff',
       opacity: 100,
       flow: 100,
     },
@@ -112,7 +118,7 @@ function defaultToolParams() {
     // refuse the first shape somebody draws with it. `color` and `opacity` are
     // kept beside it for the moment the user switches to `solid`, even though
     // the tool window does not show them until then.
-    shapes: { shape: 'rect', mode: 'fill', color: '#000000', opacity: 100, feather: 2 },
+    shapes: { shape: 'rect', mode: 'fill', color: '#ffffff', opacity: 100, feather: 0 },
     // The AI mask brush's `engine` is a **rung named outright** and not a pick
     // (`src/lib/editor/tools.js#MASK_ENGINES`), so it starts on the one rung
     // that needs no weights at all: rung 0 is arithmetic over the page's own
@@ -868,7 +874,6 @@ export async function openEditorChapter(projectId, chapterId, options = {}) {
 /** Everything that is about *this* opening of *this* chapter. */
 function resetSessionState() {
   editor.tool = 'autoClean'
-  editor.toolParams = defaultToolParams()
   editor.selectionId = null
   editor.hoverId = null
   editor.originalVisible = false
@@ -1321,6 +1326,7 @@ export async function startRun(scope = 'page') {
     // is the default on the other side of the seam too, so an old stored
     // record with no such key reviews that text as it always did.
     outsideBubbles: String(params.outsideBubbles ?? 'review'),
+    bubbleColor: String(params.bubbleColor ?? '#ffffff'),
   })
   return adoptRun(handle, scope)
 }

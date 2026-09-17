@@ -53,21 +53,18 @@
   import {
     TOOL_ICONS,
     effectiveChoice,
-    hexInvalid,
-    hexOnCommit,
-    hexOnInput,
     paramGroups,
     toolSpec,
   } from './tools.js'
   import { windowGesture, closeWindowFocusing } from './windowgesture.js'
   import {
     Button,
+    ColorPicker,
     IconButton,
     Menu,
     Popover,
     Segmented,
     Slider,
-    TextInput,
   } from '../ui/index.js'
   import Icon from '../icons/Icon.svelte'
   import { t } from '../i18n/index.js'
@@ -79,7 +76,6 @@
 
   const uid = $props.id()
   const titleId = `${uid}-name`
-  const hexNoteId = `${uid}-hex`
   const blockedId = `${uid}-blocked`
 
   /**
@@ -95,7 +91,7 @@
    * What it *does* decide is which side of the Adjustments button each
    * parameter falls on, and that is the one rule the bar owns: `size` and the
    * colour's swatch stay out on the bar, and every other slider goes behind the
-   * button with the hex field. A group left with nothing on the bar draws no
+   * button. A group left with nothing on the bar draws no
    * hairline of its own.
    */
   const layout = $derived.by(() => {
@@ -103,8 +99,6 @@
     const groups = []
     /** @type {Array<import('./tools.js').RangeParam>} */
     const behind = []
-    /** @type {import('./tools.js').ColorParam|null} */
-    let colorParam = null
 
     for (const group of paramGroups(spec, values)) {
       /** @type {Array<any>} */
@@ -112,17 +106,16 @@
       for (const param of group.params) {
         if (param.kind === 'range' && param.key !== 'size') behind.push(param)
         else {
-          if (param.kind === 'color') colorParam = param
           onBar.push(param)
         }
       }
       if (onBar.length) groups.push({ key: group.key, params: onBar })
     }
-    return { groups, behind, colorParam }
+    return { groups, behind }
   })
 
   /** Whether the Adjustments button has anything to open. */
-  const adjustable = $derived(layout.behind.length > 0 || layout.colorParam !== null)
+  const adjustable = $derived(layout.behind.length > 0)
 
   /**
    * A choice is a group of icon cells when **every** option has a glyph, and a
@@ -210,67 +203,6 @@
     }
   })
 
-  /**
-   * What the user has typed into the hex field since it was last committed, or
-   * null while they are not editing it.
-   *
-   * The field is a second route into a value the swatch owns, so it shows the
-   * committed colour whenever nothing is being typed; while something is, it
-   * shows the text as typed - otherwise a value on its way to being a colour
-   * would be overwritten by the colour it has not become yet. It is one
-   * variable because a spec has at most one colour parameter.
-   *
-   * @type {string|null}
-   */
-  let hexTyped = $state(null)
-  /** @type {string|null} */
-  let hexTypedTool = $state(null)
-
-  // Switching tool abandons whatever was half-typed: the next tool's colour is
-  // a different value, and carrying the text across would show it under the
-  // wrong swatch.
-  $effect(() => {
-    void spec.id
-    void layout.colorParam?.key
-    hexTyped = null
-    hexTypedTool = spec.id
-  })
-
-  /**
-   * The eyedropper is Chromium's alone. Where it is missing the button is
-   * **absent** rather than disabled: the swatch and the hex
-   * field are two working routes to the same value on every platform, so there
-   * is nothing being withheld and nothing to explain.
-   */
-  const hasEyeDropper = typeof (/** @type {any} */ (globalThis).EyeDropper) === 'function'
-
-  /**
-   * @param {string} key - the colour parameter this writes
-   */
-  async function pickFromScreen(key) {
-    try {
-      const picked = await new (/** @type {any} */ (globalThis).EyeDropper)().open()
-      const hex = hexOnCommit(String(picked?.sRGBHex ?? ''))
-      if (hex) {
-        hexTyped = null
-        hexTypedTool = null
-        set(key, hex)
-      }
-    } catch {
-      /* the user pressed Escape; the colour is unchanged, which is the answer */
-    }
-  }
-
-  /**
-   * @param {string} key
-   * @param {string} text
-   */
-  function commitHex(key, text) {
-    const hex = hexOnCommit(text)
-    if (hex) set(key, hex)
-    hexTyped = null
-    hexTypedTool = null
-  }
 
   const running = $derived(editor.run.active)
   const page = $derived(currentPage())
@@ -454,16 +386,10 @@
               onchange={(value) => set(param.key, value)}
             />
           {:else if param.kind === 'color'}
-            <input
-              type="color"
-              class="swatch"
-              value={String(values[param.key] ?? param.default ?? '#000000')}
-              aria-label={t(param.labelKey)}
-              oninput={(e) => {
-                hexTyped = null
-                hexTypedTool = null
-                set(param.key, e.currentTarget.value)
-              }}
+            <ColorPicker
+              value={String(values[param.key] ?? param.default ?? '#ffffff')}
+              label={t(param.labelKey)}
+              onchange={(hex) => set(param.key, hex)}
             />
           {:else}
             {@const opts = optionsFor(param)}
@@ -546,51 +472,6 @@
               onchange={(value) => set(param.key, value)}
             />
           {/each}
-
-          {#if layout.colorParam}
-            {@const key = layout.colorParam.key}
-            {@const shown =
-              (hexTypedTool === spec.id ? hexTyped : null) ??
-              String(values[key] ?? layout.colorParam.default ?? '#000000')}
-            {@const invalid = hexInvalid(shown)}
-            <div class="hex">
-              <span class="hex-label">{t('tools.param.colorHex')}</span>
-              <TextInput
-                size="sm"
-                value={shown}
-                label={t('tools.param.colorHex')}
-                spellcheck="false"
-                autocapitalize="off"
-                autocomplete="off"
-                aria-invalid={invalid ? 'true' : undefined}
-                aria-describedby={invalid ? hexNoteId : undefined}
-                onchange={(text) => {
-                  hexTyped = text
-                  hexTypedTool = spec.id
-                  const hex = hexOnInput(text)
-                  if (hex) set(key, hex)
-                }}
-                onblur={(e) => commitHex(key, e.currentTarget.value)}
-                onkeydown={(e) => {
-                  if (e.key === 'Enter') commitHex(key, e.currentTarget.value)
-                }}
-              />
-              {#if hasEyeDropper}
-                <IconButton
-                  icon="eyedropper"
-                  label={t('tools.action.eyedropper')}
-                  size={26}
-                  iconSize={14}
-                  onclick={() => pickFromScreen(key)}
-                />
-              {/if}
-            </div>
-            {#if invalid}
-              <p class="gate hex-note" id={hexNoteId} data-hex-invalid>
-                {t('tools.param.colorHexInvalid')}
-              </p>
-            {/if}
-          {/if}
         </div>
       </Popover>
     {/if}
@@ -745,33 +626,6 @@
   }
   .drop:hover { border-color: var(--tint) }
   .drop-key { color: var(--t3) }
-
-  .swatch {
-    -webkit-appearance: none;
-    -moz-appearance: none;
-    appearance: none;
-    flex: none;
-    width: 26px;
-    height: 26px;
-    padding: 0;
-    border: 1px solid var(--line2);
-    border-radius: var(--r-chip);
-    background: transparent;
-    cursor: pointer;
-  }
-  .swatch::-webkit-color-swatch-wrapper { padding: 2px }
-  .swatch::-webkit-color-swatch {
-    border: none;
-    border-radius: calc(var(--r-chip) - 2px);
-  }
-  .swatch::-moz-color-swatch {
-    border: none;
-    border-radius: calc(var(--r-chip) - 2px);
-  }
-  .swatch:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-  }
 
   /* The popover's own body, which is the panel grid the tool window used to
      be: a fixed label column, the control filling what is left, and a readout

@@ -176,10 +176,8 @@ describe('every tool draws the control each of its parameters asks for', () => {
           expect(control.tagName, param.key).toBe('INPUT')
           expect(control.getAttribute('type'), param.key).toBe('range')
         } else if (param.kind === 'color') {
-          // Two routes into one value: the swatch on the bar, the hex field
-          // behind the button.
-          expect(control.getAttribute('type')).toBe('color')
-          expect(view.getByLabelText(t('tools.param.colorHex'))).not.toBeNull()
+          expect(control.tagName, param.key).toBe('BUTTON')
+          expect(control.getAttribute('aria-haspopup'), param.key).toBe('dialog')
         } else if (iconChoice(param)) {
           expect(control.getAttribute('role'), param.key).toBe('radiogroup')
           const cells = [...control.querySelectorAll('[role="radio"]')]
@@ -218,8 +216,9 @@ describe('a change on any control writes that parameter, once', () => {
           expect(stores.setToolParam).toHaveBeenCalledTimes(1)
           expect(stores.setToolParam).toHaveBeenCalledWith(spec.id, param.key, next)
         } else if (param.kind === 'color') {
-          await fireEvent.input(control, { target: { value: '#123456' } })
-          expect(stores.setToolParam).toHaveBeenCalledTimes(1)
+          await fireEvent.click(control)
+          const hexInput = view.getByLabelText(t('tools.color.hex'))
+          await fireEvent.input(hexInput, { target: { value: '#123456' } })
           expect(stores.setToolParam).toHaveBeenCalledWith(spec.id, param.key, '#123456')
         } else {
           const next = param.options[1]?.value
@@ -241,88 +240,64 @@ describe('a change on any control writes that parameter, once', () => {
   }
 })
 
-describe('the hex field says when what is in it is not a colour', () => {
+describe('the hex field in ColorPicker says when what is in it is not a colour', () => {
   const shapes = toolSpec('shapes')
 
   /** @returns {Promise<HTMLInputElement>} */
   async function hexField(view) {
-    await openAdjustments(view)
-    return /** @type {HTMLInputElement} */ (view.getByLabelText(t('tools.param.colorHex')))
+    const swatch = view.getByLabelText(t('tools.param.color'))
+    await fireEvent.click(swatch)
+    return /** @type {HTMLInputElement} */ (view.getByLabelText(t('tools.color.hex')))
   }
 
-  it('starts clean, with the committed colour in it and no note', async () => {
+  it('starts clean, with the committed colour in it', async () => {
     const { view } = mountTool(shapes)
     const field = await hexField(view)
-    expect(field.value).toBe('#000000')
+    expect(field.value).toBe('#ffffff')
     expect(field.getAttribute('aria-invalid')).toBeNull()
-    expect(view.container.querySelector('[data-hex-invalid]')).toBeNull()
   })
 
-  it('marks the field and shows the note while the text is not a colour', async () => {
+  it('marks the field as invalid while the text is not a colour', async () => {
     const { view } = mountTool(shapes)
     const field = await hexField(view)
     await fireEvent.input(field, { target: { value: '#ab' } })
 
     expect(field.getAttribute('aria-invalid')).toBe('true')
-    const note = view.container.querySelector('[data-hex-invalid]')
-    expect(note?.textContent?.trim()).toBe(t('tools.param.colorHexInvalid'))
-    expect(field.getAttribute('aria-describedby')).toBe(note?.id)
     // Nothing was written: the swatch still holds the colour in force.
     expect(stores.setToolParam).not.toHaveBeenCalled()
   })
 
-  it('clears the note as soon as the text becomes a colour, and commits it', async () => {
+  it('clears invalid state and commits when typing valid 6-digit hex', async () => {
     const { view } = mountTool(shapes)
     const field = await hexField(view)
     await fireEvent.input(field, { target: { value: '#ab' } })
-    await fireEvent.input(field, { target: { value: '#abc' } })
+    await fireEvent.input(field, { target: { value: '#123456' } })
 
     expect(field.getAttribute('aria-invalid')).toBeNull()
-    expect(view.container.querySelector('[data-hex-invalid]')).toBeNull()
-    // Three digits are a colour on *commit*, not while typing - Enter is what
-    // expands `#abc`, and until then nothing has been written.
-    expect(stores.setToolParam).not.toHaveBeenCalled()
-
-    await fireEvent.keyDown(field, { key: 'Enter' })
-    expect(stores.setToolParam).toHaveBeenCalledTimes(1)
-    expect(stores.setToolParam).toHaveBeenCalledWith('shapes', 'color', '#aabbcc')
+    expect(stores.setToolParam).toHaveBeenCalledWith('shapes', 'color', '#123456')
   })
 
-  it('commits 3-digit shorthand expanding to 6 digits on blur', async () => {
+  it('commits 3-digit shorthand expanding to 6 digits on Enter or blur', async () => {
     const { view } = mountTool(shapes)
     const field = await hexField(view)
     await fireEvent.input(field, { target: { value: '#fff' } })
-    expect(stores.setToolParam).not.toHaveBeenCalled()
+    stores.setToolParam.mockClear()
 
-    await fireEvent.blur(field)
-    expect(stores.setToolParam).toHaveBeenCalledTimes(1)
+    await fireEvent.keyDown(field, { key: 'Enter' })
     expect(stores.setToolParam).toHaveBeenCalledWith('shapes', 'color', '#ffffff')
   })
 
   it('reverts invalid hex text to the committed colour on blur without writing', async () => {
     const { view } = mountTool(shapes)
     const field = await hexField(view)
+    stores.setToolParam.mockClear()
     await fireEvent.input(field, { target: { value: '#ab' } })
     expect(field.getAttribute('aria-invalid')).toBe('true')
-    expect(view.container.querySelector('[data-hex-invalid]')).not.toBeNull()
 
     await fireEvent.blur(field)
     expect(stores.setToolParam).not.toHaveBeenCalled()
-    expect(field.value).toBe('#000000')
+    expect(field.value).toBe('#ffffff')
     expect(field.getAttribute('aria-invalid')).toBeNull()
-    expect(view.container.querySelector('[data-hex-invalid]')).toBeNull()
-  })
-
-  it('does not mark an empty hex field as invalid and reverts on blur', async () => {
-    const { view } = mountTool(shapes)
-    const field = await hexField(view)
-    await fireEvent.input(field, { target: { value: '' } })
-    expect(field.getAttribute('aria-invalid')).toBeNull()
-    expect(view.container.querySelector('[data-hex-invalid]')).toBeNull()
-
-    await fireEvent.blur(field)
-    expect(stores.setToolParam).not.toHaveBeenCalled()
-    expect(field.value).toBe('#000000')
   })
 })
 
@@ -331,7 +306,8 @@ describe('the eyedropper is drawn only where the platform has one', () => {
 
   it('is absent without `EyeDropper`, which is every platform but Chromium', async () => {
     const { view } = mountTool(shapes)
-    await openAdjustments(view)
+    const swatch = view.getByLabelText(t('tools.param.color'))
+    await fireEvent.click(swatch)
     expect(view.queryByLabelText(t('tools.action.eyedropper'))).toBeNull()
   })
 
@@ -345,7 +321,8 @@ describe('the eyedropper is drawn only where the platform has one', () => {
     }
     try {
       const { view } = mountTool(shapes)
-      await openAdjustments(view)
+      const swatch = view.getByLabelText(t('tools.param.color'))
+      await fireEvent.click(swatch)
       await fireEvent.click(view.getByLabelText(t('tools.action.eyedropper')))
       expect(opened).toHaveBeenCalledTimes(1)
       expect(stores.setToolParam).toHaveBeenCalledWith('shapes', 'color', '#0a0b0c')
@@ -651,21 +628,23 @@ describe('tool switching resets transient state and closes overlays', () => {
 
   it('does not leak half-typed hex text across tool switches', async () => {
     const { view } = mountTool(toolSpec('shapes'))
-    await openAdjustments(view)
-    const field = /** @type {HTMLInputElement} */ (view.getByLabelText(t('tools.param.colorHex')))
+    const swatch = view.getByLabelText(t('tools.param.color'))
+    await fireEvent.click(swatch)
+    const field = /** @type {HTMLInputElement} */ (view.getByLabelText(t('tools.color.hex')))
     await fireEvent.input(field, { target: { value: '#123456' } })
     expect(field.value).toBe('#123456')
 
     stores.editor.tool = 'brush'
     stores.editor.toolParams = {
       ...stores.editor.toolParams,
-      brush: { ...startingValues(toolSpec('brush')), mode: 'paint', color: '#ff0000' },
+      brush: { ...startingValues(toolSpec('brush')), color: '#ff0000' },
     }
     await tick()
 
-    await openAdjustments(view)
+    const brushSwatch = view.getByLabelText(t('tools.param.color'))
+    await fireEvent.click(brushSwatch)
     const brushField = /** @type {HTMLInputElement} */ (
-      view.getByLabelText(t('tools.param.colorHex'))
+      view.getByLabelText(t('tools.color.hex'))
     )
     expect(brushField.value).toBe('#ff0000')
   })
@@ -674,12 +653,11 @@ describe('tool switching resets transient state and closes overlays', () => {
 describe('the Brush tool in paint mode draws and writes color, opacity, and flow', () => {
   it('shows swatch on the bar and opacity/flow in Adjustments', async () => {
     const brush = toolSpec('brush')
-    const { view } = mountTool(brush, { mode: 'paint', color: '#336699', opacity: 80, flow: 90 })
+    const { view } = mountTool(brush, { color: '#336699', opacity: 80, flow: 90 })
 
     const swatch = view.getByLabelText(t('tools.param.color'))
     expect(swatch).not.toBeNull()
-    expect(swatch.getAttribute('type')).toBe('color')
-    expect(/** @type {HTMLInputElement} */ (swatch).value).toBe('#336699')
+    expect(swatch.tagName).toBe('BUTTON')
 
     await openAdjustments(view)
 

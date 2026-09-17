@@ -5,6 +5,7 @@
  */
 
 export { default as Button } from './Button.svelte'
+export { default as ColorPicker } from './ColorPicker.svelte'
 export { default as ContextMenu } from './ContextMenu.svelte'
 export { default as Disclosure } from './Disclosure.svelte'
 export { default as Empty } from './Empty.svelte'

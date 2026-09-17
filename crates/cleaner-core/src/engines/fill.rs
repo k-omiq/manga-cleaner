@@ -13,7 +13,7 @@
 //! RGB.
 
 use crate::fit::{Fitted, ring};
-use crate::image::{ColorMode, Raster};
+use crate::image::{BitDepth, ColorMode, Raster};
 
 /// The pixels a fill produces, covering `mask.bounds`.
 ///
@@ -121,6 +121,119 @@ pub fn render_solid(page: &Raster, fitted: &Fitted) -> Raster {
                     page.sample(px as u32, py as u32, channel)
                 } else {
                     median
+                };
+                patch.set_sample(x, y, channel, value);
+            }
+        }
+    }
+    patch
+}
+
+/// The pixels a solid color fill produces, covering `mask.bounds`.
+///
+/// Unlike [`render_solid`] (which samples median tone from surroundings),
+/// this paints the masked area with a specified RGB color (`[r, g, b]`),
+/// adapted to the raster's color mode and bit depth while preserving
+/// unchanged outside regions and alpha channels.
+pub fn render_solid_color(page: &Raster, fitted: &Fitted, color: [u8; 3]) -> Raster {
+    let bounds = fitted.mask.bounds;
+    let samples = page.mode.samples();
+
+    let mut patch = Raster {
+        width: bounds.w,
+        height: bounds.h,
+        mode: page.mode,
+        depth: page.depth,
+        icc: None,
+        palette: page.palette.clone(),
+        trns: page.trns.clone(),
+        srgb_intent: None,
+        data: vec![0; {
+            let bits = bounds.w as usize * samples * page.depth.bits() as usize;
+            bits.div_ceil(8) * bounds.h as usize
+        }],
+    };
+
+    let scale_to_depth = |val: u8| -> u16 {
+        match page.depth {
+            BitDepth::Sixteen => (val as u16) * 257,
+            BitDepth::Eight => val as u16,
+            other => {
+                let max = ((1u32 << other.bits()) - 1) as u16;
+                ((val as u32 * max as u32) / 255) as u16
+            }
+        }
+    };
+
+    let [r, g, b] = color;
+
+    let fill_samples: Vec<u16> = match page.mode {
+        ColorMode::Gray => {
+            let luma = ((r as u32 * 299 + g as u32 * 587 + b as u32 * 114) / 1000) as u8;
+            vec![scale_to_depth(luma)]
+        }
+        ColorMode::GrayAlpha => {
+            let luma = ((r as u32 * 299 + g as u32 * 587 + b as u32 * 114) / 1000) as u8;
+            vec![scale_to_depth(luma), 0]
+        }
+        ColorMode::Rgb => {
+            vec![scale_to_depth(r), scale_to_depth(g), scale_to_depth(b)]
+        }
+        ColorMode::Rgba => {
+            vec![scale_to_depth(r), scale_to_depth(g), scale_to_depth(b), 0]
+        }
+        ColorMode::Indexed => {
+            let mut best_index = 0u16;
+            if let Some(palette) = &page.palette {
+                let entries = palette.len() / 3;
+                let mut min_dist = i64::MAX;
+                for i in 0..entries {
+                    let pr = palette[i * 3] as i64;
+                    let pg = palette[i * 3 + 1] as i64;
+                    let pb = palette[i * 3 + 2] as i64;
+                    let dr = pr - r as i64;
+                    let dg = pg - g as i64;
+                    let db = pb - b as i64;
+                    let dist = dr * dr + dg * dg + db * db;
+                    if dist < min_dist {
+                        min_dist = dist;
+                        best_index = i as u16;
+                    }
+                }
+            }
+            vec![best_index]
+        }
+        ColorMode::Cmyk => {
+            let max_rgb = r.max(g).max(b);
+            let k = 255 - max_rgb;
+            let (c, m, y) = if k == 255 {
+                (0, 0, 0)
+            } else {
+                let denom = (255 - k) as u32;
+                (
+                    ((255 - r as u32 - k as u32) * 255 / denom) as u8,
+                    ((255 - g as u32 - k as u32) * 255 / denom) as u8,
+                    ((255 - b as u32 - k as u32) * 255 / denom) as u8,
+                )
+            };
+            vec![
+                scale_to_depth(c),
+                scale_to_depth(m),
+                scale_to_depth(y),
+                scale_to_depth(k),
+            ]
+        }
+    };
+
+    for y in 0..bounds.h {
+        for x in 0..bounds.w {
+            let (px, py) = (bounds.x + x as i64, bounds.y + y as i64);
+            let inside = fitted.mask.contains(px, py);
+            for (channel, &sample_val) in fill_samples.iter().enumerate() {
+                let value = if !inside || page.mode.alpha_channel() == Some(channel) {
+                    page.sample(px as u32, py as u32, channel)
+                } else {
+                    sample_val
                 };
                 patch.set_sample(x, y, channel, value);
             }
@@ -304,5 +417,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_solid_color_fill_paints_chosen_color_in_gray_and_rgb() {
+        let gray = gray_page(80, 80, |_, _| 100);
+        let fitted = fitted_over(&gray, Rect::new(30, 30, 20, 20));
+        // Pure white [255, 255, 255]
+        let patch = render_solid_color(&gray, &fitted, [255, 255, 255]);
+        assert_eq!(patch.sample(10, 10, 0), 255);
+
+        // RGB page
+        let rgb_page = fixtures::by_name("rgb8").raster;
+        let fitted_rgb = fitted_over(&rgb_page, Rect::new(10, 10, 20, 20));
+        let patch_rgb = render_solid_color(&rgb_page, &fitted_rgb, [255, 128, 64]);
+        assert_eq!(patch_rgb.sample(5, 5, 0), 255);
+        assert_eq!(patch_rgb.sample(5, 5, 1), 128);
+        assert_eq!(patch_rgb.sample(5, 5, 2), 64);
+    }
+
+    #[test]
+    fn a_solid_color_fill_preserves_alpha_and_scales_depth() {
+        let rgba = fixtures::by_name("rgba8").raster;
+        let fitted = fitted_over(&rgba, Rect::new(20, 16, 12, 10));
+        let patch = render_solid_color(&rgba, &fitted, [255, 255, 255]);
+        assert_eq!(patch.sample(5, 5, 0), 255);
+        assert_eq!(patch.sample(5, 5, 1), 255);
+        assert_eq!(patch.sample(5, 5, 2), 255);
+        // Alpha preserved from page
+        assert_eq!(patch.sample(5, 5, 3), rgba.sample(25, 21, 3));
+
+        // 16-bit gray page
+        let l16 = fixtures::by_name("l16").raster;
+        let fitted_16 = fitted_over(&l16, Rect::new(10, 10, 20, 20));
+        let patch_16 = render_solid_color(&l16, &fitted_16, [255, 255, 255]);
+        assert_eq!(patch_16.sample(5, 5, 0), 65535);
+    }
+
+    #[test]
+    fn a_solid_color_fill_keeps_indexed_and_cmyk_pages_in_their_native_modes() {
+        let indexed = fixtures::by_name("indexed-p").raster;
+        let indexed_fit = fitted_over(&indexed, Rect::new(20, 16, 12, 10));
+        let indexed_patch = render_solid_color(&indexed, &indexed_fit, [250, 20, 30]);
+        let entries = indexed.palette.as_ref().unwrap().len() / 3;
+        assert_eq!(indexed_patch.mode, ColorMode::Indexed);
+        assert!((indexed_patch.sample(5, 5, 0) as usize) < entries);
+
+        let cmyk = fixtures::by_name("cmyk8").raster;
+        let cmyk_fit = fitted_over(&cmyk, Rect::new(20, 16, 12, 10));
+        let cmyk_patch = render_solid_color(&cmyk, &cmyk_fit, [255, 0, 0]);
+        assert_eq!(cmyk_patch.mode, ColorMode::Cmyk);
+        assert_eq!(
+            (0..4).map(|channel| cmyk_patch.sample(5, 5, channel)).collect::<Vec<_>>(),
+            vec![0, 255, 255, 0],
+        );
     }
 }

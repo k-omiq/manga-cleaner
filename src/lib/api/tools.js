@@ -97,7 +97,7 @@ export function isOutsideHeld(region) {
  * @param {import('../model/types.js').Region} region
  * @param {import('../model/types.js').Page} page
  * @param {ToolContext} ctx
- * @param {{ engineCeiling?: string, bubbleEngine?: string, outsideEngine?: string }} options
+ * @param {{ engineCeiling?: string, bubbleEngine?: string, outsideEngine?: string, bubbleColor?: string }} options
  * @returns {import('../model/types.js').Mask|null} null when the region was left alone
  */
 export function cleanRegionAutomatically(region, page, ctx, options = {}) {

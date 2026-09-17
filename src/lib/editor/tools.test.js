@@ -24,6 +24,7 @@ import {
 } from './tools.js'
 import { ROW_ENGINES } from '../model/masks.js'
 import { iconNames } from '../icons/paths.js'
+import { hexToRgb, hsbToHex, hsbToRgb, rgbToHex, rgbToHsb } from '../ui/color.js'
 
 describe('isDrawingTool', () => {
   it('is the four tools whose gesture is a drag', () => {
@@ -100,7 +101,7 @@ describe('toolSpec', () => {
       kind: 'color',
       key: 'color',
       labelKey: 'tools.param.color',
-      default: '#000000',
+      default: '#ffffff',
       group: 'paint',
     })
 
@@ -243,7 +244,14 @@ describe('the Shapes tool', () => {
   // A parameter with no predicate is live for every value, including none -
   // the filter must not drop the rows that never had a condition.
   it('leaves an unconditional row alone', () => {
-    expect(activeParams(toolSpec('autoClean')).map((p) => p.key)).toEqual([
+    expect(activeParams(toolSpec('autoClean'), { bubbleEngine: 'fill' }).map((p) => p.key)).toEqual([
+      'scope',
+      'bubbleEngine',
+      'bubbleColor',
+      'outsideEngine',
+      'outsideBubbles',
+    ])
+    expect(activeParams(toolSpec('autoClean'), { bubbleEngine: 'lama' }).map((p) => p.key)).toEqual([
       'scope',
       'bubbleEngine',
       'outsideEngine',
@@ -276,8 +284,13 @@ describe('paramGroups', () => {
     }
   })
 
-  it('reads Auto clean as a scope, then two models and the outside-bubble opt-in', () => {
-    expect(paramGroups(toolSpec('autoClean')).map((group) => [group.key, group.params.length]))
+  it('reads Auto clean as a scope, then models and the outside-bubble opt-in', () => {
+    expect(paramGroups(toolSpec('autoClean'), { bubbleEngine: 'fill' }).map((group) => [group.key, group.params.length]))
+      .toEqual([
+        ['scope', 1],
+        ['engines', 4],
+      ])
+    expect(paramGroups(toolSpec('autoClean'), { bubbleEngine: 'lama' }).map((group) => [group.key, group.params.length]))
       .toEqual([
         ['scope', 1],
         ['engines', 3],
@@ -447,6 +460,31 @@ describe('hexInvalid', () => {
     expect(hexInvalid('#aabbccd')).toBe(true)
     expect(hexInvalid('zzz')).toBe(true)
     expect(hexInvalid('rebeccapurple')).toBe(true)
+  })
+})
+
+describe('custom color picker conversions', () => {
+  it('maps the HSB primaries and canonical hex values exactly', () => {
+    expect(hsbToRgb(0, 100, 100)).toEqual({ r: 255, g: 0, b: 0 })
+    expect(hsbToRgb(120, 100, 100)).toEqual({ r: 0, g: 255, b: 0 })
+    expect(hsbToRgb(240, 100, 100)).toEqual({ r: 0, g: 0, b: 255 })
+    expect(hsbToHex(210, 67, 60)).toBe('#326699')
+  })
+
+  it('round-trips RGB through HSB within one byte per channel', () => {
+    for (const rgb of [
+      { r: 0, g: 0, b: 0 },
+      { r: 255, g: 255, b: 255 },
+      { r: 18, g: 52, b: 86 },
+      { r: 240, g: 91, b: 17 },
+    ]) {
+      const hsb = rgbToHsb(rgb.r, rgb.g, rgb.b)
+      const roundTrip = hsbToRgb(hsb.h, hsb.s, hsb.b)
+      expect(Math.abs(roundTrip.r - rgb.r)).toBeLessThanOrEqual(1)
+      expect(Math.abs(roundTrip.g - rgb.g)).toBeLessThanOrEqual(1)
+      expect(Math.abs(roundTrip.b - rgb.b)).toBeLessThanOrEqual(1)
+      expect(hexToRgb(rgbToHex(rgb.r, rgb.g, rgb.b))).toEqual(rgb)
+    }
   })
 })
 

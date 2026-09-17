@@ -408,6 +408,19 @@ pub(crate) fn parse_pick(name: Option<&str>) -> Option<EnginePick> {
     }
 }
 
+/// Parse a hex color string (e.g. "#ffffff" or "ffffff") to RGB bytes.
+pub(crate) fn parse_color_hex(hex: Option<&str>) -> Option<[u8; 3]> {
+    let text = hex?.trim();
+    let s = text.strip_prefix('#').unwrap_or(text);
+    if s.len() != 6 || !s.chars().all(|character| character.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some([r, g, b])
+}
+
 /// The rung a region **starts** on: the route's own answer, moved by the user's
 /// pick for this kind of text.
 ///
@@ -972,6 +985,7 @@ pub struct Pipeline {
     /// tool window always sends both - so the empty case is `spikes/clean-page`
     /// and the tests, where the fit's own answer is the thing under test.
     picks: Option<Picks>,
+    bubble_color: Option<[u8; 3]>,
     /// What this run does with text the balloon question puts outside a
     /// balloon. [`cleaner_core::gate::OutsideText::Review`] unless the tool
     /// window's row said otherwise, and a property of the run for the same
@@ -1400,6 +1414,7 @@ impl Pipeline {
             rung2: Rung2::new(models, preference),
             ladder: memory::Ladder::new(),
             picks: None,
+            bubble_color: None,
             outside: OutsideText::Review,
             fault: None,
             previous_strip_detections: Vec::new(),
@@ -1413,6 +1428,12 @@ impl Pipeline {
     /// the fit alone rather than silently acquiring the interface's defaults.
     pub fn with_picks(mut self, picks: Picks) -> Pipeline {
         self.picks = Some(picks);
+        self
+    }
+
+    /// The solid color to paint inside speech bubble regions when speech bubbles use the fill engine.
+    pub fn with_bubble_color(mut self, color: Option<[u8; 3]>) -> Pipeline {
+        self.bubble_color = color;
         self
     }
 
@@ -1753,9 +1774,14 @@ impl Cleaner for Pipeline {
                 // gate asked above and the only thing the two picks are told
                 // apart by.
                 let pick = self.picks.map(|picks| picks.for_region(inside));
+                let solid_color = if inside && pick == Some(EnginePick::Fill) {
+                    self.bubble_color
+                } else {
+                    None
+                };
 
                 let attempt =
-                    match clean_region(&mut self.rung2, engine_crop, &fitted, ceiling, pick, noise) {
+                    match clean_region_with_color(&mut self.rung2, engine_crop, &fitted, ceiling, pick, noise, solid_color) {
                         Ok(attempt) => attempt,
                         // **The one thing the ladder can fail on is rung 2's
                         // own run call.** Every rung below it is arithmetic
@@ -1930,6 +1956,18 @@ pub(crate) fn clean_region(
     pick: Option<EnginePick>,
     noise: f32,
 ) -> Result<Attempt, String> {
+    clean_region_with_color(rung2, crop, fitted, ceiling, pick, noise, None)
+}
+
+pub(crate) fn clean_region_with_color(
+    rung2: &mut Rung2,
+    crop: &Raster,
+    fitted: &fit::Fitted,
+    ceiling: Engine,
+    pick: Option<EnginePick>,
+    noise: f32,
+    solid_color: Option<[u8; 3]>,
+) -> Result<Attempt, String> {
     let Some(start) = start_rung(fitted.route, ceiling, pick) else {
         return Ok(Attempt::Declined("decline.reason.rungUnavailable"));
     };
@@ -1938,7 +1976,7 @@ pub(crate) fn clean_region(
     let mut refused = "decline.reason.rungUnavailable";
 
     for engine in ladder_from(start, ceiling, crop) {
-        let made = match render_rung(rung2, engine, crop, fitted, noise)? {
+        let made = match render_rung_with_color(rung2, engine, crop, fitted, noise, solid_color)? {
             Rendered::Refused(key) => {
                 refused = key;
                 continue;
@@ -1949,6 +1987,13 @@ pub(crate) fn clean_region(
         // exactly the pair `assess` asks for: the surround has to begin
         // outside everything the edit wrote.
         let verdict = quality::assess(crop, &made.mask, &made.pixels, noise);
+        // A solid colour is an explicit paint choice, not a reconstruction
+        // proposal for the quality metric to replace with another engine.
+        // Keep the verdict for provenance, but honour the chosen colour even
+        // when it deliberately differs from the surrounding paper.
+        if solid_color.is_some() && engine == Engine::Fill {
+            return Ok(Attempt::Cleaned(made, verdict));
+        }
         if let Some(cause) = verdict.cause() {
             refused = decline_key(cause);
             // Rule 6 at the rung scale: this rung's buffers go before the
@@ -1976,6 +2021,17 @@ pub(crate) fn render_rung(
     crop: &Raster,
     fitted: &fit::Fitted,
     noise: f32,
+) -> Result<Rendered, String> {
+    render_rung_with_color(rung2, engine, crop, fitted, noise, None)
+}
+
+pub(crate) fn render_rung_with_color(
+    rung2: &mut Rung2,
+    engine: Engine,
+    crop: &Raster,
+    fitted: &fit::Fitted,
+    noise: f32,
+    solid_color: Option<[u8; 3]>,
 ) -> Result<Rendered, String> {
     let plain = |mask: Mask, pixels: Raster| {
         Rendered::Made(Box::new(Made {
@@ -2068,7 +2124,13 @@ pub(crate) fn render_rung(
         }
         // Rung 0. A fill is the answer that cannot be wrong for a region that
         // got here.
-        Engine::Fill => Ok(plain(fitted.mask.clone(), fill::render(crop, fitted))),
+        Engine::Fill => {
+            let pixels = match solid_color {
+                Some(color) => fill::render_solid_color(crop, fitted, color),
+                None => fill::render(crop, fitted),
+            };
+            Ok(plain(fitted.mask.clone(), pixels))
+        }
     }
 }
 
@@ -3027,6 +3089,19 @@ pub(crate) fn start(
     picks: Picks,
     outside: OutsideText,
 ) -> Result<RunHandle, String> {
+    start_with_color(app, scope, chapter_id, page_index, engine_ceiling, picks, outside, None)
+}
+
+pub(crate) fn start_with_color(
+    app: &tauri::AppHandle,
+    scope: &str,
+    chapter_id: &str,
+    page_index: Option<u32>,
+    engine_ceiling: Option<String>,
+    picks: Picks,
+    outside: OutsideText,
+    bubble_color: Option<[u8; 3]>,
+) -> Result<RunHandle, String> {
     {
         let guard = active().lock().map_err(|e| e.to_string())?;
         if let Some(run) = guard.as_ref() {
@@ -3093,7 +3168,10 @@ pub(crate) fn start(
     // to `OpenError` will fail to compile here rather than falling into the
     // notice or out of it by the shape of its wording.
     let pipeline = match Pipeline::open(&models, preference_from(&settings)) {
-        Ok(pipeline) => pipeline.with_picks(picks).with_outside(outside),
+        Ok(pipeline) => pipeline
+            .with_picks(picks)
+            .with_outside(outside)
+            .with_bubble_color(bubble_color),
         Err(OpenError::MissingModel { .. }) => {
             events::notice("notice.run.modelsMissing", serde_json::json!({}), "warn");
             return Ok(RunHandle { run_id: None, pages: Vec::new(), already_running: None });
@@ -3303,11 +3381,13 @@ pub async fn run_clean(
     bubble_engine: Option<String>,
     outside_engine: Option<String>,
     outside_bubbles: Option<String>,
+    bubble_color: Option<String>,
 ) -> Result<RunHandle, String> {
     crate::library::blocking(move || {
         let picks = Picks::from_args(bubble_engine.as_deref(), outside_engine.as_deref());
         let outside = OutsideText::from_arg(outside_bubbles.as_deref());
-        start(
+        let parsed_color = parse_color_hex(bubble_color.as_deref());
+        start_with_color(
             &app,
             scope.as_deref().unwrap_or("chapter"),
             &chapter_id,
@@ -3315,6 +3395,7 @@ pub async fn run_clean(
             engine_ceiling,
             picks,
             outside,
+            parsed_color,
         )
     })
     .await

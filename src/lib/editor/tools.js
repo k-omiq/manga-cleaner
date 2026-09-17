@@ -198,7 +198,7 @@ function choice(key, labelKey, options, shortKey) {
  * @param {string} [defaultValue]
  * @returns {ColorParam}
  */
-export function color(key, labelKey, defaultValue = '#000000') {
+export function color(key, labelKey, defaultValue = '#ffffff') {
   return { kind: 'color', key, labelKey, default: defaultValue }
 }
 
@@ -328,6 +328,10 @@ export const TOOL_SPECS = [
       // inside a balloon.
       ...section('engines', [
         choice('bubbleEngine', 'tools.param.bubbleText', ENGINES, 'tools.short.bubbleText'),
+        onlyWhen(
+          color('bubbleColor', 'tools.param.bubbleColor', '#ffffff'),
+          (values) => (values?.bubbleEngine ?? 'fill') === 'fill',
+        ),
         choice('outsideEngine', 'tools.param.outsideText', ENGINES, 'tools.short.outsideText'),
         // The pipeline's own rule: text outside a balloon is "cleaned only if
         // the user opts in". This is the opt-in. Off, the run
@@ -381,7 +385,7 @@ export const TOOL_SPECS = [
       // in `editor.toolParams` because it is what the seam reads
       // (`paint.js#paintParamsOf`, `region.rs#paint_plan`).
       ...section('paint', [
-        color('color', 'tools.param.color'),
+        color('color', 'tools.param.color', '#ffffff'),
         range('opacity', 'tools.param.opacity', 0, 100, 5, '%'),
         range('flow', 'tools.param.flow', 0, 100, 5, '%'),
       ]),
@@ -410,7 +414,7 @@ export const TOOL_SPECS = [
       // gutter has to go flat.
       ...section('mode', [
         choice('mode', 'tools.param.mode', SHAPE_MODES, 'tools.short.mode'),
-        onlyWhen(color('color', 'tools.param.color'), isSolidFill),
+        onlyWhen(color('color', 'tools.param.color', '#ffffff'), isSolidFill),
         // The paint plan carries a stroke-level opacity, so a solid fill can be
         // a wash as well as a cover. Meaningless for the engine modes, which
         // replace what is under them outright.

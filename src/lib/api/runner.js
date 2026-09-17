@@ -82,6 +82,7 @@ export function createRunner(deps) {
         engineCeiling: active.engineCeiling,
         bubbleEngine: active.bubbleEngine,
         outsideEngine: active.outsideEngine,
+        bubbleColor: active.bubbleColor,
       })
       active.regionsCleaned += 1
       deps.emit({
@@ -149,6 +150,7 @@ export function createRunner(deps) {
         bubbleEngine: options.bubbleEngine,
         outsideEngine: options.outsideEngine,
         outsideBubbles: options.outsideBubbles ?? 'review',
+        bubbleColor: options.bubbleColor ?? '#ffffff',
         queue,
         index: 0,
         timer: null,

@@ -403,6 +403,17 @@ describe('run scheduler', () => {
     expect(outsideFill.length).toBeGreaterThan(0)
     expect(bubbleRedraw.every((eng) => eng === 'lama')).toBe(true)
     expect(outsideFill.every((eng) => eng === 'fill')).toBe(true)
+
+    const { backend: colorBackend, events: colorEvents } = makeBackend()
+    await settle(
+      colorBackend.runClean({
+        scope: 'chapter',
+        chapterId: CHAPTER,
+        bubbleEngine: 'fill',
+        bubbleColor: '#ffffff',
+      }),
+    )
+    expect(colorEvents.filter((e) => e.type === 'region-done').length).toBeGreaterThan(0)
   })
 
   it('cleans gate-skipped outside-bubble regions only when the run opts in', async () => {
