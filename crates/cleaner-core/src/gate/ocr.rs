@@ -65,8 +65,8 @@ const INPUT_SIDE: usize = 224;
 const PAD: i64 = 0;
 const CLS: i64 = 2;
 const SEP: i64 = 3;
-/// Every id below this is a special token: [PAD] [UNK] [CLS] [SEP] [MASK].
-const FIRST_ORDINARY: i64 = 5;
+/// Every id below this is a special token: [PAD] [UNK] [CLS] [SEP] [MASK] and <unused0>..<unused9>.
+const FIRST_ORDINARY: i64 = 15;
 
 /// How many tokens a reading may run to. See the module docs.
 pub const MAX_TOKENS: usize = 64;
@@ -342,19 +342,22 @@ pub fn cjk_share(text: &str) -> f32 {
     cjk as f32 / counted as f32
 }
 
-/// A character that belongs to no script: whitespace, and the ASCII digits and
-/// punctuation any language sets in the same glyphs. See [`cjk_share`].
+/// A character that belongs to no script: whitespace, General Punctuation
+/// (e.g. ellipsis, dashes), and the ASCII digits and punctuation any language
+/// sets in the same glyphs. See [`cjk_share`].
 fn is_neutral(ch: char) -> bool {
     ch.is_whitespace()
         || ch.is_ascii_digit()
         || ch.is_ascii_punctuation()
+        // General Punctuation: … (U+2026), ― (U+2015), — (U+2014), ‼ (U+203C), ⁉ (U+2049), etc.
+        || matches!(ch as u32, 0x2000..=0x206F)
         // Fullwidth digits, which Japanese typesetting uses in vertical text.
         || matches!(ch as u32, 0xFF10..=0xFF19)
 }
 
 pub(crate) fn is_japanese_block(ch: char) -> bool {
     matches!(ch as u32,
-        // CJK symbols and punctuation: 、。「」〜…
+        // CJK symbols and punctuation: 、。「」〜
         0x3000..=0x303F
         // Hiragana, Katakana, and the phonetic extensions after them.
         | 0x3040..=0x309F
@@ -365,6 +368,9 @@ pub(crate) fn is_japanese_block(ch: char) -> bool {
         | 0x4E00..=0x9FFF
         // Compatibility ideographs, which a few common characters live in.
         | 0xF900..=0xFAFF
+        // Supplementary-plane CJK ideographs (Extension B through I, and Compatibility Supplement).
+        | 0x20000..=0x2FA1F
+        | 0x30000..=0x323AF
         // Of the halfwidth and fullwidth forms, only the fullwidth punctuation
         // a balloon ends on (！？) and halfwidth katakana. Fullwidth Latin
         // letters (ＡＢＣ) and halfwidth Hangul live in the same block and are
@@ -422,6 +428,10 @@ mod tests {
         assert_eq!(cjk_share("「あ」！"), 1.0);
         // Halfwidth katakana is the same script in a narrower box.
         assert_eq!(cjk_share("ｱｲｳ"), 1.0);
+        // Supplementary plane ideographs (e.g. Extension B U+20BB7 in 𠮷野家).
+        assert!(is_japanese_block('\u{20BB7}'));
+        assert_eq!(cjk_share("𠮷野家"), 1.0);
+        assert_eq!(cjk_share("𠮷"), 1.0);
     }
 
     #[test]
@@ -441,9 +451,27 @@ mod tests {
         assert_eq!(cjk_share("はぁぁぁ..."), 1.0);
         assert_eq!(cjk_share("あ!?"), 1.0);
         assert_eq!(cjk_share("第3話"), 1.0);
+        // General Punctuation (ellipsis, horizontal bar, em dash, double punctuation)
+        // abstains rather than penalizing CJK share or counting as Japanese evidence.
+        assert_eq!(cjk_share("「……」"), 1.0);
+        assert_eq!(cjk_share("「え――っ」"), 1.0);
+        assert_eq!(cjk_share("はぁぁぁ…"), 1.0);
+        assert_eq!(cjk_share("あ――"), 1.0);
+        assert_eq!(cjk_share("あ……"), 1.0);
+        assert_eq!(cjk_share("あ‼⁉"), 1.0);
+        assert!(is_neutral('…'));
+        assert!(is_neutral('―'));
+        assert!(is_neutral('—'));
+        assert!(is_neutral('‼'));
+        assert!(is_neutral('⁉'));
+        assert!(!is_japanese_block('…'));
+        assert!(!is_japanese_block('―'));
         // And an abstention on its own is not a verdict either way.
         assert_eq!(cjk_share("..."), 0.0);
         assert_eq!(cjk_share("12345"), 0.0);
+        assert_eq!(cjk_share("……"), 0.0);
+        assert_eq!(cjk_share("――"), 0.0);
+        assert_eq!(cjk_share("‼⁉"), 0.0);
     }
 
     /// Whitespace is not evidence either way, and an empty reading is not
@@ -457,11 +485,11 @@ mod tests {
     }
 
     #[test]
-    fn the_special_tokens_are_the_first_five_ids() {
-        for id in 0..5 {
+    fn the_special_tokens_are_the_first_fifteen_ids() {
+        for id in 0..15 {
             assert!(is_special(id), "{id}");
         }
-        assert!(!is_special(5));
+        assert!(!is_special(15));
         assert!(is_special(CLS) && is_special(SEP) && is_special(PAD));
     }
 
