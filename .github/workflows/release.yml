@@ -223,7 +223,10 @@ jobs:
           set -euo pipefail
           # node, not python3: the windows runner's git-bash has no reliable python3.
           VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          BUNDLE="src-tauri/target/${{ matrix.target }}/release/bundle"
+          # Cargo's workspace target directory is at the repository root, not
+          # under src-tauri. Tauri prints the completed bundle paths from this
+          # location on every platform.
+          BUNDLE="target/${{ matrix.target }}/release/bundle"
           OUT="out/${{ matrix.platform }}"
           PREFIX="MangaCleaner_${VERSION}_${{ matrix.platform }}"
           mkdir -p "$OUT"
