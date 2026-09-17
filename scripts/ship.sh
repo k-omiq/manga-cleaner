@@ -117,6 +117,15 @@ c['version'] = v
 open(p, 'w').write(json.dumps(c, indent=2) + '\n')
 PY
 python3 - "$VERSION" <<'PY'
+import json, sys
+v = sys.argv[1]
+p = 'package-lock.json'
+c = json.load(open(p))
+c['version'] = v
+c['packages']['']['version'] = v
+open(p, 'w').write(json.dumps(c, indent=2) + '\n')
+PY
+python3 - "$VERSION" <<'PY'
 import re, sys
 v = sys.argv[1]
 p = 'Cargo.toml'
