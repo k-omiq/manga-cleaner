@@ -978,22 +978,22 @@ fn edit_with_bench(
             let mask = job.load_patch(record).map_err(|e| e.to_string())?.mask;
             (mask, 1.0, true)
         }
-        Geometry::Detected(rect) => match bench.text_under(&page, rect, &source_sha256) {
+        Geometry::Detected(rect) => match bench.text_under(page, rect, &source_sha256) {
             Some((seed, scale)) => (seed, scale, false),
-            None => (Mask::filled(clamped(rect, &page)), 1.0, true),
+            None => (Mask::filled(clamped(rect, page)), 1.0, true),
         },
     };
     if seed.is_empty() {
         return Ok(Outcome::Refused("decline.reason.rungUnavailable"));
     }
 
-    let noise = fit::page_noise_sigma(&page);
-    let edges = EdgeMap::sobel(&page);
-    let fitted = fit::fit(&page, &seed, scale, noise, &edges, manual);
+    let noise = fit::page_noise_sigma(page);
+    let edges = EdgeMap::sobel(page);
+    let fitted = fit::fit(page, &seed, scale, noise, &edges, manual);
 
     let started = Instant::now();
     let (mut made, verdict) = if plan.fill_mode == Some("solid") {
-        let pixels = cleaner_core::engines::fill::render_solid(&page, &fitted);
+        let pixels = cleaner_core::engines::fill::render_solid(page, &fitted);
         let made = run::Made {
             engine: Engine::Fill,
             mask: fitted.mask.clone(),
@@ -1004,7 +1004,7 @@ fn edit_with_bench(
             pad: cleaner_core::strip::EdgePad::None,
             tiles: None,
         };
-        let verdict = quality::assess(&page, &made.mask, &made.pixels, noise);
+        let verdict = quality::assess(page, &made.mask, &made.pixels, noise);
         (made, verdict)
     } else {
         match plan.choice {
@@ -1012,22 +1012,22 @@ fn edit_with_bench(
                 // The same ceiling a run gets, and the same cap: a *pick* is a
                 // starting rung, and nothing that starts by itself may reach rung
                 // 3a or the cloud.
-                match run::clean_region(&mut bench.rung2, &page, &fitted, ceiling, pick, noise) {
+                match run::clean_region(&mut bench.rung2, page, &fitted, ceiling, pick, noise) {
                     Ok(run::Attempt::Cleaned(made, verdict)) => (*made, verdict),
                     Ok(run::Attempt::Declined(reason)) => return Ok(Outcome::Refused(reason)),
                     Err(detail) => return Ok(Outcome::Refused(engine_fault(&detail))),
                 }
             }
-            Choice::Exact(Engine::Flux) => match bench.flux(&page, &fitted) {
+            Choice::Exact(Engine::Flux) => match bench.flux(page, &fitted) {
                 Ok(pair) => pair,
                 Err(reason) => return Ok(Outcome::Refused(reason)),
             },
             Choice::Exact(engine) => {
-                match run::render_rung(&mut bench.rung2, engine, &page, &fitted, noise) {
+                match run::render_rung(&mut bench.rung2, engine, page, &fitted, noise) {
                     Err(detail) => return Ok(Outcome::Refused(engine_fault(&detail))),
                     Ok(run::Rendered::Refused(reason)) => return Ok(Outcome::Refused(reason)),
                     Ok(run::Rendered::Made(made)) => {
-                        let verdict = quality::assess(&page, &made.mask, &made.pixels, noise);
+                        let verdict = quality::assess(page, &made.mask, &made.pixels, noise);
                         (*made, verdict)
                     }
                 }
@@ -1280,6 +1280,7 @@ fn paint_patch(
 /// patch**, not against the source page: a semi-transparent shape over a
 /// cleaned balloon must read the cleaned balloon, or the paint would show the
 /// text the run took out.
+#[allow(clippy::too_many_arguments)]
 fn shape_patch(
     job: &Job,
     source_idx: usize,
@@ -2959,7 +2960,7 @@ mod tests {
         assert!(record.bbox.y < h as i64 && record.bbox.bottom() > h as i64);
         let patch = written.load_patch(record).unwrap();
         assert!(!patch.mask.contains(record.bbox.x, record.bbox.y), "ellipse became its box");
-        assert!(patch.mask.bits.iter().any(|b| *b == 0) && patch.mask.bits.iter().any(|b| *b != 0));
+        assert!(patch.mask.bits.contains(&0) && patch.mask.bits.iter().any(|b| *b != 0));
         let strip = run::strip_of(&written.project);
         let global = cleaner_core::export::StripPatch::lift(&strip, 0, &patch).unwrap();
         let first = cleaner_core::export::patches_on_page(&strip, 0, std::slice::from_ref(&global));

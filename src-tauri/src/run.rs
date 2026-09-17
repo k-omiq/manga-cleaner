@@ -3092,6 +3092,7 @@ pub(crate) fn start(
     start_with_color(app, scope, chapter_id, page_index, engine_ceiling, picks, outside, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_with_color(
     app: &tauri::AppHandle,
     scope: &str,
