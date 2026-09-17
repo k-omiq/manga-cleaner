@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Manga Cleaner",
-  "version": "1.0.0-beta.1",
+  "version": "1.0.0-beta.2",
   "identifier": "com.mangacleaner.studio",
   "build": {
     "frontendDist": "../dist",
@@ -33,7 +33,13 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg", "deb", "appimage", "nsis"],
+    "targets": [
+      "app",
+      "dmg",
+      "deb",
+      "appimage",
+      "nsis"
+    ],
     "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
