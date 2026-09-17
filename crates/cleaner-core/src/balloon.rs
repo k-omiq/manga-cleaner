@@ -541,6 +541,103 @@ pub fn adopt_uncovered_text(
     adopted
 }
 
+/// Supply an ink mask for text boxes recovered by the multilingual detector.
+///
+/// The primary detector couples boxes to a segmentation head, but it was
+/// trained on manga/comic data and can miss Korean and Chinese lettering. The
+/// companion detector was trained across manga, webtoon and manhua and finds
+/// those text boxes, but has no mask output. An adopted box with an empty mask
+/// therefore used to fail twice: the script gate could not split it into lines,
+/// then `fit::seed_mask` discarded it.
+///
+/// This fallback performs Otsu binarisation inside only an adopted region's
+/// text bounds and marks the smaller luma population as ink. Existing mask
+/// evidence wins wholesale. A minimum contrast and population floor keep flat
+/// paper and isolated scan noise empty. Script identification still decides
+/// whether an in-balloon region is cleaned, so Latin protection remains in the
+/// gate; outside-balloon text retains the run's explicit policy.
+pub fn seed_adopted_text(page: &Raster, segmentation: &mut Segmentation, regions: &[Region]) {
+    for region in regions {
+        let bounds = region.text_bounds().grown(0, page.width, page.height);
+        if bounds.w == 0 || bounds.h == 0 {
+            continue;
+        }
+        let existing = (bounds.y..bounds.bottom())
+            .flat_map(|y| (bounds.x..bounds.right()).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                x >= 0 && y >= 0 && segmentation.is_text(x as u32, y as u32)
+            })
+            .count();
+        let meaningful_existing = ((bounds.w as usize * bounds.h as usize) / 100).max(4);
+        if existing >= meaningful_existing {
+            continue;
+        }
+
+        let mut histogram = [0u32; 256];
+        for y in bounds.y..bounds.bottom() {
+            for x in bounds.x..bounds.right() {
+                let level = (page.luma16_at(x as u32, y as u32) >> 8) as usize;
+                histogram[level] += 1;
+            }
+        }
+        let Some(threshold) = otsu_threshold(&histogram) else { continue };
+        let low: u32 = histogram[..=threshold].iter().sum();
+        let high: u32 = histogram[threshold + 1..].iter().sum();
+        let ink_is_low = low <= high;
+        let ink = low.min(high);
+        let total = low + high;
+        // Text must be a visible population, but cannot occupy most of its own
+        // detector box. These broad bounds admit dense Hangul and Han while
+        // refusing one-pixel noise and near-even texture.
+        if ink < 4 || ink * 100 < total || ink * 100 > total * 45 {
+            continue;
+        }
+        for y in bounds.y..bounds.bottom() {
+            for x in bounds.x..bounds.right() {
+                let level = (page.luma16_at(x as u32, y as u32) >> 8) as usize;
+                let is_ink = if ink_is_low { level <= threshold } else { level > threshold };
+                if is_ink && x < segmentation.width as i64 && y < segmentation.height as i64 {
+                    segmentation.levels[y as usize * segmentation.width as usize + x as usize] = 255;
+                }
+            }
+        }
+    }
+}
+
+fn otsu_threshold(histogram: &[u32; 256]) -> Option<usize> {
+    let total: u64 = histogram.iter().map(|&n| n as u64).sum();
+    let first = histogram.iter().position(|&n| n != 0)?;
+    let last = histogram.iter().rposition(|&n| n != 0)?;
+    if last.saturating_sub(first) < 12 {
+        return None;
+    }
+    let weighted: u64 = histogram
+        .iter()
+        .enumerate()
+        .map(|(level, &n)| level as u64 * n as u64)
+        .sum();
+    let mut below = 0u64;
+    let mut below_weighted = 0u64;
+    let mut best = None;
+    let mut best_variance = -1.0f64;
+    for (level, &count) in histogram.iter().enumerate().take(255) {
+        below += count as u64;
+        below_weighted += level as u64 * count as u64;
+        let above = total - below;
+        if below == 0 || above == 0 {
+            continue;
+        }
+        let delta = below_weighted as f64 / below as f64
+            - (weighted - below_weighted) as f64 / above as f64;
+        let variance = below as f64 * above as f64 * delta * delta;
+        if variance > best_variance {
+            best_variance = variance;
+            best = Some(level);
+        }
+    }
+    best
+}
+
 /// The narrowest tolerance a luma may sit from the band's own fill and still be
 /// that fill, in 16-bit luma. Six 8-bit levels: wider than a clean scan's noise
 /// floor - the pages [`crate::fit::ring`] is calibrated against sit at a few
@@ -1330,6 +1427,97 @@ mod tests {
             1000,
             1000,
         )
+    }
+
+    fn gray_raster(width: u32, height: u32, data: Vec<u8>) -> Raster {
+        Raster {
+            width,
+            height,
+            mode: ColorMode::Gray,
+            depth: BitDepth::Eight,
+            icc: None,
+            palette: None,
+            trns: None,
+            srgb_intent: None,
+            data,
+        }
+    }
+
+    fn empty_segmentation(width: u32, height: u32) -> Segmentation {
+        Segmentation {
+            width,
+            height,
+            levels: vec![0; width as usize * height as usize],
+            fit: Letterbox::fit(width, height),
+        }
+    }
+
+    #[test]
+    fn an_adopted_box_gets_a_local_ink_seed_when_the_primary_mask_missed_it() {
+        let mut data = vec![245; 80 * 60];
+        // Several disconnected, high-contrast strokes, shaped like the dense
+        // block glyphs this path was added for rather than one solid rectangle.
+        for &(x, y, w, h) in &[(25, 20, 4, 20), (34, 20, 4, 20), (25, 27, 13, 4)] {
+            for py in y..y + h {
+                for px in x..x + w {
+                    data[py * 80 + px] = 20;
+                }
+            }
+        }
+        let page = gray_raster(80, 60, data);
+        let region = Region::from_box(
+            Rect::new(20, 15, 24, 30),
+            0.9,
+            DetectedLanguage::Japanese,
+            80,
+            60,
+            0,
+        );
+        let mut segmentation = empty_segmentation(80, 60);
+        // One unrelated primary-mask pixel must not suppress recovery of the
+        // whole missed block.
+        segmentation.levels[18 * 80 + 22] = 255;
+
+        seed_adopted_text(&page, &mut segmentation, std::slice::from_ref(&region));
+
+        assert!(segmentation.is_text(26, 22), "dark glyph stroke was not seeded");
+        assert!(!segmentation.is_text(22, 17), "the light paper became ink");
+        assert!(!segmentation.is_text(2, 2), "the fallback escaped its recovered box");
+        let seed = crate::fit::seed_mask(&segmentation, &region, page.width, page.height);
+        assert!(!seed.is_empty(), "the normal cleaning pipeline still received an empty seed");
+        let edges = crate::fit::EdgeMap::sobel(&page);
+        let fitted = crate::fit::fit(
+            &page,
+            &seed,
+            segmentation.proxy_scale(),
+            crate::fit::page_noise_sigma(&page),
+            &edges,
+            false,
+        );
+        let rendered = crate::engines::fill::render(&page, &fitted);
+        let local_x = 26 - fitted.mask.bounds.x as u32;
+        let local_y = 22 - fitted.mask.bounds.y as u32;
+        assert!(fitted.mask.contains(26, 22), "fitting lost the recovered glyph");
+        assert!(
+            rendered.sample(local_x, local_y, 0) > 200,
+            "the normal fill path left the recovered dark ink in place"
+        );
+    }
+
+    #[test]
+    fn flat_paper_does_not_turn_an_adopted_box_into_a_cleaning_mask() {
+        let page = gray_raster(40, 40, vec![240; 40 * 40]);
+        let region = Region::from_box(
+            Rect::new(10, 10, 20, 20),
+            0.9,
+            DetectedLanguage::Japanese,
+            40,
+            40,
+            0,
+        );
+        let mut segmentation = empty_segmentation(40, 40);
+        seed_adopted_text(&page, &mut segmentation, &[region]);
+        assert!(segmentation.levels.iter().all(|&level| level == 0));
     }
 
     #[test]
@@ -2282,4 +2470,3 @@ mod tests {
         assert!(read.settles(Detected::Bubble));
     }
 }
-

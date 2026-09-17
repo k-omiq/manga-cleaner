@@ -35,9 +35,11 @@
    *   current?: boolean,
    *   strip?: boolean,
    *   tabbable?: boolean,
+   *   stripMinY?: number,
+   *   stripMaxY?: number,
    * }}
    */
-  let { page, width, current = true, strip = false, tabbable = true } = $props()
+  let { page, width, current = true, strip = false, tabbable = true, stripMinY = 0, stripMaxY = 100 } = $props()
 
   const ratio = $derived(pageRatio(page))
   const wipe = $derived(editor.wipe)
@@ -59,7 +61,7 @@
 
 <div
   class="sheet"
-  class:marked={strip && current}
+  class:strip
   style:width="{width}px"
   style:aspect-ratio="1 / {ratio}"
 >
@@ -71,7 +73,7 @@
   <RegionLayer {page} {tabbable} interactive={!drawing} />
 
   {#if drawing}
-    <DrawLayer {page} {tabbable} />
+    <DrawLayer {page} {tabbable} {strip} {stripMinY} {stripMaxY} />
   {/if}
 
   {#if divider}
@@ -91,10 +93,10 @@
     container-type: inline-size;
   }
 
-  /* The strip's current position (design file: the canvas page's outline). */
-  .sheet.marked {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
+  /* Paginated sheets float above the canvas. A longstrip is one continuous
+     image: shadows and focus outlines would draw artificial seams. */
+  .sheet.strip {
+    box-shadow: none;
   }
 
   .cleaned {

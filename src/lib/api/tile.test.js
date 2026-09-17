@@ -324,8 +324,15 @@ describe('the version token', () => {
   it('covers the tile geometry as well as the content', () => {
     const page = aPage()
     const token = pageVersion(page, 'source')
-    expect(token).toBe(fold(`${PROXY_SHORT_EDGE}x${PROXY_TILE_LONG_EDGE}|${page.sourceSha}`))
+    expect(token).toBe(fold(`${PROXY_SHORT_EDGE}x${PROXY_TILE_LONG_EDGE}|${page.sourceSha}|0`))
     expect(token).not.toBe(fold(`|${page.sourceSha}`))
+  })
+
+  it('changes when a cross-page edit invalidates a page without changing its own region list', () => {
+    const page = aPage()
+    const before = pageVersion(page, 'cleaned')
+    page.tileRevision = 1
+    expect(pageVersion(page, 'cleaned')).not.toBe(before)
   })
 
   it('is sixteen hex characters, so it is a URL-safe cache key', () => {

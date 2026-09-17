@@ -298,6 +298,8 @@
           strip
           current={index === editor.pageIndex}
           tabbable={index === editor.pageIndex}
+          stripMinY={index > 0 ? -(Number(list[index - 1]?.height) || 1) / (Number(page.height) || 1) * 100 : 0}
+          stripMaxY={index + 1 < list.length ? 100 + (Number(list[index + 1]?.height) || 1) / (Number(page.height) || 1) * 100 : 100}
         />
       </div>
     {/each}
@@ -315,8 +317,8 @@
     flex: none;
   }
 
-  /* The column carries no CSS gap: each page owns the space under it, which is
-     what makes the virtual window's spacers exact (see `strip.js`). */
+  /* Each slot owns its (normally zero) trailing space so virtual spacers and
+     rendered geometry continue to share the same arithmetic. */
   .slot {
     flex: none;
     margin-bottom: var(--strip-gap);

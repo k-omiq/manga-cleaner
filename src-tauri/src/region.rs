@@ -45,6 +45,7 @@
 //! was sent.
 
 use std::path::PathBuf;
+use std::borrow::Cow;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -492,6 +493,10 @@ struct Plan {
     /// seam methods already converge on [`edit`]; this is what keeps the
     /// convergence true of painting as well.
     paint: Option<PaintPlan>,
+    /// The caller's complete hand-drawn bounds, before shape rasterisation.
+    requested: Option<Rect>,
+    stroke: Option<PaintedStroke>,
+    drawn: Option<PaintedShape>,
 }
 
 /// What an edit did.
@@ -789,6 +794,19 @@ fn overlap(a: Rect, b: Rect) -> u64 {
 /// entirely.
 fn edit(app: &tauri::AppHandle, located: &Located, plan: Plan) -> Result<Outcome, String> {
     let mut bench = Bench::open(app);
+    let stored = crate::settings::read(app)
+        .ok()
+        .and_then(|s| s.get("engineCeiling").and_then(|v| v.as_str()).map(str::to_owned));
+    let ceiling = run::effective_ceiling(None, stored.as_deref());
+    edit_with_bench(&mut bench, ceiling, located, plan)
+}
+
+fn edit_with_bench(
+    bench: &mut Bench,
+    ceiling: Engine,
+    located: &Located,
+    mut plan: Plan,
+) -> Result<Outcome, String> {
     let _lock = run::lock_job(&located.job_path);
     // Read-only from here: the manifest is mutated in `commit`, which takes the
     // job by value and is the only writer either path reaches.
@@ -798,14 +816,118 @@ fn edit(app: &tauri::AppHandle, located: &Located, plan: Plan) -> Result<Outcome
     };
     let Some(path) = job.source_path(source_idx) else { return Ok(Outcome::NotFound) };
     let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let page = decode(&bytes).map_err(|e| e.to_string())?;
+    let anchor_page = decode(&bytes).map_err(|e| e.to_string())?;
     // The source's digest, computed once: it goes into this patch's provenance
     // below, and it is the key the page's detection is remembered under
     // ([`cleaner_core::detect::detect_page`]).
     let source_sha256 = sha256_hex(&bytes);
-
     let existing: Option<PatchRecord> =
         job.project.patches.iter().find(|record| record.id == plan.region_id).cloned();
+
+    // A hand gesture may continue past the anchor page in longstrip mode. Read
+    // only the native decode window surrounding it, then run the ordinary edit
+    // pipeline in that window's local coordinates. The resulting patch is
+    // translated back to anchor-page coordinates before persistence, which is
+    // the representation StripPatch already knows how to split for export.
+    let strip = run::strip_of(&job.project);
+    let anchor = strip.pages().get(located.page_index).copied();
+    let requested = plan.requested.map(|target| manual_requested(target, plan.paint.as_ref(), anchor));
+    let crosses = requested.zip(anchor).filter(|(r, p)| {
+        r.x < 0 || r.y < 0 || r.right() > p.width as i64 || r.bottom() > p.height as i64
+    });
+    let mut patch_shift = (0i64, 0i64);
+    let window_page;
+    let page = if job.project.strip.mode == cleaner_core::project::StripMode::Longstrip {
+        if let Some((requested, anchor)) = crosses {
+            let global = Rect::new(
+                requested.x + anchor.x_offset,
+                requested.y + anchor.y_offset,
+                requested.w,
+                requested.h,
+            );
+            let mut joins = cleaner_core::strip::Joins::unchecked(strip.joins());
+            for join in 0..strip.joins() { joins.set(join, cleaner_core::strip::JoinState::Verified); }
+            let context = if plan.paint.is_some() { cleaner_core::strip::EngineContext::None }
+                else { cleaner_core::strip::EngineContext::Local };
+            let window = cleaner_core::strip::decode_window(&strip, &joins, global, 1.0, context);
+            // Refuse pathological chapter-scale gestures. Normal edits remain
+            // a small context window even when they straddle a join.
+            const MAX_MANUAL_WINDOW_PIXELS: u64 = 4096 * 4096;
+            if u64::from(window.rect.w) * u64::from(window.rect.h) > MAX_MANUAL_WINDOW_PIXELS {
+                return Ok(Outcome::Refused("decline.reason.rungUnavailable"));
+            }
+            let read = cleaner_core::strip::read_window_borrowing(&strip, window, |position| {
+                if position == located.page_index {
+                    return Ok(Cow::Borrowed(&anchor_page));
+                }
+                let source = Library::resolve_page(&job.project, position)
+                    .ok_or_else(|| format!("strip page {position} is missing"))?;
+                let path = job.source_path(source)
+                    .ok_or_else(|| format!("strip page {position} has no source"))?;
+                let data = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                decode(&data).map(Cow::Owned).map_err(|e| e.to_string())
+            })?;
+            patch_shift = (read.origin.0 - anchor.x_offset, read.origin.1 - anchor.y_offset);
+            let local = Rect::new(global.x - read.origin.0, global.y - read.origin.1, global.w, global.h);
+            if matches!(plan.geometry, Geometry::Stored) {
+                let Some(record) = existing.as_ref() else { return Ok(Outcome::NotFound) };
+                let mut mask = job.load_patch(record).map_err(|e| e.to_string())?.mask;
+                mask.bounds.x += anchor.x_offset - read.origin.0;
+                mask.bounds.y += anchor.y_offset - read.origin.1;
+                plan.geometry = Geometry::Painted(mask);
+            } else {
+                plan.geometry = Geometry::Given(local);
+            }
+            if let Some(paint) = plan.paint.as_mut() {
+                let map = |x: f64, y: f64| {
+                    let gx = x / 100.0 * anchor.width as f64 + anchor.x_offset as f64;
+                    let gy = y / 100.0 * anchor.height as f64 + anchor.y_offset as f64;
+                    ((gx - read.origin.0 as f64) / read.raster.width as f64 * 100.0,
+                     (gy - read.origin.1 as f64) / read.raster.height as f64 * 100.0)
+                };
+                for point in &mut paint.points {
+                    (point.x, point.y) = map(point.x, point.y);
+                }
+                match &mut paint.kind {
+                    PaintKind::Shape { shape, .. } => {
+                        for point in &mut shape.points {
+                            (point.x, point.y) = map(point.x, point.y);
+                        }
+                    }
+                    PaintKind::Clone { offset, .. } => {
+                        offset.0 = offset.0 * anchor.width as f64 / read.raster.width as f64;
+                        offset.1 = offset.1 * anchor.height as f64 / read.raster.height as f64;
+                    }
+                    PaintKind::Brush { .. } => {}
+                }
+            }
+            if plan.paint.is_none() {
+                if let Some(mut stroke) = plan.stroke.take() {
+                    for point in &mut stroke.points {
+                        let gx = point.x / 100.0 * anchor.width as f64 + anchor.x_offset as f64;
+                        let gy = point.y / 100.0 * anchor.height as f64 + anchor.y_offset as f64;
+                        point.x = (gx - read.origin.0 as f64) / read.raster.width as f64 * 100.0;
+                        point.y = (gy - read.origin.1 as f64) / read.raster.height as f64 * 100.0;
+                    }
+                    if let Some(mask) = stroke_mask(&stroke, read.raster.width, read.raster.height) {
+                        plan.geometry = Geometry::Painted(mask);
+                    }
+                } else if let Some(mut shape) = plan.drawn.take() {
+                    for point in &mut shape.points {
+                        let gx = point.x / 100.0 * anchor.width as f64 + anchor.x_offset as f64;
+                        let gy = point.y / 100.0 * anchor.height as f64 + anchor.y_offset as f64;
+                        point.x = (gx - read.origin.0 as f64) / read.raster.width as f64 * 100.0;
+                        point.y = (gy - read.origin.1 as f64) / read.raster.height as f64 * 100.0;
+                    }
+                    if let Some(mask) = shape_mask(&shape, read.raster.width, read.raster.height) {
+                        plan.geometry = Geometry::Painted(mask);
+                    }
+                }
+            }
+            window_page = read.raster;
+            &window_page
+        } else { &anchor_page }
+    } else { &anchor_page };
 
     // **The paint branch, and it is here rather than beside the `solid` fill.**
     //
@@ -821,10 +943,17 @@ fn edit(app: &tauri::AppHandle, located: &Located, plan: Plan) -> Result<Outcome
             .as_ref()
             .map(|record| record.order)
             .unwrap_or_else(|| next_order(&job, source_idx));
-        let (made, dabs) = match paint_patch(&job, source_idx, &page, paint, order) {
+        let paint_context = (job.project.strip.mode == cleaner_core::project::StripMode::Longstrip)
+            .then_some(StripPaintContext {
+                strip: &strip,
+                origin: (anchor.map_or(0, |p| p.x_offset) + patch_shift.0,
+                         anchor.map_or(0, |p| p.y_offset) + patch_shift.1),
+            });
+        let (mut made, dabs) = match paint_patch(&job, source_idx, page, paint, order, paint_context) {
             Ok(pair) => pair,
             Err(reason) => return Ok(Outcome::Refused(reason)),
         };
+        translate_made(&mut made, patch_shift);
         let snapshot = paint_snapshot(&plan, paint, made.engine, dabs, started.elapsed());
         return commit(
             located,
@@ -840,7 +969,7 @@ fn edit(app: &tauri::AppHandle, located: &Located, plan: Plan) -> Result<Outcome
     }
 
     let (seed, scale, manual) = match plan.geometry {
-        Geometry::Given(rect) => (Mask::filled(clamped(rect, &page)), 1.0, true),
+        Geometry::Given(rect) => (Mask::filled(clamped(rect, page)), 1.0, true),
         // The shape the hand drew, used as it came. Nothing is fitted over it
         // and nothing is squared off: that is the whole point of carrying it.
         Geometry::Painted(mask) => (mask, 1.0, true),
@@ -863,7 +992,7 @@ fn edit(app: &tauri::AppHandle, located: &Located, plan: Plan) -> Result<Outcome
     let fitted = fit::fit(&page, &seed, scale, noise, &edges, manual);
 
     let started = Instant::now();
-    let (made, verdict) = if plan.fill_mode == Some("solid") {
+    let (mut made, verdict) = if plan.fill_mode == Some("solid") {
         let pixels = cleaner_core::engines::fill::render_solid(&page, &fitted);
         let made = run::Made {
             engine: Engine::Fill,
@@ -883,10 +1012,6 @@ fn edit(app: &tauri::AppHandle, located: &Located, plan: Plan) -> Result<Outcome
                 // The same ceiling a run gets, and the same cap: a *pick* is a
                 // starting rung, and nothing that starts by itself may reach rung
                 // 3a or the cloud.
-                let stored = crate::settings::read(app)
-                    .ok()
-                    .and_then(|s| s.get("engineCeiling").and_then(|v| v.as_str()).map(str::to_owned));
-                let ceiling = run::effective_ceiling(None, stored.as_deref());
                 match run::clean_region(&mut bench.rung2, &page, &fitted, ceiling, pick, noise) {
                     Ok(run::Attempt::Cleaned(made, verdict)) => (*made, verdict),
                     Ok(run::Attempt::Declined(reason)) => return Ok(Outcome::Refused(reason)),
@@ -910,6 +1035,7 @@ fn edit(app: &tauri::AppHandle, located: &Located, plan: Plan) -> Result<Outcome
         }
     };
 
+    translate_made(&mut made, patch_shift);
     let pad = made.pad;
     let mut snapshot = run::params_snapshot(made.engine, &fitted, started.elapsed(), pad, made.tiles, &verdict);
     snapshot["source"] = serde_json::json!(plan.source);
@@ -932,6 +1058,38 @@ fn edit(app: &tauri::AppHandle, located: &Located, plan: Plan) -> Result<Outcome
         source_sha256,
         order,
     )
+}
+
+/// Include a clone stroke's sampling area in its bounded strip read. Clone
+/// offsets are target minus source in anchor-page percent.
+fn manual_requested(
+    target: Rect,
+    paint: Option<&PaintPlan>,
+    anchor: Option<cleaner_core::strip::Placement>,
+) -> Rect {
+    let Some(PaintPlan { kind: PaintKind::Clone { offset, .. }, .. }) = paint else {
+        return target;
+    };
+    let Some(anchor) = anchor else { return target };
+    let dx = (offset.0 / 100.0 * anchor.width as f64).round() as i64;
+    let dy = (offset.1 / 100.0 * anchor.height as f64).round() as i64;
+    let source = Rect::new(target.x - dx, target.y - dy, target.w, target.h);
+    let x = target.x.min(source.x);
+    let y = target.y.min(source.y);
+    Rect::new(
+        x,
+        y,
+        (target.right().max(source.right()) - x) as u32,
+        (target.bottom().max(source.bottom()) - y) as u32,
+    )
+}
+
+fn translate_made(made: &mut run::Made, by: (i64, i64)) {
+    if by == (0, 0) { return; }
+    made.mask.bounds.x += by.0;
+    made.mask.bounds.y += by.1;
+    made.ink.bounds.x += by.0;
+    made.ink.bounds.y += by.1;
 }
 
 /// Write the patch and answer with the region - the half of an edit that is the
@@ -1015,6 +1173,7 @@ fn paint_patch(
     page: &Raster,
     paint: &PaintPlan,
     order: u32,
+    strip_context: Option<StripPaintContext<'_>>,
 ) -> Result<(run::Made, usize), &'static str> {
     use cleaner_core::paint::{self, CloneMode, HealMode, PaintError, StrokePoint};
 
@@ -1026,7 +1185,7 @@ fn paint_patch(
     // no spacing to walk. What it has is a mask and a colour, which is the
     // whole of the work.
     if let PaintKind::Shape { color, shape } = &paint.kind {
-        return shape_patch(job, source_idx, page, shape, *color, &paint.spec, order);
+        return shape_patch(job, source_idx, page, shape, *color, &paint.spec, order, strip_context);
     }
 
     let (width, height) = (page.width as f64, page.height as f64);
@@ -1048,7 +1207,7 @@ fn paint_patch(
         PaintKind::Clone { offset, .. } => (offset.0 / 100.0 * width, offset.1 / 100.0 * height),
     };
 
-    let under = patches_under(job, source_idx, order, &points, paint.spec.size, offset)
+    let under = patches_under(job, source_idx, order, &points, paint.spec.size, offset, strip_context)
         .map_err(|_| "decline.reason.rungUnavailable")?;
 
     let painted = match paint.kind {
@@ -1129,13 +1288,15 @@ fn shape_patch(
     color: [u8; 3],
     spec: &cleaner_core::paint::BrushSpec,
     order: u32,
+    strip_context: Option<StripPaintContext<'_>>,
 ) -> Result<(run::Made, usize), &'static str> {
     // An empty mask is "there is no patch to make here", which is the sentence
     // `rungUnavailable` already carries for an empty seed.
     let mask = shape_mask(shape, page.width, page.height).ok_or("decline.reason.rungUnavailable")?;
     let bounds = mask.bounds;
 
-    let under = patches_over(job, source_idx, order, bounds).map_err(|_| "decline.reason.rungUnavailable")?;
+    let under = patches_over(job, source_idx, order, bounds, strip_context)
+        .map_err(|_| "decline.reason.rungUnavailable")?;
     let mut pixels = cleaner_core::composite::composite_region(page, &under, bounds, Some(order))
         .map_err(|_| "decline.reason.rungUnavailable")?;
     // The window came back clamped to the page. The mask's bounds were built
@@ -1216,21 +1377,65 @@ fn solid_levels(mode: cleaner_core::image::ColorMode, color: [u8; 3]) -> Vec<Opt
 /// `order` is exclusive, so a re-painted region blends over what is beneath it
 /// and not over its own previous commit, and the box is intersected against
 /// each record's `bbox` before its buffer is read.
+#[derive(Clone, Copy)]
+struct StripPaintContext<'a> {
+    strip: &'a cleaner_core::strip::Strip,
+    /// Origin of the bounded raster in strip coordinates.
+    origin: (i64, i64),
+}
+
+fn patch_in_paint_space(
+    job: &Job,
+    record: &PatchRecord,
+    context: Option<StripPaintContext<'_>>,
+) -> Result<Option<Patch>, String> {
+    let mut patch = job.load_patch(record).map_err(|e| e.to_string())?;
+    let Some(context) = context else { return Ok(Some(patch)) };
+    let Some(placed) = context.strip.pages().iter().find(|p| p.source_idx == record.source_idx)
+    else { return Ok(None) };
+    let dx = placed.x_offset - context.origin.0;
+    let dy = placed.y_offset - context.origin.1;
+    patch.mask.bounds.x += dx;
+    patch.mask.bounds.y += dy;
+    patch.ink.bounds.x += dx;
+    patch.ink.bounds.y += dy;
+    Ok(Some(patch))
+}
+
+fn record_box_in_paint_space(
+    record: &PatchRecord,
+    context: Option<StripPaintContext<'_>>,
+) -> Option<Rect> {
+    let Some(context) = context else { return Some(record.bbox) };
+    let placed = context.strip.pages().iter().find(|p| p.source_idx == record.source_idx)?;
+    Some(Rect::new(
+        record.bbox.x + placed.x_offset - context.origin.0,
+        record.bbox.y + placed.y_offset - context.origin.1,
+        record.bbox.w,
+        record.bbox.h,
+    ))
+}
+
 fn patches_over(
     job: &Job,
     source_idx: usize,
     order: u32,
     box_of: Rect,
+    strip_context: Option<StripPaintContext<'_>>,
 ) -> Result<Vec<Patch>, String> {
     let mut patches = Vec::new();
     for record in &job.project.patches {
-        if record.source_idx != source_idx || !record.visible || record.order >= order {
+        if !record.visible
+            || record.order >= order
+            || (strip_context.is_none() && record.source_idx != source_idx)
+        {
             continue;
         }
-        if !overlaps(record.bbox, box_of) {
+        let Some(record_box) = record_box_in_paint_space(record, strip_context) else { continue };
+        if !overlaps(record_box, box_of) {
             continue;
         }
-        patches.push(job.load_patch(record).map_err(|e| e.to_string())?);
+        if let Some(patch) = patch_in_paint_space(job, record, strip_context)? { patches.push(patch); }
     }
     Ok(patches)
 }
@@ -1250,6 +1455,7 @@ fn patches_under(
     points: &[cleaner_core::paint::StrokePoint],
     size: f64,
     offset: (f64, f64),
+    strip_context: Option<StripPaintContext<'_>>,
 ) -> Result<Vec<Patch>, String> {
     let reach = size / 2.0 + 2.0;
     let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
@@ -1273,13 +1479,17 @@ fn patches_under(
 
     let mut patches = Vec::new();
     for record in &job.project.patches {
-        if record.source_idx != source_idx || !record.visible || record.order >= order {
+        if !record.visible
+            || record.order >= order
+            || (strip_context.is_none() && record.source_idx != source_idx)
+        {
             continue;
         }
-        if !overlaps(record.bbox, box_of) {
+        let Some(record_box) = record_box_in_paint_space(record, strip_context) else { continue };
+        if !overlaps(record_box, box_of) {
             continue;
         }
-        patches.push(job.load_patch(record).map_err(|e| e.to_string())?);
+        if let Some(patch) = patch_in_paint_space(job, record, strip_context)? { patches.push(patch); }
     }
     Ok(patches)
 }
@@ -1378,11 +1588,10 @@ fn clamped(rect: Rect, page: &Raster) -> Rect {
 
 /// The order a new patch takes on its page: after everything already there, so
 /// a hand edit composites over the automatic pass's own work.
-fn next_order(job: &Job, source_idx: usize) -> u32 {
+fn next_order(job: &Job, _source_idx: usize) -> u32 {
     job.project
         .patches
         .iter()
-        .filter(|record| record.source_idx == source_idx)
         .map(|record| record.order + 1)
         .max()
         .unwrap_or(0)
@@ -2126,6 +2335,7 @@ pub async fn apply_tool(
         // over the shape's box that nothing then reads.
         let paint = paint_plan(&tool, &params);
         let fill_mode = string("fillMode").unwrap_or_else(|| "match-surround".to_owned());
+        let mut requested = None;
         let geometry = match bbox {
             Some(bbox) => {
                 let _lock = run::lock_job(&located.job_path);
@@ -2145,7 +2355,9 @@ pub async fn apply_tool(
                         .and_then(|stroke| stroke_mask(stroke, w, h))
                         .or_else(|| drawn.as_ref().and_then(|shape| shape_mask(shape, w, h)))
                 };
-                painted_geometry(pixels_of(bbox, w, h), painted)
+                let rect = pixels_of(bbox, w, h);
+                requested = Some(rect);
+                painted_geometry(rect, painted)
             }
             None => existing_geometry(&located, &region_id)?,
         };
@@ -2171,6 +2383,9 @@ pub async fn apply_tool(
             // no row to take.
             clears_untouched: true,
             paint,
+            requested,
+            stroke: stroke.clone(),
+            drawn: drawn.clone(),
         };
         match edit(&app, &located, plan)? {
             Outcome::Cleaned(edited) => Ok(ApplyResult::applied(edited)),
@@ -2307,6 +2522,9 @@ pub async fn create_region(
             fill_mode: Some(fill_mode_key(&fill_mode)),
             clears_untouched: false,
             paint,
+            requested: Some(rect),
+            stroke,
+            drawn,
         };
         match edit(&app, &located, plan)? {
             Outcome::Cleaned(edited) => {
@@ -2357,7 +2575,7 @@ pub async fn rerun_mask(
         // What the mask currently is. A re-run of a region with no patch is a
         // re-run of nothing - the same `null` the seam gives for an id it
         // cannot find.
-        let (current, current_fill) = {
+        let (current, current_fill, current_bbox) = {
             let _lock = run::lock_job(&located.job_path);
             let job = Job::open(&located.job_path).map_err(|e| e.to_string())?;
             let Some(record) =
@@ -2372,7 +2590,7 @@ pub async fn rerun_mask(
                 .and_then(|v| v.as_str())
                 .unwrap_or("match-surround")
                 .to_owned();
-            (record.provenance.engine, fill)
+            (record.provenance.engine, fill, record.bbox)
         };
 
         // The one kind that is not an edit: the mask is kept exactly as it is
@@ -2439,6 +2657,9 @@ pub async fn rerun_mask(
             // ladder, which is recorded rather than a silent behaviour.
             paint: None,
             clears_untouched: false,
+            requested: Some(current_bbox),
+            stroke: None,
+            drawn: None,
         };
         match edit(&app, &located, plan)? {
             Outcome::Cleaned(edited) => {
@@ -2586,6 +2807,9 @@ pub async fn clean_anyway(
             // `cleanAnyway` answers the gate, which nothing painted ever met.
             paint: None,
             clears_untouched: true,
+            requested: None,
+            stroke: None,
+            drawn: None,
         };
         match edit(&app, &located, plan)? {
             Outcome::Cleaned(edited) => {
@@ -2636,6 +2860,211 @@ pub async fn list_sidecar_models(app: tauri::AppHandle) -> Result<Vec<SidecarMod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strip_edit_fixture(name: &str) -> (PathBuf, Located) {
+        use cleaner_core::image::{Format, encode, fixtures};
+        use cleaner_core::ingest::source_ref;
+        use cleaner_core::project::{Project, StripMode};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "mc-region-strip-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let raws = root.join("raws");
+        std::fs::create_dir_all(&raws).unwrap();
+        let mut raster = fixtures::by_name("l8").raster;
+        let original = raster.data.clone();
+        let original_height = raster.height;
+        let stride = raster.stride();
+        raster.height = 400;
+        raster.data = (0..raster.height)
+            .flat_map(|row| {
+                let row = row as usize % original_height as usize;
+                original[row * stride..(row + 1) * stride].to_vec()
+            })
+            .collect();
+        let bytes = encode(&raster, Format::Png).unwrap();
+        let sources = (0..2)
+            .map(|index| {
+                let path = raws.join(format!("{index:03}.png"));
+                std::fs::write(&path, &bytes).unwrap();
+                source_ref(&path, &bytes).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let manifest = root.join("job/chapter.mtclean");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        let project = Project::new(manifest.parent().unwrap(), "test", StripMode::Longstrip, &sources);
+        Job::create(&manifest, project).unwrap();
+        let located = Located { chapter_id: "chapter".into(), job_path: manifest, page_index: 0 };
+        (root, located)
+    }
+
+    fn test_bench(root: &std::path::Path) -> Bench {
+        let models = root.join("no-models");
+        Bench {
+            app_data: None,
+            sidecar_override: None,
+            flux_model: None,
+            flux_backend: None,
+            detector: run::detector_on_demand(&models, Preference::CpuOnly),
+            rung2: run::Rung2::new(&models, Preference::CpuOnly),
+            flux: None,
+            flux_key: None,
+        }
+    }
+
+    #[test]
+    fn a_cross_join_shape_commits_reruns_and_survives_undo_on_disk() {
+        let (root, located) = strip_edit_fixture("shape");
+        let initial = Job::open(&located.job_path).unwrap();
+        let source = initial.project.strip.order[0];
+        let (w, h) = page_size(&initial, source).unwrap();
+        let rect = pixels_of(Bbox { x: 25.0, y: 90.0, w: 50.0, h: 20.0 }, w, h);
+        let shape = PaintedShape {
+            kind: ShapeKind::Ellipse,
+            points: vec![
+                StrokePoint { x: 25.0, y: 90.0 },
+                StrokePoint { x: 75.0, y: 90.0 },
+                StrokePoint { x: 75.0, y: 110.0 },
+                StrokePoint { x: 25.0, y: 110.0 },
+            ],
+            feather: 0.0,
+        };
+        let plan = Plan {
+            region_id: "chapter-p001-h1".into(),
+            geometry: Geometry::Given(rect),
+            choice: Choice::Exact(Engine::Fill),
+            source: "hand",
+            tool: Some("shapes".into()),
+            fill_mode: Some("solid"),
+            clears_untouched: false,
+            paint: Some(PaintPlan {
+                kind: PaintKind::Shape { color: [30, 30, 30], shape: shape.clone() },
+                points: Vec::new(),
+                spec: cleaner_core::paint::BrushSpec::default(),
+                alignment: "aligned",
+            }),
+            requested: Some(rect),
+            stroke: None,
+            drawn: Some(shape),
+        };
+        let mut bench = test_bench(&root);
+        let created = edit_with_bench(&mut bench, Engine::Fill, &located, plan).unwrap();
+        assert!(matches!(created, Outcome::Cleaned(_)));
+
+        let written = Job::open(&located.job_path).unwrap();
+        let record = written.project.patches.iter().find(|p| p.id == "chapter-p001-h1").unwrap();
+        assert!(record.bbox.y < h as i64 && record.bbox.bottom() > h as i64);
+        let patch = written.load_patch(record).unwrap();
+        assert!(!patch.mask.contains(record.bbox.x, record.bbox.y), "ellipse became its box");
+        assert!(patch.mask.bits.iter().any(|b| *b == 0) && patch.mask.bits.iter().any(|b| *b != 0));
+        let strip = run::strip_of(&written.project);
+        let global = cleaner_core::export::StripPatch::lift(&strip, 0, &patch).unwrap();
+        let first = cleaner_core::export::patches_on_page(&strip, 0, std::slice::from_ref(&global));
+        let second = cleaner_core::export::patches_on_page(&strip, 1, std::slice::from_ref(&global));
+        assert!(!first.is_empty() && first[0].mask.bits.iter().any(|bit| *bit != 0));
+        assert!(!second.is_empty() && second[0].mask.bits.iter().any(|bit| *bit != 0));
+
+        let rerun = Plan {
+            region_id: "chapter-p001-h1".into(),
+            geometry: Geometry::Stored,
+            choice: Choice::Exact(Engine::Fill),
+            source: "hand",
+            tool: Some("shapes".into()),
+            fill_mode: Some("match-surround"),
+            clears_untouched: false,
+            paint: None,
+            requested: Some(record.bbox),
+            stroke: None,
+            drawn: None,
+        };
+        // A later edit anchored on page two must see and composite over the
+        // older page-one-owned seam patch, even though this gesture itself is
+        // wholly inside page two.
+        let second_located = Located {
+            chapter_id: located.chapter_id.clone(),
+            job_path: located.job_path.clone(),
+            page_index: 1,
+        };
+        let second_shape = PaintedShape {
+            kind: ShapeKind::Rect,
+            points: vec![
+                StrokePoint { x: 30.0, y: 2.0 },
+                StrokePoint { x: 70.0, y: 2.0 },
+                StrokePoint { x: 70.0, y: 8.0 },
+                StrokePoint { x: 30.0, y: 8.0 },
+            ],
+            feather: 0.0,
+        };
+        let second_rect = Rect::new(19, 8, 26, 24);
+        let second_plan = Plan {
+            region_id: "chapter-p002-h1".into(),
+            geometry: Geometry::Given(second_rect),
+            choice: Choice::Exact(Engine::Fill),
+            source: "hand",
+            tool: Some("shapes".into()),
+            fill_mode: Some("solid"),
+            clears_untouched: false,
+            paint: Some(PaintPlan {
+                kind: PaintKind::Shape { color: [230, 230, 230], shape: second_shape.clone() },
+                points: Vec::new(),
+                spec: cleaner_core::paint::BrushSpec {
+                    opacity: 50.0,
+                    ..cleaner_core::paint::BrushSpec::default()
+                },
+                alignment: "aligned",
+            }),
+            requested: Some(second_rect),
+            stroke: None,
+            drawn: Some(second_shape),
+        };
+        assert!(matches!(
+            edit_with_bench(&mut bench, Engine::Fill, &second_located, second_plan).unwrap(),
+            Outcome::Cleaned(_)
+        ));
+        let layered = Job::open(&located.job_path).unwrap();
+        let old_order = layered.project.patches.iter().find(|p| p.id == "chapter-p001-h1").unwrap().order;
+        let old_record = layered.project.patches.iter().find(|p| p.id == "chapter-p001-h1").unwrap();
+        let new_record = layered.project.patches.iter().find(|p| p.id == "chapter-p002-h1").unwrap();
+        let new_order = new_record.order;
+        assert!(new_order > old_order, "strip paint order must be chapter-wide");
+        let old_patch = layered.load_patch(old_record).unwrap();
+        let new_patch = layered.load_patch(new_record).unwrap();
+        let global_x = 32i64;
+        let anchor_y = h as i64 + 20;
+        assert!(old_patch.mask.contains(global_x, anchor_y));
+        assert!(new_patch.mask.contains(global_x, 20));
+        let below = old_patch.pixels.sample(
+            (global_x - old_patch.mask.bounds.x) as u32,
+            (anchor_y - old_patch.mask.bounds.y) as u32,
+            0,
+        );
+        let above = new_patch.pixels.sample(
+            (global_x - new_patch.mask.bounds.x) as u32,
+            (20 - new_patch.mask.bounds.y) as u32,
+            0,
+        );
+        let expected = ((230.0 + below as f64) / 2.0).round() as u16;
+        assert_eq!(below, 30, "the older seam paint must be the sampled under-layer");
+        assert_eq!(above, expected, "page-two paint did not composite over the seam patch");
+
+        assert!(matches!(
+            edit_with_bench(&mut bench, Engine::Fill, &located, rerun).unwrap(),
+            Outcome::Cleaned(_)
+        ));
+
+        let mut undone = Job::open(&located.job_path).unwrap();
+        undone.project.patches.iter_mut().find(|p| p.id == "chapter-p001-h1").unwrap().visible = false;
+        undone.flush().unwrap();
+        assert!(!Job::open(&located.job_path).unwrap().project.patches.iter().find(|p| p.id == "chapter-p001-h1").unwrap().visible);
+        let mut redone = Job::open(&located.job_path).unwrap();
+        redone.project.patches.iter_mut().find(|p| p.id == "chapter-p001-h1").unwrap().visible = true;
+        redone.flush().unwrap();
+        assert!(Job::open(&located.job_path).unwrap().project.patches.iter().find(|p| p.id == "chapter-p001-h1").unwrap().visible);
+        std::fs::remove_dir_all(root).ok();
+    }
 
     /* -- rung 3a's backend, as a preference ---------------------------- */
 
@@ -2923,6 +3352,60 @@ mod tests {
         assert_eq!(paint_plan("brush", &serde_json::json!({ "mode": "paint" })), None);
     }
 
+    #[test]
+    fn a_window_patch_is_persisted_in_anchor_coordinates_without_changing_its_shape() {
+        let bounds = Rect::new(12, 18, 3, 4);
+        let mut mask = Mask::empty(bounds);
+        mask.set(13, 19, true);
+        mask.set(14, 20, true);
+        let bits = mask.bits.clone();
+        let pixels = Raster {
+            width: 3,
+            height: 4,
+            mode: cleaner_core::image::ColorMode::Gray,
+            depth: cleaner_core::image::BitDepth::Eight,
+            icc: None,
+            palette: None,
+            trns: None,
+            srgb_intent: None,
+            data: vec![200; 12],
+        };
+        let mut made = run::Made {
+            engine: Engine::Fill,
+            ink: mask.clone(),
+            mask,
+            pixels,
+            provider: None,
+            model_sha256: None,
+            pad: cleaner_core::strip::EdgePad::None,
+            tiles: None,
+        };
+
+        translate_made(&mut made, (-7, 95));
+
+        assert_eq!(made.mask.bounds, Rect::new(5, 113, 3, 4));
+        assert_eq!(made.ink.bounds, made.mask.bounds);
+        assert_eq!(made.mask.bits, bits, "translation must not demote a stroke to its box");
+        assert!(made.mask.contains(6, 114));
+        assert!(!made.mask.contains(5, 113));
+        assert_eq!((made.pixels.width, made.pixels.height), (3, 4));
+    }
+
+    #[test]
+    fn a_clone_window_includes_its_cross_join_source() {
+        let strip = cleaner_core::strip::Strip::of_sizes(&[(100, 100), (100, 100)]);
+        let anchor = strip.pages()[0];
+        let target = Rect::new(20, 80, 30, 10);
+        let paint = PaintPlan {
+            kind: PaintKind::Clone { heal: false, offset: (0.0, -30.0) },
+            points: Vec::new(),
+            spec: cleaner_core::paint::BrushSpec::default(),
+            alignment: "aligned",
+        };
+
+        assert_eq!(manual_requested(target, Some(&paint), Some(anchor)), Rect::new(20, 80, 30, 40));
+    }
+
     /// Both hex spellings, and black for everything else - a stroke with an
     /// unreadable colour paints ink rather than being refused.
     #[test]
@@ -2969,6 +3452,9 @@ mod tests {
             fill_mode: None,
             clears_untouched: false,
             paint: Some(paint),
+            requested: None,
+            stroke: None,
+            drawn: None,
         };
         let params = serde_json::json!({
             "mode": "paint",

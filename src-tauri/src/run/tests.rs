@@ -2173,7 +2173,7 @@ fn clean_fixture(pipeline: &mut Pipeline, fixture: &str, ceiling: Engine) -> Opt
     let survey = cleaner_core::strip::survey(&strip, |_| None);
     let joins = survey.joins.clone();
     let context =
-        PageContext { strip: &strip, joins: &joins, segments: &survey.segments, placement: 0 };
+        PageContext { strip: &strip, joins: &joins, segments: &survey.segments, placement: 0, sources: &[] };
     Some(pipeline.clean_page("c1-p001", &bytes, ceiling, &context).expect("the page cleaned"))
 }
 
@@ -2847,6 +2847,59 @@ fn a_duplicated_join_is_reported_on_the_stream() {
     );
 }
 
+/// The shipped strip is a single webtoon canvas cut into source pages. With
+/// real detector, balloon and script-gate sessions, the clean pass must keep a
+/// region at its verified first join whole and must not emit its overlap again
+/// when the second page is processed.
+#[test]
+fn the_real_pipeline_persists_one_patch_across_a_verified_join() {
+    let _serial = one_gpu_at_a_time();
+    let Some(mut pipeline) = the_real_pipeline() else { return };
+    let scratch = Scratch::new("real-cross-join");
+    let Some((library, _, chapter_id)) = a_longstrip_chapter(&scratch) else { return };
+    let entries = plan(&library, "chapter", &chapter_id, None).unwrap();
+    let recorder = Recorder::new();
+    execute(
+        "cross-join",
+        &chapter_id,
+        &entries,
+        &mut pipeline,
+        Engine::Fill,
+        &recorder.cancel,
+        &recorder.sink(),
+    );
+
+    let job = Job::open(&entries[0].job_path).unwrap();
+    let first_height = job.project.sources[entries[0].source_idx].h as i64;
+    let spanning: Vec<_> = job.project.patches.iter().filter_map(|record| {
+        (record.source_idx == entries[0].source_idx)
+            .then(|| job.load_patch(record).ok())
+            .flatten()
+            .filter(|patch| patch.mask.bounds.y < first_height
+                && patch.mask.bounds.bottom() > first_height)
+    }).collect();
+    assert_eq!(spanning.len(), 1, "the verified join must produce one anchored spanning patch");
+
+    let strip = strip_of(&job.project);
+    let lifted = cleaner_core::export::StripPatch::lift(&strip, 0, &spanning[0]).unwrap();
+    assert!(cleaner_core::export::patches_on_page(&strip, 0, std::slice::from_ref(&lifted)).len() == 1);
+    let on_second = cleaner_core::export::patches_on_page(&strip, 1, std::slice::from_ref(&lifted));
+    assert_eq!(on_second.len(), 1);
+    let expected = on_second[0].mask.bounds;
+    let duplicate = job.project.patches.iter().filter(|record| record.source_idx == entries[1].source_idx)
+        .filter_map(|record| job.load_patch(record).ok())
+        .any(|patch| {
+            let other = patch.mask.bounds;
+            let w = (expected.right().min(other.right()) - expected.x.max(other.x)).max(0);
+            let h = (expected.bottom().min(other.bottom()) - expected.y.max(other.y)).max(0);
+            let intersection = w * h;
+            let smaller = (i64::from(expected.w) * i64::from(expected.h))
+                .min(i64::from(other.w) * i64::from(other.h));
+            smaller > 0 && intersection * 2 >= smaller
+        });
+    assert!(!duplicate, "the second page emitted a clipped duplicate of the spanning patch");
+}
+
 /// **Rule 2's plan, recorded.** `strip.splits` had no writer at all - the
 /// field's own doc comment says so - and rule 2 requires a fallback to be
 /// "recorded in `strip.splits` and surfaced in review".
@@ -2933,6 +2986,7 @@ fn a_regions_decode_window_is_clamped_by_the_strip_it_sits_in() {
         joins: &survey.joins,
         segments: &survey.segments,
         placement: 1,
+        sources: &[],
     };
 
     // A box hard against the narrow page's left edge, in that page's own
@@ -2956,4 +3010,30 @@ fn a_regions_decode_window_is_clamped_by_the_strip_it_sits_in() {
     let decoded = fixtures::by_name("l8").raster;
     let bounds = context.to_crop(window.rect, 0, &decoded);
     assert_eq!(bounds.x, 0);
+}
+
+#[test]
+fn detection_on_a_second_page_never_anchors_to_an_unverified_previous_join() {
+    let strip = Strip::of_sizes(&[(800, 4_000), (800, 4_000)]);
+    let survey = cleaner_core::strip::survey(&strip, |_| None);
+    let context = PageContext { strip: &strip, joins: &survey.joins,
+        segments: &survey.segments, placement: 1, sources: &[] };
+    let segment = context.page_segments()[0];
+    let window = detection_window(&context, segment);
+    assert_eq!(window.rect.y, 4_000);
+    assert_eq!(window.rect.bottom(), segment.detect_end as i64);
+    assert!(window.rect.bottom() > 4_000, "the current page, not its predecessor, is read");
+}
+
+#[test]
+fn engine_context_at_a_second_page_top_stays_anchored_on_that_page() {
+    let strip = Strip::of_sizes(&[(800, 4_000), (800, 4_000)]);
+    let survey = cleaner_core::strip::survey(&strip, |_| None);
+    let context = PageContext { strip: &strip, joins: &survey.joins,
+        segments: &survey.segments, placement: 1, sources: &[] };
+    let region = Rect::new(200, 4_005, 80, 40);
+    let window = anchored_engine_window(&context, region, 1.0, EngineContext::Local);
+    assert_eq!(window.rect.y, 4_000);
+    assert!(window.rect.bottom() > region.bottom());
+    assert_eq!(window.pad, EdgePad::Replicate);
 }

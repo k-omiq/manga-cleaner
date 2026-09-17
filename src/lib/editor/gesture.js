@@ -49,16 +49,48 @@ function clamp(value, min, max) {
  * @param {number} clientY
  * @param {Rect} rect - the sheet's measured box, i.e. the drawn scale
  * @param {number} [pressure] - pointer pressure 0..1 (0.5 when unknown or zero)
- * @returns {Point} clamped to the page
+ * @param {boolean} [clampToPage] - false for a continuous longstrip gesture
+ * @returns {Point}
  */
-export function pointIn(clientX, clientY, rect, pressure) {
+export function pointIn(clientX, clientY, rect, pressure, clampToPage = true) {
   const width = rect.width || 1
   const height = rect.height || 1
   const p = typeof pressure === 'number' && pressure > 0 ? pressure : 0.5
   return {
+    // A strip continues vertically. Horizontally it still has page edges (and
+    // possibly gutters beside a narrower neighbour), so x always clamps.
     x: clamp(((clientX - rect.left) / width) * PAGE_SPAN, 0, PAGE_SPAN),
-    y: clamp(((clientY - rect.top) / height) * PAGE_SPAN, 0, PAGE_SPAN),
+    y: clampToPage
+      ? clamp(((clientY - rect.top) / height) * PAGE_SPAN, 0, PAGE_SPAN)
+      : ((clientY - rect.top) / height) * PAGE_SPAN,
     p,
+  }
+}
+
+/** A drag box that may cross a longstrip page boundary. */
+export function stripRectBetween(a, b) {
+  return {
+    x: Math.min(a.x, b.x),
+    y: Math.min(a.y, b.y),
+    w: Math.max(MIN_SPAN, Math.abs(a.x - b.x)),
+    h: Math.max(MIN_SPAN, Math.abs(a.y - b.y)),
+  }
+}
+
+/** Bounds of a stroke in anchor-page coordinates, without a page-edge clamp. */
+export function stripBoundsOf(points, radius = {}) {
+  if (!points || points.length === 0) return null
+  const rx = radius.rx ?? 0
+  const ry = radius.ry ?? 0
+  const xs = points.map((point) => point.x)
+  const ys = points.map((point) => point.y)
+  const x = Math.min(...xs) - rx
+  const y = Math.min(...ys) - ry
+  return {
+    x,
+    y,
+    w: Math.max(MIN_SPAN, Math.max(...xs) - Math.min(...xs) + rx * 2),
+    h: Math.max(MIN_SPAN, Math.max(...ys) - Math.min(...ys) + ry * 2),
   }
 }
 

@@ -51,11 +51,11 @@ describe('stripUnit', () => {
 describe('stripMetrics', () => {
   it('gives every page its own height, so the column is the sum and not a multiple', () => {
     const metrics = metricsOf(SEGMENTS)
-    expect(metrics.units).toEqual([4012, 2612, 3412])
-    expect(metrics.offsets).toEqual([0, 4012, 6624, 10036])
-    expect(metrics.total).toBe(10036)
+    expect(metrics.units).toEqual([4000, 2600, 3400])
+    expect(metrics.offsets).toEqual([0, 4000, 6600, 10000])
+    expect(metrics.total).toBe(10000)
     // What page 0's aspect ratio alone would have said.
-    expect(metrics.total).not.toBe(SEGMENTS.length * 4012)
+    expect(metrics.total).not.toBe(SEGMENTS.length * 4000)
   })
 
   it('draws a narrow page narrow rather than stretching it to the column', () => {
@@ -64,7 +64,7 @@ describe('stripMetrics', () => {
     // the wrong place.
     const metrics = metricsOf([{ width: 800, height: 4000 }, { width: 700, height: 3500 }])
     expect(metrics.widths).toEqual([800, 700])
-    expect(metrics.units).toEqual([4012, 3512])
+    expect(metrics.units).toEqual([4000, 3500])
   })
 
   it('scales every page by the same factor', () => {
@@ -192,9 +192,8 @@ describe('stripWindow', () => {
     const band = stripWindow({ metrics, columnTop: -20000, viewportHeight: 900 })
     expect(band.padTop).toBe(metrics.offsets[band.start])
     expect(band.padTop + band.padBottom).toBeLessThan(metrics.total)
-    // Uniform arithmetic would have put this scroll position six pages down
-    // (20000 / 4012), and the true answer is page 5.
-    expect(band.start).toBe(5 - OVERSCAN)
+    // The scroll position is exactly page 6's top; overscan keeps page 5.
+    expect(band.start).toBe(6 - OVERSCAN)
   })
 })
 
@@ -207,15 +206,15 @@ describe('visibleIndices', () => {
 
   it('is every page the viewport overlaps', () => {
     const metrics = metricsOf(Array.from({ length: 6 }, () => ({ width: 300, height: 288 })))
-    expect(metrics.units[0]).toBe(300)
+    expect(metrics.units[0]).toBe(288)
     expect(visibleIndices({ metrics, columnTop: -250, viewportHeight: 700 })).toEqual([0, 1, 2, 3])
   })
 
   it('overlaps a page it merely touches the top of, and not one it stops at', () => {
     const metrics = metricsOf(Array.from({ length: 6 }, () => ({ width: 300, height: 288 })))
     // A viewport ending exactly on page 2's first row is inside pages 0 and 1.
-    expect(visibleIndices({ metrics, columnTop: 0, viewportHeight: 600 })).toEqual([0, 1])
-    expect(visibleIndices({ metrics, columnTop: 0, viewportHeight: 601 })).toEqual([0, 1, 2])
+    expect(visibleIndices({ metrics, columnTop: 0, viewportHeight: 576 })).toEqual([0, 1])
+    expect(visibleIndices({ metrics, columnTop: 0, viewportHeight: 577 })).toEqual([0, 1, 2])
   })
 
   it('clamps at the end of the column', () => {
@@ -289,10 +288,10 @@ describe('scrollTopFor', () => {
    */
   it('lands on the top of the page asked for, not on a multiple of page 0', () => {
     const metrics = metricsOf(SEGMENTS)
-    expect(scrollTopFor({ index: 1, metrics, scrollTop: 0, columnTop: 70 })).toBe(70 + 4012)
-    expect(scrollTopFor({ index: 2, metrics, scrollTop: 0, columnTop: 70 })).toBe(70 + 6624)
+    expect(scrollTopFor({ index: 1, metrics, scrollTop: 0, columnTop: 70 })).toBe(70 + 4000)
+    expect(scrollTopFor({ index: 2, metrics, scrollTop: 0, columnTop: 70 })).toBe(70 + 6600)
     // The end of the column is a position too: `index === count` is the bottom.
-    expect(scrollTopFor({ index: 3, metrics, scrollTop: 0, columnTop: 70 })).toBe(70 + 10036)
-    expect(scrollTopFor({ index: 99, metrics, scrollTop: 0, columnTop: 70 })).toBe(70 + 10036)
+    expect(scrollTopFor({ index: 3, metrics, scrollTop: 0, columnTop: 70 })).toBe(70 + 10000)
+    expect(scrollTopFor({ index: 99, metrics, scrollTop: 0, columnTop: 70 })).toBe(70 + 10000)
   })
 })

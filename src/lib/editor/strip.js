@@ -54,8 +54,8 @@
 
 import { naturalWidth, pageRatio, sheetWidth } from './zoom.js'
 
-/** The design file's column gap. */
-export const STRIP_GAP = 12
+/** Longstrip pages meet on the same row boundary as the source pixels. */
+export const STRIP_GAP = 0
 
 /** Below this many pages the column renders whole. */
 export const VIRTUAL_THRESHOLD = 12

@@ -350,6 +350,7 @@ export function scopedRegions() {
  */
 export function replaceRegion(region, pageStatus) {
   if (!region) return false
+  for (const page of pages()) page.tileRevision = (page.tileRevision ?? 0) + 1
   for (const page of pages()) {
     const index = page.regions.findIndex((candidate) => candidate.id === region.id)
     if (index >= 0) {
@@ -428,6 +429,11 @@ function forgetRegion(regionId) {
  * @returns {boolean} whether the chapter changed
  */
 export function applyRegionState(regionId, region, pageStatus) {
+  // A longstrip patch may intersect pages other than the id's anchor page.
+  // Bump the lightweight URL token on every page header; only the bounded DOM
+  // window requests tiles, while undo/redo and edits refresh both sides of a
+  // visible join without loading chapter raster data.
+  for (const page of pages()) page.tileRevision = (page.tileRevision ?? 0) + 1
   for (const page of pages()) {
     const index = page.regions.findIndex((candidate) => candidate.id === regionId)
     if (index < 0) continue

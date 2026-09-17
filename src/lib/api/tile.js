@@ -256,7 +256,11 @@ export function tileUrl(page, variant, tile) {
  * @returns {string}
  */
 export function pageVersion(page, variant) {
-  const parts = [`${PROXY_SHORT_EDGE}x${PROXY_TILE_LONG_EDGE}`, page.sourceSha ?? '']
+  const parts = [
+    `${PROXY_SHORT_EDGE}x${PROXY_TILE_LONG_EDGE}`,
+    page.sourceSha ?? '',
+    String(page.tileRevision ?? 0),
+  ]
   if (variant === 'cleaned') {
     const masks = (page.regions ?? [])
       .map((region) => region.mask)

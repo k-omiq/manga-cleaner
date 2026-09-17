@@ -62,7 +62,7 @@ fn main() -> Result<()> {
     for path in pages {
         let bytes = std::fs::read(&path)?;
         let page = decode(&bytes).map_err(|e| anyhow!("{e}"))?;
-        let detection = detector.detect(&page)?;
+        let mut detection = detector.detect(&page)?;
         let boxes = balloons.detect(&page)?;
         let mut regions = build_regions_separated(detection.boxes.clone(), page.width, page.height, |a, b| {
             balloon::merge_crosses_a_balloon(&page, &detection.segmentation, a, b)
@@ -73,6 +73,7 @@ fn main() -> Result<()> {
         let adopted = balloon::adopt_uncovered_text(&regions, &boxes, page.width, page.height, median);
         let marks: Vec<(cleaner_core::mask::Rect, f32)> =
             adopted.iter().map(|r| (r.masking, r.members[0].confidence)).collect();
+        balloon::seed_adopted_text(&page, &mut detection.segmentation, &adopted);
         regions.extend(adopted);
         cleaner_core::detect::sort_regions(&mut regions);
         println!(

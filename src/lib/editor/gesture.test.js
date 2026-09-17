@@ -24,6 +24,8 @@ import {
   regionAt,
   resizeBbox,
   shouldStamp,
+  stripBoundsOf,
+  stripRectBetween,
 } from './gesture.js'
 
 const RECT = { left: 100, top: 50, width: 400, height: 600 }
@@ -51,11 +53,31 @@ describe('pointIn', () => {
     expect(pointIn(5000, 5000, RECT)).toEqual({ x: 100, y: 100, p: 0.5 })
   })
 
+  it('keeps anchor-relative coordinates past a longstrip join when requested', () => {
+    const point = pointIn(300, 710, RECT, 0.5, false)
+    expect(point).toMatchObject({ x: 50, p: 0.5 })
+    expect(point.y).toBeCloseTo(110)
+  })
+
   it('survives a zero-sized box rather than dividing by it', () => {
     const point = pointIn(10, 10, { left: 0, top: 0, width: 0, height: 0 })
     expect(Number.isFinite(point.x)).toBe(true)
     expect(Number.isFinite(point.y)).toBe(true)
     expect(point.p).toBe(0.5)
+  })
+})
+
+describe('continuous strip geometry', () => {
+  it('keeps a rectangle on both sides of a join', () => {
+    expect(stripRectBetween({ x: 20, y: 95 }, { x: 70, y: 108 })).toEqual({
+      x: 20, y: 95, w: 50, h: 13,
+    })
+  })
+
+  it('keeps stroke bounds past the anchor page', () => {
+    expect(stripBoundsOf([{ x: 40, y: 98 }, { x: 50, y: 104 }], { rx: 2, ry: 3 })).toEqual({
+      x: 38, y: 95, w: 14, h: 12,
+    })
   })
 })
 

@@ -57,6 +57,7 @@ use crate::ingest::SourceRef;
 use crate::mask::Rect;
 
 pub mod join;
+pub mod raster;
 pub mod segment;
 pub mod split;
 pub mod stream;
@@ -64,6 +65,7 @@ pub mod survey;
 pub mod window;
 
 pub use join::{JOIN_PROBE_ROWS, EdgeRows, JoinAnomaly, JoinState, Joins, check_join};
+pub use raster::{WindowRaster, read_window, read_window_borrowing};
 pub use segment::{DetectedInSegment, GlobalBox, Segment, detection_segments, merge_global};
 pub use split::{RowProfile, Split, SplitKind, plan_splits};
 pub use stream::{stream_windows, windows_in_flight};

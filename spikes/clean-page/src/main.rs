@@ -137,6 +137,7 @@ fn main() -> Result<()> {
         joins: &survey.joins,
         segments: &survey.segments,
         placement: 0,
+        sources: &[],
     };
 
     let whole = std::time::Instant::now();

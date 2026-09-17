@@ -42,7 +42,7 @@
 //! a **page join** it does not fire, so a bubble split across one is still two
 //! boxes to the detector even where [`Strip::clamp`] would let the read cross.
 
-use crate::image::Raster;
+use crate::image::{BitDepth, ColorMode, Raster};
 
 use super::{
     EdgeRows, JOIN_PROBE_ROWS, JoinAnomaly, Joins, RowProfile, Segment, Split, SplitKind, Strip,
@@ -120,7 +120,7 @@ pub fn crop_rows(strip: &Strip, placement: usize, segment: &Segment) -> Option<(
 pub fn survey(strip: &Strip, mut page: impl FnMut(usize) -> Option<Raster>) -> Survey {
     let mut joins = Joins::unchecked(strip.joins());
     let mut profile = RowProfile::zeroed(strip.height());
-    let mut previous: Option<EdgeRows> = None;
+    let mut previous: Option<(EdgeRows, Encoding)> = None;
 
     for (index, placement) in strip.pages().iter().enumerate() {
         let Some(raster) = page(index) else {
@@ -130,11 +130,13 @@ pub fn survey(strip: &Strip, mut page: impl FnMut(usize) -> Option<Raster>) -> S
         profile.add_page(placement.y_offset, &raster);
 
         if index > 0 {
-            if let Some(above) = previous.take() {
-                joins.set(index - 1, check_join(&above, &EdgeRows::top_of(&raster, JOIN_PROBE_ROWS)));
+            if let Some((above, encoding)) = previous.take() {
+                if encoding == Encoding::of(&raster) {
+                    joins.set(index - 1, check_join(&above, &EdgeRows::top_of(&raster, JOIN_PROBE_ROWS)));
+                }
             }
         }
-        previous = Some(EdgeRows::bottom_of(&raster, JOIN_PROBE_ROWS));
+        previous = Some((EdgeRows::bottom_of(&raster, JOIN_PROBE_ROWS), Encoding::of(&raster)));
         // Explicit, because the whole claim of this pass is that it holds one
         // page at a time and the next iteration's decode must not overlap this
         // one's samples.
@@ -144,6 +146,23 @@ pub fn survey(strip: &Strip, mut page: impl FnMut(usize) -> Option<Raster>) -> S
     let splits = plan_splits(strip, &profile);
     let segments = segments_for(strip, &splits);
     Survey { joins, splits, segments }
+}
+
+#[derive(PartialEq, Eq)]
+struct Encoding {
+    mode: ColorMode,
+    depth: BitDepth,
+    icc: Option<Vec<u8>>,
+    palette: Option<Vec<u8>>,
+    trns: Option<Vec<u8>>,
+    srgb_intent: Option<u8>,
+}
+
+impl Encoding {
+    fn of(raster: &Raster) -> Self {
+        Self { mode: raster.mode, depth: raster.depth, icc: raster.icc.clone(),
+            palette: raster.palette.clone(), trns: raster.trns.clone(), srgb_intent: raster.srgb_intent }
+    }
 }
 
 /// Rule 3's segments over rule 2's plan **and** the page boundaries.

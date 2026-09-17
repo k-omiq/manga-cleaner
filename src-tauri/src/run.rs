@@ -548,6 +548,9 @@ pub struct PageContext<'a> {
     /// This page's position in `strip.pages()`, which is also its position in
     /// the manifest's `strip.order`.
     pub placement: usize,
+    /// Resolved sources in strip order. Adjacent pages are decoded only when a
+    /// verified join makes a bounded detection/engine window intersect them.
+    pub sources: &'a [Option<PathBuf>],
 }
 
 impl PageContext<'_> {
@@ -590,13 +593,27 @@ impl PageContext<'_> {
 
     /// A rectangle in a segment crop's coordinates, in strip coordinates.
     /// `top` is where the crop begins in the page.
+    #[cfg(test)]
     fn to_strip(&self, rect: Rect, top: u32) -> Rect {
         let (x, y) = self.origin();
         Rect::new(rect.x + x, rect.y + y + top as i64, rect.w, rect.h)
     }
 
+    fn read_window(&self, window: strip::DecodeWindow, current: &Raster) -> Result<strip::WindowRaster, String> {
+        strip::read_window_borrowing(self.strip, window, |position| {
+            if position == self.placement {
+                return Ok(std::borrow::Cow::Borrowed(current));
+            }
+            let path = self.sources.get(position).and_then(Option::as_ref)
+                .ok_or_else(|| format!("no source for strip position {position}"))?;
+            let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            decode(&bytes).map(std::borrow::Cow::Owned).map_err(|e| e.to_string())
+        })
+    }
+
     /// The reverse, clamped to the crop: a decode window may reach onto another
     /// page through a verified join, and this build's reader holds one page.
+    #[cfg(test)]
     fn to_crop(&self, rect: Rect, top: u32, crop: &Raster) -> Rect {
         let (x, y) = self.origin();
         let x0 = (rect.x - x).max(0);
@@ -605,6 +622,39 @@ impl PageContext<'_> {
         let y1 = (rect.bottom() - y - top as i64).min(crop.height as i64);
         Rect::new(x0, y0, (x1 - x0).max(0) as u32, (y1 - y0).max(0) as u32)
     }
+}
+
+fn detection_window(context: &PageContext<'_>, segment: Segment) -> strip::DecodeWindow {
+    let requested = Rect::new(
+        0,
+        segment.start as i64,
+        context.strip.width(),
+        segment.detect_end.saturating_sub(segment.start),
+    );
+    let rect = context.strip.clamp(requested, context.joins);
+    strip::DecodeWindow { rect, requested, pad: strip::EdgePad::None }
+}
+
+fn anchored_engine_window(
+    context: &PageContext<'_>,
+    boxr: Rect,
+    scale: f32,
+    engine: EngineContext,
+) -> strip::DecodeWindow {
+    let mut window = strip::decode_window(context.strip, context.joins, boxr, scale, engine);
+    if window.rect.x <= boxr.x && window.rect.y <= boxr.y
+        && window.rect.right() >= boxr.right() && window.rect.bottom() >= boxr.bottom() {
+        return window;
+    }
+    let Some(page) = context.strip.pages().get(context.placement) else { return window };
+    let page = page.rect();
+    let x = window.requested.x.max(page.x);
+    let y = window.requested.y.max(page.y);
+    let right = window.requested.right().min(page.right());
+    let bottom = window.requested.bottom().min(page.bottom());
+    window.rect = Rect::new(x, y, (right - x).max(0) as u32, (bottom - y).max(0) as u32);
+    window.pad = strip::EdgePad::Replicate;
+    window
 }
 
 /// What turns one page of pixels into region outcomes.
@@ -932,6 +982,8 @@ pub struct Pipeline {
     /// run loop is asking about and not for one three pages ago, and read back
     /// through [`Cleaner::last_fault`].
     fault: Option<EngineFault>,
+    previous_strip_detections: Vec<DetectedInSegment>,
+    previous_placement: Option<usize>,
 }
 
 /// A session borrowed the first time something needs it and handed back to
@@ -1350,6 +1402,8 @@ impl Pipeline {
             picks: None,
             outside: OutsideText::Review,
             fault: None,
+            previous_strip_detections: Vec::new(),
+            previous_placement: None,
         })
     }
 
@@ -1507,10 +1561,6 @@ impl Cleaner for Pipeline {
         // the two things that were missing are the same at all four sites: the
         // dead session was kept and handed to the next page, and the error text
         // was dropped on the floor.
-        let session = self.balloons.get()?;
-        let boxes = session.detect(&page);
-        let balloons = ran(boxes, &*session, &accel::BALLOON, &mut self.fault)?;
-
         // Page-level statistics, measured once and handed to every region.
         // **Per page and not per segment**, because the noise floor is one of
         // the two bounded exceptions to "no global operations" and it is
@@ -1532,28 +1582,42 @@ impl Cleaner for Pipeline {
         let cuts = context.cuts();
 
         let mut outcome = PageOutcome::default();
-        let mut previous: Vec<DetectedInSegment> = Vec::new();
+        if self.previous_placement.and_then(|p| p.checked_add(1)) != Some(context.placement) {
+            self.previous_strip_detections.clear();
+        }
+        let mut previous = std::mem::take(&mut self.previous_strip_detections);
         let mut index = 0usize;
 
         for segment in context.page_segments() {
-            let Some((top, bottom)) = strip::crop_rows(context.strip, context.placement, &segment)
-            else {
-                continue;
-            };
-            // The whole page is the common case and it is *the same object*
-            // rather than a copy of itself: a page that is one segment costs
-            // exactly what it cost before this rule was wired.
-            let cropped;
-            let crop: &Raster = if top == 0 && bottom == page.height {
-                &page
-            } else {
-                cropped = page.rows(top, bottom);
-                &cropped
-            };
+            let window = detection_window(context, segment);
+            let requested = window.requested;
+            let rect = window.rect;
+            if rect.w == 0 || rect.h == 0 { continue; }
+            let bounded = context.read_window(window, &page).or_else(|_| {
+                let placed = context.strip.pages().get(context.placement)
+                    .ok_or_else(|| "page is outside strip".to_owned())?;
+                let page_rect = placed.rect();
+                let x = requested.x.max(page_rect.x);
+                let y = requested.y.max(page_rect.y);
+                let right = requested.right().min(page_rect.right());
+                let bottom = requested.bottom().min(page_rect.bottom());
+                let local = Rect::new(x, y, (right - x).max(0) as u32, (bottom - y).max(0) as u32);
+                context.read_window(strip::DecodeWindow {
+                    rect: local,
+                    requested,
+                    pad: strip::EdgePad::Replicate,
+                }, &page)
+            })?;
+            let crop = &bounded.raster;
+            let (crop_x, crop_y) = bounded.origin;
+
+            let session = self.balloons.get()?;
+            let boxes = session.detect(crop);
+            let balloons = ran(boxes, &*session, &accel::BALLOON, &mut self.fault)?;
 
             let session = self.detector.get()?;
             let output = session.detect(crop);
-            let detection = ran(output, &*session, &accel::DETECTOR, &mut self.fault)?;
+            let mut detection = ran(output, &*session, &accel::DETECTOR, &mut self.fault)?;
             let mut regions = build_regions_separated(detection.boxes.clone(), crop.width, crop.height, |a, b| {
                 cleaner_core::balloon::merge_crosses_a_balloon(crop, &detection.segmentation, a, b)
             });
@@ -1564,21 +1628,14 @@ impl Cleaner for Pipeline {
             // becomes a region here, and the gate below asks it exactly what it
             // asks every other region.
             //
-            // The balloon boxes are the **page's**, in page coordinates, and
-            // everything here is the segment crop's. Rule 3 is what makes the
-            // translation a filter rather than a clip: a segment's detection
+            // The balloon boxes and text regions are both in this bounded
+            // crop's coordinates. Rule 3 is what makes their overlap a filter
+            // rather than a clip: a segment's detection
             // range runs past the next segment's start, so a box straddling a
             // cut is whole in one of the two crops and is adopted there, by
             // whichever segment `owned_by` gives it to below. A box clipped to
             // this crop would be a different box.
-            let in_crop: Vec<cleaner_core::balloon::BalloonBox> = balloons
-                .iter()
-                .filter(|b| b.rect.y >= top as i64 && b.rect.bottom() <= bottom as i64)
-                .map(|b| cleaner_core::balloon::BalloonBox {
-                    rect: Rect::new(b.rect.x, b.rect.y - top as i64, b.rect.w, b.rect.h),
-                    ..*b
-                })
-                .collect();
+            let in_crop = balloons.clone();
             let median = cleaner_core::detect::median_box_area(&detection.boxes);
             let adopted = cleaner_core::balloon::adopt_uncovered_text(
                 &regions,
@@ -1587,6 +1644,7 @@ impl Cleaner for Pipeline {
                 crop.height,
                 median,
             );
+            cleaner_core::balloon::seed_adopted_text(crop, &mut detection.segmentation, &adopted);
             regions.extend(adopted);
             // Sorted rather than appended, because `region_id` names a region
             // by its index in this list: appending would give the adopted
@@ -1594,14 +1652,14 @@ impl Cleaner for Pipeline {
             // reading order, and two runs have to agree on the order.
             cleaner_core::detect::sort_regions(&mut regions);
             let scale = detection.segmentation.proxy_scale();
-            let edges = EdgeMap::sobel(crop);
 
             let found: Vec<DetectedInSegment> = regions
                 .iter()
                 .map(|region| {
                     DetectedInSegment::new(
                         segment.index,
-                        context.to_strip(region.masking, top),
+                        Rect::new(region.masking.x + crop_x, region.masking.y + crop_y,
+                            region.masking.w, region.masking.h),
                         region.members.iter().map(|m| m.confidence).fold(0.0, f32::max),
                     )
                 })
@@ -1611,7 +1669,8 @@ impl Cleaner for Pipeline {
             let globals = merge_global(&evidence, &cuts, context.segments);
 
             for region in regions.iter() {
-                let strip_rect = context.to_strip(region.masking, top);
+                let strip_rect = Rect::new(region.masking.x + crop_x, region.masking.y + crop_y,
+                    region.masking.w, region.masking.h);
                 if !owned_by(&globals, strip_rect, segment.index) {
                     // Some other segment's work. A box in this segment's
                     // detection overlap is whole here *and* whole there, and
@@ -1627,14 +1686,11 @@ impl Cleaner for Pipeline {
                 // Everything the manifest records is in **page** coordinates,
                 // so a bbox reported to the seam means the same thing whether
                 // the page was one segment or six.
-                let on_page = Rect::new(
-                    region.masking.x,
-                    region.masking.y + top as i64,
-                    region.masking.w,
-                    region.masking.h,
-                );
+                let (page_x, page_y) = context.origin();
+                let on_page = Rect::new(strip_rect.x - page_x, strip_rect.y - page_y,
+                    strip_rect.w, strip_rect.h);
 
-                let detected = cleaner_core::balloon::detected(on_page, &balloons);
+                let detected = cleaner_core::balloon::detected(region.masking, &balloons);
                 let inside = detected.inside();
                 let outside = self.outside;
                 let session = self.gate.get()?;
@@ -1660,18 +1716,26 @@ impl Cleaner for Pipeline {
                 }
 
                 // **Rule 4.** Every term native, and the clamp is rule 1's.
-                let window = strip::decode_window(
-                    context.strip,
-                    context.joins,
-                    strip_rect,
-                    scale,
-                    engine_context,
-                );
-                let bounds = context.to_crop(window.rect, top, crop);
+                let window = anchored_engine_window(context, strip_rect, scale, engine_context);
+                // Detection overlap is forward-only for deterministic ownership,
+                // but fitting and rendering need context on both sides. Read that
+                // bounded engine window separately; if a neighbour changed after
+                // survey, retain the valid detection crop instead of failing the page.
+                let engine_read = context.read_window(window, &page).ok();
+                let (engine_crop, engine_x, engine_y) = engine_read.as_ref()
+                    .map(|read| (&read.raster, read.origin.0, read.origin.1))
+                    .unwrap_or((crop, crop_x, crop_y));
+                let seed = translated(seed, crop_x - engine_x, crop_y - engine_y);
+                let x0 = (window.rect.x - engine_x).max(0);
+                let y0 = (window.rect.y - engine_y).max(0);
+                let x1 = (window.rect.right() - engine_x).min(engine_crop.width as i64);
+                let y1 = (window.rect.bottom() - engine_y).min(engine_crop.height as i64);
+                let bounds = Rect::new(x0, y0, (x1 - x0).max(0) as u32, (y1 - y0).max(0) as u32);
                 if bounds.w == 0 || bounds.h == 0 {
                     continue;
                 }
-                let fitted = fit::fit_within(crop, &seed, scale, noise, &edges, false, bounds);
+                let edges = EdgeMap::sobel(engine_crop);
+                let fitted = fit::fit_within(engine_crop, &seed, scale, noise, &edges, false, bounds);
 
                 // **The pressure ladder, between regions.** The last region's
                 // buffers are gone and this one's model tensors do not exist
@@ -1691,7 +1755,7 @@ impl Cleaner for Pipeline {
                 let pick = self.picks.map(|picks| picks.for_region(inside));
 
                 let attempt =
-                    match clean_region(&mut self.rung2, crop, &fitted, ceiling, pick, noise) {
+                    match clean_region(&mut self.rung2, engine_crop, &fitted, ceiling, pick, noise) {
                         Ok(attempt) => attempt,
                         // **The one thing the ladder can fail on is rung 2's
                         // own run call.** Every rung below it is arithmetic
@@ -1728,8 +1792,8 @@ impl Cleaner for Pipeline {
                     }
                     Attempt::Cleaned(made, verdict) => (*made, verdict),
                 };
-                let mask = lowered(made.mask, top as i64);
-                let ink = lowered(made.ink, top as i64);
+                let mask = translated(made.mask, engine_x - page_x, engine_y - page_y);
+                let ink = translated(made.ink, engine_x - page_x, engine_y - page_y);
 
                 // Rule 4's term is the window's, and rung 2 reports its own -
                 // the tiles it ran are what actually met an edge. Either one
@@ -1780,6 +1844,8 @@ impl Cleaner for Pipeline {
             // the next iteration.
             previous = found;
         }
+        self.previous_strip_detections = previous;
+        self.previous_placement = Some(context.placement);
         Ok(outcome)
     }
 
@@ -2049,8 +2115,8 @@ fn owned_by(globals: &[GlobalBox], rect: Rect, segment: usize) -> bool {
 /// The patch's pixels need no move: [`fill::render`] and [`denoise::render`]
 /// size their raster to the mask's bounds and the compositor places it there,
 /// so the mask's rectangle is the patch's position.
-fn lowered(mask: Mask, by: i64) -> Mask {
-    Mask { bounds: Rect { y: mask.bounds.y + by, ..mask.bounds }, bits: mask.bits }
+fn translated(mask: Mask, dx: i64, dy: i64) -> Mask {
+    Mask { bounds: Rect { x: mask.bounds.x + dx, y: mask.bounds.y + dy, ..mask.bounds }, bits: mask.bits }
 }
 
 /// The provenance snapshot a run writes.
@@ -2226,6 +2292,7 @@ pub struct PlanEntry {
 pub struct JobStrip {
     pub strip: Strip,
     pub survey: Survey,
+    pub sources: Vec<Option<PathBuf>>,
 }
 
 /// The manifest's `sources` and `strip.order`, as rule 1's coordinate system.
@@ -2286,13 +2353,13 @@ fn survey_job(job: &mut Job, emit: &dyn Fn(Event)) -> JobStrip {
     let strip = strip_of(&job.project);
     let longstrip = job.project.strip.mode == StripMode::Longstrip;
 
-    let survey = if survey_is_worth_it(&job.project) {
-        let sources: Vec<Option<PathBuf>> = (0..strip.pages().len())
+    let sources: Vec<Option<PathBuf>> = (0..strip.pages().len())
             .map(|page| {
                 library::Library::resolve_page(&job.project, page)
                     .and_then(|source| job.source_path(source))
             })
             .collect();
+    let mut survey = if survey_is_worth_it(&job.project) {
         strip::survey(&strip, |placement| {
             let path = sources.get(placement)?.as_ref()?;
             let bytes = std::fs::read(path).ok()?;
@@ -2306,6 +2373,14 @@ fn survey_job(job: &mut Job, emit: &dyn Fn(Event)) -> JobStrip {
     };
 
     if longstrip {
+        for segment in &mut survey.segments {
+            if let Some(join) = (0..strip.joins()).find(|j| strip.join_row(*j) == Some(segment.end)) {
+                if survey.joins.is_verified(join) {
+                    segment.detect_end = segment.end.saturating_add(strip::DETECTION_OVERLAP)
+                        .min(strip.height());
+                }
+            }
+        }
         for (join, anomaly) in survey.anomalies() {
             if let Some(key) = anomaly.reason_key() {
                 emit(events::notice_event(
@@ -2321,7 +2396,7 @@ fn survey_job(job: &mut Job, emit: &dyn Fn(Event)) -> JobStrip {
         }
     }
 
-    JobStrip { strip, survey }
+    JobStrip { strip, survey, sources }
 }
 
 /// Whether a page is work a run has left to do.
@@ -2633,6 +2708,7 @@ fn walk(
             joins: &geometry.survey.joins,
             segments: &geometry.survey.segments,
             placement: entry.page_index,
+            sources: &geometry.sources,
         };
         // Bound before the match rather than matched on directly, because the
         // failure arm asks the cleaner a second question and the closure above

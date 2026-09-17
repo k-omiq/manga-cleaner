@@ -63,7 +63,7 @@ impl OutsideText {
 pub enum Verdict {
     /// Confidently CJK. Clean it.
     Clean { script: String },
-    /// Confidently something else - Latin, Cyrillic, Hangul. Leave it, and say
+    /// Confidently something else - Latin, Cyrillic, Greek. Leave it, and say
     /// so: this is the case that must never be silent.
     NotJapanese { script: String },
     /// The model said too little to act on. Held back and flagged, the same as
@@ -123,10 +123,19 @@ impl Verdict {
 /// *"is this the Latin typesetting a localiser added?"*, and against that
 /// question every CJK label is the same answer.
 ///
-/// Hangul is **not** here. It is a different language with its own product,
-/// reached instead through per-script selection.
-const CJK_LABELS: [&str; 6] =
-    ["Japanese", "Japanese_vert", "HanS", "HanS_vert", "HanT", "HanT_vert"];
+/// Korean and Chinese pages use this same cleaning path. The identifier has
+/// explicit horizontal and vertical Hangul labels, so they are positive
+/// evidence just like its simplified- and traditional-Han labels.
+const CJK_LABELS: [&str; 8] = [
+    "Japanese",
+    "Japanese_vert",
+    "HanS",
+    "HanS_vert",
+    "HanT",
+    "HanT_vert",
+    "Hangul",
+    "Hangul_vert",
+];
 
 fn is_cjk(label: &str) -> bool {
     let base = label.strip_suffix("-dn").unwrap_or(label);
@@ -166,12 +175,10 @@ const MIN_LINE_STRENGTH: usize = 2;
 /// model is not entitled to reach alone, and [`ScriptGate::judge`] puts it to
 /// the reader instead. The `-dn` suffix is the model's own "dotted normalised"
 /// variant of a label and means the same script.
-const TRUSTED_SCRIPTS: [&str; 9] = [
+const TRUSTED_SCRIPTS: [&str; 7] = [
     "Latin",
     "Cyrillic",
     "Greek",
-    "Hangul",
-    "Hangul_vert",
     "Fraktur",
     "Arabic",
     "Hebrew",
@@ -450,10 +457,19 @@ mod tests {
 
     #[test]
     fn every_cjk_label_the_model_can_emit_is_recognised() {
-        for label in ["Japanese", "Japanese_vert", "HanS_vert", "HanT", "Japanese-dn"] {
+        for label in [
+            "Japanese",
+            "Japanese_vert",
+            "HanS_vert",
+            "HanT",
+            "Hangul",
+            "Hangul_vert",
+            "Hangul-dn",
+            "Japanese-dn",
+        ] {
             assert!(is_cjk(label), "{label}");
         }
-        for label in ["Latin", "Cyrillic", "Hangul", "Hangul_vert", "Fraktur"] {
+        for label in ["Latin", "Cyrillic", "Greek", "Fraktur"] {
             assert!(!is_cjk(label), "{label}");
         }
     }
@@ -523,12 +539,12 @@ mod tests {
     /// and the two labels that started this are both outside it.
     #[test]
     fn the_scripts_the_identifier_reads_well_are_believed_and_the_rest_are_not() {
-        for label in ["Latin", "Cyrillic", "Greek", "Hangul_vert", "Fraktur", "Thai", "Latin-dn"] {
+        for label in ["Latin", "Cyrillic", "Greek", "Fraktur", "Thai", "Latin-dn"] {
             assert!(is_trusted(label), "{label}");
         }
         // The two the user's pages actually produced over kana, and the CJK
         // labels, which never reach the rescue because they are `Clean`.
-        for label in ["Tibetan", "Syriac", "Japanese", "HanS_vert", "Devanagari", ""] {
+        for label in ["Tibetan", "Syriac", "Japanese", "HanS_vert", "Hangul", "Devanagari", ""] {
             assert!(!is_trusted(label), "{label}");
         }
     }

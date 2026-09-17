@@ -25,6 +25,8 @@
     moveBbox,
     pointIn,
     rectBetween,
+    stripBoundsOf,
+    stripRectBetween,
     regionAt,
     resizeBbox,
     shouldStamp,
@@ -67,9 +69,12 @@
    * @type {{
    *   page: import('../api/backend.js').ApiPage,
    *   tabbable?: boolean,
+   *   strip?: boolean,
+   *   stripMinY?: number,
+   *   stripMaxY?: number,
    * }}
    */
-  let { page, tabbable = true } = $props()
+  let { page, tabbable = true, strip = false, stripMinY = 0, stripMaxY = 100 } = $props()
 
   /** How much of the page a keyboard draft starts as, and how far a key moves it. */
   const KEY_DRAFT = { w: 18, h: 11 }
@@ -164,7 +169,10 @@
    */
   function at(event) {
     const rect = sheetRect()
-    return rect ? pointIn(event.clientX, event.clientY, rect, event.pressure) : null
+    if (!rect) return null
+    const point = pointIn(event.clientX, event.clientY, rect, event.pressure, !strip)
+    if (strip) point.y = Math.min(stripMaxY, Math.max(stripMinY, point.y))
+    return point
   }
 
   /* ---------------------------------------------------------------- */
@@ -239,14 +247,14 @@
       setDraftBbox(
         event.shiftKey
           ? squareBetween(active.points[0], point)
-          : rectBetween(active.points[0], point),
+          : strip ? stripRectBetween(active.points[0], point) : rectBetween(active.points[0], point),
       )
       return
     }
     if (shouldStamp(active.points.at(-1) ?? null, point, radius, Number(params.spacing ?? 12))) {
       addPoint(point)
     }
-    setDraftBbox(boundsOf(active.points, feathered()))
+    setDraftBbox(strip ? stripBoundsOf(active.points, feathered()) : boundsOf(active.points, feathered()))
   }
 
   /** @param {PointerEvent} event */
@@ -341,10 +349,11 @@
     )
     const signX = to.x < from.x ? -1 : 1
     const signY = to.y < from.y ? -1 : 1
-    return rectBetween(from, {
+    const corner = {
       x: from.x + (signX * side * 100) / pageW,
       y: from.y + (signY * side * 100) / pageH,
-    })
+    }
+    return strip ? stripRectBetween(from, corner) : rectBetween(from, corner)
   }
 
   /** The `feather` parameter, as a radius in page percent on each axis. */
@@ -405,7 +414,11 @@
       }
       addPoint(point)
     }
-    setDraftBbox(boundsOf(draft.active?.points ?? [], feathered()))
+    setDraftBbox(
+      strip
+        ? stripBoundsOf(draft.active?.points ?? [], feathered())
+        : boundsOf(draft.active?.points ?? [], feathered()),
+    )
   }
 
   /* ---------------------------------------------------------------- */

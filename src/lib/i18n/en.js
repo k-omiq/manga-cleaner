@@ -751,10 +751,11 @@ export const en = {
       gateSkippedLowConfidence: 'The script gate was not confident enough to clean it',
       gateSkippedOutsideBubble: 'Text outside a speech bubble',
       // Not a failure of the gate - the opposite. It read the script, the
-      // script was not Japanese, and leaving Latin text alone is the product.
+      // script was not one the cleaner targets, and leaving Latin text alone is
+      // the product.
       // Distinct from `low-confidence` because
       // reporting a confident refusal as an uncertain one is backwards.
-      gateSkippedNotJapanese: 'Not Japanese, left as it was',
+      gateSkippedNotJapanese: 'Not Chinese, Japanese, or Korean; left as it was',
       cloudAccepted: 'A cloud request was accepted, so check it against the page',
       cloudRejectedSafetyFilter: 'the provider’s safety filter refused it',
       cloudRejectedTransportError: 'the request never completed',
