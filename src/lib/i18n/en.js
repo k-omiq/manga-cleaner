@@ -353,6 +353,17 @@ export const en = {
       },
       status: {
         saved: 'Inference configuration saved.',
+        profileRemoved:
+          'Profile removed from local configuration. Remote resources, tokens, and secret-store entries were not modified.',
+      },
+      removal: {
+        confirmTitle: 'Confirm profile removal',
+        confirmTitleNamed: 'Remove {name} ({id})',
+        description:
+          'Removing this profile deletes its endpoint configuration from local application settings only.',
+        scopeWarning:
+          'This action does not revoke API tokens, delete secret-store entries, stop running services, or uninstall provider resources. Status polling and result retrieval for any active remote attempts will be interrupted until this profile is restored.',
+        confirmButton: 'Confirm removal',
       },
     },
     // The tab strip. `general` heads the five preference rows, which had no

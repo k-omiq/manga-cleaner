@@ -356,6 +356,9 @@ describe('InferenceSettings Component', () => {
     // Delete modal-prod, which is currently selectedTarget
     await fireEvent.click(deleteButtons[0])
 
+    const confirmButton = screen.getByRole('button', { name: 'Confirm removal' })
+    await fireEvent.click(confirmButton)
+
     await waitFor(() => {
       expect(mockBackend.writeInferenceConfig).toHaveBeenCalledWith({
         config: expect.objectContaining({
@@ -365,6 +368,12 @@ describe('InferenceSettings Component', () => {
           beamProfiles: expect.objectContaining({ 'beam-prod': expect.any(Object) }),
         }),
       })
+    })
+
+    await waitFor(() => {
+      const statusBox = container.querySelector('.status-banner.success')
+      expect(statusBox).toBeTruthy()
+      expect(statusBox.textContent).toContain('Profile removed from local configuration.')
     })
   })
 
@@ -380,6 +389,9 @@ describe('InferenceSettings Component', () => {
     // Delete beam-prod (modal-prod is the selected target)
     await fireEvent.click(deleteButtons[1])
 
+    const confirmButton = screen.getByRole('button', { name: 'Confirm removal' })
+    await fireEvent.click(confirmButton)
+
     await waitFor(() => {
       expect(mockBackend.writeInferenceConfig).toHaveBeenCalledWith({
         config: expect.objectContaining({
@@ -390,6 +402,114 @@ describe('InferenceSettings Component', () => {
         }),
       })
     })
+
+    await waitFor(() => {
+      const statusBox = container.querySelector('.status-banner.success')
+      expect(statusBox).toBeTruthy()
+      expect(statusBox.textContent).toContain('Profile removed from local configuration.')
+    })
+  })
+
+  it('explains local-only scope upon removal request and does not write before confirmation', async () => {
+    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
+    const { container } = render(InferenceSettings)
+
+    await waitFor(() => {
+      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
+    })
+
+    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
+    await fireEvent.click(deleteButtons[0])
+
+    const confirmCard = container.querySelector('.removal-confirm-card')
+    expect(confirmCard).toBeTruthy()
+    expect(confirmCard.textContent).toContain('Remove Modal Production (modal-prod)')
+    expect(confirmCard.textContent).toContain(
+      'Removing this profile deletes its endpoint configuration from local application settings only.',
+    )
+    expect(confirmCard.textContent).toContain(
+      'This action does not revoke API tokens, delete secret-store entries, stop running services, or uninstall provider resources.',
+    )
+    expect(confirmCard.textContent).toContain(
+      'Status polling and result retrieval for any active remote attempts will be interrupted until this profile is restored.',
+    )
+
+    // No backend write occurred without explicit confirmation
+    expect(mockBackend.writeInferenceConfig).not.toHaveBeenCalled()
+  })
+
+  it('does nothing when profile removal confirmation is cancelled', async () => {
+    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
+    const { container } = render(InferenceSettings)
+
+    await waitFor(() => {
+      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
+    })
+
+    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
+    await fireEvent.click(deleteButtons[0])
+
+    expect(container.querySelector('.removal-confirm-card')).toBeTruthy()
+
+    const cancelButton = screen.getByRole('button', { name: 'Cancel' })
+    await fireEvent.click(cancelButton)
+
+    // Confirmation card is dismissed
+    expect(container.querySelector('.removal-confirm-card')).toBeNull()
+
+    // No backend write occurred
+    expect(mockBackend.writeInferenceConfig).not.toHaveBeenCalled()
+
+    // Both profiles remain in the DOM
+    const profileIds = Array.from(container.querySelectorAll('.profile-id')).map((el) => el.textContent)
+    expect(profileIds).toContain('(modal-prod)')
+    expect(profileIds).toContain('(beam-prod)')
+  })
+
+  it('displays precise success copy stating local-only scope when removal succeeds', async () => {
+    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
+    const { container } = render(InferenceSettings)
+
+    await waitFor(() => {
+      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
+    })
+
+    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
+    await fireEvent.click(deleteButtons[0])
+
+    const confirmButton = screen.getByRole('button', { name: 'Confirm removal' })
+    await fireEvent.click(confirmButton)
+
+    await waitFor(() => {
+      const statusBox = container.querySelector('.status-banner.success')
+      expect(statusBox).toBeTruthy()
+      expect(statusBox.textContent).toBe(
+        'Profile removed from local configuration. Remote resources, tokens, and secret-store entries were not modified.',
+      )
+    })
+  })
+
+  it('displays sanitized error message when profile removal fails to save', async () => {
+    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
+    mockBackend.writeInferenceConfig.mockRejectedValueOnce(new Error('raw-backend-sensitive-error-url'))
+    const { container } = render(InferenceSettings)
+
+    await waitFor(() => {
+      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
+    })
+
+    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
+    await fireEvent.click(deleteButtons[0])
+
+    const confirmButton = screen.getByRole('button', { name: 'Confirm removal' })
+    await fireEvent.click(confirmButton)
+
+    await waitFor(() => {
+      const errorBox = container.querySelector('.status-banner.error')
+      expect(errorBox).toBeTruthy()
+      expect(errorBox.textContent).toContain('Failed to save inference configuration.')
+    })
+    expect(container.textContent).not.toContain('raw-backend-sensitive-error-url')
   })
 
   it('handles read rejection then successful retry and write rejection with selector restoration', async () => {
@@ -546,5 +666,229 @@ describe('InferenceSettings Component', () => {
     expect(statusText).toBeTruthy()
     expect(statusText.textContent).toContain('Remote execution:')
     expect(statusText.textContent).toContain('Unavailable (provider execution is not enabled in this build)')
+  })
+
+  it('disables delete buttons during profile editing and removal confirmation and prevents discarding draft or confirmation', async () => {
+    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
+    const { container } = render(InferenceSettings)
+
+    await waitFor(() => {
+      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
+    })
+
+    // 1. Enter edit mode on Modal profile and make unsaved changes to draft
+    const editButtons = screen.getAllByRole('button', { name: /^Edit / })
+    await fireEvent.click(editButtons[0])
+
+    const nameInput = screen.getByPlaceholderText('e.g. Production GPU Worker')
+    await fireEvent.input(nameInput, { target: { value: 'Draft Name In Progress' } })
+
+    // Verify all Delete buttons are disabled while editingProfile is active
+    const deleteButtonsDuringEdit = screen.getAllByRole('button', { name: /^Delete / })
+    expect(deleteButtonsDuringEdit.length).toBe(2)
+    expect(deleteButtonsDuringEdit[0].disabled).toBe(true)
+    expect(deleteButtonsDuringEdit[1].disabled).toBe(true)
+
+    // Attempt to click Delete on both modal and beam profiles
+    await fireEvent.click(deleteButtonsDuringEdit[0])
+    await fireEvent.click(deleteButtonsDuringEdit[1])
+
+    // Verify draft is preserved, removal card did not appear, and no backend write occurred
+    expect(nameInput.value).toBe('Draft Name In Progress')
+    expect(container.querySelector('.profile-form-card')).toBeTruthy()
+    expect(container.querySelector('.removal-confirm-card')).toBeNull()
+    expect(mockBackend.writeInferenceConfig).not.toHaveBeenCalled()
+
+    // Cancel edit to return to idle state
+    const cancelEditButton = screen.getByRole('button', { name: 'Cancel' })
+    await fireEvent.click(cancelEditButton)
+    expect(container.querySelector('.profile-form-card')).toBeNull()
+
+    // 2. Start removal confirmation for Modal profile
+    const idleDeleteButtons = screen.getAllByRole('button', { name: /^Delete / })
+    expect(idleDeleteButtons[0].disabled).toBe(false)
+    expect(idleDeleteButtons[1].disabled).toBe(false)
+
+    await fireEvent.click(idleDeleteButtons[0])
+
+    const confirmCard = container.querySelector('.removal-confirm-card')
+    expect(confirmCard).toBeTruthy()
+    expect(confirmCard.textContent).toContain('Remove Modal Production (modal-prod)')
+
+    // Verify all Delete buttons are disabled while removingProfile is active
+    const deleteButtonsDuringRemoval = screen.getAllByRole('button', { name: /^Delete / })
+    expect(deleteButtonsDuringRemoval[0].disabled).toBe(true)
+    expect(deleteButtonsDuringRemoval[1].disabled).toBe(true)
+
+    // Attempt to click Beam delete button while Modal removal confirmation is active
+    await fireEvent.click(deleteButtonsDuringRemoval[1])
+
+    // Verify modal removal confirmation is still intact and not overwritten by beam, and no write occurred
+    expect(container.querySelector('.removal-confirm-card')?.textContent).toContain(
+      'Remove Modal Production (modal-prod)',
+    )
+    expect(container.querySelector('.removal-confirm-card')?.textContent).not.toContain('beam-prod')
+    expect(mockBackend.writeInferenceConfig).not.toHaveBeenCalled()
+  })
+
+  it('moves focus to confirmation card control on open and returns focus to originating delete control on cancel', async () => {
+    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
+    const { container } = render(InferenceSettings)
+
+    await waitFor(() => {
+      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
+    })
+
+    // Find the Modal profile Delete button
+    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
+    const modalDeleteBtn = deleteButtons[0]
+    expect(modalDeleteBtn.getAttribute('aria-label')).toBe('Delete Modal Production (modal-prod)')
+
+    // 1. Simulate keyboard focus arriving at Delete button and activating it
+    modalDeleteBtn.focus()
+    expect(document.activeElement).toBe(modalDeleteBtn)
+
+    await fireEvent.click(modalDeleteBtn)
+
+    // Confirm removal card is open and trigger is disabled
+    const confirmCard = container.querySelector('.removal-confirm-card')
+    expect(confirmCard).toBeTruthy()
+    expect(modalDeleteBtn.disabled).toBe(true)
+
+    // Verify focus has moved to a confirmation-card control (Cancel button)
+    const cancelButton = screen.getByRole('button', { name: 'Cancel' })
+    expect(confirmCard.contains(document.activeElement)).toBe(true)
+    expect(document.activeElement).toBe(cancelButton)
+    expect(document.activeElement.disabled).toBe(false)
+
+    // 2. Activate Cancel to dismiss confirmation card
+    await fireEvent.click(cancelButton)
+
+    // Verify confirmation card dismissed
+    expect(container.querySelector('.removal-confirm-card')).toBeNull()
+
+    // Verify originating Delete button is enabled again and has focus returned
+    expect(modalDeleteBtn.disabled).toBe(false)
+    expect(document.activeElement).toBe(modalDeleteBtn)
+    expect(document.activeElement.disabled).toBe(false)
+  })
+
+  it('restores focus to originating Beam delete button when beam profile removal is cancelled', async () => {
+    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
+    const { container } = render(InferenceSettings)
+
+    await waitFor(() => {
+      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
+    })
+
+    // Find the Beam profile Delete button (second delete button)
+    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
+    const beamDeleteBtn = deleteButtons[1]
+    expect(beamDeleteBtn.getAttribute('aria-label')).toBe('Delete Beam Production (beam-prod)')
+
+    beamDeleteBtn.focus()
+    expect(document.activeElement).toBe(beamDeleteBtn)
+
+    await fireEvent.click(beamDeleteBtn)
+
+    const confirmCard = container.querySelector('.removal-confirm-card')
+    expect(confirmCard).toBeTruthy()
+    expect(beamDeleteBtn.disabled).toBe(true)
+
+    const cancelButton = screen.getByRole('button', { name: 'Cancel' })
+    expect(confirmCard.contains(document.activeElement)).toBe(true)
+    expect(document.activeElement).toBe(cancelButton)
+
+    // Cancel removal
+    await fireEvent.click(cancelButton)
+
+    expect(container.querySelector('.removal-confirm-card')).toBeNull()
+    expect(beamDeleteBtn.disabled).toBe(false)
+    expect(document.activeElement).toBe(beamDeleteBtn)
+  })
+
+  it('ensures no focus to unmounted nodes when profile removal is confirmed rather than cancelled', async () => {
+    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
+    const { container } = render(InferenceSettings)
+
+    await waitFor(() => {
+      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
+    })
+
+    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
+    const modalDeleteBtn = deleteButtons[0]
+
+    modalDeleteBtn.focus()
+    await fireEvent.click(modalDeleteBtn)
+
+    const confirmButton = screen.getByRole('button', { name: 'Confirm removal' })
+    await fireEvent.click(confirmButton)
+
+    await waitFor(() => {
+      expect(container.querySelector('.removal-confirm-card')).toBeNull()
+      // Profile was removed, so original modal delete button is unmounted from the DOM
+      expect(document.contains(modalDeleteBtn)).toBe(false)
+      // Focus must not be on unmounted button
+      expect(document.activeElement).not.toBe(modalDeleteBtn)
+    })
+  })
+
+  it('dismisses removal confirmation on Escape, restores focus, does not write backend, and stops propagation to window keydown listener', async () => {
+    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
+    const { container } = render(InferenceSettings)
+
+    await waitFor(() => {
+      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
+    })
+
+    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
+    const modalDeleteBtn = deleteButtons[0]
+
+    // 1. Focus originating delete button and trigger removal
+    modalDeleteBtn.focus()
+    expect(document.activeElement).toBe(modalDeleteBtn)
+
+    await fireEvent.click(modalDeleteBtn)
+
+    const confirmCard = container.querySelector('.removal-confirm-card')
+    expect(confirmCard).toBeTruthy()
+    expect(modalDeleteBtn.disabled).toBe(true)
+
+    const focusedControl = document.activeElement
+    expect(confirmCard.contains(focusedControl)).toBe(true)
+    expect(focusedControl.disabled).toBe(false)
+
+    // Window keydown listener representing parent Modal.svelte listener
+    const windowKeydownListener = vi.fn()
+    window.addEventListener('keydown', windowKeydownListener)
+
+    try {
+      // Other keys are left untouched and bubble to window without dismissing
+      const arrowNotPrevented = await fireEvent.keyDown(focusedControl, { key: 'ArrowDown' })
+      expect(arrowNotPrevented).toBe(true)
+      expect(windowKeydownListener).toHaveBeenCalledTimes(1)
+      expect(container.querySelector('.removal-confirm-card')).toBeTruthy()
+
+      windowKeydownListener.mockClear()
+
+      // 2. Press Escape on focused card control
+      const notPrevented = await fireEvent.keyDown(focusedControl, { key: 'Escape' })
+      expect(notPrevented).toBe(false)
+
+      // 3. Verify card dismissed
+      expect(container.querySelector('.removal-confirm-card')).toBeNull()
+
+      // 4. Verify no backend write occurred
+      expect(mockBackend.writeInferenceConfig).not.toHaveBeenCalled()
+
+      // 5. Verify focus restored to originating delete control
+      expect(modalDeleteBtn.disabled).toBe(false)
+      expect(document.activeElement).toBe(modalDeleteBtn)
+
+      // 6. Verify window keydown listener did not receive the event
+      expect(windowKeydownListener).not.toHaveBeenCalled()
+    } finally {
+      window.removeEventListener('keydown', windowKeydownListener)
+    }
   })
 })

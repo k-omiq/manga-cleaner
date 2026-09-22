@@ -396,3 +396,214 @@ packaged-helper evidence. P5/P6 lack genuine GPU crop/staging and durable
 provider-native handle recovery. P7/P8 lack live drivers, packaged helper
 integration, provider-account approvals, and tested target platforms. No
 fallback code may convert those missing proofs into a ready/paid path.
+
+## Post-checkpoint local work (2026-09-22; uncommitted)
+
+The P1–P8 offline-foundations checkpoint was committed on
+`codex/cloud-integration` as `b16664a`, then amended for the backend
+fail-closed safety correction to `7afe0f1`, retaining message
+`feat(cloud): checkpoint offline P1-P8 foundations` (both commit commands
+exited 0). It was not pushed. The checkpoint is **not** evidence that P1,
+P3–P8 meet their external acceptance gates.
+
+P11 CPU-only CI increment: initial e-swarm implementer `agy-lumen`
+`03b1f5b3-b650-4347-81e5-24fa6b95ea60` returned an empty response after
+a denied command and made no edit: failed run. Replacement implementer
+`agy-nimbus` `c579a96d-c8fb-42ba-8e77-6c6cdd6a6fe6` added only a Python
+3.11 job to `.github/workflows/ci.yml`, with three separate unittest and
+compileall steps; no secrets, GPU, model downloads or deployment. Parallel
+reviewers: `agy-onyx` `15d45a13-6baa-46e6-9529-ffd5970d8e98`
+(completed, no findings; original review verified by pinned follow-up) and
+`agy-tundra` `44fea54f-3f2a-48c5-9bf9-59377cb49318`
+(empty response after denied command: failed review). Replacement independent
+reviewer `agy-axiom` `09690082-a951-4beb-b0c1-05ad48acc86f` completed
+with no findings. The orchestrator personally inspected the 15-line YAML diff
+and parsed its five-step job with
+`ruby -e 'require "yaml"; d=YAML.load_file(".github/workflows/ci.yml"); p d.fetch("jobs").fetch("python").fetch("steps").length'`
+(exit 0, result 5). Local verification on installed Python 3.12:
+`python3.12 -m unittest discover -v -s deploy/cloud/tests` (exit 0, 84),
+`python3.12 -m unittest discover -v -s provisioner` (exit 0, 106), and
+`python3.12 -m compileall deploy/cloud provisioner` (exit 0). The host's
+default `python3` is 3.9.6, below the helper's declared >=3.10 floor;
+this is not a GitHub-hosted CI run or a packaged-platform check. The workflow
+is uncommitted under the user's post-checkpoint commit rule.
+
+Post-checkpoint source audit found a high-risk inconsistency: frontend
+`isCloudExecutionReady()` is false, but the registered production
+`submit_cloud_attempt` Tauri handler could still reach `CloudHttpClient::submit_job`
+after caller configuration, consent and grant. Those checks do not constitute
+the missing real-provider release gate. No real submission was attempted.
+Initial hard-stop implementer `agy-quasar`
+`df6dad6b-c615-4615-b5c5-588c77e13604` returned empty after 10 minutes
+and reported terminating a background task: failed run, no edit accepted.
+A narrower one-file replacement was assigned. Amending the unpushed
+checkpoint was justified solely to correct this newly discovered safety
+defect; P11 workflow work remains uncommitted.
+
+Replacement `agy-vesper` `90ef9596-4f61-4232-a8b2-f141b332fa4b`
+returned a completed one-file edit adding a hardcoded guard and a focused
+test. Personal diff inspection rejected the patch as
+written: it deleted the original `spawn_blocking` production handler body,
+added `unused_variables` suppression and a dummy tuple, and duplicated the
+error after the guaranteed guard return. The intended fail-closed gate can
+be placed before the original body without discarding it. Separate fixer
+`agy-zephyr` `7939a069-535b-4dfe-af45-8122de8640ba` restored that body,
+retaining a first-statement, hardcoded, caller/config/environment-independent
+guard and its test. The orchestrator checked the complete final diff:
+19 additive lines only, no original production code removed. Independent
+parallel security reviewers `agy-lumen`
+`402ae0a4-bbf3-41c2-a3cb-c800600a73c2` and `agy-nimbus`
+`551dc483-6327-4548-9297-adc86dc1efb8` each completed with no findings;
+their claims were checked against command registration, the direct IPC entry,
+and all other job-creating calls in `commands.rs`. Review scope does not
+establish live provider readiness.
+
+Post-guard local checks (foreground, completed):
+
+| Command | Exit | Result |
+| --- | ---: | --- |
+| `cargo test -p manga-cleaner --lib inference::commands::tests -- --test-threads=1` | 0 | 28 passed; 391 filtered out. |
+| `cargo clippy -p cleaner-core -p manga-cleaner --all-targets --no-deps -- -D warnings` | 0 | Strict all-target check passed. |
+| `cargo test --workspace --exclude spike-strip-memory -- --test-threads=1` | 0 | Core 569 passed/1 ignored; app 419 passed; integration suites 4+4+5+1; spike 2; core docs 2 passed/1 ignored; app doc 1 ignored. |
+| `set -o pipefail; cargo test --workspace --exclude spike-strip-memory -- --test-threads=1 2>&1 \| rg '^test result:'` | 0 | Summary re-run confirmed the exact counts above. |
+| `cargo check --workspace --exclude spike-strip-memory` | 0 | Workspace check passed. |
+| `git diff --check` and `git diff --cached --check` (safety patch before amend) | 0 each | No whitespace error. |
+
+The public production submit command now returns a static sanitized error
+before project reads, grant consumption, journal intent, network I/O, or paid
+work; the pure inner implementation remains available for offline fault
+tests. This is a deliberate release stop, not a working cloud crop.
+
+### Final local/offline status after the checkpoint amendment
+
+The post-checkpoint P11 workflow and this log are intentionally the only
+uncommitted files. No push, staging deployment, provider-account operation,
+credential use, GPU run, resource creation, or packaged-platform test occurred.
+`git diff --check` exited 0 for the current working tree. The amended
+checkpoint is `7afe0f1`; the original `b16664a` hash is superseded and was
+never pushed. No further commit was made for P11.
+
+| Command | Exit | Observed result |
+| --- | ---: | --- |
+| `npm test` | 0 | 52 files, 999 tests passed. |
+| `npm run build` | 0 | Vite build, 336 modules transformed. |
+| `python3 -m unittest discover -v -s deploy/cloud/tests` | 0 | 84 tests passed. |
+| `python3 -m unittest discover -v -s provisioner` | 0 | 106 tests passed. |
+| `python3 -m compileall deploy/cloud provisioner` | 0 | Both trees compiled. |
+| `npm audit --audit-level=high` | 0 | Three moderate advisories remain (`@vitest/mocker`, `devalue`); no high advisory. |
+| `cargo audit` | 0 | No vulnerability; eight warning advisories remain. |
+| `git diff --check` | 0 | Current two-file unstaged diff has no whitespace errors. |
+
+P9 cannot truthfully progress to account-check, deploy, repair, rotation,
+stop, or uninstall UX backed by real resources: both real provisioning
+drivers refuse live calls, and resource ownership/provider scopes are
+unverified. The safe local UI already offers public profile management,
+advanced endpoint entry, and clearly unavailable execution; adding a
+success-shaped setup wizard against fake drivers would mislead users.
+P10's explicit 20–60-page paid second pass depends on verified P5/P6 crops,
+durable native handles, provider compatibility and staging authorization;
+only local-only and per-region fault foundations are verified. Enabling a
+chapter path before those dependencies would expose paid work and undermine
+the no-blind-retry guarantee. P11 gained the reviewed CPU-only Python CI job,
+but hosted CI execution, signed packaged helpers, staging/GPU/recovery,
+token-scope and release evidence remain absent. P12 is not defined by the
+supplied master plan; no acceptance criteria can be inferred.
+
+Specific next external action: the owner must provide explicit staging
+authorization plus eligible Modal and Beam test accounts/credentials through
+a secure mechanism, confirm permission to run **CPU-only** inspection and
+resource-scope experiments first, and arrange clean Apple Silicon macOS and
+Windows x64 packaged-app test hosts. After those prerequisites, implement
+the real drivers and run the P1 feasibility probes in the plan; only then
+seek separate approval for billable GPU deployment/inference and the
+staged P5–P11 acceptance tests. The owner must also define P12's scope and
+exit criteria. Until then the exact safe action is to leave the backend
+paid-submit guard in place and keep the P11 workflow uncommitted for review.
+
+## P9–P11 offline continuation (2026-09-22; uncommitted)
+
+This continuation started at checkpoint `7afe0f1` on `codex/cloud-integration`.
+It preserved the pre-existing uncommitted `.github/workflows/ci.yml` and this
+work log. No commit, push, deployment, provider call, credential use, GPU run,
+model download, or packaged-platform verification occurred. The registered
+`submit_cloud_attempt` handler still returns its hardcoded fail-closed error
+before any project read, grant use, journal write, or network operation.
+
+### Bounded local increments
+
+- **P9 local profile removal UX:** An inline confirmation now explains that
+  removing a public profile changes local endpoint configuration only; it does
+  not revoke tokens, delete secret-store entries, stop services, or uninstall
+  provider resources. It warns that active accepted attempts may lose status
+  polling/result retrieval until the same profile is restored. Cancel and
+  Escape do not write configuration; focus moves to Cancel and returns to the
+  Delete trigger on cancellation. Delete is disabled during edits or another
+  removal, failed saves retain the form and show a sanitized error, and a
+  successfully removed selected target falls back to Local. This does not
+  implement provider setup, repair, rotation, stop, or uninstall.
+- **P10 local-only regression gate:** `startRun` now has four table-driven
+  frontend cases for default/page/chapter/project scopes. Each asserts the
+  actual `runClean` argument contains `engineCeiling: 'lama'` even if local
+  tool parameters attempt `cloud` or `flux`. This tests frontend argument
+  assembly only; it does not simulate remote target routing or staged 20/60-page
+  cloud-assisted chapters. No production chapter dispatch path was added.
+- **P11 CPU-only CI:** The pre-existing uncommitted Python 3.11 CI job remains
+  scoped to gateway/provisioner unit tests and byte compilation. This host has
+  Python 3.12, so these local runs do not prove the hosted Python 3.11 job ran.
+
+### e-swarm review disposition
+
+- P9 implementer `agy-quasar` `0a05659e-ff8a-4ada-8309-a09e9d4306f3`
+  edited the scoped files but returned a progress-only response; its report is
+  not counted as verification. Parallel original reviewers `agy-axiom`
+  `10df04c0-269f-40d9-883a-a53e83262af8` and `agy-onyx`
+  `d0f844bc-83f6-4159-ad78-b82d09a72d5e` reviewed independently. Axiom
+  initially found none; Onyx found edit/removal button overlap, focus
+  stranding, and Escape bubbling. Personal source inspection accepted those
+  findings and additionally found the accepted-attempt recovery consequence.
+  Separate fixers were `agy-vesper` `00c0e8f9-8a36-4546-9df1-55bf1f2c856f`
+  (button exclusion), `agy-quasar` `a2ba6e71-e856-4f4d-8e8a-d7a8b60919b6`
+  (focus; first overbuilt patch rejected and simplified in a pinned follow-up),
+  `agy-tundra` `07a17f05-4370-4217-bbcf-b8f2ae0df86d` (Escape), and
+  `agy-lumen` `92026fa7-0299-4fbf-bad0-6065bb7a6ad2` (recovery copy).
+  Both original reviewers re-reviewed the final diff in parallel, approved the
+  bounded local UX patch, and reported no remaining P0–P3 findings. Approval
+  does not establish provider lifecycle readiness.
+- P10 implementer `agy-tundra` `52716064-b352-4fb4-a873-4af29c6c2859`
+  timed out with a partial report while background checks were running; its
+  claimed verification was rejected. Independent original reviewer
+  `agy-zephyr` `21c3420d-3686-4e59-848d-62fdb56288da` found misleading
+  unused remote-target mocks, duplicate cases, a stubbed mock-backend
+  "integration" case, and manual run-state reset. I accepted these as one
+  root finding: the test suite implied remote coverage it did not exercise.
+  `agy-lumen` failed with a
+  503 eligibility response; replacement independent reviewer `agy-nimbus`
+  `8a5c2d0c-4a08-476b-8fe0-802d71bce0d1` found none, but its integration
+  claim was rejected because `runClean` was stubbed. Separate fixer
+  `agy-axiom` `9713ef8d-a971-4151-a463-e55cc289f179` replaced the entire
+  misleading block with a narrow scope matrix. Both original completed
+  reviewers, Zephyr and Nimbus, re-reviewed that final patch in parallel and
+  found no remaining P0–P3 issues within the unit-test boundary.
+
+### Personally completed local checks
+
+| Command | Exit | Observed result |
+| --- | ---: | --- |
+| `npx vitest run src/lib/dialogs/InferenceSettings.dom.test.js` | 0 | 27 passed after all P9 fixes. |
+| `npx vitest run src/lib/state/editor.svelte.test.js` | 0 | 32 passed after the P10 fixer; four are new scope cases. |
+| `npm test` | 0 | 52 files, 1,012 tests passed. |
+| `npm run build` | 0 | Vite production build, 336 modules transformed. |
+| `python3.12 -m unittest discover -q -s deploy/cloud/tests` | 0 | 84 gateway tests passed. |
+| `python3.12 -m unittest discover -q -s provisioner` | 0 | 106 provisioner tests passed. |
+| `python3.12 -m compileall -q deploy/cloud provisioner` | 0 | Both trees byte-compiled. |
+| `cargo test -p manga-cleaner --lib inference::commands::tests::test_guard_cloud_execution_enabled_fails_closed -- --test-threads=1` | 0 | One hard-stop guard test passed; 418 filtered out. |
+| Ruby YAML parse of `.github/workflows/ci.yml` | 0 | Python job parses as `ubuntu-latest`, Python `3.11`, five steps. |
+| `git diff --check` | 0 | Current tracked diff has no whitespace errors. |
+
+P9 remains incomplete until real, owned provider installations and lifecycle
+actions can be verified. P10 remains incomplete until genuine P5/P6 crops,
+durable provider-native recovery, authorization, and staged 20/60-page sessions
+exist. P11 remains incomplete until hosted CI, signed packaged helpers on clean
+macOS/Windows hosts, staging/GPU/recovery, token-scope, cleanup, and release
+evidence exist. The uncommitted CI and UI/test/log changes are reviewable local
+work only. The backend paid-submit guard stays closed.

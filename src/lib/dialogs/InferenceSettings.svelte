@@ -108,7 +108,7 @@
    * 4. Target Integrity: Deleting the currently selected profile resets the target to Local.
    * 5. Draft Isolation: Form edits use local drafts; changes commit atomically to backend.
    */
-  import { onMount } from 'svelte'
+  import { onMount, tick } from 'svelte'
   import { Button, Field, Select, TextInput } from '../ui/index.js'
   import { getBackend } from '../api/backend.js'
   import { t } from '../i18n/index.js'
@@ -133,6 +133,24 @@
    * @type {{ isNew: boolean, provider: 'modal'|'beam', id: string, name: string, endpointUrl: string, originalEndpointUrl: string, createdAtMs: number }|null}
    */
   let editingProfile = $state(null)
+
+  /**
+   * Profile currently pending removal confirmation.
+   * @type {{ provider: 'modal'|'beam', id: string, name: string }|null}
+   */
+  let removingProfile = $state(null)
+
+  /**
+   * DOM element reference to the inline removal confirmation card.
+   * @type {HTMLElement|null}
+   */
+  let removalCardEl = $state(null)
+
+  /**
+   * Originating trigger button that opened removal confirmation, to restore focus upon cancel.
+   * @type {HTMLElement|null}
+   */
+  let removalTriggerEl = null
 
   /** @type {string|null} */
   let formError = $state(null)
@@ -206,6 +224,8 @@
     loading = true
     errorMessage = null
     statusMessage = null
+    removingProfile = null
+    removalTriggerEl = null
     try {
       const loaded = await getBackend().readInferenceConfig()
       if (operationSeq === currentSeq) {
@@ -289,6 +309,8 @@
     formError = null
     errorMessage = null
     statusMessage = null
+    removingProfile = null
+    removalTriggerEl = null
     editingProfile = {
       isNew: true,
       provider,
@@ -311,6 +333,8 @@
     formError = null
     errorMessage = null
     statusMessage = null
+    removingProfile = null
+    removalTriggerEl = null
     editingProfile = {
       isNew: false,
       provider,
@@ -415,6 +439,82 @@
   }
 
   /**
+   * Request removal confirmation for a profile.
+   *
+   * @param {'modal'|'beam'} provider
+   * @param {import('../api/backend.js').CloudProfile} profile
+   * @param {Event|HTMLElement} [trigger]
+   */
+  async function startRemove(provider, profile, trigger) {
+    if (saving || loading || editingProfile || removingProfile) return
+    const button = trigger instanceof HTMLElement
+      ? trigger
+      : trigger?.currentTarget instanceof HTMLElement
+        ? trigger.currentTarget
+        : document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : null
+    removalTriggerEl = button
+    formError = null
+    errorMessage = null
+    statusMessage = null
+    editingProfile = null
+    removingProfile = {
+      provider,
+      id: profile.id,
+      name: profile.name,
+    }
+
+    await tick()
+
+    if (removalCardEl) {
+      const cancelBtn = removalCardEl.querySelectorAll('button')[1]
+      if (cancelBtn && !cancelBtn.disabled && (cancelBtn.isConnected ?? document.contains(cancelBtn))) {
+        cancelBtn.focus()
+      }
+    }
+  }
+
+  /**
+   * Cancel profile removal confirmation.
+   */
+  async function cancelRemoval() {
+    const trigger = removalTriggerEl
+    removingProfile = null
+    removalTriggerEl = null
+
+    await tick()
+
+    if (trigger && !trigger.disabled && (trigger.isConnected ?? document.contains(trigger))) {
+      trigger.focus()
+    }
+  }
+
+  /**
+   * Narrowly scoped keydown handler on confirmation card to intercept Escape,
+   * prevent default and stop propagation so parent Modal does not close,
+   * invoke cancelRemoval() to restore focus, and leave all other keys untouched.
+   *
+   * @param {KeyboardEvent} e
+   */
+  function handleRemovalKeydown(e) {
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      e.stopPropagation()
+      cancelRemoval()
+    }
+  }
+
+  /**
+   * Confirm removal of the currently pending profile.
+   */
+  async function confirmRemoval() {
+    if (!removingProfile || !config || saving || loading) return
+    const { provider, id: profileId } = removingProfile
+    await deleteProfile(provider, profileId)
+  }
+
+  /**
    * Delete a profile from a provider and persist to backend.
    * If the deleted profile was the selected target, resets selectedTarget to local.
    *
@@ -464,7 +564,15 @@
         ) {
           editingProfile = null
         }
-        statusMessage = 'settings.inference.status.saved'
+        if (
+          removingProfile &&
+          removingProfile.provider === provider &&
+          removingProfile.id === profileId
+        ) {
+          removingProfile = null
+          removalTriggerEl = null
+        }
+        statusMessage = 'settings.inference.status.profileRemoved'
         targetSelectKey += 1
       }
     } catch {
@@ -699,6 +807,41 @@
           </Button>
         </div>
       </div>
+    {:else if removingProfile}
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+      <div
+        class="profile-form-card removal-confirm-card"
+        role="region"
+        aria-label={t('settings.inference.removal.confirmTitle')}
+        bind:this={removalCardEl}
+        onkeydown={handleRemovalKeydown}
+      >
+        <div class="form-header">
+          <h4 class="form-title">
+            {t('settings.inference.removal.confirmTitleNamed', {
+              name: removingProfile.name,
+              id: removingProfile.id,
+            })}
+          </h4>
+        </div>
+
+        <p class="removal-description">
+          {t('settings.inference.removal.description')}
+        </p>
+
+        <div class="warning-note" role="note">
+          {t('settings.inference.removal.scopeWarning')}
+        </div>
+
+        <div class="form-actions">
+          <Button variant="primary" onclick={confirmRemoval} disabled={saving}>
+            {t('settings.inference.removal.confirmButton')}
+          </Button>
+          <Button onclick={cancelRemoval} disabled={saving}>
+            {t('settings.inference.cancel')}
+          </Button>
+        </div>
+      </div>
     {/if}
 
     <div class="provider-section">
@@ -707,7 +850,7 @@
         <Button
           size="sm"
           onclick={() => startAdd('modal')}
-          disabled={saving || !!editingProfile}
+          disabled={saving || !!editingProfile || !!removingProfile}
         >
           {t('settings.inference.addProfile')}
         </Button>
@@ -751,15 +894,15 @@
                   size="sm"
                   aria-label={t("settings.inference.editNamed", { name: profile.name, id })}
                   onclick={() => startEdit('modal', profile)}
-                  disabled={saving || !!editingProfile}
+                  disabled={saving || !!editingProfile || !!removingProfile}
                 >
                   {t('settings.inference.edit')}
                 </Button>
                 <Button
                   size="sm"
                   aria-label={t("settings.inference.deleteNamed", { name: profile.name, id })}
-                  onclick={() => deleteProfile('modal', id)}
-                  disabled={saving}
+                  onclick={(e) => startRemove('modal', profile, e?.currentTarget)}
+                  disabled={saving || !!editingProfile || !!removingProfile}
                 >
                   {t('settings.inference.deleteProfile')}
                 </Button>
@@ -776,7 +919,7 @@
         <Button
           size="sm"
           onclick={() => startAdd('beam')}
-          disabled={saving || !!editingProfile}
+          disabled={saving || !!editingProfile || !!removingProfile}
         >
           {t('settings.inference.addProfile')}
         </Button>
@@ -820,15 +963,15 @@
                   size="sm"
                   aria-label={t("settings.inference.editNamed", { name: profile.name, id })}
                   onclick={() => startEdit('beam', profile)}
-                  disabled={saving || !!editingProfile}
+                  disabled={saving || !!editingProfile || !!removingProfile}
                 >
                   {t('settings.inference.edit')}
                 </Button>
                 <Button
                   size="sm"
                   aria-label={t("settings.inference.deleteNamed", { name: profile.name, id })}
-                  onclick={() => deleteProfile('beam', id)}
-                  disabled={saving}
+                  onclick={(e) => startRemove('beam', profile, e?.currentTarget)}
+                  disabled={saving || !!editingProfile || !!removingProfile}
                 >
                   {t('settings.inference.deleteProfile')}
                 </Button>
@@ -1025,6 +1168,13 @@
     color: var(--warn);
     font-size: 10.5px;
     line-height: 1.4;
+  }
+
+  .removal-description {
+    margin: 0;
+    font-size: 11px;
+    color: var(--t2);
+    line-height: 1.45;
   }
 
   .form-error {

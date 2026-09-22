@@ -2,10 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   applyRegionState,
   editor,
+  LOCAL_CEILING,
   openEditorChapter,
   recordRegionEdit,
   select,
   selectedRegion,
+  startRun,
   undo,
 } from './editor.svelte.js'
 import { app } from './app.svelte.js'
@@ -644,4 +646,82 @@ describe('selectedRegion', () => {
     select('ch1-p001-r0')
     expect(selectedRegion()).toBe(null)
   })
+})
+
+describe('startRun local engine ceiling boundary', () => {
+  const initialToolParams = structuredClone(editor.toolParams)
+
+  beforeEach(() => {
+    editor.chapter = { id: 'ch-test-1', pages: [{ id: 'p0', index: 0, regions: [], status: 'unclean' }] }
+    editor.pageIndex = 0
+    editor.run = {
+      active: false,
+      runId: null,
+      scope: null,
+      queued: 0,
+      pagesDone: 0,
+      currentPageIndex: null,
+      nextPageIndex: null,
+    }
+  })
+
+  afterEach(() => {
+    setBackend(null)
+    editor.chapter = null
+    editor.run = {
+      active: false,
+      runId: null,
+      scope: null,
+      queued: 0,
+      pagesDone: 0,
+      currentPageIndex: null,
+      nextPageIndex: null,
+    }
+    editor.toolParams = structuredClone(initialToolParams)
+  })
+
+  it.each([
+    { inputScope: undefined, expectedScope: 'page', paramCeiling: undefined },
+    { inputScope: 'page', expectedScope: 'page', paramCeiling: 'cloud' },
+    { inputScope: 'chapter', expectedScope: 'chapter', paramCeiling: 'flux' },
+    { inputScope: 'project', expectedScope: 'project', paramCeiling: 'cloud' },
+  ])(
+    'always passes LOCAL_CEILING ("lama") to runClean for scope $inputScope (effective: $expectedScope)',
+    async ({ inputScope, expectedScope, paramCeiling }) => {
+      if (paramCeiling) {
+        editor.toolParams.autoClean = {
+          ...editor.toolParams.autoClean,
+          engineCeiling: paramCeiling,
+        }
+      }
+
+      const runClean = vi.fn().mockResolvedValue({
+        runId: 'mock-run-id',
+        pages: [{ id: 'p0' }],
+      })
+      setBackend(/** @type {any} */ ({ runClean }))
+
+      const runId = await startRun(inputScope)
+
+      expect(runId).toBe('mock-run-id')
+      expect(runClean).toHaveBeenCalledTimes(1)
+      expect(runClean).toHaveBeenCalledWith({
+        scope: expectedScope,
+        chapterId: 'ch-test-1',
+        pageIndex: 0,
+        engineCeiling: 'lama',
+        bubbleEngine: 'fill',
+        outsideEngine: 'lama',
+        outsideBubbles: 'review',
+        bubbleColor: '#ffffff',
+      })
+      expect(runClean.mock.calls[0][0].engineCeiling).toBe(LOCAL_CEILING)
+      expect(editor.run).toMatchObject({
+        active: true,
+        runId: 'mock-run-id',
+        scope: expectedScope,
+        queued: 1,
+      })
+    },
+  )
 })
