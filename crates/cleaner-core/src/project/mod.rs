@@ -45,26 +45,16 @@ pub mod buffers;
 /// It still says nothing about a shape that changes *without* the number
 /// changing. That is a decision to be justified in each case, and
 /// [`Strip::splits`] carries the one instance of it in this build.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// The oldest manifest this build reads.
 ///
-/// **Version 2 is the paint bump, and it is a widening rather than a change of
-/// shape.** [`crate::patch::Engine`] gained `Paint` and `Clone`, so the first
-/// time anyone paints, `"engine": "paint"` reaches disk and a version-1 build
-/// meeting it fails as `unknown variant`, having passed the version probe.
-/// That is what the bump exists to make legible from the *other* side; it is
-/// not a reason for this build to refuse the files it already wrote.
-///
-/// So the gate is a range and not an equality. A v1 manifest decodes
-/// identically under the v2 types - the enum only widened, and nothing else
-/// moved - so there is no migration to run and reading one costs a comparison.
-/// Bumping without this would refuse every project that already exists, and
-/// there is no path in this build to read them with, so the refusal would be
-/// permanent rather than a step.
-///
-/// A file is rewritten at [`FORMAT_VERSION`] on the next flush, which is how a
-/// v1 project becomes a v2 one: by being saved, not by being converted.
+/// **Version 3 is the cloud provenance and nullable-cost bump.** It extends
+/// [`crate::patch::CloudRecord`] with nullable cost, model/recipe identities,
+/// attempt/request metadata, and provider execution details, while preserving
+/// deserialization of legacy v1 and v2 manifests. A v1 or v2 manifest opens
+/// without fabricating unmeasured data, and is upgraded in memory to v3.
+/// The disk file remains untouched until the next [`Job::flush`].
 pub const OLDEST_READABLE_VERSION: u32 = 1;
 
 /// The extension §1 names, and the sidecar directory beside it.
@@ -1437,7 +1427,7 @@ mod tests {
 
         // Opening raises the number in memory; the file on disk is untouched
         // until something writes it.
-        let reopened = Job::open(job.path()).expect("a v1 manifest is readable by a v2 build");
+        let reopened = Job::open(job.path()).expect("a v1 manifest is still readable");
         assert_eq!(reopened.project.version, FORMAT_VERSION);
 
         // And the next flush is what upgrades the file - no migration pass, no
@@ -1447,8 +1437,91 @@ mod tests {
         // a v1 file carrying `"engine": "paint"`.
         reopened.flush().unwrap();
         let text = std::fs::read_to_string(job.path()).unwrap();
-        assert!(text.contains("\"version\": 2"), "the flush did not rewrite the version");
+        assert!(text.contains(&format!("\"version\": {FORMAT_VERSION}")), "the flush did not rewrite the version");
         assert_eq!(Job::open(job.path()).unwrap().project.version, FORMAT_VERSION);
+    }
+
+    #[test]
+    fn legacy_cloud_json_migrates_without_inventing_history_or_writing_on_read() {
+        for version in [1, 2] {
+            let scratch = Scratch::new(&format!("legacy-cloud-v{version}"));
+            let mut job = a_job(&scratch);
+            job.complete_region(0, &a_patch("legacy"), None).unwrap();
+            if version == 2 {
+                for (id, engine) in [("paint", Engine::Paint), ("clone", Engine::Clone)] {
+                    let mut patch = a_patch(id);
+                    patch.provenance.engine = engine;
+                    job.complete_region(0, &patch, None).unwrap();
+                }
+            }
+            let mut fixture: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(job.path()).unwrap(),
+            ).unwrap();
+            fixture["version"] = serde_json::json!(version);
+            fixture["patches"][0]["engine"] = serde_json::json!("cloud");
+            fixture["patches"][0]["provenance"]["engine"] = serde_json::json!("cloud");
+            // This is the exact old JSON shape, not serialization of the new
+            // CloudRecord with invented defaults for its additional fields.
+            fixture["patches"][0]["provenance"]["cloud"] = serde_json::json!({
+                "provider": "legacy-provider", "model": "legacy-model",
+                "request_id": "legacy-request", "tier": "standard", "cost": 0.014
+            });
+            let before = serde_json::to_vec_pretty(&fixture).unwrap();
+            std::fs::write(job.path(), &before).unwrap();
+            let reopened = Job::open(job.path()).unwrap();
+            assert_eq!(std::fs::read(job.path()).unwrap(), before);
+            assert_eq!(reopened.project.version, FORMAT_VERSION);
+            let record = &reopened.project.patches[0];
+            assert_eq!(record.engine, Engine::Cloud);
+            assert_eq!(record.provenance.engine, Engine::Cloud);
+            let cloud = record.provenance.cloud.as_ref().unwrap();
+            assert_eq!(cloud.provider, "legacy-provider");
+            assert_eq!(cloud.model, "legacy-model");
+            assert_eq!(cloud.cost, Some(0.014));
+            assert_eq!(cloud.tier.as_deref(), Some("standard"));
+            assert_eq!(cloud.profile_id, None);
+            assert_eq!(cloud.job_id, None);
+            assert_eq!(cloud.attempt_id, None);
+            assert_eq!(cloud.recipe_id, None);
+            assert_eq!(cloud.model_revision, None);
+            assert_eq!(cloud.duration_ms, None);
+            reopened.flush().unwrap();
+            let upgraded = Job::open(job.path()).unwrap();
+            assert_eq!(upgraded.project.patches, reopened.project.patches);
+            let saved: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(job.path()).unwrap(),
+            ).unwrap();
+            assert_eq!(saved["version"], FORMAT_VERSION);
+            assert_eq!(saved["patches"][0]["provenance"]["cloud"], fixture["patches"][0]["provenance"]["cloud"]);
+            if version == 2 {
+                assert_eq!(upgraded.project.patches[1].engine, Engine::Paint);
+                assert_eq!(upgraded.project.patches[2].engine, Engine::Clone);
+            }
+        }
+    }
+
+    #[test]
+    fn v3_cloud_patch_roundtrips_explicit_null_cost_and_provenance() {
+        let scratch = Scratch::new("v3-cloud-null-cost");
+        let mut job = a_job(&scratch);
+        let mut patch = a_patch("remote");
+        patch.provenance.engine = Engine::Flux;
+        patch.provenance.cloud = Some(serde_json::from_value(serde_json::json!({
+            "provider": "modal", "profile_id": "test-profile", "job_id": "test-job",
+            "request_id": "test-request", "attempt_id": "test-attempt",
+            "recipe_id": "test-recipe", "model": "test-model",
+            "model_revision": "test-immutable-revision", "cost": null, "duration_ms": 120
+        })).unwrap());
+        job.complete_region(0, &patch, None).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(job.path()).unwrap()).unwrap();
+        assert_eq!(saved["version"], 3);
+        let cloud_json = &saved["patches"][0]["provenance"]["cloud"];
+        assert!(cloud_json.as_object().unwrap().contains_key("cost"));
+        assert!(cloud_json["cost"].is_null());
+        let reopened = Job::open(job.path()).unwrap();
+        assert_eq!(reopened.project.patches[0].provenance, patch.provenance);
+        assert_eq!(reopened.project.patches[0].engine, Engine::Flux);
+        assert_eq!(reopened.load_patch(&reopened.project.patches[0]).unwrap().pixels.data, patch.pixels.data);
     }
 
     /// A patch made by either hand tool survives the manifest, under the rung

@@ -69,10 +69,10 @@ export function provenanceFacts(mask) {
     { key: 'masks.provenance.elapsed', value: mask.elapsedMs },
   ]
   if (mask.provenance.cloud) {
-    facts.push(
-      { key: 'masks.provenance.cloudCost', value: mask.provenance.cloud.cost },
-      { key: 'masks.provenance.cloudRequestId', value: mask.provenance.cloud.request_id },
-    )
+    facts.push({ key: 'masks.provenance.cloudCost', value: mask.provenance.cloud.cost ?? null })
+    if (mask.provenance.cloud.request_id) {
+      facts.push({ key: 'masks.provenance.cloudRequestId', value: mask.provenance.cloud.request_id })
+    }
   }
   return facts
 }
@@ -145,15 +145,19 @@ const UNANSWERED = Object.freeze({ flux: false })
 /**
  * Whether a mask's engine may be re-run or swapped from a Layers row.
  *
- * False for a cloud mask, for the reason `ROW_ENGINES` gives: re-running one
- * is another billable request, and the row cannot ask for the confirmation
- * that would make it legitimate.
+ * False for a cloud mask (legacy `cloud` engine or remote mask with cloud provenance),
+ * for the reason `ROW_ENGINES` gives: re-running one is another billable request,
+ * and the row cannot ask for the confirmation that would make it legitimate.
  *
  * @param {import('./types.js').Mask|null} mask
  * @returns {boolean}
  */
 export function reRunnable(mask) {
-  return !!mask && mask.provenance.engine !== 'cloud'
+  if (!mask || !mask.provenance) return false
+  if (mask.provenance.engine === 'cloud' || Boolean(mask.provenance.cloud)) {
+    return false
+  }
+  return true
 }
 
 /**

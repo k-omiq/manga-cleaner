@@ -63,6 +63,9 @@ const EXPORT_FORMATS = Object.freeze({
   CBZ: 'cbz',
 })
 
+/** Pinned immutable cloud model revision for FLUX Schnell / SDNQ recipes. */
+export const PINNED_CLOUD_MODEL_REVISION = '0123456789abcdef0123456789abcdef01234567'
+
 /** @param {string} value */
 function isAbsolutePath(value) {
   return /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(String(value ?? ''))
@@ -102,11 +105,27 @@ export function createMockBackend(options = {}) {
     Object.entries(base).map(([key, ms]) => [key, Math.max(0, Math.round(ms / speed))]),
   )
 
+  const defaultInferenceConfig = () => ({
+    schemaVersion: 1,
+    selectedTarget: { type: 'local' },
+    beamProfiles: {},
+    modalProfiles: {},
+  })
+
   const fixtures = buildFixtures()
   const state = {
     projects: fixtures.projects,
     settings: defaultSettings(),
+    inferenceConfig: defaultInferenceConfig(),
     session: { cloudAcknowledged: false, spendConfirmed: false },
+    /** Profile mutation epochs keyed by profileId. @type {Map<string, number>} */
+    profileEpochs: new Map(),
+    /** Cached consent proposals. @type {Map<string, any>} */
+    cachedProposals: new Map(),
+    /** Cached authorization grants. @type {Map<string, any>} */
+    cachedGrants: new Map(),
+    /** Attempt journal state machine. @type {Map<string, any>} */
+    attemptJournal: new Map(),
     /**
      * Which catalogue rows this machine does *not* have. The redraw model
      * starts here on purpose - see `listModels` - so the engine gating is
@@ -330,6 +349,104 @@ export function createMockBackend(options = {}) {
   }
 
   const snapshot = (value) => structuredClone(value)
+
+  /**
+   * Project a public inference configuration DTO, ensuring no unknown fields
+   * (especially secrets, tokens, or credential keys) are retained in mock memory.
+   *
+   * @param {Object} raw
+   * @returns {import('./backend.js').InferenceConfig}
+   */
+  const projectPublicInferenceConfig = (raw) => {
+    if (!raw || typeof raw !== 'object') {
+      throw new Error('invalid inference configuration: expected an object')
+    }
+
+    const allowedTopKeys = new Set([
+      'schemaVersion',
+      'selectedTarget',
+      'beamProfiles',
+      'modalProfiles',
+    ])
+    for (const key of Object.keys(raw)) {
+      if (!allowedTopKeys.has(key)) {
+        throw new Error(`unrecognized inference config field '${key}'`)
+      }
+    }
+
+    const schemaVersion = raw.schemaVersion ?? 1
+    if (typeof schemaVersion !== 'number') {
+      throw new Error('invalid schemaVersion: expected number')
+    }
+
+    const rawTarget = raw.selectedTarget ?? { type: 'local' }
+    if (!rawTarget || typeof rawTarget !== 'object' || typeof rawTarget.type !== 'string') {
+      throw new Error('invalid selectedTarget: expected object with type')
+    }
+
+    let selectedTarget
+    if (rawTarget.type === 'local') {
+      for (const key of Object.keys(rawTarget)) {
+        if (key !== 'type') {
+          throw new Error(`unrecognized field '${key}' in local execution target`)
+        }
+      }
+      selectedTarget = { type: 'local' }
+    } else if (rawTarget.type === 'beam' || rawTarget.type === 'modal') {
+      for (const key of Object.keys(rawTarget)) {
+        if (key !== 'type' && key !== 'profile_id') {
+          throw new Error(`unrecognized field '${key}' in ${rawTarget.type} execution target`)
+        }
+      }
+      if (typeof rawTarget.profile_id !== 'string') {
+        throw new Error(`missing or invalid profile_id in ${rawTarget.type} execution target`)
+      }
+      selectedTarget = { type: rawTarget.type, profile_id: rawTarget.profile_id }
+    } else {
+      throw new Error(`unknown execution target type '${rawTarget.type}'`)
+    }
+
+    const projectProfileMap = (rawMap, provider) => {
+      const projected = Object.create(null)
+      if (!rawMap || typeof rawMap !== 'object') return projected
+      const allowedProfileKeys = new Set([
+        'id',
+        'name',
+        'endpointUrl',
+        'canonicalOrigin',
+        'canonicalOriginFingerprint',
+        'createdAtMs',
+        'updatedAtMs',
+      ])
+      for (const [id, profile] of Object.entries(rawMap)) {
+        if (!profile || typeof profile !== 'object') {
+          throw new Error(`invalid ${provider} profile '${id}'`)
+        }
+        for (const key of Object.keys(profile)) {
+          if (!allowedProfileKeys.has(key)) {
+            throw new Error(`unrecognized field '${key}' in ${provider} profile '${id}'`)
+          }
+        }
+        projected[id] = {
+          id: String(profile.id ?? id),
+          name: String(profile.name ?? id),
+          endpointUrl: String(profile.endpointUrl ?? ''),
+          canonicalOrigin: String(profile.canonicalOrigin ?? ''),
+          canonicalOriginFingerprint: String(profile.canonicalOriginFingerprint ?? ''),
+          createdAtMs: Number(profile.createdAtMs ?? 0),
+          updatedAtMs: Number(profile.updatedAtMs ?? 0),
+        }
+      }
+      return projected
+    }
+
+    return {
+      schemaVersion,
+      selectedTarget,
+      beamProfiles: projectProfileMap(raw.beamProfiles, 'beam'),
+      modalProfiles: projectProfileMap(raw.modalProfiles, 'modal'),
+    }
+  }
 
   /**
    * A settings snapshot with the Hugging Face token taken out.
@@ -1438,6 +1555,486 @@ export function createMockBackend(options = {}) {
       await delay(timing.method)
       Object.assign(state.settings, patch)
       return withoutToken(snapshot(state.settings))
+    },
+
+    async readInferenceConfig() {
+      await delay(timing.method)
+      return snapshot(state.inferenceConfig)
+    },
+
+    async writeInferenceConfig({ config }) {
+      await delay(timing.method)
+      const projected = projectPublicInferenceConfig(config)
+
+      // Advance profile epochs and invalidate cached proposals/grants for mutated/deleted profiles
+      const oldProfiles = new Set([
+        ...Object.keys(state.inferenceConfig.beamProfiles || {}),
+        ...Object.keys(state.inferenceConfig.modalProfiles || {}),
+      ])
+      const newProfiles = new Set([
+        ...Object.keys(projected.beamProfiles || {}),
+        ...Object.keys(projected.modalProfiles || {}),
+      ])
+      const allProfiles = new Set([...oldProfiles, ...newProfiles])
+      for (const id of allProfiles) {
+        const currentEpoch = state.profileEpochs.get(id) ?? 1
+        state.profileEpochs.set(id, currentEpoch + 1)
+      }
+      state.cachedProposals.clear()
+      state.cachedGrants.clear()
+
+      state.inferenceConfig = projected
+      return snapshot(state.inferenceConfig)
+    },
+
+    async storeCloudSecret() {
+      throw new Error('Cloud secret operations are unavailable in browser mock')
+    },
+
+    async deleteCloudSecret() {
+      throw new Error('Cloud secret operations are unavailable in browser mock')
+    },
+
+    async getCloudSecretSummary() {
+      throw new Error('Cloud secret operations are unavailable in browser mock')
+    },
+
+    async checkCloudConnection({ provider, profileId }) {
+      await delay(timing.method)
+      if (!provider || !profileId) {
+        throw new Error('provider and profileId are required for checkCloudConnection')
+      }
+      const profile = provider === 'beam'
+        ? state.inferenceConfig.beamProfiles?.[profileId]
+        : state.inferenceConfig.modalProfiles?.[profileId]
+      if (!profile) {
+        throw new Error(`${provider} profile '${profileId}' does not exist in inference configuration`)
+      }
+      // Ordinary connection check: reachability of control-plane endpoint only.
+      // Never triggers GPU work, worker warmup, or model downloads.
+      if (profile.endpointUrl.includes('unreachable') || profile.endpointUrl.includes('offline')) {
+        return {
+          ok: false,
+          status: 'unreachable',
+          provider,
+          profileId,
+          message: 'Endpoint unreachable',
+        }
+      }
+      return {
+        ok: true,
+        status: 'reachable',
+        provider,
+        profileId,
+        latencyMs: 42,
+      }
+    },
+
+    async getCloudModelInfo({ provider, profileId }) {
+      await delay(timing.method)
+      if (!provider || !profileId) {
+        throw new Error('provider and profileId are required for getCloudModelInfo')
+      }
+      const profile = provider === 'beam'
+        ? state.inferenceConfig.beamProfiles?.[profileId]
+        : state.inferenceConfig.modalProfiles?.[profileId]
+      if (!profile) {
+        throw new Error(`${provider} profile '${profileId}' does not exist in inference configuration`)
+      }
+      return {
+        supportedProtocolVersion: '1.0.0',
+        pinnedModelId: 'flux-schnell',
+        pinnedModelRevision: PINNED_CLOUD_MODEL_REVISION,
+        pinnedRecipeId: 'sdnq-v1',
+        limits: {
+          maxDimensions: [2048, 2048],
+          maxMegapixels: 4.19,
+          maxPngBytes: 16777216,
+          maxMultipartBytes: 33554432,
+          defaultWorkerDeadlineSec: 120,
+        },
+      }
+    },
+
+    async prepareCloudConsent(spec) {
+      await delay(timing.method)
+      const { target, recipe, intent, simulateBlocked } = spec ?? {}
+      if (simulateBlocked || state.settings.cloudEngines !== 'allowed') {
+        throw new Error('Backend authorization blocked: cloudEngines permission denied')
+      }
+      if (!target || target.type === 'local') {
+        throw new Error('Consent proposal requires a remote execution target (modal or beam)')
+      }
+      const profile = target.type === 'beam'
+        ? state.inferenceConfig.beamProfiles?.[target.profile_id]
+        : state.inferenceConfig.modalProfiles?.[target.profile_id]
+      if (!profile) {
+        throw new Error(`${target.type} profile '${target.profile_id}' does not exist in inference configuration`)
+      }
+
+      const proposalId = `prop-${rng.sha256().slice(0, 16)}`
+      const profileEpoch = state.profileEpochs.get(target.profile_id) ?? 1
+      const proposal = {
+        proposalId,
+        profileId: target.profile_id,
+        provider: target.type,
+        endpointUrl: profile.endpointUrl,
+        canonicalOriginFingerprint: profile.canonicalOriginFingerprint,
+        profileEpoch,
+        cropSha256: rng.sha256(),
+        hintSha256: rng.sha256(),
+        sourceHash: rng.sha256(),
+        maskHash: rng.sha256(),
+        regionRevision: spec.regionRevision ?? 1,
+        rect: spec.rect ?? { x: 0, y: 0, w: 256, h: 256 },
+        recipe: recipe ?? {
+          recipe_id: 'sdnq-v1',
+          preprocessing_version: '1.0.0',
+          model_id: 'flux-schnell',
+          model_revision: PINNED_CLOUD_MODEL_REVISION,
+          native_mask_conditioning: false,
+        },
+        intent: intent ?? { action: 'applyTool', tool: 'contentAwareFill' },
+        createdAtMs: timers.now(),
+        expiresAtMs: timers.now() + 300000,
+        estimatedCostUsd: null, // Unknown costs stay unknown!
+      }
+
+      if (state.cachedProposals.size >= 256) {
+        const oldest = state.cachedProposals.keys().next().value
+        state.cachedProposals.delete(oldest)
+      }
+      state.cachedProposals.set(proposalId, proposal)
+      return snapshot(proposal)
+    },
+
+    async confirmCloudConsent({ proposalId, intent, simulateEpochMismatch }) {
+      await delay(timing.method)
+      if (!proposalId) {
+        throw new Error('proposalId is required for confirmCloudConsent')
+      }
+      const proposal = state.cachedProposals.get(proposalId)
+      if (!proposal) {
+        throw new Error('Proposal not found or expired')
+      }
+      if (proposal.consumed) {
+        throw new Error('Proposal already consumed')
+      }
+      if (timers.now() > proposal.expiresAtMs) {
+        state.cachedProposals.delete(proposalId)
+        throw new Error('Proposal expired')
+      }
+
+      const currentEpoch = state.profileEpochs.get(proposal.profileId) ?? 1
+      if (simulateEpochMismatch || currentEpoch !== proposal.profileEpoch) {
+        throw new Error('Profile mutated: epoch mismatch')
+      }
+
+      if (intent && JSON.stringify(intent) !== JSON.stringify(proposal.intent)) {
+        throw new Error('Intent mismatch')
+      }
+
+      proposal.consumed = true
+      const grant = {
+        nonce: `grant-${rng.sha256().slice(0, 16)}`,
+        scope: {
+          provider: proposal.provider,
+          profileId: proposal.profileId,
+          endpointFingerprint: proposal.canonicalOriginFingerprint,
+          cropSha256: proposal.cropSha256,
+          maskHash: proposal.maskHash,
+          revision: proposal.regionRevision,
+          recipe: proposal.recipe,
+          operationDigest: rng.sha256(),
+        },
+        issuedAtMs: timers.now(),
+        expiresAtMs: timers.now() + 300000,
+        allowedAttempts: 1,
+        usedAttempts: 0,
+      }
+
+      if (state.cachedGrants.size >= 256) {
+        const oldest = state.cachedGrants.keys().next().value
+        state.cachedGrants.delete(oldest)
+      }
+      state.cachedGrants.set(grant.nonce, grant)
+      return snapshot(grant)
+    },
+
+    async submitCloudAttempt(spec) {
+      await delay(timing.method)
+      const { attemptId, grantNonce, simulateMode, snapshot: regionSnapshot } = spec ?? {}
+      if (!attemptId || typeof attemptId !== 'string') {
+        throw new Error('Valid attemptId is required for submitCloudAttempt')
+      }
+
+      // Check authorization: non-empty grantNonce present in cachedGrants, fail closed when missing/unknown
+      if (
+        simulateMode === 'blocked_authorization' ||
+        !grantNonce ||
+        typeof grantNonce !== 'string' ||
+        grantNonce.trim().length === 0 ||
+        !state.cachedGrants.has(grantNonce)
+      ) {
+        throw new Error('Authorization blocked: invalid or missing grant')
+      }
+
+      const grant = state.cachedGrants.get(grantNonce)
+      if (grant.expiresAtMs && timers.now() > grant.expiresAtMs) {
+        state.cachedGrants.delete(grantNonce)
+        throw new Error('Authorization blocked: grant expired')
+      }
+
+      // Atomically enforce allowedAttempts and increment usedAttempts so replay cannot submit
+      if (typeof grant.allowedAttempts === 'number' && (grant.usedAttempts ?? 0) >= grant.allowedAttempts) {
+        throw new Error('Authorization blocked: grant attempt limit reached (replay detected)')
+      }
+      grant.usedAttempts = (grant.usedAttempts ?? 0) + 1
+
+      // Ambiguous acceptance test: transport error during dispatch
+      if (simulateMode === 'ambiguous_acceptance') {
+        const record = {
+          attemptId,
+          grantNonce,
+          phase: 'unknown',
+          handle: null,
+          autoRetryable: false,
+          snapshot: regionSnapshot ?? { regionRevision: 1, sourceImageHash: 'src-hash' },
+          createdAtMs: timers.now(),
+        }
+        state.attemptJournal.set(attemptId, record)
+        return {
+          attemptId,
+          handle: null,
+          status: 'unknown',
+          autoRetryable: false,
+          error: 'Transport error during dispatch: ambiguous acceptance',
+        }
+      }
+
+      const handle = `handle-mock-${attemptId}`
+      const record = {
+        attemptId,
+        grantNonce,
+        phase: 'accepted',
+        handle,
+        autoRetryable: false,
+        snapshot: regionSnapshot ?? { regionRevision: 1, sourceImageHash: 'src-hash' },
+        resultDigest: 'res-digest-' + attemptId,
+        status: 'pending',
+        reportedCostUsd: null,
+        createdAtMs: timers.now(),
+      }
+      state.attemptJournal.set(attemptId, record)
+      return {
+        attemptId,
+        handle,
+        status: 'accepted',
+        requestDigest: 'req-digest-' + attemptId,
+        autoRetryable: false,
+      }
+    },
+
+    async getCloudAttemptStatus({ attemptId, handle }) {
+      await delay(timing.method)
+      let record = null
+      if (attemptId && state.attemptJournal.has(attemptId)) {
+        record = state.attemptJournal.get(attemptId)
+      } else if (handle) {
+        for (const r of state.attemptJournal.values()) {
+          if (r.handle === handle) {
+            record = r
+            break
+          }
+        }
+      }
+      if (!record) {
+        throw new Error(`Attempt '${attemptId ?? handle}' not found in journal`)
+      }
+
+      if (record.phase === 'unknown') {
+        return {
+          attemptId: record.attemptId,
+          handle: null,
+          status: 'unknown',
+          reportedCostUsd: null,
+        }
+      }
+
+      if (record.phase === 'cancel_requested') {
+        // Non-terminal cancellation request
+        return {
+          attemptId: record.attemptId,
+          handle: record.handle,
+          status: 'cancel_requested',
+          reportedCostUsd: null,
+          acknowledged: true,
+        }
+      }
+
+      // Normal progress simulation
+      if (record.status === 'pending') {
+        record.status = 'running'
+      } else if (record.status === 'running') {
+        record.status = 'completed'
+        record.phase = 'result_cached'
+      }
+
+      return {
+        attemptId: record.attemptId,
+        handle: record.handle,
+        status: record.status,
+        reportedCostUsd: null, // Unknown costs stay unknown
+        createdAtMs: record.createdAtMs,
+      }
+    },
+
+    async getCloudAttemptResult({ attemptId, handle }) {
+      await delay(timing.method)
+      let record = null
+      if (attemptId && state.attemptJournal.has(attemptId)) {
+        record = state.attemptJournal.get(attemptId)
+      } else if (handle) {
+        for (const r of state.attemptJournal.values()) {
+          if (r.handle === handle) {
+            record = r
+            break
+          }
+        }
+      }
+      if (!record) {
+        throw new Error(`Attempt '${attemptId ?? handle}' not found in journal`)
+      }
+
+      // Idempotent and retry-safe: can be retrieved repeatedly without creating new jobs
+      return {
+        attemptId: record.attemptId,
+        handle: record.handle ?? `handle-mock-${record.attemptId}`,
+        resultDigest: record.resultDigest ?? 'mock-result-digest',
+        reportedCostUsd: null,
+        width: 256,
+        height: 256,
+        cached: true,
+      }
+    },
+
+    async cancelCloudAttempt({ attemptId, handle }) {
+      await delay(timing.method)
+      let record = null
+      if (attemptId && state.attemptJournal.has(attemptId)) {
+        record = state.attemptJournal.get(attemptId)
+      } else if (handle) {
+        for (const r of state.attemptJournal.values()) {
+          if (r.handle === handle) {
+            record = r
+            break
+          }
+        }
+      }
+      if (!record) {
+        throw new Error(`Attempt '${attemptId ?? handle}' not found in journal`)
+      }
+
+      // Nonterminal cancellation acknowledgement
+      record.phase = 'cancel_requested'
+      record.status = 'cancel_requested'
+      return {
+        handle: record.handle ?? `handle-mock-${record.attemptId}`,
+        status: 'cancel_requested',
+        acknowledged: true,
+      }
+    },
+
+    async reconcileCloudRecovery(spec = {}) {
+      await delay(timing.method)
+      const { attemptId, simulateStale, regionRevision, sourceImageHash } = spec
+
+      let record = null
+      if (attemptId && state.attemptJournal.has(attemptId)) {
+        record = state.attemptJournal.get(attemptId)
+      } else {
+        // Pick the most recent attempt in journal if none specified
+        for (const r of state.attemptJournal.values()) {
+          record = r
+        }
+      }
+
+      if (!record) {
+        return {
+          decision: 'terminal',
+          message: 'No uncommitted attempts found in journal',
+        }
+      }
+
+      // Ambiguous unknown: crash or disconnect during dispatch -> NEVER auto-retried
+      if (record.phase === 'unknown') {
+        return {
+          decision: 'ambiguous_unknown',
+          attemptId: record.attemptId,
+          autoRetryable: false,
+          message: 'Crash or transport error during dispatch. Remote execution ambiguous; automatic resubmission is forbidden.',
+        }
+      }
+
+      // Known handle recovery
+      if (record.phase === 'accepted' && record.handle) {
+        return {
+          decision: 'resume_polling',
+          attemptId: record.attemptId,
+          handle: record.handle,
+          message: 'Discovered known accepted handle; resuming status polling without creating a new job.',
+        }
+      }
+
+      // Nonterminal cancel polling
+      if (record.phase === 'cancel_requested' && record.handle) {
+        return {
+          decision: 'resume_cancel_polling',
+          attemptId: record.attemptId,
+          handle: record.handle,
+          message: 'Discovered cancel-requested attempt; resuming status polling to reconcile terminal state.',
+        }
+      }
+
+      // Stale attachment check vs result cached
+      if (record.phase === 'result_cached' || record.status === 'completed') {
+        const storedSnap = record.snapshot ?? {}
+        const isStale = simulateStale ||
+          (regionRevision !== undefined && storedSnap.regionRevision !== undefined && regionRevision !== storedSnap.regionRevision) ||
+          (sourceImageHash !== undefined && storedSnap.sourceImageHash !== undefined && sourceImageHash !== storedSnap.sourceImageHash)
+
+        if (isStale) {
+          return {
+            decision: 'stale_attachment',
+            attemptId: record.attemptId,
+            handle: record.handle,
+            resultDigest: record.resultDigest,
+            message: 'Region revision or source hash drifted since submission. Attachment rejected; validated result retained in cache for inspection.',
+          }
+        }
+
+        return {
+          decision: 'result_cached_ready',
+          attemptId: record.attemptId,
+          handle: record.handle,
+          resultDigest: record.resultDigest,
+          message: 'Validated cached result ready for attachment.',
+        }
+      }
+
+      if (record.phase === 'committed') {
+        return {
+          decision: 'already_committed',
+          attemptId: record.attemptId,
+          patchId: record.patchId,
+        }
+      }
+
+      return {
+        decision: 'terminal',
+        attemptId: record.attemptId,
+        message: 'Attempt reached terminal state.',
+      }
     },
 
     async about() {

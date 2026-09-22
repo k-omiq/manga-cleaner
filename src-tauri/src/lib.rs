@@ -11,6 +11,7 @@ mod diagnostics;
 mod events;
 mod exporting;
 mod history;
+pub mod inference;
 mod library;
 mod models;
 mod region;
@@ -38,6 +39,20 @@ pub fn run() {
             about::about,
             settings::read_settings,
             settings::write_settings,
+            inference::commands::read_inference_config,
+            inference::commands::write_inference_config,
+            inference::commands::store_cloud_secret,
+            inference::commands::delete_cloud_secret,
+            inference::commands::get_cloud_secret_summary,
+            inference::commands::check_cloud_connection,
+            inference::commands::get_cloud_model_info,
+            inference::commands::prepare_cloud_consent,
+            inference::commands::confirm_cloud_consent,
+            inference::commands::submit_cloud_attempt,
+            inference::commands::get_cloud_attempt_status,
+            inference::commands::get_cloud_attempt_result,
+            inference::commands::cancel_cloud_attempt,
+            inference::commands::reconcile_cloud_recovery,
             library::list_projects,
             library::create_project,
             library::create_chapter,

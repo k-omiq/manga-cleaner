@@ -344,6 +344,20 @@ import { createTauriBackend, isTauri } from './tauri.js'
  * @property {(opts: {chapterId: string, format?: string, destination?: 'new-folder'|'source-folder'|string, masks?: 'flattened'|'separate-layer', layout?: 'per-page'|'stitched'}) => Promise<{status: 'exported'|'refused', fileCount?: number, path?: string, reasonKey?: string, gutterPixels?: number}|null>} exportChapter - `format` is `'PNG' | 'TIFF' | 'PSD' | 'CBZ'`; `destination` also takes an absolute path; `layout: 'stitched'` is longstrip only and never PSD; `masks: 'separate-layer'` is a mask file beside each raster page or a layer per region in a PSD, and is refused for CBZ; `gutterPixels` comes back on a stitched export alone
  * @property {() => Promise<Object>} readSettings
  * @property {(patch: Object) => Promise<Object>} writeSettings
+ * @property {() => Promise<InferenceConfig>} readInferenceConfig - read public inference configuration from `inference.json`
+ * @property {(spec: { config: InferenceConfig }) => Promise<InferenceConfig>} writeInferenceConfig - validate and atomically persist public inference configuration to `inference.json`
+ * @property {(spec: { provider: 'beam'|'modal', profileId: string, role: SecretRole, secret: string, tokenId?: string, sessionOnly?: boolean }) => Promise<SecretSummary>} storeCloudSecret - store cloud credential into OS keyring or session store (write-only)
+ * @property {(spec: { provider: 'beam'|'modal', profileId: string, role: SecretRole }) => Promise<SecretSummary>} deleteCloudSecret - delete cloud credential from OS keyring and session store
+ * @property {(spec: { provider: 'beam'|'modal', profileId: string, role: SecretRole }) => Promise<SecretSummary>} getCloudSecretSummary - query safe summary of cloud credential presence
+ * @property {(spec: { provider: 'beam'|'modal', profileId: string }) => Promise<import('../model/types.js').CloudConnectionStatus>} checkCloudConnection - test control-plane reachability (ordinary check; never triggers GPU work)
+ * @property {(spec: { provider: 'beam'|'modal', profileId: string }) => Promise<import('../model/types.js').CloudModelInfo>} getCloudModelInfo - query wire metadata, model revision, and provisional service limits
+ * @property {(spec: { target: ExecutionTarget, recipe?: import('../model/types.js').RenderRecipe, intent: import('../model/types.js').OperationIntent, regionId?: string, chapterId?: string, pageIndex?: number, simulateBlocked?: boolean }) => Promise<import('../model/types.js').ConsentProposal>} prepareCloudConsent - prepare backend-authorized consent proposal with exact crop/hint digests
+ * @property {(spec: { proposalId: string, intent: import('../model/types.js').OperationIntent, simulateEpochMismatch?: boolean }) => Promise<import('../model/types.js').Grant>} confirmCloudConsent - validate proposal and mint scoped attempt-limited authorization grant
+ * @property {(spec: { attemptId: string, grantNonce: string, proposalId?: string, target?: ExecutionTarget, recipe?: import('../model/types.js').RenderRecipe, simulateMode?: 'blocked_authorization'|'ambiguous_acceptance', snapshot?: Object }) => Promise<import('../model/types.js').CloudAttemptSubmission>} submitCloudAttempt - persist durable intent and submit cloud attempt (never auto-retried if ambiguous)
+ * @property {(spec: { attemptId: string, handle?: string }) => Promise<import('../model/types.js').CloudAttemptStatus>} getCloudAttemptStatus - poll authoritative remote attempt lifecycle status
+ * @property {(spec: { attemptId: string, handle?: string }) => Promise<import('../model/types.js').CloudAttemptResult>} getCloudAttemptResult - retry-safe, idempotent retrieval of validated output crop
+ * @property {(spec: { attemptId: string, handle?: string }) => Promise<import('../model/types.js').CloudCancelResult>} cancelCloudAttempt - request nonterminal attempt cancellation
+ * @property {(spec?: { attemptId?: string, chapterId?: string, pageIndex?: number, regionId?: string, regionRevision?: number|string, sourceImageHash?: string, simulateStale?: boolean }) => Promise<import('../model/types.js').CloudRecoveryDecision>} reconcileCloudRecovery - evaluate crash discovery and attempt recovery against local project snapshot
  * @property {() => Promise<{available: boolean, reasonKey: string|null}>} sidecarAvailable - whether rung 3a (the FLUX sidecar) can be offered on this machine. `reasonKey` is null when there is nothing to say, which is the ordinary case of nothing installed
  * @property {() => Promise<Array<{id: string, label: string}>>} listSidecarModels - list available model directories discovered under the sidecar weights root
  * @property {() => Promise<{appVersion: string, facts: Array<{labelKey: string, value: string}>}>} about
@@ -358,6 +372,59 @@ import { createTauriBackend, isTauri } from './tauri.js'
  * @property {(spec: {id: string}) => Promise<boolean>} discardPartial - throw away the unfinished download the row reports as `partialBytes`, and say whether there was one. `false` is also what a transfer in flight answers: its `.part` is a file being written and is not deleted out from under it
  * @property {() => Promise<DownloadStart>} downloadRuntime - fetch and unpack the ONNX Runtime build this platform is set to; reports under the id `runtime`
  * @property {() => Promise<DeleteOutcome>} deleteRuntime - remove it from the app-data runtimes directory only, with the same three answers `deleteModel` gives
+ */
+
+/**
+ * Where a rendering or inference operation should execute.
+ *
+ * @typedef {{ type: 'local' } | { type: 'beam', profile_id: string } | { type: 'modal', profile_id: string }} ExecutionTarget
+ */
+
+/**
+ * A validated public configuration profile for a cloud deployment (Beam or Modal).
+ * Plaintext secrets (API tokens, workspace keys) never reside in public configuration.
+ *
+ * @typedef {Object} CloudProfile
+ * @property {string} id
+ * @property {string} name
+ * @property {string} endpointUrl
+ * @property {string} canonicalOrigin
+ * @property {string} canonicalOriginFingerprint
+ * @property {number} createdAtMs
+ * @property {number} updatedAtMs
+ */
+
+/**
+ * Public inference configuration persisted in `inference.json`.
+ *
+ * @typedef {Object} InferenceConfig
+ * @property {number} schemaVersion
+ * @property {ExecutionTarget} selectedTarget
+ * @property {Record<string, CloudProfile>} beamProfiles
+ * @property {Record<string, CloudProfile>} modalProfiles
+ */
+
+/**
+ * The distinct roles a cloud credential can fulfill.
+ *
+ * @typedef {'setup'|'runtime'|'model_download'} SecretRole
+ */
+
+/**
+ * The storage backend where a secret is retained.
+ *
+ * @typedef {'keyring'|'session'|'unavailable'} StorageBackendKind
+ */
+
+/**
+ * Safe public summary of credential presence and storage backend.
+ *
+ * @typedef {Object} SecretSummary
+ * @property {'beam'|'modal'} provider
+ * @property {string} profileId
+ * @property {SecretRole} role
+ * @property {boolean} present
+ * @property {StorageBackendKind} backend
  */
 
 /**
@@ -541,4 +608,53 @@ export function getBackend() {
 export function setBackend(backend) {
   instance = backend
   return instance
+}
+
+/**
+ * The cloud commands currently registered in `src-tauri/src/lib.rs` (P3 configuration & secrets).
+ */
+export const TAURI_REGISTERED_CLOUD_COMMANDS = Object.freeze([
+  'read_inference_config',
+  'write_inference_config',
+  'store_cloud_secret',
+  'delete_cloud_secret',
+  'get_cloud_secret_summary',
+  'check_cloud_connection',
+  'get_cloud_model_info',
+  'prepare_cloud_consent',
+  'confirm_cloud_consent',
+  'submit_cloud_attempt',
+  'get_cloud_attempt_status',
+  'get_cloud_attempt_result',
+  'cancel_cloud_attempt',
+  'reconcile_cloud_recovery',
+])
+
+/**
+ * The cloud lifecycle commands defined by backend wire/consent/journal contracts
+ * awaiting registration in `src-tauri/src/lib.rs` (P3b consent IPC, P4 durable lifecycle & recovery).
+ */
+export const TAURI_PENDING_CLOUD_COMMANDS = Object.freeze([])
+
+/**
+ * Truthfully reports whether all required remote execution lifecycle commands are registered in Tauri IPC.
+ * Registration indicates that genuine backend handlers exist in `src-tauri/src/lib.rs` and are mapped in the adapter.
+ *
+ * @returns {boolean}
+ */
+export function isCloudExecutionRegistered() {
+  return TAURI_PENDING_CLOUD_COMMANDS.length === 0 && TAURI_REGISTERED_CLOUD_COMMANDS.length > 0
+}
+
+/**
+ * Reports whether remote cloud execution is ready for live operations.
+ *
+ * Semantic split: while Tauri IPC command registration truth is true (`isCloudExecutionRegistered() === true`),
+ * execution readiness must remain false until an authoritative backend capability exists.
+ * Caller-supplied attestation is rejected to prevent untrusted premature readiness bypass.
+ *
+ * @returns {boolean}
+ */
+export function isCloudExecutionReady() {
+  return false
 }

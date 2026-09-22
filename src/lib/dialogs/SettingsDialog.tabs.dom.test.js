@@ -44,7 +44,7 @@ const SPEC = {
 }
 
 /** The tabs, in the order the strip offers them. */
-const TABS = ['general', 'models', 'acceleration', 'shortcuts', 'about']
+const TABS = ['general', 'models', 'acceleration', 'inference', 'shortcuts', 'about']
 
 /** The two panels whose tail holds nothing focusable, so the scroller is the stop. */
 const FOCUSABLE_SCROLLERS = new Set(['acceleration', 'about'])
@@ -62,6 +62,7 @@ beforeEach(() => {
       about: vi.fn(async () => ({ appVersion: '0.0.0-test', facts: [] })),
       subscribe: vi.fn(() => () => {}),
       writeSettings: vi.fn(async () => ({})),
+      readInferenceConfig: vi.fn(async () => ({schemaVersion: 1, selectedTarget: {type: "local"}, beamProfiles: {}, modalProfiles: {}})),
     }),
   )
 })

@@ -65,13 +65,30 @@ impl Engine {
 
 /// What a cloud request cost and where it went. Separate from the rest of the
 /// record because it is absent for every local rung.
+///
+/// When deserializing legacy manifests, optional fields are omitted or null
+/// without fabricating unmeasured data.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CloudRecord {
     pub provider: String,
-    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
     pub request_id: String,
-    pub tier: String,
-    pub cost: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe_id: Option<String>,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    #[serde(default)]
+    pub cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 /// Enough to reproduce a patch, or to know that it cannot be reproduced.
@@ -131,5 +148,57 @@ impl Patch {
     /// Whether the patch's pixel buffer actually covers its mask.
     pub fn is_well_formed(&self) -> bool {
         self.pixels.width == self.mask.bounds.w && self.pixels.height == self.mask.bounds.h
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloud_record_cost_none_serializes_explicit_null() {
+        let record = CloudRecord {
+            provider: "beam".to_string(),
+            profile_id: Some("prof-1".to_string()),
+            job_id: None,
+            request_id: "req-123".to_string(),
+            attempt_id: None,
+            recipe_id: Some("flux-sdnq-v1".to_string()),
+            model: "flux-schnell".to_string(),
+            model_revision: None,
+            tier: None,
+            cost: None,
+            duration_ms: Some(1200),
+        };
+
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(
+            json.contains(r#""cost":null"#),
+            "JSON must serialize explicit null cost: {json}"
+        );
+
+        let de: CloudRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.cost, None);
+        assert_eq!(de.provider, "beam");
+        assert_eq!(de.profile_id.as_deref(), Some("prof-1"));
+        assert_eq!(de.recipe_id.as_deref(), Some("flux-sdnq-v1"));
+    }
+
+    #[test]
+    fn cloud_record_cost_deserializes_missing_null_and_numeric() {
+        // Missing cost field
+        let missing_json = r#"{"provider":"modal","request_id":"req-1","model":"flux"}"#;
+        let de_missing: CloudRecord = serde_json::from_str(missing_json).unwrap();
+        assert_eq!(de_missing.cost, None);
+
+        // Explicit null cost
+        let null_json = r#"{"provider":"modal","request_id":"req-1","model":"flux","cost":null}"#;
+        let de_null: CloudRecord = serde_json::from_str(null_json).unwrap();
+        assert_eq!(de_null.cost, None);
+
+        // Numeric cost
+        let num_json = r#"{"provider":"modal","request_id":"req-1","model":"flux","cost":0.035}"#;
+        let de_num: CloudRecord = serde_json::from_str(num_json).unwrap();
+        assert_eq!(de_num.cost, Some(0.035));
     }
 }

@@ -7,6 +7,8 @@
 
 pub mod accel;
 pub mod balloon;
+pub mod cloud_wire;
+pub mod cloud_decode;
 pub mod composite;
 pub mod constants;
 pub mod detect;

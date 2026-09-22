@@ -108,9 +108,8 @@ export function cleanRegionAutomatically(region, page, ctx, options = {}) {
   // reaching past a user who blocked the cloud.
   const setting = ctx.settings.engineCeiling ?? 'lama'
   const requested = options.engineCeiling ? capRung(options.engineCeiling, setting) : setting
-  // Cloud is opt-in. When Settings block it the
-  // ceiling is capped again at the highest local rung.
-  const ceiling = ctx.settings.cloudEngines === 'allowed' ? requested : capRung(requested, 'lama')
+  // Automatic runs never escalate beyond LaMa: FLUX and cloud are explicit manual tools only.
+  const ceiling = capRung(requested, 'lama')
   // The two rows now name rungs outright rather than the two families they
   // used to, so a pick *is* a starting rung -
   // capped by the ceiling, and still only a starting point. The two retired

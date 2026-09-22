@@ -22,7 +22,8 @@
   /** @type {{ spec: import('../state/app.svelte.js').ModalSpec }} */
   let { spec } = $props()
 
-  const estimatedCost = $derived(Number(/** @type {any} */ (spec.props)?.estimatedCost) || 0)
+  const rawCost = $derived(/** @type {any} */ (spec.props)?.estimatedCost)
+  const isCostKnown = $derived(typeof rawCost === 'number' && Number.isFinite(rawCost) && rawCost >= 0)
 </script>
 
 <Modal
@@ -31,7 +32,11 @@
   blocking={spec.blocking}
   onclose={spec.dismissable ? () => closeModal(null) : undefined}
 >
-  <p class="statement">{t('modal.body.cloudCost', { cost: estimatedCost })}</p>
+  {#if isCostKnown}
+    <p class="statement">{t('modal.body.cloudCost', { cost: rawCost })}</p>
+  {:else}
+    <p class="statement">{t('modal.body.cloudCostUnknown')}</p>
+  {/if}
 
 
   {#snippet buttons()}

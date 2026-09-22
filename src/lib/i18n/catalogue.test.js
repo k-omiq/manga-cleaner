@@ -101,7 +101,7 @@ const HINT_KEYS = reviewEntryActions({ outcome: 'gate-skipped' }).map(
  * Over every rung, not only `ROW_ENGINES`: a mask that ran on a rung the picker
  * does not offer still names its own entry, which is the `cloud` case.
  */
-const ENGINE_CHOICE_KEYS = [...new Set([...RUNGS, ...ROW_ENGINES])].map(engineChoiceLabel)
+const ENGINE_CHOICE_KEYS = [...new Set([...RUNGS, ...ROW_ENGINES, 'cloud'])].map(engineChoiceLabel)
 
 const RUNTIME_KEYS = [...DYNAMIC_KEYS, ...GROUP_KEYS, ...HINT_KEYS, ...ENGINE_CHOICE_KEYS]
 

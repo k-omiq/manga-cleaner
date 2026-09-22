@@ -1,7 +1,21 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { createTauriBackend, implementedMethods, isTauri, SEAM_METHODS } from './tauri.js'
-import { getBackend, setBackend } from './backend.js'
+import {
+  createTauriBackend,
+  implementedMethods,
+  isCloudExecutionReady as isTauriCloudExecutionReady,
+  isCloudExecutionRegistered,
+  isTauri,
+  SEAM_METHODS,
+  TAURI_PENDING_CLOUD_COMMANDS,
+  TAURI_REGISTERED_CLOUD_COMMANDS,
+} from './tauri.js'
+import {
+  getBackend,
+  isCloudExecutionReady,
+  isCloudExecutionRegistered as isBackendCloudExecutionRegistered,
+  setBackend,
+} from './backend.js'
 
 /**
  * A fallback that records every call and answers with something identifiable,
@@ -223,6 +237,467 @@ describe('the Tauri adapter', () => {
     await expect(backend.applyTool({ tool: 'brush', regionId: 'r1' })).rejects.toThrow(
       /outside a Tauri window/,
     )
+  })
+
+  describe('inference and cloud secrets command mapping', () => {
+    it('maps readInferenceConfig to read_inference_config command', async () => {
+      const invoke = vi.fn().mockResolvedValue({
+        schemaVersion: 1,
+        selectedTarget: { type: 'local' },
+        beamProfiles: {},
+        modalProfiles: {},
+      })
+      const fallback = recordingFallback()
+      const backend = createTauriBackend({ fallback, invoke })
+
+      const result = await backend.readInferenceConfig()
+      expect(invoke).toHaveBeenCalledWith('read_inference_config')
+      expect(result).toEqual({
+        schemaVersion: 1,
+        selectedTarget: { type: 'local' },
+        beamProfiles: {},
+        modalProfiles: {},
+      })
+      expect(fallback.calls.some((c) => c.method === 'readInferenceConfig')).toBe(false)
+    })
+
+    it('maps writeInferenceConfig to write_inference_config command with { config } argument', async () => {
+      const config = {
+        schemaVersion: 1,
+        selectedTarget: { type: 'beam', profile_id: 'beam-prod' },
+        beamProfiles: {
+          'beam-prod': {
+            id: 'beam-prod',
+            name: 'Beam Prod',
+            endpointUrl: 'https://api.beam.cloud/ep',
+            canonicalOrigin: 'https://api.beam.cloud',
+            canonicalOriginFingerprint: 'fp123',
+            createdAtMs: 100,
+            updatedAtMs: 200,
+          },
+        },
+        modalProfiles: {},
+      }
+      const invoke = vi.fn().mockResolvedValue(config)
+      const fallback = recordingFallback()
+      const backend = createTauriBackend({ fallback, invoke })
+
+      const result = await backend.writeInferenceConfig({ config })
+      expect(invoke).toHaveBeenCalledWith('write_inference_config', { config })
+      expect(result).toEqual(config)
+      expect(JSON.stringify(result)).not.toContain('secret')
+      expect(fallback.calls.some((c) => c.method === 'writeInferenceConfig')).toBe(false)
+    })
+
+    it('maps storeCloudSecret with exact parameter structure', async () => {
+      const summary = {
+        provider: 'beam',
+        profileId: 'beam-prod',
+        role: 'runtime',
+        present: true,
+        backend: 'keyring',
+      }
+      const invoke = vi.fn().mockResolvedValue(summary)
+      const fallback = recordingFallback()
+      const backend = createTauriBackend({ fallback, invoke })
+
+      const result = await backend.storeCloudSecret({
+        provider: 'beam',
+        profileId: 'beam-prod',
+        role: 'runtime',
+        secret: 'raw-secret-token-value',
+        sessionOnly: false,
+      })
+
+      expect(invoke).toHaveBeenCalledWith('store_cloud_secret', {
+        provider: 'beam',
+        profileId: 'beam-prod',
+        role: 'runtime',
+        secret: 'raw-secret-token-value',
+        sessionOnly: false,
+      })
+      expect(result).toEqual(summary)
+      expect(result).not.toHaveProperty('secret')
+      expect(fallback.calls.some((c) => c.method === 'storeCloudSecret')).toBe(false)
+    })
+
+    it('maps storeCloudSecret with tokenId for modal runtime', async () => {
+      const summary = {
+        provider: 'modal',
+        profileId: 'modal-prod',
+        role: 'runtime',
+        present: true,
+        backend: 'keyring',
+      }
+      const invoke = vi.fn().mockResolvedValue(summary)
+      const fallback = recordingFallback()
+      const backend = createTauriBackend({ fallback, invoke })
+
+      const result = await backend.storeCloudSecret({
+        provider: 'modal',
+        profileId: 'modal-prod',
+        role: 'runtime',
+        secret: 'raw-secret-token-value',
+        tokenId: 'ak-genuine-token-id',
+        sessionOnly: false,
+      })
+
+      expect(invoke).toHaveBeenCalledWith('store_cloud_secret', {
+        provider: 'modal',
+        profileId: 'modal-prod',
+        role: 'runtime',
+        secret: 'raw-secret-token-value',
+        tokenId: 'ak-genuine-token-id',
+        sessionOnly: false,
+      })
+      expect(result).toEqual(summary)
+      expect(result).not.toHaveProperty('secret')
+      expect(result).not.toHaveProperty('tokenId')
+      expect(fallback.calls.some((c) => c.method === 'storeCloudSecret')).toBe(false)
+    })
+
+    it('maps deleteCloudSecret with exact parameter structure', async () => {
+      const summary = {
+        provider: 'modal',
+        profileId: 'modal-dev',
+        role: 'setup',
+        present: false,
+        backend: 'keyring',
+      }
+      const invoke = vi.fn().mockResolvedValue(summary)
+      const fallback = recordingFallback()
+      const backend = createTauriBackend({ fallback, invoke })
+
+      const result = await backend.deleteCloudSecret({
+        provider: 'modal',
+        profileId: 'modal-dev',
+        role: 'setup',
+      })
+
+      expect(invoke).toHaveBeenCalledWith('delete_cloud_secret', {
+        provider: 'modal',
+        profileId: 'modal-dev',
+        role: 'setup',
+      })
+      expect(result).toEqual(summary)
+      expect(fallback.calls.some((c) => c.method === 'deleteCloudSecret')).toBe(false)
+    })
+
+    it('maps getCloudSecretSummary with exact parameter structure', async () => {
+      const summary = {
+        provider: 'modal',
+        profileId: 'modal-dev',
+        role: 'model_download',
+        present: true,
+        backend: 'session',
+      }
+      const invoke = vi.fn().mockResolvedValue(summary)
+      const fallback = recordingFallback()
+      const backend = createTauriBackend({ fallback, invoke })
+
+      const result = await backend.getCloudSecretSummary({
+        provider: 'modal',
+        profileId: 'modal-dev',
+        role: 'model_download',
+      })
+
+      expect(invoke).toHaveBeenCalledWith('get_cloud_secret_summary', {
+        provider: 'modal',
+        profileId: 'modal-dev',
+        role: 'model_download',
+      })
+      expect(result).toEqual(summary)
+      expect(fallback.calls.some((c) => c.method === 'getCloudSecretSummary')).toBe(false)
+    })
+
+    it('propagates rejected invoke errors without falling back to mock for all 5 methods', async () => {
+      const invoke = vi.fn().mockRejectedValue(new Error('Tauri command failure'))
+      const fallback = recordingFallback()
+      const backend = createTauriBackend({ fallback, invoke })
+
+      await expect(backend.readInferenceConfig()).rejects.toThrow('Tauri command failure')
+      await expect(
+        backend.writeInferenceConfig({
+          schemaVersion: 1,
+          selectedTarget: { type: 'local' },
+          beamProfiles: {},
+          modalProfiles: {},
+        }),
+      ).rejects.toThrow('Tauri command failure')
+      await expect(
+        backend.storeCloudSecret({
+          provider: 'beam',
+          profileId: 'p1',
+          role: 'runtime',
+          secret: 's1',
+        }),
+      ).rejects.toThrow('Tauri command failure')
+      await expect(
+        backend.deleteCloudSecret({
+          provider: 'beam',
+          profileId: 'p1',
+          role: 'runtime',
+        }),
+      ).rejects.toThrow('Tauri command failure')
+      await expect(
+        backend.getCloudSecretSummary({
+          provider: 'beam',
+          profileId: 'p1',
+          role: 'runtime',
+        }),
+      ).rejects.toThrow('Tauri command failure')
+
+      // Assert that none of the 5 methods fell back to fallback mock implementation
+      expect(fallback.calls.filter((c) =>
+        [
+          'readInferenceConfig',
+          'writeInferenceConfig',
+          'storeCloudSecret',
+          'deleteCloudSecret',
+          'getCloudSecretSummary',
+        ].includes(c.method),
+      )).toHaveLength(0)
+    })
+  })
+
+  describe('cloud lifecycle command mapping and registration', () => {
+    it('maps prepareCloudConsent with exact parameters', async () => {
+      const proposal = {
+        proposalId: 'prop-123',
+        profileId: 'beam-prod',
+        provider: 'beam',
+        endpointUrl: 'https://api.beam.cloud/ep',
+        canonicalOriginFingerprint: 'fp123',
+        profileEpoch: 1,
+        cropSha256: 'crop123',
+        hintSha256: 'hint123',
+        sourceHash: 'src123',
+        maskHash: 'mask123',
+        regionRevision: 1,
+        rect: { x: 0, y: 0, w: 100, h: 100 },
+        recipe: { recipeId: 'sdnq-v1', preprocessingVersion: '1.0.0', modelId: 'flux', modelRevision: 'rev', nativeMaskConditioning: false },
+        intent: { action: 'cleanAnyway' },
+        createdAtMs: 1000,
+        expiresAtMs: 2000,
+      }
+      const invoke = vi.fn().mockResolvedValue(proposal)
+      const fallback = recordingFallback()
+      const backend = createTauriBackend({ fallback, invoke })
+
+      const req = {
+        target: { type: 'beam', profile_id: 'beam-prod' },
+        intent: { action: 'cleanAnyway' },
+        chapterId: 'ch-1',
+        pageIndex: 0,
+        regionId: 'reg-1',
+      }
+      const res = await backend.prepareCloudConsent(req)
+      expect(invoke).toHaveBeenCalledWith('prepare_cloud_consent', req)
+      expect(res).toEqual(proposal)
+      expect(fallback.calls.some((c) => c.method === 'prepareCloudConsent')).toBe(false)
+    })
+
+    it('maps confirmCloudConsent with exact parameters', async () => {
+      const grant = {
+        nonce: 'grant-nonce-xyz',
+        scope: {
+          provider: 'beam',
+          profileId: 'beam-prod',
+          endpointFingerprint: 'fp123',
+          cropSha256: 'crop123',
+          maskHash: 'mask123',
+          revision: 1,
+          recipe: { recipeId: 'sdnq-v1', preprocessingVersion: '1.0.0', modelId: 'flux', modelRevision: 'rev', nativeMaskConditioning: false },
+          operationDigest: 'opdig123',
+        },
+        issuedAtMs: 1000,
+        expiresAtMs: 2000,
+        allowedAttempts: 1,
+        usedAttempts: 0,
+      }
+      const invoke = vi.fn().mockResolvedValue(grant)
+      const fallback = recordingFallback()
+      const backend = createTauriBackend({ fallback, invoke })
+
+      const req = {
+        proposalId: 'prop-123',
+        intent: { action: 'cleanAnyway' },
+      }
+      const res = await backend.confirmCloudConsent(req)
+      expect(invoke).toHaveBeenCalledWith('confirm_cloud_consent', req)
+      expect(res).toEqual(grant)
+      expect(fallback.calls.some((c) => c.method === 'confirmCloudConsent')).toBe(false)
+    })
+
+    it('maps submitCloudAttempt with exact parameters', async () => {
+      const submission = {
+        attemptId: 'att-123',
+        handle: 'h-456',
+        status: 'accepted',
+        requestDigest: 'reqdig123',
+        autoRetryable: false,
+      }
+      const invoke = vi.fn().mockResolvedValue(submission)
+      const fallback = recordingFallback()
+      const backend = createTauriBackend({ fallback, invoke })
+
+      const req = {
+        attemptId: 'att-123',
+        grantNonce: 'grant-nonce-xyz',
+        proposalId: 'prop-123',
+      }
+      const res = await backend.submitCloudAttempt(req)
+      expect(invoke).toHaveBeenCalledWith('submit_cloud_attempt', req)
+      expect(res).toEqual(submission)
+      expect(fallback.calls.some((c) => c.method === 'submitCloudAttempt')).toBe(false)
+    })
+
+    it('maps getCloudAttemptStatus with exact parameters', async () => {
+      const status = {
+        attemptId: 'att-123',
+        handle: 'h-456',
+        status: 'completed',
+        reportedCostUsd: 0.002,
+        acknowledged: true,
+      }
+      const invoke = vi.fn().mockResolvedValue(status)
+      const fallback = recordingFallback()
+      const backend = createTauriBackend({ fallback, invoke })
+
+      const req = { attemptId: 'att-123', handle: 'h-456' }
+      const res = await backend.getCloudAttemptStatus(req)
+      expect(invoke).toHaveBeenCalledWith('get_cloud_attempt_status', req)
+      expect(res).toEqual(status)
+      expect(fallback.calls.some((c) => c.method === 'getCloudAttemptStatus')).toBe(false)
+    })
+
+    it('maps getCloudAttemptResult with exact parameters', async () => {
+      const result = {
+        attemptId: 'att-123',
+        handle: 'h-456',
+        resultDigest: 'resdig123',
+        reportedCostUsd: 0.002,
+        width: 100,
+        height: 100,
+        cached: true,
+      }
+      const invoke = vi.fn().mockResolvedValue(result)
+      const fallback = recordingFallback()
+      const backend = createTauriBackend({ fallback, invoke })
+
+      const req = { attemptId: 'att-123', handle: 'h-456' }
+      const res = await backend.getCloudAttemptResult(req)
+      expect(invoke).toHaveBeenCalledWith('get_cloud_attempt_result', req)
+      expect(res).toEqual(result)
+      expect(fallback.calls.some((c) => c.method === 'getCloudAttemptResult')).toBe(false)
+    })
+
+    it('maps cancelCloudAttempt with exact parameters', async () => {
+      const cancelRes = {
+        handle: 'h-456',
+        status: 'cancel_requested',
+        acknowledged: true,
+      }
+      const invoke = vi.fn().mockResolvedValue(cancelRes)
+      const fallback = recordingFallback()
+      const backend = createTauriBackend({ fallback, invoke })
+
+      const req = { attemptId: 'att-123', handle: 'h-456' }
+      const res = await backend.cancelCloudAttempt(req)
+      expect(invoke).toHaveBeenCalledWith('cancel_cloud_attempt', req)
+      expect(res).toEqual(cancelRes)
+      expect(fallback.calls.some((c) => c.method === 'cancelCloudAttempt')).toBe(false)
+    })
+
+    it('maps reconcileCloudRecovery with exact parameters and defaults', async () => {
+      const recovery = {
+        decision: 'resume_polling',
+        attemptId: 'att-123',
+        handle: 'h-456',
+        autoRetryable: false,
+      }
+      const invoke = vi.fn().mockResolvedValue(recovery)
+      const fallback = recordingFallback()
+      const backend = createTauriBackend({ fallback, invoke })
+
+      const res1 = await backend.reconcileCloudRecovery({ attemptId: 'att-123' })
+      expect(invoke).toHaveBeenCalledWith('reconcile_cloud_recovery', { attemptId: 'att-123' })
+      expect(res1).toEqual(recovery)
+
+      const res2 = await backend.reconcileCloudRecovery()
+      expect(invoke).toHaveBeenCalledWith('reconcile_cloud_recovery', {})
+      expect(res2).toEqual(recovery)
+      expect(fallback.calls.some((c) => c.method === 'reconcileCloudRecovery')).toBe(false)
+    })
+
+    it('maintains semantic split between registration truth and execution readiness', () => {
+      // Registration truth: all 14 remote execution lifecycle commands are registered in Tauri
+      expect(isCloudExecutionRegistered()).toBe(true)
+      expect(isBackendCloudExecutionRegistered()).toBe(true)
+      expect(TAURI_PENDING_CLOUD_COMMANDS).toEqual([])
+      expect(TAURI_REGISTERED_CLOUD_COMMANDS).toEqual([
+        'read_inference_config',
+        'write_inference_config',
+        'store_cloud_secret',
+        'delete_cloud_secret',
+        'get_cloud_secret_summary',
+        'check_cloud_connection',
+        'get_cloud_model_info',
+        'prepare_cloud_consent',
+        'confirm_cloud_consent',
+        'submit_cloud_attempt',
+        'get_cloud_attempt_status',
+        'get_cloud_attempt_result',
+        'cancel_cloud_attempt',
+        'reconcile_cloud_recovery',
+      ])
+
+      // Execution readiness: must remain false until an authoritative backend capability exists
+      // Asserts that caller-supplied attestation and forged truthy objects cannot bypass readiness
+      expect(isCloudExecutionReady()).toBe(false)
+      expect(isTauriCloudExecutionReady()).toBe(false)
+      expect(isCloudExecutionReady(null)).toBe(false)
+      expect(isCloudExecutionReady(undefined)).toBe(false)
+      expect(isCloudExecutionReady({})).toBe(false)
+      expect(isCloudExecutionReady(true)).toBe(false)
+      expect(isTauriCloudExecutionReady(true)).toBe(false)
+      expect(isCloudExecutionReady({ stagingAvailable: true })).toBe(false)
+      expect(isCloudExecutionReady({ runtimeAvailable: true })).toBe(false)
+      expect(isCloudExecutionReady({ integrationReady: true })).toBe(false)
+      expect(isCloudExecutionReady({ stagingAvailable: true, runtimeAvailable: true })).toBe(false)
+      expect(isCloudExecutionReady({ livePrerequisitesMet: true })).toBe(false)
+      expect(isTauriCloudExecutionReady({ livePrerequisitesMet: true })).toBe(false)
+      expect(
+        isCloudExecutionReady({
+          stagingAvailable: true,
+          runtimeAvailable: true,
+          integrationReady: true,
+        }),
+      ).toBe(false)
+      expect(
+        isTauriCloudExecutionReady({
+          stagingAvailable: true,
+          runtimeAvailable: true,
+          integrationReady: true,
+        }),
+      ).toBe(false)
+      expect(
+        isCloudExecutionReady({
+          modalStaging: true,
+          beamStaging: true,
+          runtimeAvailable: true,
+          integrationReady: true,
+        }),
+      ).toBe(false)
+      expect(
+        isTauriCloudExecutionReady({
+          modalStaging: true,
+          beamStaging: true,
+          runtimeAvailable: true,
+          integrationReady: true,
+        }),
+      ).toBe(false)
+    })
   })
 })
 

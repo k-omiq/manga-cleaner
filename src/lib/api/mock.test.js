@@ -28,8 +28,15 @@ function makeBackend() {
 
 /** Resolves a backend promise, flushing every timer it waits on. */
 async function settle(promise) {
+  // Attach rejection handling before advancing timers that may reject it.
+  const observed = promise.then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  )
   await vi.runAllTimersAsync()
-  return promise
+  const result = await observed
+  if ('error' in result) throw result.error
+  return result.value
 }
 
 /** Resolves a backend promise without running the run it may have started. */
@@ -925,5 +932,239 @@ describe('the model catalogue', () => {
     const read = await settle(backend.readSettings())
     expect(read).not.toHaveProperty('hfToken')
     expect(JSON.stringify(read)).not.toContain('hf_secret')
+  })
+})
+
+describe('inference config and cloud secrets in mock backend', () => {
+  it('reads default local target and empty profile maps in memory', async () => {
+    const { backend } = makeBackend()
+    const config = await settle(backend.readInferenceConfig())
+
+    expect(config).toEqual({
+      schemaVersion: 1,
+      selectedTarget: { type: 'local' },
+      beamProfiles: {},
+      modalProfiles: {},
+    })
+  })
+
+  it('updates public inference configuration and returns isolated clone without secrets', async () => {
+    const { backend } = makeBackend()
+    const newConfig = {
+      schemaVersion: 1,
+      selectedTarget: { type: 'beam', profile_id: 'beam-1' },
+      beamProfiles: {
+        'beam-1': {
+          id: 'beam-1',
+          name: 'Beam Worker',
+          endpointUrl: 'https://api.beam.cloud/v1',
+          canonicalOrigin: 'https://api.beam.cloud',
+          canonicalOriginFingerprint: 'a1b2c3d4',
+          createdAtMs: 1000,
+          updatedAtMs: 2000,
+        },
+      },
+      modalProfiles: {},
+    }
+
+    const written = await settle(backend.writeInferenceConfig({ config: newConfig }))
+    expect(written).toEqual(newConfig)
+    expect(written).not.toBe(newConfig) // isolated clone
+
+    // Mutating written object does not affect stored state
+    written.selectedTarget = { type: 'local' }
+    const readAgain = await settle(backend.readInferenceConfig())
+    expect(readAgain.selectedTarget).toEqual({ type: 'beam', profile_id: 'beam-1' })
+    expect(JSON.stringify(readAgain)).not.toContain('secret')
+  })
+
+  it('rejects adversarial extra keys and secrets in writeInferenceConfig', async () => {
+    const { backend } = makeBackend()
+
+    // Adversarial top-level extra secret key
+    await expect(
+      settle(
+        backend.writeInferenceConfig({
+          config: {
+            schemaVersion: 1,
+            selectedTarget: { type: 'local' },
+            beamProfiles: {},
+            modalProfiles: {},
+            secret: 'injected-top-level-secret',
+          },
+        }),
+      ),
+    ).rejects.toThrow(/unrecognized inference config field/)
+
+    // Adversarial profile-level secret key
+    await expect(
+      settle(
+        backend.writeInferenceConfig({
+          config: {
+            schemaVersion: 1,
+            selectedTarget: { type: 'beam', profile_id: 'beam-1' },
+            beamProfiles: {
+              'beam-1': {
+                id: 'beam-1',
+                name: 'Beam Worker',
+                endpointUrl: 'https://api.beam.cloud/v1',
+                canonicalOrigin: 'https://api.beam.cloud',
+                canonicalOriginFingerprint: 'a1b2c3d4',
+                createdAtMs: 1000,
+                updatedAtMs: 2000,
+                secret: 'injected-profile-secret',
+              },
+            },
+            modalProfiles: {},
+          },
+        }),
+      ),
+    ).rejects.toThrow(/unrecognized field 'secret' in beam profile/)
+
+    // Ensure state remains clean
+    const cleanRead = await settle(backend.readInferenceConfig())
+    expect(JSON.stringify(cleanRead)).not.toContain('injected')
+  })
+
+  it('secret operations explicitly refuse / reject in browser mock without timer hang', async () => {
+    const { backend } = makeBackend()
+
+    await expect(
+      backend.storeCloudSecret({
+        provider: 'beam',
+        profileId: 'beam-1',
+        role: 'runtime',
+        secret: 'raw-secret',
+      }),
+    ).rejects.toThrow(/unavailable in browser mock/)
+
+    await expect(
+      backend.deleteCloudSecret({
+        provider: 'beam',
+        profileId: 'beam-1',
+        role: 'runtime',
+      }),
+    ).rejects.toThrow(/unavailable in browser mock/)
+
+    await expect(
+      backend.getCloudSecretSummary({
+        provider: 'beam',
+        profileId: 'beam-1',
+        role: 'runtime',
+      }),
+    ).rejects.toThrow(/unavailable in browser mock/)
+  })
+
+  it('pins immutable model revision in getCloudModelInfo and default consent recipe', async () => {
+    const { backend } = makeBackend()
+    await settle(
+      backend.writeInferenceConfig({
+        config: {
+          schemaVersion: 1,
+          selectedTarget: { type: 'modal', profile_id: 'm1' },
+          beamProfiles: {},
+          modalProfiles: {
+            m1: {
+              id: 'm1',
+              name: 'Modal Worker',
+              endpointUrl: 'https://modal.run/v1',
+              canonicalOrigin: 'https://modal.run',
+              canonicalOriginFingerprint: 'fp-1',
+              createdAtMs: 1,
+              updatedAtMs: 1,
+            },
+          },
+        },
+      }),
+    )
+
+    const info = await settle(backend.getCloudModelInfo({ provider: 'modal', profileId: 'm1' }))
+    expect(info.pinnedModelRevision).toBe('0123456789abcdef0123456789abcdef01234567')
+    expect(info.pinnedModelRevision).not.toBe('main')
+
+    await settle(backend.writeSettings({ cloudEngines: 'allowed' }))
+    const proposal = await settle(
+      backend.prepareCloudConsent({
+        target: { type: 'modal', profile_id: 'm1' },
+        intent: { action: 'applyTool', tool: 'contentAwareFill' },
+      }),
+    )
+    expect(proposal.recipe.model_revision).toBe('0123456789abcdef0123456789abcdef01234567')
+    expect(proposal.recipe.model_revision).not.toBe('main')
+  })
+
+  it('submitCloudAttempt requires valid grant, fails closed when missing/unknown, and prevents replay', async () => {
+    const { backend } = makeBackend()
+    await settle(
+      backend.writeInferenceConfig({
+        config: {
+          schemaVersion: 1,
+          selectedTarget: { type: 'modal', profile_id: 'm1' },
+          beamProfiles: {},
+          modalProfiles: {
+            m1: {
+              id: 'm1',
+              name: 'Modal Worker',
+              endpointUrl: 'https://modal.run/v1',
+              canonicalOrigin: 'https://modal.run',
+              canonicalOriginFingerprint: 'fp-1',
+              createdAtMs: 1,
+              updatedAtMs: 1,
+            },
+          },
+        },
+      }),
+    )
+    await settle(backend.writeSettings({ cloudEngines: 'allowed' }))
+
+    // Missing grantNonce
+    await expect(
+      settle(backend.submitCloudAttempt({ attemptId: 'att-missing' })),
+    ).rejects.toThrow(/invalid or missing grant/)
+
+    // Empty grantNonce
+    await expect(
+      settle(backend.submitCloudAttempt({ attemptId: 'att-empty', grantNonce: '' })),
+    ).rejects.toThrow(/invalid or missing grant/)
+
+    // Unknown grantNonce
+    await expect(
+      settle(backend.submitCloudAttempt({ attemptId: 'att-unknown', grantNonce: 'grant-unknown' })),
+    ).rejects.toThrow(/invalid or missing grant/)
+
+    // Mint valid grant
+    const proposal = await settle(
+      backend.prepareCloudConsent({
+        target: { type: 'modal', profile_id: 'm1' },
+        intent: { action: 'applyTool', tool: 'contentAwareFill' },
+      }),
+    )
+    const grant = await settle(
+      backend.confirmCloudConsent({
+        proposalId: proposal.proposalId,
+        intent: { action: 'applyTool', tool: 'contentAwareFill' },
+      }),
+    )
+
+    // First attempt succeeds
+    const first = await settle(
+      backend.submitCloudAttempt({
+        attemptId: 'att-valid-1',
+        grantNonce: grant.nonce,
+        snapshot: { regionRevision: 1, sourceImageHash: 'h1' },
+      }),
+    )
+    expect(first.status).toBe('accepted')
+
+    // Replay attempt fails closed
+    await expect(
+      settle(
+        backend.submitCloudAttempt({
+          attemptId: 'att-replay-1',
+          grantNonce: grant.nonce,
+          snapshot: { regionRevision: 1, sourceImageHash: 'h1' },
+        }),
+      ),
+    ).rejects.toThrow(/replay detected/)
   })
 })

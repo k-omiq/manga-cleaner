@@ -107,19 +107,22 @@ const PARAMS_SNAPSHOT = Object.freeze({
  * id, so the same region always comes back on the same rung - a re-run is a
  * re-run, not a dice roll.
  *
+ * Automatic routing never escalates to FLUX or cloud: the automatic ceiling
+ * is pinned at LaMa ('lama').
+ *
  * @param {number} hash - `hashString(regionId)`
- * @param {string} ceiling - highest rung permitted, a member of `RUNGS`
+ * @param {string} ceiling - highest rung permitted, a member of `RUNGS` or legacy 'cloud'
  * @returns {string} rung id
  */
 export function routeRung(hash, ceiling) {
-  const ceilingIndex = Math.max(0, RUNGS.indexOf(ceiling))
+  const resolvedCeiling = ceiling === 'cloud' || ceiling === 'flux' ? 'lama' : ceiling
+  const ceilingIndex = Math.min(2, Math.max(0, RUNGS.indexOf(resolvedCeiling)))
   // Most regions are flat paper and belong on rung 0.
   // Only a few reach the inpainter, because every one of those is a review
   // entry and the flag rate is capped at 5% of boxes.
   const bucket = hash % 32
   let index = 0
-  if (bucket === 31 && ceilingIndex >= 4) index = 4
-  else if (bucket >= 29) index = 2
+  if (bucket >= 29) index = 2
   else if (bucket >= 22) index = 1
   return RUNGS[Math.min(index, ceilingIndex)]
 }
@@ -133,12 +136,15 @@ export function routeRung(hash, ceiling) {
  * @returns {string} rung id, the lower of the two
  */
 export function capRung(requested, ceiling) {
-  const top = RUNGS.length - 1
+  if (requested === ceiling) return requested
+  if (requested === 'cloud') return ceiling === 'cloud' ? 'cloud' : capRung('lama', ceiling)
+  if (ceiling === 'cloud') return requested
   const requestedIndex = RUNGS.indexOf(requested)
   const ceilingIndex = RUNGS.indexOf(ceiling)
-  return RUNGS[
-    Math.min(requestedIndex === -1 ? top : requestedIndex, ceilingIndex === -1 ? top : ceilingIndex)
-  ]
+  if (requestedIndex === -1 && ceilingIndex === -1) return 'fill'
+  if (requestedIndex === -1) return ceiling
+  if (ceilingIndex === -1) return requested
+  return RUNGS[Math.min(requestedIndex, ceilingIndex)]
 }
 
 /**

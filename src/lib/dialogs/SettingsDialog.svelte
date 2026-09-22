@@ -125,6 +125,7 @@
   } from '../state/session.svelte.js'
   import ShortcutSheet from './ShortcutSheet.svelte'
   import AboutSection from './AboutSection.svelte'
+  import InferenceSettings from './InferenceSettings.svelte'
 
   /** @type {{ spec: import('../state/app.svelte.js').ModalSpec }} */
   let { spec } = $props()
@@ -914,6 +915,7 @@
     { id: 'general', labelKey: 'settings.section.general' },
     { id: 'models', labelKey: 'settings.section.models' },
     { id: 'acceleration', labelKey: 'settings.section.acceleration' },
+    { id: 'inference', labelKey: 'settings.section.inference' },
     { id: 'shortcuts', labelKey: 'settings.section.shortcuts' },
     { id: 'about', labelKey: 'settings.section.about' },
   ]
@@ -1470,6 +1472,17 @@
           {/each}
         </ul>
       {/if}
+    </div>
+
+    <div
+      class="panel"
+      role="tabpanel"
+      id={panelId('inference')}
+      aria-labelledby={tabId('inference')}
+      hidden={active !== 'inference'}
+    >
+      <h3 class="panel-heading">{t('settings.section.inference')}</h3>
+      <InferenceSettings />
     </div>
 
     <div

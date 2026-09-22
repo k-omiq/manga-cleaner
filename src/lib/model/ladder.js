@@ -1,14 +1,15 @@
 /**
  * The engine ladder: planar fill → denoise →
- * manga-LaMa → cloud, ordered weakest/cheapest to strongest/most expensive. `stronger`/`simpler` step along it and clamp at
- * both ends - there is no engine below planar fill or above cloud.
+ * manga-LaMa → FLUX, ordered weakest/cheapest to strongest/most expensive.
+ * `stronger`/`simpler` step along it and clamp at both ends - there is no
+ * engine below planar fill or above FLUX.
  *
  * `decline` is a terminal pipeline outcome, not a
  * rung to escalate to or from; it lives on `Region.outcome`, not here.
  */
 
 /** @type {ReadonlyArray<string>} */
-export const RUNGS = Object.freeze(['fill', 'denoise', 'lama', 'cloud'])
+export const RUNGS = Object.freeze(['fill', 'denoise', 'lama', 'flux'])
 
 const LABEL_KEYS = Object.freeze({
   fill: 'ladder.rung.fill',
@@ -22,9 +23,10 @@ const LABEL_KEYS = Object.freeze({
 
 /**
  * @param {string} rung
- * @returns {string} the rung one step stronger, clamped at the top ('cloud')
+ * @returns {string} the rung one step stronger, clamped at the top ('flux')
  */
 export function stronger(rung) {
+  if (rung === 'cloud') return 'cloud'
   const i = RUNGS.indexOf(rung)
   if (i === -1) return rung
   return RUNGS[Math.min(i + 1, RUNGS.length - 1)]
@@ -35,6 +37,7 @@ export function stronger(rung) {
  * @returns {string} the rung one step simpler, clamped at the bottom ('fill')
  */
 export function simpler(rung) {
+  if (rung === 'cloud') return 'lama'
   const i = RUNGS.indexOf(rung)
   if (i === -1) return rung
   return RUNGS[Math.max(i - 1, 0)]

@@ -157,7 +157,9 @@ function subLine(region, mask) {
   if (!mask) return [{ key: 'masks.sub.noMask' }]
   const parts = [{ key: fillModeLabel(mask.fillMode) }]
   if (mask.provenance.cloud) {
-    parts.push({ key: 'masks.value.cloudCost', params: { cost: mask.provenance.cloud.cost } })
+    if (typeof mask.provenance.cloud.cost === 'number' && Number.isFinite(mask.provenance.cloud.cost)) {
+      parts.push({ key: 'masks.value.cloudCost', params: { cost: mask.provenance.cloud.cost } })
+    }
   }
   if (region.source === 'hand') parts.push({ key: 'masks.origin.hand' })
   return parts
@@ -211,7 +213,10 @@ function displayFact(fact) {
     case 'masks.provenance.elapsed':
       return { key: fact.key, valueKey: 'masks.value.elapsed', params: { ms: fact.value } }
     case 'masks.provenance.cloudCost':
-      return { key: fact.key, valueKey: 'masks.value.cloudCost', params: { cost: fact.value } }
+      if (typeof fact.value === 'number' && Number.isFinite(fact.value)) {
+        return { key: fact.key, valueKey: 'masks.value.cloudCost', params: { cost: fact.value } }
+      }
+      return { key: fact.key, value: '—' }
     default:
       // A model version and a cloud request id are proper nouns; translating
       // them would be translating an identifier.

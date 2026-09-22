@@ -91,7 +91,7 @@ export function confirmCloud(confirmation) {
       blocking: true,
       props: {
         regionId: confirmation.regionId ?? null,
-        estimatedCost: confirmation.estimatedCost ?? 0,
+        estimatedCost: confirmation.estimatedCost ?? null,
       },
       actions: [
         { id: 'cancel', labelKey: 'shell.action.cancel' },

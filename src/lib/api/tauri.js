@@ -47,6 +47,20 @@ const IMPLEMENTED = Object.freeze({
   about: 'about',
   readSettings: 'read_settings',
   writeSettings: 'write_settings',
+  readInferenceConfig: 'read_inference_config',
+  writeInferenceConfig: 'write_inference_config',
+  storeCloudSecret: 'store_cloud_secret',
+  deleteCloudSecret: 'delete_cloud_secret',
+  getCloudSecretSummary: 'get_cloud_secret_summary',
+  checkCloudConnection: 'check_cloud_connection',
+  getCloudModelInfo: 'get_cloud_model_info',
+  prepareCloudConsent: 'prepare_cloud_consent',
+  confirmCloudConsent: 'confirm_cloud_consent',
+  submitCloudAttempt: 'submit_cloud_attempt',
+  getCloudAttemptStatus: 'get_cloud_attempt_status',
+  getCloudAttemptResult: 'get_cloud_attempt_result',
+  cancelCloudAttempt: 'cancel_cloud_attempt',
+  reconcileCloudRecovery: 'reconcile_cloud_recovery',
   listProjects: 'list_projects',
   createProject: 'create_project',
   createChapter: 'create_chapter',
@@ -111,6 +125,20 @@ export const SEAM_METHODS = Object.freeze([
   'listSidecarModels',
   'readSettings',
   'writeSettings',
+  'readInferenceConfig',
+  'writeInferenceConfig',
+  'storeCloudSecret',
+  'deleteCloudSecret',
+  'getCloudSecretSummary',
+  'checkCloudConnection',
+  'getCloudModelInfo',
+  'prepareCloudConsent',
+  'confirmCloudConsent',
+  'submitCloudAttempt',
+  'getCloudAttemptStatus',
+  'getCloudAttemptResult',
+  'cancelCloudAttempt',
+  'reconcileCloudRecovery',
   'about',
   'listLoadedModels',
   'unloadModel',
@@ -172,6 +200,32 @@ export function createTauriBackend({ fallback, invoke }) {
     about: () => call(IMPLEMENTED.about),
     readSettings: async () => withDefaults(await call(IMPLEMENTED.readSettings)),
     writeSettings: async (patch) => withDefaults(await call(IMPLEMENTED.writeSettings, { patch })),
+    readInferenceConfig: () => call(IMPLEMENTED.readInferenceConfig),
+    writeInferenceConfig: ({ config }) => call(IMPLEMENTED.writeInferenceConfig, { config }),
+    storeCloudSecret: ({ provider, profileId, role, secret, tokenId, sessionOnly = false }) =>
+      call(IMPLEMENTED.storeCloudSecret, {
+        provider,
+        profileId,
+        role,
+        secret,
+        ...(tokenId !== undefined ? { tokenId } : {}),
+        sessionOnly,
+      }),
+    deleteCloudSecret: ({ provider, profileId, role }) =>
+      call(IMPLEMENTED.deleteCloudSecret, { provider, profileId, role }),
+    getCloudSecretSummary: ({ provider, profileId, role }) =>
+      call(IMPLEMENTED.getCloudSecretSummary, { provider, profileId, role }),
+    checkCloudConnection: ({ provider, profileId }) =>
+      call(IMPLEMENTED.checkCloudConnection, { provider, profileId }),
+    getCloudModelInfo: ({ provider, profileId }) =>
+      call(IMPLEMENTED.getCloudModelInfo, { provider, profileId }),
+    prepareCloudConsent: (spec) => call(IMPLEMENTED.prepareCloudConsent, spec),
+    confirmCloudConsent: (spec) => call(IMPLEMENTED.confirmCloudConsent, spec),
+    submitCloudAttempt: (spec) => call(IMPLEMENTED.submitCloudAttempt, spec),
+    getCloudAttemptStatus: (spec) => call(IMPLEMENTED.getCloudAttemptStatus, spec),
+    getCloudAttemptResult: (spec) => call(IMPLEMENTED.getCloudAttemptResult, spec),
+    cancelCloudAttempt: (spec) => call(IMPLEMENTED.cancelCloudAttempt, spec),
+    reconcileCloudRecovery: (spec = {}) => call(IMPLEMENTED.reconcileCloudRecovery, spec),
 
     // Straight passthrough. The commands answer in the seam's own shapes - the
     // conversions that used to justify a mapping layer happen in Rust, where
@@ -316,4 +370,54 @@ export function createTauriBackend({ fallback, invoke }) {
 /** Which seam methods this adapter answers itself. For tests and for `about`. */
 export function implementedMethods() {
   return Object.keys(IMPLEMENTED).sort()
+}
+
+/**
+ * The cloud commands currently registered in `src-tauri/src/lib.rs` (P3 configuration & secrets).
+ */
+export const TAURI_REGISTERED_CLOUD_COMMANDS = Object.freeze([
+  'read_inference_config',
+  'write_inference_config',
+  'store_cloud_secret',
+  'delete_cloud_secret',
+  'get_cloud_secret_summary',
+  'check_cloud_connection',
+  'get_cloud_model_info',
+  'prepare_cloud_consent',
+  'confirm_cloud_consent',
+  'submit_cloud_attempt',
+  'get_cloud_attempt_status',
+  'get_cloud_attempt_result',
+  'cancel_cloud_attempt',
+  'reconcile_cloud_recovery',
+])
+
+/**
+ * The cloud lifecycle commands defined by backend wire/consent/journal contracts
+ * awaiting registration in `src-tauri/src/lib.rs` (P3b consent IPC, P4 durable lifecycle & recovery).
+ * Mapped directly to invoke calls to guarantee no mock fake-success in production Tauri windows.
+ */
+export const TAURI_PENDING_CLOUD_COMMANDS = Object.freeze([])
+
+/**
+ * Truthfully reports whether all required remote execution lifecycle commands are registered in Tauri.
+ * Registration indicates that genuine backend handlers exist in `src-tauri/src/lib.rs` and are mapped in the adapter.
+ *
+ * @returns {boolean}
+ */
+export function isCloudExecutionRegistered() {
+  return TAURI_PENDING_CLOUD_COMMANDS.length === 0 && TAURI_REGISTERED_CLOUD_COMMANDS.length > 0
+}
+
+/**
+ * Reports whether remote cloud execution is ready for live operations.
+ *
+ * Semantic split: while Tauri IPC command registration truth is true (`isCloudExecutionRegistered() === true`),
+ * execution readiness must remain false until an authoritative backend capability exists.
+ * Caller-supplied attestation is rejected to prevent untrusted premature readiness bypass.
+ *
+ * @returns {boolean}
+ */
+export function isCloudExecutionReady() {
+  return false
 }

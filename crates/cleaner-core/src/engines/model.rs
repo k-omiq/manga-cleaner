@@ -378,6 +378,7 @@ pub fn tiles(bounds: Rect) -> Vec<Tile> {
 /// the edge as a box. Around `ink` the same offset fades out over two pixels
 /// along the outline of the glyphs themselves, which is a shape the eye reads as
 /// nothing at all.
+#[derive(Debug, Clone)]
 pub struct AlphaRamp {
     core: Mask,
     rings: Vec<Mask>,

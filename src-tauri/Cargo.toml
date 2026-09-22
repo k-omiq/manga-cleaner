@@ -47,6 +47,11 @@ zip = { version = "4", default-features = false, features = ["deflate"] }
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# Cryptographic nonce generation for inference authorization grants
+getrandom = "0.3"
+# Compiler-barrier memory zeroization for sensitive cloud credentials
+zeroize = { version = "1", features = ["derive"] }
+url = "2"
 
 # The Hugging Face token, in the operating system's own credential store rather
 # than in `settings.json`. `keyring` 3 compiles no platform

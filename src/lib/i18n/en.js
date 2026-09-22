@@ -85,7 +85,9 @@ export const en = {
       cloudTransmission:
         'A bounded crop of the page, including the image content surrounding the text and not just the masked region, is transmitted to Google, processed there, and returned. Nothing else about the page or the project is sent. Local engines never leave this machine.',
       cloudCost:
-        'One region, reconstructed in the cloud. Estimated {cost:currency}, billed on return; a rejected request is not billed.',
+        'One region, reconstructed in the cloud. Estimated {cost:currency}.',
+      cloudCostUnknown:
+        'One region, reconstructed in the cloud. Cost estimate unavailable; provider charges may apply.',
       formatConversion: {
         one: 'Convert one {from} file to {to} so it can be edited? The original stays.',
         other: 'Convert {count} {from} files to {to} so they can be edited? The originals stay.',
@@ -282,12 +284,84 @@ export const en = {
         shift: 'Shift',
       },
     },
+    inference: {
+      target: {
+        label: 'Default execution target',
+        local: 'Local (default)',
+        option: '{provider}: {name} ({id})',
+      },
+      disclaimer:
+        'Remote execution is unavailable in this build. Selecting a profile configures endpoint settings only and does not transmit crops, contact remote hosts, or authorize paid work.',
+      executionStatus: {
+        label: 'Remote execution',
+        unavailable: 'Unavailable (provider execution is not enabled in this build)',
+      },
+      testConnection: 'Test connection',
+      testNamed: 'Test connection for {name} ({id})',
+      testingConnection: 'Testing connection…',
+      connectionReachable: 'Reachable ({latency} ms)',
+      connectionFailed: 'Connection check failed',
+      commandNotRegistered: 'Connection check command not registered in this build',
+      recovery: {
+        title: 'Attempt recovery status',
+        check: 'Check recovery',
+        none: 'No interrupted remote attempts found.',
+        ambiguous: 'Interrupted attempt detected (status unknown). Automatic re-dispatch is forbidden.',
+        cached: 'Validated remote result cached and ready for local project review.',
+        stale: 'Interrupted attempt result retained in cache; region was modified locally (stale attachment rejected).',
+      },
+      modalSection: 'Modal profiles',
+      beamSection: 'Beam profiles',
+      noProfiles: 'No profiles configured.',
+      addProfile: 'Add profile',
+      editProfile: 'Edit profile',
+      deleteProfile: 'Delete',
+      editNamed: 'Edit {name} ({id})',
+      deleteNamed: 'Delete {name} ({id})',
+      edit: 'Edit',
+      cancel: 'Cancel',
+      save: 'Save profile',
+      loading: 'Loading inference configuration…',
+      provider: {
+        label: 'Provider',
+        modal: 'Modal',
+        beam: 'Beam',
+      },
+      id: {
+        label: 'Profile ID',
+        placeholder: 'e.g. modal-prod-1',
+      },
+      name: {
+        label: 'Display name',
+        placeholder: 'e.g. Production GPU Worker',
+      },
+      endpoint: {
+        label: 'Endpoint URL',
+        placeholder: 'https://…',
+      },
+      originWarning:
+        'Changing the endpoint URL changes the target origin. Any credentials previously stored for this profile remain bound to the previous origin and must be replaced separately.',
+      error: {
+        invalidId:
+          'Profile ID must be 1 to 64 ASCII alphanumeric characters, hyphens, or underscores, starting with an alphanumeric character.',
+        idTaken: 'A profile with this ID already exists for this provider.',
+        invalidName: 'Profile name must be 1 to 128 characters.',
+        invalidUrl:
+          'Endpoint URL must be a valid HTTPS URL (no query parameters, fragments, or user credentials).',
+        saveFailed: 'Failed to save inference configuration.',
+        loadFailed: 'Failed to load inference configuration.',
+      },
+      status: {
+        saved: 'Inference configuration saved.',
+      },
+    },
     // The tab strip. `general` heads the five preference rows, which had no
     // heading at all while they were simply the top of the scroller.
     section: {
       general: 'General',
       models: 'Models',
       acceleration: 'Acceleration',
+      inference: 'Inference',
       shortcuts: 'Shortcuts',
       about: 'About',
     },

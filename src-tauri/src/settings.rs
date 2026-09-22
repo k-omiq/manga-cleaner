@@ -84,8 +84,48 @@ fn token_of(value: &Value) -> Result<&str, String> {
     })
 }
 
+/// Recursively verify that a patch contains no cloud secrets, tokens, or inference configurations.
+///
+/// Cloud configuration and secrets must be persisted exclusively in `inference.json` and the
+/// OS keyring via [`crate::inference`], never in `settings.json`.
+fn check_no_cloud_secrets(key_path: &str, value: &Value) -> Result<(), String> {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                let next_path = if key_path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{key_path}.{k}")
+                };
+                let lower_k = k.to_ascii_lowercase();
+                // HuggingFace token is handled separately by weights::store_token and is exempt.
+                let reserved = lower_k.contains("token")
+                    || lower_k.contains("secret")
+                    || lower_k.contains("apikey")
+                    || lower_k.contains("api_key")
+                    || matches!(lower_k.as_str(), "inference" | "inferencesettings" | "beamprofiles" | "modalprofiles");
+                if reserved && !(key_path.is_empty() && k == crate::weights::TOKEN_SETTING) {
+                    return Err("cloud credentials and inference profiles require dedicated storage".to_string());
+                }
+                check_no_cloud_secrets(&next_path, v)?;
+            }
+        }
+        Value::Array(arr) => {
+            for (i, v) in arr.iter().enumerate() {
+                let next_path = format!("{key_path}[{i}]");
+                check_no_cloud_secrets(&next_path, v)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Merge a patch and return the whole snapshot.
 pub fn write(app: &tauri::AppHandle, mut patch: Value) -> Result<Value, String> {
+    // Reject any cloud secrets or cloud configuration attempting to be stored in settings.json
+    check_no_cloud_secrets("", &patch)?;
+
     // Taken out of the patch before the merge so that no path through this
     // function can write it into the file by accident. See the module docs.
     let token = match &mut patch {
@@ -438,5 +478,57 @@ mod tests {
         assert_eq!(mode, 0o600);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cloud_secret_keys_are_rejected_recursively() {
+        // Top-level cloud tokens rejected
+        assert!(check_no_cloud_secrets("", &serde_json::json!({ "beamToken": "secret-1" })).is_err());
+        assert!(check_no_cloud_secrets("", &serde_json::json!({ "modalToken": "secret-2" })).is_err());
+        assert!(check_no_cloud_secrets("", &serde_json::json!({ "apiKey": "secret-3" })).is_err());
+        assert!(check_no_cloud_secrets("", &serde_json::json!({ "cloudSecret": "secret-4" })).is_err());
+
+        // Nested cloud tokens rejected
+        assert!(check_no_cloud_secrets("", &serde_json::json!({
+            "cloud": {
+                "apiKey": "nested-secret"
+            }
+        })).is_err());
+
+        assert!(check_no_cloud_secrets("", &serde_json::json!({
+            "inference": {
+                "runtimeToken": "nested-token"
+            }
+        })).is_err());
+
+        assert!(check_no_cloud_secrets("", &serde_json::json!({
+            "nested": {
+                "deep": {
+                    "modal_token": "deep-secret"
+                }
+            }
+        })).is_err());
+
+        // Array-nested secrets rejected
+        assert!(check_no_cloud_secrets("", &serde_json::json!({
+            "items": [
+                { "cloudToken": "array-secret" }
+            ]
+        })).is_err());
+
+        // Only the exact top-level legacy key is intercepted by weights::store_token.
+        assert!(check_no_cloud_secrets("", &serde_json::json!({"nested": {"hfToken": "secret"}})).is_err());
+        assert!(check_no_cloud_secrets("", &serde_json::json!({"HFTOKEN": "secret"})).is_err());
+
+        // Valid settings accepted
+        assert!(check_no_cloud_secrets("", &serde_json::json!({
+            "theme": "dark",
+            "accelerator": "auto",
+            "runtimeFlavour": "cuda12",
+            "cloud": {
+                "allowed": true
+            },
+            "hfToken": "hf_legitimate_token"
+        })).is_ok());
     }
 }

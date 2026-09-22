@@ -108,6 +108,22 @@ describe('maskRows - unfiltered', () => {
     expect(row.reRunnable).toBe(false)
     expect(row.deletable).toBe(true)
   })
+
+  it('withholds reRunnable from a remote FLUX mask with cloud provenance', () => {
+    const remoteFlux = mask({
+      provenance: {
+        ...mask().provenance,
+        engine: 'flux',
+        cloud: { provider: 'beam', model: 'flux-schnell', request_id: 'r-flux', tier: 't4', cost: null },
+      },
+    })
+    const [row] = maskRows([region({ mask: remoteFlux })])
+    expect(row.engine).toBe('flux')
+    expect(row.reRunnable).toBe(false)
+    expect(row.deletable).toBe(true)
+    // subline does not contain fake zero cost
+    expect(row.sub.map((s) => s.key)).not.toContain('masks.value.cloudCost')
+  })
 })
 
 describe('maskRows - the review filter', () => {
@@ -181,6 +197,11 @@ describe('maskRow facts', () => {
     const keys = row.facts.map((fact) => fact.key)
     expect(keys).toContain('masks.provenance.cloudCost')
     expect(keys).toContain('masks.provenance.cloudRequestId')
+    expect(row.facts.find((fact) => fact.key === 'masks.provenance.cloudCost')).toEqual({
+      key: 'masks.provenance.cloudCost',
+      valueKey: 'masks.value.cloudCost',
+      params: { cost: 0.02 },
+    })
     expect(row.facts.at(-1)).toEqual({
       key: 'masks.provenance.flagged',
       valueKey: 'review.reason.cloudAccepted',
@@ -188,6 +209,21 @@ describe('maskRow facts', () => {
     expect(row.facts.find((fact) => fact.key === 'masks.provenance.cloudRequestId').value).toBe(
       'req-77',
     )
+  })
+
+  it('renders explicit dash for cloudCost when cost is null', () => {
+    const cloudMaskNullCost = mask({
+      provenance: {
+        ...mask().provenance,
+        engine: 'flux',
+        cloud: { provider: 'beam', model: 'flux-schnell', request_id: 'req-88', cost: null },
+      },
+    })
+    const row = maskRow(region({ mask: cloudMaskNullCost }), false)
+    expect(row.facts.find((fact) => fact.key === 'masks.provenance.cloudCost')).toEqual({
+      key: 'masks.provenance.cloudCost',
+      value: '—',
+    })
   })
 
   it('says what a region with no mask has had done to it', () => {

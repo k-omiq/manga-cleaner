@@ -1,0 +1,19 @@
+# Pinned and hashed runtime dependencies for manga-cleaner-cloud-provisioner
+# Source of truth: provisioner/matrix.py (PyPI release metadata as of 2026-09-19)
+#
+# Core provisioner runtime has 0 required external dependencies (pure stdlib).
+# Provider SDK candidates are optional and gated at runtime.
+#
+# --- Modal SDK Candidate ---
+modal==1.5.5 \
+    --hash=sha256:8d10d3ee09818aaba1973b73ce2521ab8961b63a29b5b52e3ff0d25e7a74808e \
+    --hash=sha256:30df363ed1898cc3d91a09ff3f95c38ab043f6b6294011b01085312c6a0ac777
+
+# --- Beam SDK Candidates ---
+beam-client==0.2.211 \
+    --hash=sha256:ffa8c9bb086d85ad1bff07bf8ebde65d5e122a4df1469d1aec56598ddf44c561 \
+    --hash=sha256:8ca975ce814ada1100d737764024c7f489ac05a72cba3265517ee6452ff7daed
+
+beta9==0.1.268 \
+    --hash=sha256:eb21e48b9ae0871449b2434b2e735024a59298ffce64953a066d9d36b8358a75 \
+    --hash=sha256:693e4f65771e40d925946f149d70eedb82baea846de351567a383b7dd11a4b96

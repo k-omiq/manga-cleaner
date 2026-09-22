@@ -355,6 +355,50 @@ pub struct CloudOutcome {
     pub rejection_cause: Option<&'static str>,
 }
 
+/// Validate and sanitize an identifier string exposed across the public Tauri seam.
+///
+/// Implements conservative lexical sanitization using a bounded symbolic allowlist:
+/// allows ASCII alphanumeric characters plus `.`, `_`, `-`, `/` up to 128 characters,
+/// and rejects control characters, whitespace, URLs, userinfo, and empty inputs.
+///
+/// NOTE: This provides conservative lexical sanitization and boundary enforcement,
+/// not an exhaustive guarantee of cryptographic secret detection.
+pub fn sanitize_identifier(raw: &str) -> Option<String> {
+    if raw.is_empty() || raw.len() > 128 {
+        return None;
+    }
+    if raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    if !raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' || c == '/') {
+        return None;
+    }
+    if raw.contains("//") || raw.starts_with('/') || raw.ends_with('/') {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// Convert a persisted [`CloudRecord`] into a safe public representation across the seam.
+///
+/// Sanitizes newly added identifiers, rejecting raw URLs, credentials, control characters,
+/// and length bounds (> 128 chars), while preserving legacy engine and model strings on disk.
+pub fn sanitize_cloud_record(cloud: &CloudRecord) -> CloudRecord {
+    CloudRecord {
+        provider: sanitize_identifier(&cloud.provider).unwrap_or_else(|| "unknown".to_string()),
+        profile_id: cloud.profile_id.as_deref().and_then(sanitize_identifier),
+        job_id: cloud.job_id.as_deref().and_then(sanitize_identifier),
+        request_id: sanitize_identifier(&cloud.request_id).unwrap_or_else(|| "unknown".to_string()),
+        attempt_id: cloud.attempt_id.as_deref().and_then(sanitize_identifier),
+        recipe_id: cloud.recipe_id.as_deref().and_then(sanitize_identifier),
+        model: sanitize_identifier(&cloud.model).unwrap_or_else(|| "unknown".to_string()),
+        model_revision: cloud.model_revision.as_deref().and_then(sanitize_identifier),
+        tier: cloud.tier.as_deref().and_then(sanitize_identifier),
+        cost: cloud.cost,
+        duration_ms: cloud.duration_ms,
+    }
+}
+
 /// `Provenance` with one field changed: `created` crosses the seam as ISO 8601
 /// and is epoch seconds in the core.
 ///
@@ -387,7 +431,7 @@ impl ApiProvenance {
             params_snapshot: provenance.params_snapshot.clone(),
             mask_sha256: provenance.mask_sha256.clone(),
             source_sha256: provenance.source_sha256.clone(),
-            cloud: provenance.cloud.clone(),
+            cloud: provenance.cloud.as_ref().map(sanitize_cloud_record),
             created: iso8601(provenance.created),
         }
     }
@@ -4253,5 +4297,104 @@ mod tests {
         let job_after_declined = Job::open(&path).unwrap();
         assert_eq!(job_after_declined.project.counters.gate_dropped, 0);
         assert_eq!(job_after_declined.project.counters.declined, 0);
+    }
+
+    #[test]
+    fn sanitize_identifier_accepts_valid_and_rejects_unsafe() {
+        // Valid identifiers including namespace/name model IDs
+        assert_eq!(
+            sanitize_identifier("beam-us-east-1"),
+            Some("beam-us-east-1".to_string())
+        );
+        assert_eq!(
+            sanitize_identifier("flux-sdnq-klein-v1"),
+            Some("flux-sdnq-klein-v1".to_string())
+        );
+        assert_eq!(
+            sanitize_identifier("black-forest-labs/FLUX.1-schnell"),
+            Some("black-forest-labs/FLUX.1-schnell".to_string())
+        );
+        assert_eq!(
+            sanitize_identifier("req_123_abc.v2"),
+            Some("req_123_abc.v2".to_string())
+        );
+
+        // Disallowed slashes (leading, trailing, consecutive)
+        assert_eq!(sanitize_identifier("/model"), None);
+        assert_eq!(sanitize_identifier("model/"), None);
+        assert_eq!(sanitize_identifier("org//model"), None);
+
+        // Control characters & whitespace
+        assert_eq!(sanitize_identifier("bad\nidentifier"), None);
+        assert_eq!(sanitize_identifier("bad\tidentifier"), None);
+        assert_eq!(sanitize_identifier("bad\0identifier"), None);
+        assert_eq!(sanitize_identifier("bad identifier"), None);
+
+        // URLs & userinfo (contains ':', '@', etc. not in allowlist)
+        assert_eq!(sanitize_identifier("https://api.beam.cloud/v1"), None);
+        assert_eq!(sanitize_identifier("http://modal.com/endpoint"), None);
+        assert_eq!(sanitize_identifier("//evil.com/leak"), None);
+        assert_eq!(sanitize_identifier("user:password@host"), None);
+        assert_eq!(sanitize_identifier("foo@bar"), None);
+        assert_eq!(sanitize_identifier("key=secret"), None);
+        assert_eq!(sanitize_identifier("val$name"), None);
+
+        // Bounds: > 128 characters
+        let long_str = "a".repeat(129);
+        assert_eq!(sanitize_identifier(&long_str), None);
+        let max_str = "a".repeat(128);
+        assert_eq!(sanitize_identifier(&max_str), Some(max_str));
+
+        // Empty or whitespace
+        assert_eq!(sanitize_identifier(""), None);
+        assert_eq!(sanitize_identifier("   "), None);
+    }
+
+    #[test]
+    fn api_provenance_of_sanitizes_cloud_record_and_preserves_clean_data() {
+        let dirty_cloud = CloudRecord {
+            provider: "beam".to_string(),
+            profile_id: Some("https://evil.com/token".to_string()),
+            job_id: Some("Bearer secret_jwt".to_string()),
+            request_id: "req-clean-123".to_string(),
+            attempt_id: Some("attempt\nwith\nnewlines".to_string()),
+            recipe_id: Some("flux-sdnq-v1".to_string()),
+            model: "https://evil.com/malicious-model".to_string(),
+            model_revision: Some("a".repeat(130)),
+            tier: Some("gpu-t4".to_string()),
+            cost: None,
+            duration_ms: Some(1500),
+        };
+
+        let prov = cleaner_core::patch::Provenance {
+            engine: Engine::Flux,
+            engine_version: "flux-sdnq-v1".to_string(),
+            model_sha256: None,
+            execution_provider: "beam".to_string(),
+            params_snapshot: serde_json::json!({}),
+            mask_sha256: "m123".to_string(),
+            source_sha256: "s123".to_string(),
+            cloud: Some(dirty_cloud.clone()),
+            created: 1700000000,
+        };
+
+        let api_prov = ApiProvenance::of(&prov);
+        let api_cloud = api_prov.cloud.expect("cloud record present");
+        assert_eq!(api_cloud.provider, "beam");
+        assert_eq!(api_cloud.request_id, "req-clean-123");
+        assert_eq!(api_cloud.recipe_id.as_deref(), Some("flux-sdnq-v1"));
+        assert_eq!(api_cloud.tier.as_deref(), Some("gpu-t4"));
+        assert_eq!(api_cloud.cost, None);
+        assert_eq!(api_cloud.duration_ms, Some(1500));
+
+        // Unsafe fields rejected and stripped/fallen back
+        assert_eq!(api_cloud.profile_id, None, "URL in profile_id stripped");
+        assert_eq!(api_cloud.job_id, None, "Bearer token in job_id stripped");
+        assert_eq!(api_cloud.attempt_id, None, "Control chars in attempt_id stripped");
+        assert_eq!(api_cloud.model, "unknown", "Unsafe URL in model falls back to unknown");
+        assert_eq!(api_cloud.model_revision, None, "Overly long string stripped");
+
+        // The core provenance in memory / on disk was untouched
+        assert_eq!(prov.cloud, Some(dirty_cloud));
     }
 }

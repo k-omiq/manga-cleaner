@@ -10,6 +10,7 @@ import {
   FILL_MODES,
   ROW_ENGINES,
   nextFillMode,
+  provenanceFacts,
   reRunnable,
   regionMenuSections,
   rowEngines,
@@ -144,6 +145,38 @@ describe('regionMenuSections', () => {
     expect(sections[0].items[0].labelKey).toBe('masks.action.delete')
   })
 
+  it('disables reRunnable for remote cloud FLUX masks to prevent unconfirmed paid execution', () => {
+    const remoteFlux = {
+      id: 'c1-p001-r0',
+      mask: {
+        id: 'c1-p001-r0-m1',
+        fillMode: 'reconstruct',
+        provenance: {
+          engine: 'flux',
+          cloud: { provider: 'modal', request_id: 'req-123', cost: null },
+        },
+      },
+    }
+    expect(reRunnable(remoteFlux.mask)).toBe(false)
+    const sections = regionMenuSections(remoteFlux)
+    expect(ids(sections)).toEqual(['delete'])
+  })
+
+  it('allows reRunnable for local FLUX masks without cloud provenance', () => {
+    const localFlux = {
+      id: 'c1-p001-r0',
+      mask: {
+        id: 'c1-p001-r0-m1',
+        fillMode: 'reconstruct',
+        provenance: {
+          engine: 'flux',
+          cloud: null,
+        },
+      },
+    }
+    expect(reRunnable(localFlux.mask)).toBe(true)
+  })
+
   it('gives every item a key the catalogue can answer, and a unique id', () => {
     const sections = regionMenuSections(masked('lama'), { engines: { flux: true } })
     const all = ids(sections)
@@ -153,5 +186,60 @@ describe('regionMenuSections', () => {
         expect(item.labelKey, item.id).toMatch(/^masks\.[a-zA-Z]+\.[a-zA-Z]+$/)
       }
     }
+  })
+})
+
+describe('provenanceFacts', () => {
+  it('retains cloudCost as null when cost is null so UI displays unknown dash', () => {
+    const maskWithNullCost = {
+      fillMode: 'reconstruct',
+      elapsedMs: 2500,
+      provenance: {
+        engine: 'flux',
+        engine_version: 'flux-sdnq-v1',
+        cloud: {
+          provider: 'beam',
+          request_id: 'req-456',
+          cost: null,
+        },
+      },
+    }
+    const facts = provenanceFacts(maskWithNullCost)
+    expect(facts).toContainEqual({ key: 'masks.provenance.cloudCost', value: null })
+    expect(facts).toContainEqual({ key: 'masks.provenance.cloudRequestId', value: 'req-456' })
+  })
+
+  it('includes cloudCost when cost is a valid positive number', () => {
+    const maskWithCost = {
+      fillMode: 'reconstruct',
+      elapsedMs: 1800,
+      provenance: {
+        engine: 'flux',
+        engine_version: 'flux-sdnq-v1',
+        cloud: {
+          provider: 'modal',
+          request_id: 'req-789',
+          cost: 0.025,
+        },
+      },
+    }
+    const facts = provenanceFacts(maskWithCost)
+    expect(facts).toContainEqual({ key: 'masks.provenance.cloudCost', value: 0.025 })
+    expect(facts).toContainEqual({ key: 'masks.provenance.cloudRequestId', value: 'req-789' })
+  })
+
+  it('omits cloud facts entirely for local masks', () => {
+    const localMask = {
+      fillMode: 'match-surround',
+      elapsedMs: 30,
+      provenance: {
+        engine: 'fill',
+        engine_version: 'planar-1.4',
+        cloud: null,
+      },
+    }
+    const facts = provenanceFacts(localMask)
+    expect(facts.map((f) => f.key)).not.toContain('masks.provenance.cloudCost')
+    expect(facts.map((f) => f.key)).not.toContain('masks.provenance.cloudRequestId')
   })
 })

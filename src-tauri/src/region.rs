@@ -395,10 +395,10 @@ pub fn list_sidecar_models_from(
 /* ------------------------------------------------------------------ */
 
 /// Which chapter, which job and which page a region id names.
-struct Located {
-    chapter_id: String,
-    job_path: PathBuf,
-    page_index: usize,
+pub(crate) struct Located {
+    pub(crate) chapter_id: String,
+    pub(crate) job_path: PathBuf,
+    pub(crate) page_index: usize,
 }
 
 /// The page a region id sits on, from the id alone.
@@ -414,7 +414,7 @@ fn page_index_in(chapter_id: &str, region_id: &str) -> Option<usize> {
     digits.parse::<usize>().ok()?.checked_sub(1)
 }
 
-fn locate_region(library: &Library, region_id: &str) -> Result<Option<Located>, LibraryError> {
+pub(crate) fn locate_region(library: &Library, region_id: &str) -> Result<Option<Located>, LibraryError> {
     let index = library.index()?;
     let Some(chapter_id) = crate::library::chapter_holding(&index, region_id) else {
         return Ok(None);
@@ -424,7 +424,7 @@ fn locate_region(library: &Library, region_id: &str) -> Result<Option<Located>, 
     Ok(Some(Located { chapter_id, job_path, page_index }))
 }
 
-fn locate_page(
+pub(crate) fn locate_page(
     library: &Library,
     chapter_id: &str,
     page_index: usize,
@@ -793,6 +793,12 @@ fn overlap(a: Rect, b: Rect) -> u64 {
 /// and an edit that interleaved with a run's flush would lose one of them
 /// entirely.
 fn edit(app: &tauri::AppHandle, located: &Located, plan: Plan) -> Result<Outcome, String> {
+    // Saved remote FLUX selection must never silently use the local sidecar.
+    if plan.choice == Choice::Exact(Engine::Flux)
+        && !crate::inference::config::read_inference_config(app)?.selected_target.is_local()
+    {
+        return Ok(Outcome::Refused("decline.reason.rungUnavailable"));
+    }
     let mut bench = Bench::open(app);
     let stored = crate::settings::read(app)
         .ok()
@@ -2249,6 +2255,15 @@ fn refuse(reason: &'static str) {
 /* Commands                                                            */
 /* ------------------------------------------------------------------ */
 
+fn explicit_remote_or_invalid_target(params: &serde_json::Value) -> bool {
+    params.get("engine").and_then(|v| v.as_str()) == Some("cloud")
+        || ["executionTarget", "target"].iter().any(|key| {
+            params.get(*key).is_some_and(|value| {
+                value != &serde_json::json!({"type":"local"})
+            })
+        })
+}
+
 /// `applyTool`.
 #[tauri::command]
 pub async fn apply_tool(
@@ -2264,6 +2279,21 @@ pub async fn apply_tool(
         let string = |key: &str| {
             params.get(key).and_then(|value| value.as_str()).map(str::to_owned)
         };
+
+        let has_cloud_target = explicit_remote_or_invalid_target(&params);
+
+        if has_cloud_target {
+            let blocked = crate::settings::read(&app)
+                .ok()
+                .and_then(|s| s.get("cloudEngines").and_then(|v| v.as_str()).map(str::to_owned))
+                .is_some_and(|value| value != "allowed");
+            crate::events::notice(
+                if blocked { "notice.cloud.blocked" } else { "notice.cloud.unavailable" },
+                serde_json::json!({}),
+                "warn",
+            );
+            return Ok(ApplyResult::of("blocked"));
+        }
 
         // Auto clean is a run trigger and not a per-region tool: it answers
         // with the queue, and every result arrives on the event channel.
@@ -2295,18 +2325,6 @@ pub async fn apply_tool(
         // The cloud rung has no client in this build. Refused here rather than
         // one layer down, so the sentence the user reads is the true one:
         // nothing was sent.
-        if string("engine").as_deref() == Some("cloud") {
-            let blocked = crate::settings::read(&app)
-                .ok()
-                .and_then(|s| s.get("cloudEngines").and_then(|v| v.as_str()).map(str::to_owned))
-                .is_some_and(|value| value != "allowed");
-            crate::events::notice(
-                if blocked { "notice.cloud.blocked" } else { "notice.cloud.unavailable" },
-                serde_json::json!({}),
-                "warn",
-            );
-            return Ok(ApplyResult::of("blocked"));
-        }
 
         let Some(region_id) = region_id else { return Ok(ApplyResult::of("not-found")) };
         let library = Library::for_app(&app)?;
@@ -2468,6 +2486,22 @@ pub async fn create_region(
     crate::library::blocking(move || {
         let params = params.unwrap_or(serde_json::Value::Null);
         let string = |key: &str| params.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+
+        let has_cloud_target = explicit_remote_or_invalid_target(&params);
+
+        if has_cloud_target {
+            let blocked = crate::settings::read(&app)
+                .ok()
+                .and_then(|s| s.get("cloudEngines").and_then(|v| v.as_str()).map(str::to_owned))
+                .is_some_and(|value| value != "allowed");
+            crate::events::notice(
+                if blocked { "notice.cloud.blocked" } else { "notice.cloud.unavailable" },
+                serde_json::json!({}),
+                "warn",
+            );
+            return Ok(None);
+        }
+
         let library = Library::for_app(&app)?;
         let Some(located) = locate_page(&library, &chapter_id, page_index as usize)? else {
             return Ok(None);
@@ -2576,7 +2610,7 @@ pub async fn rerun_mask(
         // What the mask currently is. A re-run of a region with no patch is a
         // re-run of nothing - the same `null` the seam gives for an id it
         // cannot find.
-        let (current, current_fill, current_bbox) = {
+        let (current, current_fill, current_bbox, is_cloud_provenance) = {
             let _lock = run::lock_job(&located.job_path);
             let job = Job::open(&located.job_path).map_err(|e| e.to_string())?;
             let Some(record) =
@@ -2591,7 +2625,8 @@ pub async fn rerun_mask(
                 .and_then(|v| v.as_str())
                 .unwrap_or("match-surround")
                 .to_owned();
-            (record.provenance.engine, fill, record.bbox)
+            let is_cloud = record.provenance.cloud.is_some() || record.provenance.engine == Engine::Cloud;
+            (record.provenance.engine, fill, record.bbox, is_cloud)
         };
 
         // The one kind that is not an edit: the mask is kept exactly as it is
@@ -2636,8 +2671,17 @@ pub async fn rerun_mask(
             _ => (current, if current_fill == "solid" { Some("solid") } else { None }),
         };
 
-        if target == Engine::Cloud {
-            crate::events::notice("notice.cloud.unavailable", serde_json::json!({}), "warn");
+        // Remote-provenance rerun must NOT silently rerun local.
+        if target == Engine::Cloud || (is_cloud_provenance && kind != "engine") {
+            let blocked = crate::settings::read(&app)
+                .ok()
+                .and_then(|s| s.get("cloudEngines").and_then(|v| v.as_str()).map(str::to_owned))
+                .is_some_and(|value| value != "allowed");
+            crate::events::notice(
+                if blocked { "notice.cloud.blocked" } else { "notice.cloud.unavailable" },
+                serde_json::json!({}),
+                "warn",
+            );
             return Ok(None);
         }
 
@@ -2789,6 +2833,22 @@ pub async fn clean_anyway(
     engine: Option<String>,
 ) -> Result<Option<CleanedRegion>, String> {
     crate::library::blocking(move || {
+        let has_cloud_target = engine.as_deref() == Some("cloud")
+            || named_rung(engine.as_deref()) == Some(Engine::Cloud);
+
+        if has_cloud_target {
+            let blocked = crate::settings::read(&app)
+                .ok()
+                .and_then(|s| s.get("cloudEngines").and_then(|v| v.as_str()).map(str::to_owned))
+                .is_some_and(|value| value != "allowed");
+            crate::events::notice(
+                if blocked { "notice.cloud.blocked" } else { "notice.cloud.unavailable" },
+                serde_json::json!({}),
+                "warn",
+            );
+            return Ok(None);
+        }
+
         let library = Library::for_app(&app)?;
         let Some(located) = locate_region(&library, &region_id)? else { return Ok(None) };
 
@@ -4051,4 +4111,27 @@ mod tests {
         let out_balloon_choice = choice_for(None, untouched_fallback_pick(Some("review.reason.gateSkippedOutsideBubble")));
         assert_eq!(out_balloon_choice, Choice::Ladder(Some(EnginePick::Lama)));
     }
+
+    #[test]
+    fn named_rung_parses_cloud_correctly() {
+        assert_eq!(named_rung(Some("cloud")), Some(Engine::Cloud));
+        assert_eq!(named_rung(Some("lama")), Some(Engine::Lama));
+        assert_eq!(named_rung(Some("fill")), Some(Engine::Fill));
+        assert_eq!(named_rung(None), None);
+    }
+
+    #[test]
+    fn step_on_cloud_engine_returns_cloud_engine() {
+        assert_eq!(step(Engine::Cloud, true), Engine::Cloud);
+        assert_eq!(step(Engine::Cloud, false), Engine::Cloud);
+    }
+    #[test]
+    fn explicit_remote_and_malformed_targets_fail_closed() {
+        for value in [serde_json::json!({"type":"beam","profile_id":"p"}), serde_json::json!(null), serde_json::json!({"type":"local","extra":true})] {
+            assert!(explicit_remote_or_invalid_target(&serde_json::json!({"executionTarget":value})));
+        }
+        assert!(!explicit_remote_or_invalid_target(&serde_json::json!({"engine":"flux","executionTarget":{"type":"local"}})));
+        assert!(!explicit_remote_or_invalid_target(&serde_json::json!({"engine":"lama"})));
+    }
+
 }

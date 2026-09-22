@@ -41,3 +41,6 @@ pub mod fill;
 pub mod flux;
 pub mod lama;
 pub mod model;
+pub mod render;
+
+pub use render::{CloudProvider, ExecutionTarget, GeneratedCrop, PreparedRender, RenderRecipe};

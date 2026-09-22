@@ -1,0 +1,75 @@
+# Manga Cleaner Application & Cloud Inference Permissions Manifest
+
+[[permission]]
+identifier = "allow-app-commands"
+description = "Enables all core application commands for the main window."
+commands.allow = [
+    "diagnostics",
+    "about",
+    "read_settings",
+    "write_settings",
+    "list_projects",
+    "create_project",
+    "create_chapter",
+    "open_chapter",
+    "load_pages",
+    "history_load",
+    "history_push",
+    "history_move",
+    "rename_project",
+    "delete_project",
+    "delete_chapter",
+    "delete_mask",
+    "restore_region",
+    "apply_tool",
+    "create_region",
+    "rerun_mask",
+    "clean_anyway",
+    "sidecar_available",
+    "list_sidecar_models",
+    "export_chapter",
+    "subscribe_events",
+    "unsubscribe_events",
+    "list_loaded_models",
+    "unload_model",
+    "list_accelerators",
+    "list_models",
+    "download_model",
+    "cancel_download",
+    "delete_model",
+    "discard_partial",
+    "verify_model",
+    "download_runtime",
+    "delete_runtime",
+    "run_clean",
+    "cancel_run",
+    "resume_job",
+]
+
+[[permission]]
+identifier = "allow-inference-commands"
+description = "Enables reading and writing public inference profiles, managing cloud credentials, and checking cloud connectivity/model metadata."
+commands.allow = [
+    "read_inference_config",
+    "write_inference_config",
+    "store_cloud_secret",
+    "delete_cloud_secret",
+    "get_cloud_secret_summary",
+    "check_cloud_connection",
+    "get_cloud_model_info",
+    "prepare_cloud_consent",
+    "confirm_cloud_consent",
+    "submit_cloud_attempt",
+    "get_cloud_attempt_status",
+    "get_cloud_attempt_result",
+    "cancel_cloud_attempt",
+    "reconcile_cloud_recovery",
+]
+
+[[set]]
+identifier = "default"
+description = "Default application and cloud inference permissions"
+permissions = [
+    "allow-app-commands",
+    "allow-inference-commands",
+]

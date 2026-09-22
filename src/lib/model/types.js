@@ -33,12 +33,35 @@
  */
 
 /**
+ * @typedef {'beam' | 'modal'} CloudProvider
+ */
+
+/**
+ * @typedef {{ type: 'local' } | { type: 'beam', profile_id: string } | { type: 'modal', profile_id: string }} ExecutionTarget
+ */
+
+/**
+ * @typedef {Object} RenderRecipe
+ * @property {string} recipe_id
+ * @property {string} preprocessing_version
+ * @property {string} model_id
+ * @property {string} model_revision
+ * @property {boolean} native_mask_conditioning
+ */
+
+/**
  * @typedef {Object} CloudProvenance
  * @property {string} provider
- * @property {string} model
+ * @property {string} [profile_id]
+ * @property {string} [job_id]
  * @property {string} request_id
- * @property {string} tier
- * @property {number} cost
+ * @property {string} [attempt_id]
+ * @property {string} [recipe_id]
+ * @property {string} model
+ * @property {string} [model_revision]
+ * @property {string} [tier]
+ * @property {number|null} [cost]
+ * @property {number} [duration_ms]
  */
 
 /**
@@ -50,6 +73,157 @@
  * @typedef {Object} CloudOutcome
  * @property {boolean} accepted
  * @property {'safety-filter'|'transport-error'|'parameter-test'|'residual-test'|'structural'|null} rejectionCause
+ */
+
+/**
+ * Operation intent bound to backend authorization proposals.
+ *
+ * @typedef {Object} OperationIntent
+ * @property {'applyTool'|'createRegion'|'rerunMask'|'cleanAnyway'} action
+ * @property {string} [tool]
+ * @property {Record<string, unknown>} [params]
+ * @property {string} [maskId]
+ * @property {string} [kind]
+ * @property {string} [engine]
+ * @property {string} [regionId]
+ */
+
+/**
+ * Authoritative backend consent proposal prepared before spend/transmission confirmation.
+ *
+ * @typedef {Object} ConsentProposal
+ * @property {string} proposalId
+ * @property {string} profileId
+ * @property {CloudProvider} provider
+ * @property {string} endpointUrl
+ * @property {string} canonicalOriginFingerprint
+ * @property {number} profileEpoch
+ * @property {string} cropSha256
+ * @property {string} hintSha256
+ * @property {string} sourceHash
+ * @property {string} maskHash
+ * @property {string|number} regionRevision
+ * @property {{x: number, y: number, w: number, h: number}} rect
+ * @property {RenderRecipe} recipe
+ * @property {OperationIntent} intent
+ * @property {number} createdAtMs
+ * @property {number} expiresAtMs
+ * @property {number|null} estimatedCostUsd
+ */
+
+/**
+ * Scoped authorization bounds minted upon proposal confirmation.
+ *
+ * @typedef {Object} GrantScope
+ * @property {CloudProvider} provider
+ * @property {string} profileId
+ * @property {string} endpointFingerprint
+ * @property {string} cropSha256
+ * @property {string} maskHash
+ * @property {string|number} revision
+ * @property {RenderRecipe} recipe
+ * @property {string} operationDigest
+ */
+
+/**
+ * Backend-issued, attempt-limited authorization grant.
+ *
+ * @typedef {Object} Grant
+ * @property {string} nonce
+ * @property {GrantScope} scope
+ * @property {number} issuedAtMs
+ * @property {number} expiresAtMs
+ * @property {number} allowedAttempts
+ * @property {number} usedAttempts
+ */
+
+/**
+ * Safe public connection check result (ordinary reachability, never triggers GPU work).
+ *
+ * @typedef {Object} CloudConnectionStatus
+ * @property {boolean} ok
+ * @property {string} status
+ * @property {CloudProvider} provider
+ * @property {string} profileId
+ * @property {number} [latencyMs]
+ * @property {string} [message]
+ */
+
+/**
+ * Wire model metadata and provisional limits.
+ *
+ * @typedef {Object} CloudModelInfo
+ * @property {string} supportedProtocolVersion
+ * @property {string} pinnedModelId
+ * @property {string} pinnedModelRevision
+ * @property {string} pinnedRecipeId
+ * @property {Object} limits
+ * @property {[number, number]} limits.maxDimensions
+ * @property {number} limits.maxMegapixels
+ * @property {number} limits.maxPngBytes
+ * @property {number} limits.maxMultipartBytes
+ * @property {number} limits.defaultWorkerDeadlineSec
+ */
+
+/**
+ * Submission response for a durable remote attempt.
+ *
+ * @typedef {Object} CloudAttemptSubmission
+ * @property {string} attemptId
+ * @property {string|null} [handle]
+ * @property {'accepted'|'dispatching'|'unknown'} status
+ * @property {string} [requestDigest]
+ * @property {boolean} [autoRetryable]
+ * @property {string} [error]
+ */
+
+/**
+ * Authoritative lifecycle status for an accepted remote attempt.
+ *
+ * @typedef {Object} CloudAttemptStatus
+ * @property {string} attemptId
+ * @property {string|null} handle
+ * @property {'pending'|'running'|'completed'|'failed'|'cancelled'|'cancel_requested'|'unknown'} status
+ * @property {number|null} reportedCostUsd
+ * @property {boolean} [acknowledged]
+ * @property {number} [createdAtMs]
+ * @property {number} [startedAtMs]
+ * @property {number} [finishedAtMs]
+ */
+
+/**
+ * Validated output crop result retrieved from local cache or remote gateway.
+ *
+ * @typedef {Object} CloudAttemptResult
+ * @property {string} attemptId
+ * @property {string} handle
+ * @property {string} resultDigest
+ * @property {number|null} reportedCostUsd
+ * @property {number} width
+ * @property {number} height
+ * @property {boolean} cached
+ */
+
+/**
+ * Cancellation request acknowledgement.
+ *
+ * @typedef {Object} CloudCancelResult
+ * @property {string} handle
+ * @property {'cancel_requested'|'cancelled'} status
+ * @property {boolean} acknowledged
+ */
+
+/**
+ * Recovery decider outcome for uncommitted or interrupted attempts.
+ *
+ * @typedef {Object} CloudRecoveryDecision
+ * @property {'ambiguous_unknown'|'resume_polling'|'resume_cancel_polling'|'result_cached_ready'|'attachment_pending'|'stale_attachment'|'already_committed'|'terminal'} decision
+ * @property {string} [attemptId]
+ * @property {string|null} [handle]
+ * @property {string} [resultDigest]
+ * @property {string} [patchId]
+ * @property {boolean} [autoRetryable]
+ * @property {string} [message]
  */
 
 /**
