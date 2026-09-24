@@ -111,6 +111,9 @@ export const en = {
       light: 'Light',
       dark: 'Dark',
       system: 'System',
+      sakura: 'Sakura',
+      jade: 'Jade',
+      ocean: 'Ocean',
     },
     direction: {
       label: 'Reading direction',
@@ -285,26 +288,34 @@ export const en = {
       label: 'Language',
       english: 'English',
     },
+    // Under the Cleaning section's "AI redraw (FLUX)" heading, so the labels
+    // do not repeat it.
     sidecar: {
-      label: 'AI redraw (FLUX) folder',
+      heading: 'AI redraw (FLUX)',
+      label: 'Folder',
       chooserTitle: 'AI redraw (FLUX) folder',
       notFound: 'No engine found in this folder.',
     },
     fluxBackend: {
-      label: 'AI redraw engine',
+      label: 'Backend',
       auto: 'Automatic',
       mflux: 'MLX (Apple)',
       sdnq: 'SDNQ (any GPU)',
     },
     sidecarModel: {
-      label: 'AI redraw model',
+      label: 'Model',
       noneFound: 'No models found in weights folder.',
+      // The stored model, when the helper no longer lists it. Drawn as an
+      // option so the picker does not show a different model than the one set.
+      missing: '{id} (not found)',
     },
     // The weights and the ONNX Runtime are not bundled: they are downloaded
     // after install. Everything here is about
     // *files on this machine*, so the copy names sizes and folders and never
     // talks about "AI" - the reader is deciding what to spend disk on.
     models: {
+      // Over the file rows in Detection and Cleaning.
+      heading: 'Files',
       status: {
         installed: 'Installed',
         missing: 'Not installed',
@@ -413,11 +424,14 @@ export const en = {
       // The picker with nothing in it. `listAccelerators` is the engine runtime
       // being asked what this machine can run a model on, so a rejection is
       // almost always the runtime itself failing to load - and the runtime's
-      // own row under Models is already where the reason for that is written.
+      // own row, above it in Performance, is where the reason is written.
       // This sentence sends the reader there rather than restating it, because
       // two explanations of one fault are two things that can disagree.
       unreadable:
-        'The accelerator list could not be read, so only Automatic is offered. It comes from the engine runtime, so the reason for this will be on the runtime’s row under Models.',
+        'The accelerator list could not be read, so only Automatic is offered. The engine runtime row above says why.',
+      // A stored accelerator the list does not offer, or any before the list
+      // has been read. The id is data, so it is not translated.
+      saved: '{id} (saved)',
     },
     // Which modifier is held while clicking the page to set where Clone / heal
     // reads from. The *caps* are not here: `⌥` and `Alt` are the keys' own
@@ -552,12 +566,11 @@ export const en = {
         saveFailed: 'The cloud settings could not be saved. Nothing was changed.',
       },
     },
-    // The tab strip. `general` heads the five preference rows, which had no
-    // heading at all while they were simply the top of the scroller.
+    // The sidebar's sections. Detection and Cleaning take their names from
+    // `pipelines.*`, which onboarding shares.
     section: {
       general: 'General',
-      models: 'Models',
-      acceleration: 'Acceleration',
+      performance: 'Performance',
       inference: 'Cloud',
       shortcuts: 'Shortcuts',
       about: 'About',
@@ -930,8 +943,8 @@ export const en = {
       // than hidden: an engine option has four alternatives beside it and this
       // button has none, so a tool that quietly lost its only action would
       // read as a broken window rather than as a missing download.
-      modelsMissing: 'Auto clean needs its models. Download them in Settings › Models.',
-      runtimeMissing: 'No engine runtime found. Download it in Settings › Models.',
+      modelsMissing: 'Auto clean needs its models. Download them in Settings › Detection and Cleaning.',
+      runtimeMissing: 'No engine runtime found. Download it in Settings › Performance.',
     },
   },
 
@@ -1310,84 +1323,94 @@ export const en = {
   // sizes are real byte counts and the copy says what a thing does rather
   // than what it is, for `models.kind.*`'s reason. Settings' own names are
   // reused where a row is the same setting, so one setting has one name.
+  // The pipelines a page goes through (`model/pipelines.js`). Engine names are
+  // product names and are not here; what is here is what each one does.
+  pipelines: {
+    detection: 'Detection',
+    cleaning: 'Cleaning',
+    language: {
+      ja: 'Japanese',
+      zh: 'Chinese',
+      ko: 'Korean',
+    },
+    detector: {
+      ctdRtdetr: 'CTD finds text, RT-DETR finds bubbles',
+      ctdRtdetrOcr: 'Adds manga-ocr to rescue unclear Japanese',
+      rtdetrCoo: 'RT-DETR finds text, COO sound effects, SAM-TS the mask',
+    },
+    cleaner: {
+      lamaManga: 'Fast redraw tuned for manga tone',
+      bigLama: 'Larger LaMa for wide areas',
+      flux: 'AI redraw through the FLUX helper',
+      qwen: 'Instruction-based image editing',
+    },
+    column: {
+      engine: 'Engine',
+      efficiency: 'Efficiency',
+      light: 'Lightweight',
+      size: 'Size',
+    },
+    rating: {
+      efficiency: 'Efficiency: {value} of 5',
+      light: 'Lightweight: {value} of 5',
+    },
+    status: {
+      installed: 'Installed',
+      soon: 'Soon',
+      // A FLUX model the helper lists: nothing to download here.
+      found: 'Via helper',
+      needsHelper: 'Needs helper',
+    },
+    skip: 'Skip',
+    detectorFor: 'Detector for {language}',
+  },
   onboarding: {
     title: 'Set up Manga Cleaner',
     stepOf: 'Step {current} of {total}',
+    progressLabel: 'Setup progress',
     saveFailed: 'This setting could not be saved. Try again, or change it later in Settings.',
     action: {
-      start: 'Get started',
+      start: 'Set up the app',
       next: 'Continue',
       back: 'Back',
       skip: 'Skip setup',
+      skipStep: 'Skip',
       notNow: 'Not now',
-      close: 'Close',
     },
     welcome: {
       heading: 'Welcome to Manga Cleaner',
-      body: 'Manga Cleaner finds the text on scanned comic pages, removes it, and redraws the art underneath.',
-      local: 'Cleaning runs on this computer.',
-      steps: 'Each step is one choice. Skip any of them and change it later in Settings.',
+      body: 'An open source project that cuts the time spent cleaning and redrawing comic raws.',
+      source: 'GitHub',
     },
-    models: {
-      heading: 'Download the models',
-      body: 'Cleaning needs these files on this computer. They download once, then work offline.',
-      // The required files are one line rather than five: there is no
-      // cleaning without all of them, so there is nothing to choose between.
-      // Settings > Models keeps the one-row-per-file list.
-      required: {
-        label: 'Required for cleaning',
-        note: 'The engine runtime and the models that find text and speech bubbles.',
-        // An Intel Mac, where no runtime is published and the row is absent.
-        noteNoRuntime: 'The models that find text and speech bubbles.',
-      },
-      redraw: {
-        note: 'Redraws tones and lines where text covered the art.',
-      },
-      japanese: {
-        note: 'Reads Japanese the language checker cannot make out, so fewer lines land in review.',
-      },
-      status: {
-        installed: 'Installed',
-        waiting: 'Waiting',
-        downloading: 'Downloading',
-        paused: 'Paused',
-        failed: 'Failed',
-      },
-      download: 'Download {bytes:memory}',
-      pause: 'Pause',
-      resume: 'Resume',
-      retry: 'Try again',
-      progressLabel: 'Download progress',
-      run: {
-        downloading: 'Downloading: {nameKey}',
-        working: 'Downloading…',
-        paused: 'Paused. Resume picks up where it stopped.',
-        done: 'Downloads finished.',
-        failed: '{nameKey} could not be downloaded. Check your connection, then try again.',
-        failedAny: 'A download failed. Check your connection, then try again.',
-      },
-      amount: '{done:memory} of {total:memory}',
-      background: 'You can continue setup while this runs.',
-      ready: 'Everything cleaning needs is installed.',
-      runtimeUnavailable:
-        'No engine runtime is published for this computer, so cleaning needs one installed by hand. The models still download.',
+    theme: {
+      heading: 'Pick a theme',
     },
-    defaults: {
-      heading: 'Choose the defaults',
-      body: 'The recommended choices are already selected. Change any of them later in Settings.',
-      accel: {
-        auto: 'Automatic (recommended)',
-        note: 'Automatic picks the processor or graphics card for each model.',
-        // Asking what this machine can run on loads the runtime, so the
-        // question waits for the runtime to be here (`runtimeReady`).
-        later: 'More choices appear once the engine runtime is installed.',
-        unreadable: 'The list of processors could not be read, so Automatic is the only choice. Settings > Models shows why.',
-      },
-      flux: {
-        folderNote: 'Optional. AI redraw runs in a separate helper. Choose its folder if you have installed it.',
-        modelNote: 'Used when a region is redrawn with AI redraw.',
-        engineNote: 'Automatic uses MLX on Apple silicon and SDNQ elsewhere.',
-      },
+    token: {
+      heading: 'Hugging Face key',
+      body: 'Optional. A key makes model downloads faster and less likely to be rate limited.',
+      label: 'API key',
+      placeholder: 'hf_…',
+      saved: 'A key is saved.',
+      save: 'Save and continue',
+      failed: 'The key could not be saved. Try again, or skip.',
+    },
+    background: {
+      heading: 'Keep running in the background?',
+      keep: 'Keep running',
+      keepNote: 'The close button hides the window. Downloads and cleaning continue. Quit from the tray icon.',
+      quit: 'Quit on close',
+      quitNote: 'The close button quits the app. Downloads and cleaning stop. Unfinished downloads keep their progress for next time.',
+    },
+    detection: {
+      heading: 'Detection',
+      body: 'Choose a detector for each language. Skip a language to skip its files.',
+    },
+    cleaning: {
+      heading: 'Cleaning',
+      body: 'Choose the models that redraw the art under removed text.',
+      helper: 'FLUX helper',
+      helperNote: 'FLUX models run in a separate helper. Choose its folder if it is installed.',
+      helperMissing: 'No helper was found in that folder.',
     },
     cloud: {
       heading: 'Cloud GPU',
@@ -1402,41 +1425,58 @@ export const en = {
         'Your cloud GPU is set up, but it did not answer its first check. Test it and turn cloud cleaning on in Settings > Cloud.',
       saveFailed: 'Your cloud GPU is set up, but cloud cleaning could not be turned on. Turn it on in Settings.',
     },
-    behavior: {
-      heading: 'App behavior',
-      body: 'Change these later in Settings > General.',
-      trayNote: 'Closing the window hides it and downloads keep going. Quit from the tray icon.',
-      directionNote: 'The default for new projects. Right to left suits manga.',
+    dependencies: {
+      heading: 'Dependencies',
+      body: 'Checked on {platform}.',
+      runtime: 'Engine runtime',
+      acceleration: 'Graphics acceleration',
+      cpuOnly: 'CPU only',
+      afterRuntime: 'Checked after the runtime installs',
+      unreadable: 'Could not be read',
+      unavailable: 'Not published for this computer. Install it by hand to run local models.',
+      needs: 'Needs {items}, installed by you',
+      helper: 'FLUX helper',
+      helperFound: 'Found',
+      helperMissing: 'Not installed',
+      installed: 'Installed',
+      toDownload: '{bytes:memory}',
+      total: '{count} to download, {bytes:memory}',
+      nothing: 'Nothing to download',
+      start: 'Download',
+      platform: {
+        macArm: 'macOS on Apple silicon',
+        macIntel: 'macOS on Intel',
+        windows: 'Windows',
+        windowsArm: 'Windows on ARM',
+        linux: 'Linux',
+        linuxArm: 'Linux on ARM',
+        // Not `other`: that name is a plural category to the catalogue.
+        unknown: 'this computer',
+      },
     },
-    done: {
-      heading: 'Setup is done',
-      body: 'Start a new project to clean your first chapter. You can run this setup again from Settings.',
-      bodyDownloading: 'Downloads are still running. You can start a project now; Auto clean is ready when they finish.',
-      bodyMissing: 'Auto clean needs the required models. Download them any time from Settings > Models.',
-      summary: {
-        models: 'Models',
-        cloud: 'Cloud cleaning',
-        tray: 'Closing the window',
+    downloads: {
+      heading: 'Downloads',
+      status: {
+        waiting: 'Queued',
+        active: '{percent}%',
+        starting: 'Starting',
+        paused: 'Paused',
+        done: 'Done',
+        failed: 'Failed',
       },
-      value: {
-        installed: 'Installed',
-        downloading: 'Downloading, {percent}%',
-        paused: 'Paused at {percent}%',
-        failed: 'Download failed',
-        notDownloaded: 'Not downloaded',
-        accelCustom: 'As set in Settings',
-        cloudOff: 'Off',
-        cloudOffSaved: 'Off, {name} saved',
-        cloudOn: 'On',
-        cloudOnNamed: 'On, {name}',
-        trayKeep: 'Keeps running in the tray',
-        trayQuit: 'Quits the app',
-      },
+      pause: 'Pause {name}',
+      resume: 'Resume {name}',
+      retry: 'Retry {name}',
+      pauseAll: 'Pause all',
+      resumeAll: 'Resume all',
+      later: 'Continue in background',
+      close: 'Finish later',
+      empty: 'Nothing to download.',
     },
     // Settings > General, for anyone who skipped a step or wants the tour.
     replay: {
       label: 'Setup',
-      description: 'Walk through downloads, defaults, the cloud GPU and app behavior again.',
+      description: 'Walk through the theme, models, cloud GPU and downloads again.',
       action: 'Run setup again',
       failed: 'Setup could not open because the model list could not be read. Try again.',
     },
@@ -1837,7 +1877,7 @@ export const en = {
       // A notice rather than an error now that there is somewhere to send the
       // reader: before Settings › Models existed, this was a rejected promise
       // the interface had nowhere to put.
-      modelsMissing: 'The models are not installed. Download them in Settings › Models.',
+      modelsMissing: 'The models are not installed. Download them in Settings › Detection and Cleaning.',
       // Pages the run **could not** clean, counted separately from the pages it
       // cleaned, and said even when the number is every page in the chapter.
       // That last case is why this exists: a run where every page failed
@@ -1863,7 +1903,7 @@ export const en = {
       // so every later run in the same session fails too unless the model is
       // dropped, and that is what "unloaded" is reporting.
       engineFault:
-        'The {modelKey} stopped answering on {accelKey}, so it was unloaded. The next run builds it again. If it keeps happening, choose CPU in Settings › Acceleration.',
+        'The {modelKey} stopped answering on {accelKey}, so it was unloaded. The next run builds it again. If it keeps happening, choose CPU in Settings › Performance.',
     },
 
     // Downloading or replacing the engine runtime itself. Both of these are

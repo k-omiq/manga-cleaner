@@ -369,6 +369,27 @@ export const icons = {
   'help': [
     'M5.8 5.6a2.2 2.2 0 0 1 4.4 0c0 1.5-2.2 2-2.2 3.4M8 12.5h.01',
   ],
+
+  // Five-point star, outline. A rating's empty mark.
+  'star': [
+    'M8 2.55 9.5 6.39l4.11.24-3.18 2.61 1.04 3.98L8 11l-3.47 2.22 1.04-3.98-3.18-2.61 4.11-.24Z',
+  ],
+
+  // The same star, solid. A rating's full mark.
+  'star-filled': {
+    paths: ['M8 2.55 9.5 6.39l4.11.24-3.18 2.61 1.04 3.98L8 11l-3.47 2.22 1.04-3.98-3.18-2.61 4.11-.24Z'],
+    filled: ['M8 2.55 9.5 6.39l4.11.24-3.18 2.61 1.04 3.98L8 11l-3.47 2.22 1.04-3.98-3.18-2.61 4.11-.24Z'],
+  },
+
+  // Pause: two upright bars.
+  'pause': [
+    'M5.5 3.5v9M10.5 3.5v9',
+  ],
+
+  // Download: an arrow down onto a tray line.
+  'download': [
+    'M8 2.5v7.5M4.8 6.8 8 10l3.2-3.2M3 13.5h10',
+  ],
 }
 
 /** Every icon name in the set, in declaration order. */

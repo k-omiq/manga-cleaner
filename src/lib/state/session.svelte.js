@@ -48,9 +48,25 @@ import {
   MIN_HEIGHT,
 } from '../model/windows.js'
 
+import { DEFAULT_DETECTOR, LANGUAGES, detectorsFor } from '../model/pipelines.js'
+
 const STORAGE_KEY = 'session.v1'
 
-export const THEMES = /** @type {const} */ (['light', 'dark', 'system'])
+/**
+ * `system` follows the OS between `light` and `dark`; the rest are fixed.
+ * Every fixed name is a token block in `app.css`, keyed off `data-theme`.
+ */
+export const THEMES = /** @type {const} */ (['system', 'light', 'dark', 'sakura', 'jade', 'ocean'])
+/** @typedef {(typeof THEMES)[number]} Theme */
+/** Each theme's name, by value. @type {Record<Theme, string>} */
+export const THEME_LABEL_KEYS = Object.freeze({
+  system: 'settings.theme.system',
+  light: 'settings.theme.light',
+  dark: 'settings.theme.dark',
+  sakura: 'settings.theme.sakura',
+  jade: 'settings.theme.jade',
+  ocean: 'settings.theme.ocean',
+})
 export const READING_DIRECTIONS = /** @type {const} */ (['rtl', 'ltr'])
 export const ORIGINAL_VIEW_MODES = /** @type {const} */ (['hold', 'pinned'])
 
@@ -93,7 +109,7 @@ function viewport() {
 
 /**
  * @typedef {Object} PersistedSession
- * @property {'light'|'dark'|'system'} theme
+ * @property {Theme} theme
  * @property {'rtl'|'ltr'} readingDirection - the default for new projects; a project overrides it
  * @property {boolean} cloudAllowed
  * @property {'hold'|'pinned'} originalView
@@ -104,6 +120,7 @@ function viewport() {
  * @property {'alt'|'meta'|'control'|'shift'} cloneSourceModifier - held while clicking to set Clone / heal's source; see `setCloneSourceModifier`
  * @property {boolean} firstLaunchOffered - whether the first-launch download offer has been made on this machine
  * @property {boolean} closeToTray - close control hides the window and keeps downloads running
+ * @property {Record<string, string|null>} detection - the detector each source language uses, by language id; null skips the language
  * @property {Record<string, import('../shortcuts.js').Chord|null>} shortcuts - rebindings, by shortcut id; only the differences from the defaults
  * @property {Record<string, WindowState>} windows
  */
@@ -127,6 +144,7 @@ function defaults() {
     cloneSourceModifier: DEFAULT_POINTER_MODIFIER,
     firstLaunchOffered: false,
     closeToTray: false,
+    detection: defaultDetection(),
     shortcuts: {},
     windows,
   }
@@ -191,7 +209,7 @@ export function sanitizeSession(raw) {
   }
 
   return {
-    theme: /** @type {'light'|'dark'|'system'} */ (oneOf(record.theme, THEMES, base.theme)),
+    theme: /** @type {Theme} */ (oneOf(record.theme, THEMES, base.theme)),
     readingDirection: /** @type {'rtl'|'ltr'} */ (
       oneOf(record.readingDirection, READING_DIRECTIONS, base.readingDirection)
     ),
@@ -220,6 +238,7 @@ export function sanitizeSession(raw) {
     // wrote itself.
     firstLaunchOffered: boolOr(record.firstLaunchOffered, base.firstLaunchOffered),
     closeToTray: boolOr(record.closeToTray, base.closeToTray),
+    detection: sanitizeDetection(record.detection),
     // The shortcut table owns this vocabulary and validates it: an id the
     // table no longer has, a chord that will not parse, or a chord that is
     // only the default written out is dropped here rather than kept as a
@@ -290,6 +309,7 @@ function persistable() {
     cloneSourceModifier: session.cloneSourceModifier,
     firstLaunchOffered: session.firstLaunchOffered,
     closeToTray: session.closeToTray,
+    detection: { ...session.detection },
     shortcuts: shortcutOverrides(),
     windows,
   }
@@ -307,7 +327,7 @@ function save() {
  * The theme actually in force: `system` resolves against the OS.
  * Call it inside a template or an effect and it tracks both inputs.
  *
- * @returns {'light'|'dark'}
+ * @returns {Exclude<Theme, 'system'>}
  */
 export function resolvedTheme() {
   if (session.theme === 'system') return session.systemDark ? 'dark' : 'light'
@@ -341,7 +361,7 @@ export function installThemeSync() {
   return () => query.removeEventListener('change', onChange)
 }
 
-/** @param {'light'|'dark'|'system'} theme */
+/** @param {Theme} theme */
 export function setTheme(theme) {
   session.theme = oneOf(theme, THEMES, session.theme)
   save()
@@ -355,6 +375,42 @@ export function setTheme(theme) {
 export function setCloseToTray(enabled) {
   session.closeToTray = boolOr(enabled, session.closeToTray)
   save()
+}
+
+/**
+ * Choose the detector for one source language, or `null` to skip it.
+ *
+ * Only a ready detector that serves the language is accepted; anything else
+ * leaves the choice as it was.
+ *
+ * @param {string} language
+ * @param {string|null} detectorId
+ */
+export function setDetection(language, detectorId) {
+  if (!LANGUAGES.some((entry) => entry.id === language)) return
+  if (detectorId !== null && !detectorsFor(language).some((engine) => engine.id === detectorId)) return
+  session.detection = { ...session.detection, [language]: detectorId }
+  save()
+}
+
+/** @returns {Record<string, string|null>} */
+function defaultDetection() {
+  return Object.fromEntries(LANGUAGES.map((language) => [language.id, DEFAULT_DETECTOR]))
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {Record<string, string|null>}
+ */
+function sanitizeDetection(raw) {
+  const record = plainObject(raw)
+  const detection = defaultDetection()
+  for (const language of LANGUAGES) {
+    const value = record[language.id]
+    if (value === null) detection[language.id] = null
+    else if (detectorsFor(language.id).some((engine) => engine.id === value)) detection[language.id] = /** @type {string} */ (value)
+  }
+  return detection
 }
 
 /** @param {'rtl'|'ltr'} direction */

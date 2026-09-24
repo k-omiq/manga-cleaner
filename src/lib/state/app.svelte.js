@@ -166,11 +166,7 @@ export function back() {
  * wrap onto three lines at 400.
  */
 const MODAL_WIDTHS = {
-  // 560 since Settings became a tab strip: five labels have to sit on one line
-  // at whatever length a translation gives them, and the Models rows - a name,
-  // a size, a status and up to three buttons - were already the tightest thing
-  // in the app at 520.
-  settings: 560,
+  // No `settings`: Settings is a full-window `Screen`, not a `Modal`.
   export: 460,
   shortcuts: 460,
   newProject: 440,

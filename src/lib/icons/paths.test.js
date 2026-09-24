@@ -23,6 +23,8 @@ const REQUIRED = [
   'shape-rect', 'shape-ellipse', 'shape-lasso', 'shape-polygon',
   'book', 'sliders', 'play', 'stop', 'link',
   'link-off', 'bandage',
+  // Onboarding and Settings: ratings, and a download's pause.
+  'star', 'star-filled', 'pause', 'download',
 ]
 
 describe('icon set', () => {
@@ -58,7 +60,7 @@ describe('icon set', () => {
   it('exposes filled sub-paths only where a solid form is wanted', () => {
     const withFill = Object.keys(icons).filter((n) => glyph(n).filled.length > 0)
     expect(withFill.sort()).toEqual(
-      ['dot', 'eye', 'eye-off', 'mask-overlay', 'more-horizontal'].sort()
+      ['dot', 'eye', 'eye-off', 'mask-overlay', 'more-horizontal', 'star-filled'].sort()
     )
   })
 })

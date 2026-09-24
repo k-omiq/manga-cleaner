@@ -855,6 +855,11 @@ pub struct RuntimeRow {
     /// Whether ONNX Runtime publishes anything for this platform at all.
     /// False on Intel macOS, which is the one platform with no row.
     pub available: bool,
+    /// This machine: `macos-arm64`, `macos-x64`, `windows-x64`,
+    /// `windows-arm64`, `linux-x64` or `linux-arm64`. Data, not copy. Setup
+    /// names the platform its dependency list was checked on, and a web view's
+    /// user agent cannot tell Apple silicon from Intel.
+    pub platform: Option<&'static str>,
     /// The flavour of the build **that is actually here**, from the stamp a
     /// successful install writes ([`InstalledRuntime`]).
     ///
@@ -1016,9 +1021,23 @@ fn runtime_row(app: &tauri::AppHandle, data: Option<&Path>) -> RuntimeRow {
             })
             .collect(),
         available: host.is_some(),
+        platform: package::Platform::host().map(platform_id),
         installed_flavour: stamped.as_ref().map(|stamp| stamp.flavour.clone()),
         installed_version: stamped.as_ref().map(|stamp| stamp.version.clone()),
         partial_bytes: writable.as_deref().and_then(runtime_partial_bytes),
+    }
+}
+
+/// [`RuntimeRow::platform`]'s id for a platform.
+fn platform_id(platform: cleaner_core::runtime::package::Platform) -> &'static str {
+    use cleaner_core::runtime::package::{Arch, Os};
+    match (platform.os, platform.arch) {
+        (Os::MacOs, Arch::Aarch64) => "macos-arm64",
+        (Os::MacOs, Arch::X86_64) => "macos-x64",
+        (Os::Windows, Arch::Aarch64) => "windows-arm64",
+        (Os::Windows, Arch::X86_64) => "windows-x64",
+        (Os::Linux, Arch::Aarch64) => "linux-arm64",
+        (Os::Linux, Arch::X86_64) => "linux-x64",
     }
 }
 

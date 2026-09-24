@@ -28,6 +28,9 @@ const TRAY_ID: &str = "main";
 pub fn run() {
     use tauri::Manager;
     tauri::Builder::default()
+        // First, so a second launch while the window is hidden in the tray
+        // shows this one instead of starting another copy.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .setup(|app| {
             use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
             let show = MenuItem::with_id(app, "show", "Show Manga Cleaner", true, None::<&str>)?;
@@ -35,14 +38,26 @@ pub fn run() {
             let menu = Menu::with_items(app, &[&show, &quit])?;
             let mut tray = TrayIconBuilder::with_id(TRAY_ID)
                 .menu(&menu)
-                .show_menu_on_left_click(true)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
+                .tooltip("Manga Cleaner")
+                // A menu-bar icon opens its menu on click on macOS. Elsewhere a
+                // left click brings the window back and the menu is on the
+                // right button. Linux tray hosts do not report clicks, so there
+                // the menu is the only route, which it always offers.
+                .show_menu_on_left_click(cfg!(target_os = "macos"))
+                .on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        if !cfg!(target_os = "macos") {
+                            show_main(tray.app_handle());
                         }
                     }
+                })
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => show_main(app),
                     "quit" => app.exit(0),
                     _ => {}
                 });
@@ -83,6 +98,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // Opens the project page from onboarding in the user's browser. The
+        // capability allows that one URL and nothing else.
+        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             diagnostics::diagnostics,
             about::about,
@@ -158,7 +176,14 @@ pub fn run() {
         )
         .build(tauri::generate_context!())
         .expect("error while building the application")
-        .run(|_app, event| {
+        .run(|app, event| {
+            // A Dock click on macOS with the window hidden in the tray.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                show_main(app);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = app;
             // The provisioner helper leads its own process group, so nothing
             // ends it when this process ends. A quit during cloud setup stops
             // it here rather than leaving it deploying with no one to read the
@@ -167,4 +192,15 @@ pub fn run() {
                 provision::stop_helpers_for_exit();
             }
         });
+}
+
+/// Bring the main window back from the tray, the Dock, or a second launch,
+/// including when it was minimised before it was hidden.
+fn show_main<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    use tauri::Manager;
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
 }

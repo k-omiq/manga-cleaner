@@ -592,7 +592,7 @@ import { createTauriBackend, isTauri } from './tauri.js'
  *
  * @typedef {Object} ModelsView
  * @property {Array<{id: string, fileName: string, bytes: number, kindKey: string, requiredBy: string[], installed: boolean, path: string|null, readOnly: boolean, sha256Ok: boolean|null, downloading: boolean, partialBytes: number|null}>} models
- * @property {{installed: boolean, path: string|null, readOnly: boolean, downloading: boolean, version: string|null, flavour: string|null, bytes: number|null, flavours: Array<{id: string, ortVersion: string, bytes: number, isDefault: boolean, userInstalled: string[]}>, available: boolean, installedFlavour: string|null, installedVersion: string|null, partialBytes: number|null}} runtime
+ * @property {{installed: boolean, path: string|null, readOnly: boolean, downloading: boolean, version: string|null, flavour: string|null, bytes: number|null, flavours: Array<{id: string, ortVersion: string, bytes: number, isDefault: boolean, userInstalled: string[]}>, available: boolean, platform: string|null, installedFlavour: string|null, installedVersion: string|null, partialBytes: number|null}} runtime
  * @property {string|null} modelsDir
  * @property {string|null} runtimeDir
  * @property {boolean} hasToken

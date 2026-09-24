@@ -1,6 +1,6 @@
 /**
- * The Models section of the Settings dialog, mounted: the three things a row
- * says that nothing on the row used to say at all.
+ * The file rows of the Settings screen, mounted: the three things a row says
+ * that nothing on the row used to say at all.
  *
  * - **What a stopped download left**, and the press that gives it back.
  *   The bytes are kept so the next Download
@@ -22,18 +22,26 @@
  * calls on mount and only the catalogue is what this file is about, so the rest
  * answer the emptiest true thing.
  *
- * All of it lives in the **Models** tab, so `open()` presses that tab and
- * checks the panel is shown before anything is asserted inside it. The panels
- * are mounted and merely `hidden`, so a query that skipped the press would
- * still find the row - which is exactly why the press is asserted rather than
- * assumed.
+ * The rows live in three sections now: the redraw weight under **Cleaning**,
+ * the runtime under **Performance**, the token under **General**. `open()`
+ * presses the section a test names and checks its panel is shown, and the
+ * assertions are scoped to that panel: the panels are mounted and merely
+ * `hidden`, so a query over the whole screen would find a row in a hidden
+ * panel too.
+ *
+ * The end of the file is the two pipelines themselves: which section a file
+ * is managed from, what the per-language pickers store, what the engine
+ * tables say, and the FLUX helper's folder field.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/svelte'
+import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/svelte'
 
 import { setBackend } from '../api/backend.js'
 import { t } from '../i18n/index.js'
+import { DEFAULT_DETECTOR } from '../model/pipelines.js'
+import { capabilities } from '../state/capabilities.svelte.js'
+import { session, setDetection, setFluxModel, setSidecarPath } from '../state/session.svelte.js'
 import SettingsDialog from './SettingsDialog.svelte'
 import { resetFirstLaunch } from './firstlaunch.svelte.js'
 
@@ -96,20 +104,25 @@ function view({ model = {}, runtime = {}, token = {} } = {}) {
 let listModels
 /** @type {ReturnType<typeof vi.fn>} */
 let discardPartial
+/** @type {ReturnType<typeof vi.fn>} */
+let writeSettings
+/** What the FLUX helper lists, for the tests that turn it on. */
+let helperModels = []
 
 function stub(answer) {
   listModels = vi.fn(async () => answer())
   discardPartial = vi.fn(async () => true)
+  writeSettings = vi.fn(async () => ({}))
   setBackend(
     /** @type {any} */ ({
       listModels: (/** @type {any} */ options) => listModels(options),
       discardPartial: (/** @type {any} */ spec) => discardPartial(spec),
       listAccelerators: vi.fn(async () => ({ providers: [], models: [] })),
-      listSidecarModels: vi.fn(async () => []),
-      sidecarAvailable: vi.fn(async () => ({ available: false, reasonKey: null })),
+      listSidecarModels: vi.fn(async () => helperModels),
+      sidecarAvailable: vi.fn(async () => ({ available: capabilities.sidecar, reasonKey: null })),
       about: vi.fn(async () => ({ appVersion: '0.0.0-test', facts: [] })),
       subscribe: vi.fn(() => () => {}),
-      writeSettings: vi.fn(async () => ({})),
+      writeSettings: (/** @type {any} */ patch) => writeSettings(patch),
     }),
   )
 }
@@ -121,12 +134,18 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 
-/** Mount, open the Models tab, and wait for the first catalogue to be drawn. */
-async function open(answer) {
+/**
+ * Mount, open a section, and wait for the first catalogue to be drawn. The
+ * queries returned are scoped to that section's panel.
+ *
+ * @param {() => any} answer
+ * @param {string} sectionKey - the tab's label key
+ */
+async function open(answer, sectionKey = 'pipelines.cleaning') {
   stub(answer)
   const rendered = render(SettingsDialog, { props: { spec: SPEC } })
 
-  const tab = rendered.getByRole('tab', { name: t('settings.section.models') })
+  const tab = rendered.getByRole('tab', { name: t(sectionKey) })
   await fireEvent.click(tab)
   expect(tab.getAttribute('aria-selected')).toBe('true')
   const panel = /** @type {HTMLElement} */ (
@@ -135,8 +154,11 @@ async function open(answer) {
   expect(panel.hasAttribute('hidden')).toBe(false)
 
   await waitFor(() => expect(listModels).toHaveBeenCalled())
-  return rendered
+  return { ...within(panel), container: panel }
 }
+
+const PERFORMANCE = 'settings.section.performance'
+const GENERAL = 'settings.section.general'
 
 describe('the bytes a stopped download left', () => {
   it('are reported under the row, with a press that gives them back', async () => {
@@ -165,8 +187,9 @@ describe('the bytes a stopped download left', () => {
 
 describe('the runtime build that is actually installed', () => {
   it('is named when it is not the one the row would download', async () => {
-    const rendered = await open(() =>
-      view({ runtime: { installedFlavour: 'directml', installedVersion: '1.24.4' } }),
+    const rendered = await open(
+      () => view({ runtime: { installedFlavour: 'directml', installedVersion: '1.24.4' } }),
+      PERFORMANCE,
     )
 
     const line = t('settings.models.runtime.installedDiffers', {
@@ -179,8 +202,9 @@ describe('the runtime build that is actually installed', () => {
   })
 
   it('is said nothing about when it agrees, or when there is no record of it', async () => {
-    const agreeing = await open(() =>
-      view({ runtime: { installedFlavour: 'cuda12', installedVersion: '1.28.0' } }),
+    const agreeing = await open(
+      () => view({ runtime: { installedFlavour: 'cuda12', installedVersion: '1.28.0' } }),
+      PERFORMANCE,
     )
     await waitFor(() => expect(agreeing.getByText(t('settings.models.runtime.label'))).toBeTruthy())
     expect(agreeing.container.querySelectorAll('.row-partial')).toHaveLength(0)
@@ -188,7 +212,7 @@ describe('the runtime build that is actually installed', () => {
 
     // `null` is unknown rather than none - a runtime this application did not
     // unpack - and an unknown build is nothing to report a difference about.
-    const unknown = await open(() => view())
+    const unknown = await open(() => view(), PERFORMANCE)
     await waitFor(() => expect(unknown.getByText(t('settings.models.runtime.label'))).toBeTruthy())
     expect(unknown.container.querySelectorAll('.row-partial')).toHaveLength(0)
   })
@@ -196,8 +220,9 @@ describe('the runtime build that is actually installed', () => {
 
 describe('a credential store that would not answer', () => {
   it('says which of the four things it did', async () => {
-    const rendered = await open(() =>
-      view({ token: { tokenStore: 'fileStoreUnavailable', tokenStoreReason: 'locked' } }),
+    const rendered = await open(
+      () => view({ token: { tokenStore: 'fileStoreUnavailable', tokenStoreReason: 'locked' } }),
+      GENERAL,
     )
 
     await waitFor(() =>
@@ -209,7 +234,7 @@ describe('a credential store that would not answer', () => {
   })
 
   it('says nothing extra when the store took the token', async () => {
-    const rendered = await open(() => view({ token: { hasToken: true } }))
+    const rendered = await open(() => view({ token: { hasToken: true } }), GENERAL)
     await waitFor(() => expect(rendered.getByText(t('settings.models.token.saved'))).toBeTruthy())
     for (const reason of ['locked', 'unreachable', 'ambiguous', 'unknown']) {
       expect(rendered.queryByText(t(`settings.models.token.reason.${reason}`))).toBe(null)
@@ -231,5 +256,129 @@ describe('the once-per-process credential-store retry', () => {
     await fireEvent.click(discard)
     await waitFor(() => expect(listModels).toHaveBeenCalledTimes(2))
     expect(listModels.mock.calls[1][0]).toEqual({})
+  })
+})
+
+describe('the two pipelines', () => {
+  /** The catalogue with one detection weight beside the redraw weight. */
+  function both() {
+    const answer = view()
+    answer.models.push({
+      ...answer.models[0],
+      id: 'textDetector',
+      fileName: 'comictextdetector.onnx',
+      bytes: 94_669_756,
+      kindKey: 'models.kind.textDetector',
+      requiredBy: ['autoClean'],
+    })
+    return answer
+  }
+
+  afterEach(() => {
+    for (const language of ['ja', 'zh', 'ko']) setDetection(language, DEFAULT_DETECTOR)
+    capabilities.sidecar = false
+    helperModels = []
+    setFluxModel('')
+    setSidecarPath('')
+  })
+
+  it('manage each file in the section whose engines need it', async () => {
+    const detection = await open(both, 'pipelines.detection')
+    await waitFor(() => expect(detection.getByText(t('models.kind.textDetector'))).toBeTruthy())
+    expect(detection.queryByText(t('models.kind.inpainter'))).toBe(null)
+    cleanup()
+
+    const cleaning = await open(both)
+    await waitFor(() => expect(cleaning.getByText(t('models.kind.inpainter'))).toBeTruthy())
+    expect(cleaning.queryByText(t('models.kind.textDetector'))).toBe(null)
+  })
+
+  it('store Skip as null, and a detector by its id', async () => {
+    const detection = await open(both, 'pipelines.detection')
+    const japanese = /** @type {HTMLSelectElement} */ (
+      detection.getByRole('combobox', {
+        name: t('pipelines.detectorFor', { language: t('pipelines.language.ja') }),
+      })
+    )
+    expect(japanese.value).toBe(DEFAULT_DETECTOR)
+
+    await fireEvent.change(japanese, { target: { value: '' } })
+    expect(session.detection.ja).toBe(null)
+    expect(japanese.value).toBe('')
+
+    await fireEvent.change(japanese, { target: { value: 'ctd-rtdetr-ocr' } })
+    expect(session.detection.ja).toBe('ctd-rtdetr-ocr')
+  })
+
+  it('offer each language only the detectors that serve it, and Skip', async () => {
+    const detection = await open(both, 'pipelines.detection')
+    const options = (/** @type {string} */ language) =>
+      [
+        .../** @type {HTMLSelectElement} */ (
+          detection.getByRole('combobox', {
+            name: t('pipelines.detectorFor', { language: t(`pipelines.language.${language}`) }),
+          })
+        ).options,
+      ].map((option) => option.value)
+    expect(options('ja')).toEqual(['ctd-rtdetr', 'ctd-rtdetr-ocr', ''])
+    expect(options('zh')).toEqual(['ctd-rtdetr', ''])
+    expect(options('ko')).toEqual(['ctd-rtdetr', ''])
+  })
+
+  it('say what each engine still costs, or why it cannot be chosen', async () => {
+    const detection = await open(both, 'pipelines.detection')
+    const table = detection.getByRole('table', { name: t('pipelines.detection') })
+    const state = (/** @type {string} */ name) =>
+      within(table).getByText(name).closest('[role="row"]')?.querySelector('.state')?.textContent?.trim()
+    // The base detector needs the text detector here, which is not installed.
+    await waitFor(() => expect(state('CTD + RT-DETR v2')).toBe(t('models.value.size', { bytes: 94_669_756 })))
+    expect(state('RT-DETR v2 + COO + SAM-TS')).toBe(t('pipelines.status.soon'))
+  })
+
+  it('mark a FLUX model the helper lists as found, and the rest as needing it', async () => {
+    capabilities.sidecar = true
+    helperModels = [{ id: 'flux2-klein-4b', label: 'FLUX.2 Klein 4B' }]
+    const cleaning = await open(both)
+    const table = cleaning.getByRole('table', { name: t('pipelines.cleaning') })
+    const row = (/** @type {string} */ name) =>
+      /** @type {HTMLElement} */ (within(table).getByText(name).closest('[role="row"]'))
+
+    await waitFor(() => expect(row('FLUX.2 Klein 4B').textContent).toContain(t('pipelines.status.found')))
+    expect(row('FLUX.2 Klein 4B').classList.contains('soon')).toBe(false)
+    expect(row('FLUX.2 Klein 9B').textContent).toContain(t('pipelines.status.needsHelper'))
+    expect(row('FLUX.2 Klein 9B').classList.contains('soon')).toBe(true)
+    expect(row('Big LaMa').textContent).toContain(t('pipelines.status.soon'))
+    // The fallback model the helper chose is written, not only remembered.
+    await waitFor(() => expect(writeSettings).toHaveBeenCalledWith(expect.objectContaining({ fluxModel: 'flux2-klein-4b' })))
+  })
+
+  it('draw a stored FLUX model the helper no longer lists as itself', async () => {
+    capabilities.sidecar = true
+    helperModels = [{ id: 'flux2-klein-4b', label: 'FLUX.2 Klein 4B' }]
+    setFluxModel('flux1-dev')
+    const cleaning = await open(both)
+    const model = /** @type {HTMLSelectElement} */ (
+      await waitFor(() => cleaning.getByLabelText(t('settings.sidecarModel.label')))
+    )
+    await waitFor(() => expect(model.options).toHaveLength(2))
+    expect(model.value).toBe('flux1-dev')
+    expect(model.selectedOptions[0].textContent?.trim()).toBe(t('settings.sidecarModel.missing', { id: 'flux1-dev' }))
+    expect(session.fluxModel).toBe('flux1-dev')
+  })
+
+  it('write the helper folder when the field is left, not on every keystroke', async () => {
+    const cleaning = await open(both)
+    const field = /** @type {HTMLInputElement} */ (cleaning.getByLabelText(t('settings.sidecar.label')))
+    writeSettings.mockClear()
+
+    await fireEvent.input(field, { target: { value: '/opt/fl' } })
+    await fireEvent.input(field, { target: { value: '/opt/flux' } })
+    expect(writeSettings).not.toHaveBeenCalled()
+    expect(session.sidecarPath).toBe('')
+
+    await fireEvent.blur(field)
+    expect(session.sidecarPath).toBe('/opt/flux')
+    await waitFor(() => expect(writeSettings).toHaveBeenCalledTimes(1))
+    expect(writeSettings).toHaveBeenCalledWith(expect.objectContaining({ sidecarPath: '/opt/flux' }))
   })
 })

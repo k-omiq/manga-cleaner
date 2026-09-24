@@ -47,6 +47,8 @@ zip = { version = "4", default-features = false, features = ["deflate"] }
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-opener = "2"
 # Cryptographic nonce generation for inference authorization grants
 getrandom = "0.3"
 # Compiler-barrier memory zeroization for sensitive cloud credentials

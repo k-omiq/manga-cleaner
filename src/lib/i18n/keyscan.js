@@ -44,6 +44,7 @@ export const NAMESPACES = Object.freeze([
   'models',
   'notice',
   'onboarding',
+  'pipelines',
   'pages',
   'paging',
   'progress',

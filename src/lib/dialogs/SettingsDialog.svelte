@@ -31,92 +31,65 @@
 
 <script>
   /**
-   * Settings - five preference rows, the model catalogue, acceleration, the
-   * shortcut sheet and About, across five tabs in one 560px dialog.
+   * Settings, as a full-window screen over the route underneath.
    *
-   * **Tabs, and how the old argument against them was answered.** This file
-   * used to carry a case for one scrolling body: a tab strip would put the
-   * five preference rows a click further away, would make the dialog's height
-   * jump, would need a roving-tabindex widget of its own, and would cost the
-   * heading outline. The user overruled it - the body had grown past a
-   * thousand pixels and Shortcuts and About were below the fold of a fold  - 
-   * so the four objections are answered rather than argued with:
+   * It is still the `settings` modal kind, so every opener pushes the same
+   * spec and the editor stays mounted behind it. `Screen` owns the layer
+   * (focus in and back out, the Tab trap, Escape); this file owns the layout:
+   * a sidebar with the way back and a vertical tab list, and one scrolling
+   * column per section.
    *
-   * - **The five rows did not move.** `General` is the tab the dialog opens
-   *   on, so they are exactly where they were: the first thing on screen, no
-   *   press to reach them.
-   * - **The height does not move.** Every panel is one fixed-height scroller
-   *   (`.panel`), so switching tabs changes what is inside the box and never
-   *   the box. The height is `min(52vh, 460px)` - capped so a tall screen does
-   *   not get a dialog it has to look up and down, and proportional below that
-   *   so a short one never needs the modal's own scrollbar as well.
-   * - **The strip is a real tab list.** `role="tablist"` / `role="tab"` /
-   *   `role="tabpanel"`, `aria-selected`, `aria-controls`, one tab stop for
-   *   the whole strip, arrows to move, Home and End to the ends. Selection
-   *   follows focus, as it does in `Segmented` two files away, which is safe
-   *   here for the reason it is safe there: every panel is already mounted.
-   * - **The outline is still real.** The dialog title is the `h2`; each panel
-   *   opens with an `h3` naming it, and the shortcut sheet's group headings
-   *   are still `h4`s under it. The `h3` is visually hidden because the
-   *   selected tab is already that heading on screen, and printing the word
-   *   twice, an inch apart, is not a heading - it is an echo.
+   * **Seven sections, in the order a visit needs them.** General holds the
+   * preferences and the download token. Detection and Cleaning are the two
+   * pipelines a page goes through, each with its engines and the files those
+   * engines need, so a file is managed beside the choice that made it
+   * necessary; the FLUX helper is Cleaning's. Cloud is `InferenceSettings`,
+   * unchanged. Performance is what the engines run on: the runtime, its build,
+   * where downloads go, and the accelerator. Shortcuts and About close the
+   * list; About is a GPL-3.0 obligation and this screen is its only route.
    *
    * **Every panel is mounted, and only the selected one is shown.** `hidden`
-   * rather than `{#if}`, so `aria-controls` names an element that exists, the
-   * scroll position of a panel survives a look at another one, and - the part
-   * that matters most - the mount-time work is exactly what it was when this
-   * was one body: one `listModels`, one `listAccelerators`, one `about`. A
-   * tab that mounted on first press would turn opening Settings into four
-   * separate rounds of the same calls.
+   * rather than `{#if}`, so `aria-controls` names an element that exists, a
+   * panel keeps its scroll position while another is looked at, and the
+   * mount-time work is one `listModels` and one `about` however many panels
+   * are visited.
    *
-   * **What went in which tab.** The sidecar path, the FLUX backend and the
-   * sidecar model went to `Models` rather than to `General` or to a tab of
-   * their own: all three answer one question - what this machine can run, and
-   * where it came from - which is the question the whole tab answers, and
-   * three rows do not make a tab. `General` keeps the five that are genuinely
-   * preferences: how it looks, which way pages read, whether the cloud may be
-   * used, what the original view does, and the language.
+   * **The tab list is a real one.** `role="tablist"` with
+   * `aria-orientation="vertical"`, one tab stop, Up and Down to move, Home and
+   * End to the ends. Selection follows focus, which is safe because every
+   * panel is already mounted. The outline is h1 (the screen), h2 (the
+   * section), h3 below it.
+   *
+   * **A panel is focusable when, and only when, its tail is not** (WCAG
+   * 2.1.1). Performance ends in the placement list and About in prose, so both
+   * scrollers take a tab stop. Detection does too while it has no file rows,
+   * when it ends in the engine table.
    *
    * **The backend reconciliation is not here.** `session.*` and
-   * `backend.readSettings()` are two stores of the same four preferences, and
-   * they are reconciled once at boot, in `App.svelte` - doing it on this
-   * dialog's mount left the two free to drift for any session in which the
-   * dialog was never opened. What this dialog owns is the second half: every
-   * change pushes the session's values down to the backend immediately, so the
-   * two cannot part company again while it is open.
-   *
-   * **A panel is focusable when, and only when, its tail is not.** The one
-   * `tabindex` this dialog used to carry was on the whole body, because that
-   * body ended in About, which holds no focusable descendant at all (WCAG
-   * 2.1.1: a scroll container the keyboard cannot reach is pointer-only). Per
-   * panel the question is asked again and answers differently: `Acceleration`
-   * ends in a placement table and a note, and `About` ends in the written
-   * offer of source and the cloud terms, so both are focusable. `General`,
-   * `Models` and `Shortcuts` each end in a control - the language row, the
-   * token field, Reset all - so tabbing through them reaches the bottom, and
-   * a `tabindex` on those would be a stop that does nothing.
-   *
-   * About stays one press away in either case, which is the point: it is a
-   * GPL-3.0 obligation and this dialog is still its only route.
+   * `backend.readSettings()` are reconciled once at boot, in `App.svelte`.
+   * What this screen owns is the second half: every change pushes the
+   * session's values down to the backend immediately.
    *
    * **The shortcut section is not a read-only list.** `ShortcutSheet` is where
-   * a binding is *changed*, and it writes its own half of the settings - both
-   * stores, the same way `push()` below does - so it behaves identically here
-   * and mounted on its own by `?`.
+   * a binding is *changed*, and it writes its own half of the settings, so it
+   * behaves identically here and mounted on its own by `?`.
    */
-  import { Button, Field, Modal, Segmented, TextInput } from '../ui/index.js'
+  import { Button, Field, Screen, Segmented, Select, TextInput, ThemePicker } from '../ui/index.js'
   import Icon from '../icons/Icon.svelte'
   import { onMount, untrack } from 'svelte'
-  import { closeModal, modalWidth } from '../state/app.svelte.js'
+  import { closeModal } from '../state/app.svelte.js'
   import { getBackend } from '../api/backend.js'
   import { chooseFolder } from '../api/folder.js'
   import { CATALOGUES, LOCALE, hasKey, t } from '../i18n/index.js'
   import { capabilities, loadCapabilities } from '../state/capabilities.svelte.js'
   import {
+    THEMES,
+    THEME_LABEL_KEYS,
     backendSettingsPatch,
     session,
     setAccelerator,
     setCloseToTray,
+    setDetection,
     setFluxBackend,
     setFluxModel,
     setOriginalView,
@@ -124,6 +97,8 @@
     setSidecarPath,
     setTheme,
   } from '../state/session.svelte.js'
+  import { CLEANERS, DETECTORS, LANGUAGES, detectorsFor, engineBytes } from '../model/pipelines.js'
+  import EngineTable from './EngineTable.svelte'
   import ShortcutSheet from './ShortcutSheet.svelte'
   import AboutSection from './AboutSection.svelte'
   import InferenceSettings from './InferenceSettings.svelte'
@@ -143,6 +118,9 @@
             ? 'flux2-klein-4b'
             : sidecarModels[0].id
           setFluxModel(defaultModel)
+          // Written straight away, like every other change here. Not `push()`:
+          // that calls back into this function.
+          await getBackend().writeSettings(backendSettingsPatch())
         }
       } catch {
         sidecarModels = []
@@ -275,21 +253,24 @@
    * "Run setup again": the offer a first launch makes, over a fresh catalogue
    * so the download step shows what is here now. Settings closes first,
    * because the setup is drawn beside the modal stack and only while the
-   * stack is empty (`App.svelte`).
+   * stack is empty (`App.svelte`) - but only once the offer has been made, so
+   * a failure is said here, on a screen that is still open.
    */
   async function replayOnboarding() {
     if (replaying) return
     replaying = true
     replayError = false
+    let offered = false
     try {
       const view = await getBackend().listModels()
-      closeModal(null)
-      offerFirstLaunch(view, { force: true })
+      offered = offerFirstLaunch(view, { force: true })
+      if (!offered) replayError = true
     } catch {
       replayError = true
     } finally {
       replaying = false
     }
+    if (offered) closeModal(null)
   }
 
   /**
@@ -748,21 +729,29 @@
   }
 
   /**
-   * Asked for when the Acceleration panel is first shown, not when the dialog
+   * Asked for when the Performance panel is shown, not when the screen
    * mounts.
    *
    * The list is the loaded runtime answering, so asking for it maps the
    * runtime's library into this process - and Windows will not replace a file
-   * that is mapped, which is exactly what Settings › Models' Download has to
+   * that is mapped, which is exactly what the runtime row's Download has to
    * do. Opening Settings to fetch a runtime must not be the thing that makes
    * the fetch impossible, so the question waits until the panel that shows the
    * answer is actually looked at.
+   *
+   * Asked once, unless it was refused: a refusal is asked again the next time
+   * the panel is shown, which is after a runtime download has had its chance
+   * to put the cause right. Only `active` is tracked, so a refusal does not
+   * retry itself in a loop.
    */
   let accelAsked = false
   $effect(() => {
-    if (active !== 'acceleration' || accelAsked) return
-    accelAsked = true
-    refreshAccelerators()
+    if (active !== 'performance') return
+    untrack(() => {
+      if (accelAsked && !accelFailure) return
+      accelAsked = true
+      refreshAccelerators()
+    })
   })
 
   /**
@@ -840,6 +829,24 @@
   ])
 
   /**
+   * The options the picker draws. A stored id the list does not offer - a
+   * provider this runtime no longer reports, or any id before the list has
+   * been read - is drawn as itself rather than left out: a native select with
+   * no matching option shows its first one, and the picker would read
+   * Automatic while the setting in force was something else.
+   */
+  const acceleratorChoices = $derived.by(() => {
+    const rows = acceleratorOptions.map((option) => ({
+      value: option.id,
+      label: option.note ? `${option.label}: ${option.note}` : option.label,
+      disabled: option.disabled,
+      title: option.note,
+    }))
+    if (rows.some((row) => row.value === acceleratorValue)) return rows
+    return [...rows, { value: acceleratorValue, label: t('settings.accel.saved', { id: acceleratorValue }) }]
+  })
+
+  /**
    * One line per model: where it will run, and the caveat if there is one.
    *
    * Three things can be true of a row and all three are said: the provider it
@@ -873,6 +880,25 @@
 
   let choosing = $state(false)
 
+  /**
+   * What the folder field holds while it is being typed into, or `null` when
+   * it is showing the stored path. The path is committed on blur and on
+   * Enter, not per keystroke: each commit is a settings write, a capability
+   * probe and a model listing, and a half-typed path is none of those.
+   *
+   * @type {string|null}
+   */
+  let sidecarDraft = $state(null)
+
+  function commitSidecar() {
+    if (sidecarDraft === null) return
+    const next = sidecarDraft
+    sidecarDraft = null
+    if (next === session.sidecarPath) return
+    setSidecarPath(next)
+    push()
+  }
+
   async function browseSidecar() {
     if (choosing) return
     choosing = true
@@ -882,6 +908,7 @@
         defaultPath: session.sidecarPath || undefined,
       })
       if (chosen !== null) {
+        sidecarDraft = null
         setSidecarPath(chosen)
         await push()
       }
@@ -890,11 +917,20 @@
     }
   }
 
-  const themes = [
-    { value: 'light', label: t('settings.theme.light') },
-    { value: 'dark', label: t('settings.theme.dark') },
-    { value: 'system', label: t('settings.theme.system') },
-  ]
+  /**
+   * The helper's models as options. A stored model the helper does not list
+   * is drawn as itself, for the reason `acceleratorChoices` gives; an empty
+   * list with nothing stored is one disabled line saying so.
+   */
+  const sidecarChoices = $derived.by(() => {
+    const rows = sidecarModels.map((model) => ({ value: model.id, label: model.label }))
+    if (session.fluxModel && !rows.some((row) => row.value === session.fluxModel)) {
+      rows.push({ value: session.fluxModel, label: t('settings.sidecarModel.missing', { id: session.fluxModel }) })
+    }
+    return rows.length > 0 ? rows : [{ value: '', label: t('settings.sidecarModel.noneFound') }]
+  })
+
+  const themes = THEMES.map((value) => ({ value, label: t(THEME_LABEL_KEYS[value]) }))
   const directions = [
     { value: 'rtl', label: t('settings.direction.rtl') },
     { value: 'ltr', label: t('settings.direction.ltr') },
@@ -933,34 +969,92 @@
     label: t('settings.language.english'),
   }))
 
-  /* ---------- the tab strip ---------- */
+
+  /* ---------- the two pipelines ---------- */
+
+  /** What a language row stores for "skip this language". */
+  const SKIP = ''
+
+  /** @param {string} language */
+  function detectorOptions(language) {
+    return [
+      ...detectorsFor(language).map((engine) => ({ value: engine.id, label: engine.name })),
+      { value: SKIP, label: t('pipelines.skip') },
+    ]
+  }
 
   /**
-   * The five panels, in the order they are offered.
+   * Which catalogue rows belong to Cleaning: the files a cleaner names. Every
+   * other row is Detection's, so a weight added to the backend before this
+   * table knows it still has a place to be managed from.
+   */
+  const CLEANING_FILES = new Set(CLEANERS.flatMap((engine) => engine.files))
+  const detectionModels = $derived(catalogue?.models.filter((model) => !CLEANING_FILES.has(model.id)) ?? [])
+  const cleaningModels = $derived(catalogue?.models.filter((model) => CLEANING_FILES.has(model.id)) ?? [])
+
+  /** The catalogue by id, in the shape `engineBytes` reads. */
+  const filesById = $derived(Object.fromEntries((catalogue?.models ?? []).map((model) => [model.id, model])))
+
+  /**
+   * Whether the FLUX helper lists this engine's model. Such an engine runs
+   * through the helper and has nothing to download here.
    *
-   * `General` is first because it is what the dialog opens on and what most
-   * visits are about; `About` is last because it is a reference rather than a
-   * setting. The three between them are ordered by how large a thing they
-   * change - what is on the disk, what the engines run on, what the keyboard
-   * does.
+   * @param {import('../model/pipelines.js').Engine} engine
+   */
+  function found(engine) {
+    return Boolean(engine.sidecar && sidecarModels.some((model) => model.id === engine.sidecar))
+  }
+
+  /**
+   * The last column of an engine row: what it still costs, or that it is
+   * here. Blank until the catalogue answers, rather than a guess.
    *
-   * The label keys are the section keys the headings already used, so the tab
-   * and the panel's own `h3` are one string and cannot drift apart.
+   * @param {import('../model/pipelines.js').Engine} engine
+   */
+  function engineState(engine) {
+    if (!engine.ready) {
+      if (found(engine)) return t('pipelines.status.found')
+      return engine.sidecar ? t('pipelines.status.needsHelper') : t('pipelines.status.soon')
+    }
+    if (!catalogue) return ''
+    const bytes = engineBytes(engine, filesById)
+    return bytes > 0 ? t('models.value.size', { bytes }) : t('pipelines.status.installed')
+  }
+
+  /* ---------- the tab list ---------- */
+
+  /**
+   * The sections, in the order they are offered. The Cloud section keeps the
+   * id `inference`, which `openCloudSettings` asks for by name.
    */
   const TABS = [
-    { id: 'general', labelKey: 'settings.section.general', icon: 'settings' },
-    { id: 'models', labelKey: 'settings.section.models', icon: 'layers' },
-    { id: 'acceleration', labelKey: 'settings.section.acceleration', icon: 'cpu' },
+    { id: 'general', labelKey: 'settings.section.general', icon: 'sliders' },
+    { id: 'detection', labelKey: 'pipelines.detection', icon: 'search' },
+    { id: 'cleaning', labelKey: 'pipelines.cleaning', icon: 'brush' },
     { id: 'inference', labelKey: 'settings.section.inference', icon: 'cloud' },
+    { id: 'performance', labelKey: 'settings.section.performance', icon: 'cpu' },
     { id: 'shortcuts', labelKey: 'settings.section.shortcuts', icon: 'keyboard' },
     { id: 'about', labelKey: 'settings.section.about', icon: 'info' },
   ]
 
-  // A caller may open Settings on a tab (`openCloudSettings` asks for Cloud).
-  // Read once: after that the strip owns it.
-  let active = $state(
-    untrack(() => (TABS.some((tab) => tab.id === spec?.props?.tab) ? spec.props.tab : 'general')),
-  )
+  /**
+   * Ids a caller may still ask for from before the split: Models became
+   * Detection (with Cleaning beside it), Acceleration became Performance.
+   */
+  const RENAMED_TABS = /** @type {Record<string, string>} */ ({
+    models: 'detection',
+    acceleration: 'performance',
+  })
+
+  /** @param {unknown} requested */
+  function initialTab(requested) {
+    const id = typeof requested === 'string' ? (RENAMED_TABS[requested] ?? requested) : ''
+    return TABS.some((tab) => tab.id === id) ? id : 'general'
+  }
+
+  // A caller may open Settings on a section (`openCloudSettings` asks for
+  // Cloud). Read once: after that the list owns it.
+  let active = $state(untrack(() => initialTab(spec?.props?.tab)))
 
   const uid = $props.id()
   /** @param {string} id */
@@ -977,29 +1071,25 @@
    */
   function select(id, { focus = false } = {}) {
     active = id
-    if (!focus) return
-    // The element identity does not change - the strip is keyed over a static
+    // The element identity does not change - the list is keyed over a static
     // table - so the press can move focus without waiting for a flush.
-    tabButtons[TABS.findIndex((tab) => tab.id === id)]?.focus()
+    if (focus) tabButtons[TABS.findIndex((tab) => tab.id === id)]?.focus()
   }
 
   /**
-   * The strip's own keys. Selection follows focus, so there is one press per
-   * move rather than a move and then a commit.
-   *
-   * Both stopped as well as prevented: the editor's global arrows page the
-   * chapter, and Home / End belong to whatever is under this dialog.
+   * Up and Down move and select, Home and End go to the ends. Stopped as well
+   * as prevented: the editor underneath pages the chapter on the arrows.
    *
    * @param {KeyboardEvent} event
    */
-  function onstripkeydown(event) {
+  function onlistkeydown(event) {
     const index = TABS.findIndex((tab) => tab.id === active)
     let next
     switch (event.key) {
-      case 'ArrowRight':
+      case 'ArrowDown':
         next = (index + 1) % TABS.length
         break
-      case 'ArrowLeft':
+      case 'ArrowUp':
         next = (index - 1 + TABS.length) % TABS.length
         break
       case 'Home':
@@ -1017,36 +1107,117 @@
   }
 </script>
 
-<Modal
-  title={t(spec.titleKey)}
-  width={modalWidth(spec.kind)}
-  onclose={() => closeModal(null)}
->
-  <div class="tabs">
-    <!-- One tab stop for the whole strip - the selected tab - and the arrows
-         move it. The handler is on the tabs rather than on the list, because
-         the list is not focusable and an interactive role that takes keys and
-         cannot be focused is a control nobody can reach. -->
-    <div class="strip" role="tablist" aria-label={t('settings.tabs.label')}>
-      {#each TABS as tab, index (tab.id)}
-        <button
-          bind:this={tabButtons[index]}
-          type="button"
-          role="tab"
-          class="tab"
-          class:on={tab.id === active}
-          id={tabId(tab.id)}
-          aria-selected={tab.id === active}
-          aria-controls={panelId(tab.id)}
-          aria-label={t(tab.labelKey)}
-          title={t(tab.labelKey)}
-          tabindex={tab.id === active ? 0 : -1}
-          onclick={() => select(tab.id)}
-          onkeydown={onstripkeydown}
-        ><Icon name={tab.icon} size={17} /></button>
-      {/each}
+<!-- One catalogue row: a weight's name, size and state, with the presses that
+     apply to it. Detection and Cleaning both draw their files through this. -->
+{#snippet fileRow(/** @type {any} */ model)}
+  {@const status = statusOf(model.id, model.installed, model.sha256Ok)}
+  <li class="row">
+    <div class="row-text">
+      <span class="row-name">{t(model.kindKey)}</span>
+      <span class="row-meta">
+        {t('models.value.size', { bytes: model.bytes })} ·
+        {t(status.key, status.params)}{#if model.installed && model.readOnly}
+          · {t('settings.models.status.readOnly')}{/if}
+      </span>
+      {#if failures[model.id]}
+        <span class="row-error">{failureText(model.id)}</span>
+      {/if}
+      {#if notes[model.id]}
+        <span class="row-error">{t(notes[model.id])}</span>
+      {/if}
+      <!-- The bytes a stopped download left. Not shown while one runs: the
+           progress in the meta line already says it. -->
+      {#if model.partialBytes && !progress[model.id]}
+        <span class="row-partial">
+          {t('settings.models.status.partial', { bytes: model.partialBytes })}
+        </span>
+      {/if}
     </div>
+    <div class="row-actions">
+      {#if progress[model.id]}
+        <Button size="sm" onclick={() => cancel(model.id)}>
+          {t('settings.models.action.cancel')}
+        </Button>
+      {:else}
+        {#if model.installed}
+          <Button size="sm" onclick={() => verify(model.id)}>
+            {t('settings.models.action.verify')}
+          </Button>
+          <Button size="sm" disabled={model.readOnly} onclick={() => remove(model.id)}>
+            {t('settings.models.action.delete')}
+          </Button>
+        {:else}
+          <Button size="sm" onclick={() => download(model.id)}>
+            {t('settings.models.action.download')}
+          </Button>
+        {/if}
+        <!-- Beside either pair: a `.part` can outlive a weight installed by
+             hand, and it is still disk nobody asked to spend. -->
+        {#if model.partialBytes}
+          <Button size="sm" onclick={() => discard(model.id)}>
+            {t('settings.models.action.discard')}
+          </Button>
+        {/if}
+      {/if}
+    </div>
+  </li>
+{/snippet}
 
+{#snippet fileList(/** @type {any[]} */ models)}
+  {#if catalogue}
+    {#if models.length > 0}
+      <h3 class="sub">{t('settings.models.heading')}</h3>
+      <ul class="rows">
+        {#each models as model (model.id)}
+          {@render fileRow(model)}
+        {/each}
+      </ul>
+    {/if}
+  {:else}
+    <p class="note">{t('settings.models.unavailable')}</p>
+  {/if}
+{/snippet}
+
+<Screen label={t(spec.titleKey)} onclose={() => closeModal(null)}>
+  <div class="settings">
+    <nav class="side" aria-labelledby="{uid}-title">
+      <div class="side-head">
+        <button
+          type="button"
+          class="back"
+          aria-label={t('shell.action.done')}
+          title={t('shell.action.done')}
+          onclick={() => closeModal('done')}
+        ><Icon name="chevron-left" size={16} /></button>
+        <h1 id="{uid}-title">{t(spec.titleKey)}</h1>
+      </div>
+
+      <!-- One tab stop for the whole list: the selected tab. The handler is on
+           the tabs because the list itself is not focusable. -->
+      <div class="tabs" role="tablist" aria-orientation="vertical" aria-label={t('settings.tabs.label')}>
+        {#each TABS as tab, index (tab.id)}
+          <button
+            bind:this={tabButtons[index]}
+            type="button"
+            role="tab"
+            class="tab"
+            class:on={tab.id === active}
+            id={tabId(tab.id)}
+            aria-selected={tab.id === active}
+            aria-controls={panelId(tab.id)}
+            tabindex={tab.id === active ? 0 : -1}
+            title={t(tab.labelKey)}
+            onclick={() => select(tab.id)}
+            onkeydown={onlistkeydown}
+          >
+            <Icon name={tab.icon} size={16} />
+            <span class="tab-label">{t(tab.labelKey)}</span>
+          </button>
+        {/each}
+      </div>
+    </nav>
+
+    <!-- General -->
     <div
       class="panel"
       role="tabpanel"
@@ -1054,168 +1225,234 @@
       aria-labelledby={tabId('general')}
       hidden={active !== 'general'}
     >
-      <h3 class="panel-heading">{t('settings.section.general')}</h3>
+      <div class="column">
+        <h2>{t('settings.section.general')}</h2>
 
-      <Field label={t('settings.theme.label')} layout="row">
-        {#snippet children({ labelId })}
-          <Segmented
-            options={themes}
-            value={session.theme}
-            labelledBy={labelId}
-            onchange={(value) => {
-              setTheme(/** @type {any} */ (value))
-              push()
-            }}
-          />
-        {/snippet}
-      </Field>
-
-      <Field
-        label={t('settings.background.label')}
-        description={t('settings.background.description')}
-        layout="row"
-        controlId="settings-close-to-tray"
-      >
-        {#snippet children({ descriptionId })}
-          <input
-            id="settings-close-to-tray"
-            type="checkbox"
-            aria-describedby={descriptionId}
-            checked={session.closeToTray}
-            onchange={(event) => updateCloseToTray(/** @type {HTMLInputElement} */ (event.currentTarget))}
-          />
-        {/snippet}
-      </Field>
-      {#if backgroundError}<p role="alert">{t('settings.background.saveFailed')}</p>{/if}
-
-      <Field
-        label={t('settings.direction.label')}
-        layout="row"
-      >
-        {#snippet children({ labelId })}
-          <Segmented
-            options={directions}
-            value={session.readingDirection}
-            labelledBy={labelId}
-            onchange={(value) => {
-              setReadingDirection(/** @type {any} */ (value))
-              push()
-            }}
-          />
-        {/snippet}
-      </Field>
-
-      <!-- The cloud permission has one switch, on the Cloud tab beside the
-           endpoints it governs. This row says where it stands and goes there. -->
-      <Field
-        label={t('settings.cloud.label')}
-        description={session.cloudAllowed ? t('settings.cloud.descriptionOn') : t('settings.cloud.descriptionOff')}
-        layout="row"
-      >
-        {#snippet children()}
-          <Button size="sm" onclick={() => select('inference', { focus: true })}>{t('settings.cloud.open')}</Button>
-        {/snippet}
-      </Field>
-
-      <Field
-        label={t('settings.originalView.label')}
-        layout="row"
-      >
-        {#snippet children({ labelId })}
-          <Segmented
-            options={originalViews}
-            value={session.originalView}
-            labelledBy={labelId}
-            onchange={(value) => {
-              setOriginalView(/** @type {any} */ (value))
-              push()
-            }}
-          />
-        {/snippet}
-      </Field>
-
-      <Field
-        label={t('settings.language.label')}
-        layout="row"
-      >
-        {#snippet children({ labelId })}
-          <Segmented
-            options={languages}
-            value={LOCALE}
-            labelledBy={labelId}
-            disabled={languages.length < 2}
-            onchange={() => {}}
-          />
-        {/snippet}
-      </Field>
-
-      <!-- Last in General, where someone who skipped part of the setup goes
-           looking for it. -->
-      <Field
-        label={t('onboarding.replay.label')}
-        description={t('onboarding.replay.description')}
-        layout="row"
-      >
-        {#snippet children({ descriptionId })}
-          <Button onclick={replayOnboarding} disabled={replaying} aria-describedby={descriptionId}>
-            {t('onboarding.replay.action')}
-          </Button>
-        {/snippet}
-      </Field>
-      {#if replayError}<p role="alert">{t('onboarding.replay.failed')}</p>{/if}
-    </div>
-
-    <!-- Models. The weights and the ONNX Runtime are downloaded after install;
-         until this section existed the only way to get them was a developer's
-         shell script. One row per artefact, the runtime beside them because to
-         a reader they are one list, and the directory spelled out for the
-         offline install as well.
-
-         The three sidecar rows lead it: where an external FLUX install lives,
-         which backend it should use, and which of its models. They are the
-         same question as the rows below them - what can this machine run - and
-         the answer to it is what this tab is. -->
-    <div
-      class="panel"
-      role="tabpanel"
-      id={panelId('models')}
-      aria-labelledby={tabId('models')}
-      hidden={active !== 'models'}
-    >
-      <h3 class="panel-heading">{t('settings.section.models')}</h3>
-
-      <div class="sidecar-field-wrap">
-        <Field
-          label={t('settings.sidecar.label')}
-          controlId="settings-sidecar-path"
-        >
-          {#snippet children()}
-            <div class="sidecar-row">
-              <TextInput
-                id="settings-sidecar-path"
-                value={session.sidecarPath}
+        <div class="block theme">
+          <Field label={t('settings.theme.label')}>
+            {#snippet children({ labelId })}
+              <ThemePicker
+                options={themes}
+                value={session.theme}
+                labelledBy={labelId}
                 onchange={(value) => {
-                  setSidecarPath(value)
+                  setTheme(/** @type {any} */ (value))
                   push()
                 }}
               />
-              <Button onclick={browseSidecar} disabled={choosing}>
-                {t('shell.action.chooseFolder')}
-              </Button>
-            </div>
-            {#if session.sidecarPath && !capabilities.sidecar}
-              <div class="sidecar-status-note">{t('settings.sidecar.notFound')}</div>
-            {/if}
+            {/snippet}
+          </Field>
+        </div>
+
+        <Field
+          label={t('settings.background.label')}
+          description={t('settings.background.description')}
+          layout="row"
+          controlId="settings-close-to-tray"
+        >
+          {#snippet children({ descriptionId })}
+            <input
+              id="settings-close-to-tray"
+              class="check"
+              type="checkbox"
+              aria-describedby={descriptionId}
+              checked={session.closeToTray}
+              onchange={(event) => updateCloseToTray(/** @type {HTMLInputElement} */ (event.currentTarget))}
+            />
           {/snippet}
         </Field>
-      </div>
+        {#if backgroundError}<p class="error" role="alert">{t('settings.background.saveFailed')}</p>{/if}
 
-      {#if capabilities.sidecar}
-        <div class="sidecar-field-wrap">
-          <Field
-            label={t('settings.fluxBackend.label')}
-            layout="row"
-          >
+        <Field label={t('settings.direction.label')} layout="row">
+          {#snippet children({ labelId })}
+            <Segmented
+              options={directions}
+              value={session.readingDirection}
+              labelledBy={labelId}
+              onchange={(value) => {
+                setReadingDirection(/** @type {any} */ (value))
+                push()
+              }}
+            />
+          {/snippet}
+        </Field>
+
+        <!-- The cloud permission has one switch, on the Cloud section beside
+             the endpoints it governs. This row says where it stands and goes
+             there. -->
+        <Field
+          label={t('settings.cloud.label')}
+          description={session.cloudAllowed ? t('settings.cloud.descriptionOn') : t('settings.cloud.descriptionOff')}
+          layout="row"
+        >
+          {#snippet children()}
+            <Button size="sm" onclick={() => select('inference', { focus: true })}>{t('settings.cloud.open')}</Button>
+          {/snippet}
+        </Field>
+
+        <Field label={t('settings.originalView.label')} layout="row">
+          {#snippet children({ labelId })}
+            <Segmented
+              options={originalViews}
+              value={session.originalView}
+              labelledBy={labelId}
+              onchange={(value) => {
+                setOriginalView(/** @type {any} */ (value))
+                push()
+              }}
+            />
+          {/snippet}
+        </Field>
+
+        <Field label={t('settings.language.label')} layout="row">
+          {#snippet children({ labelId })}
+            <Segmented
+              options={languages}
+              value={LOCALE}
+              labelledBy={labelId}
+              disabled={languages.length < 2}
+              onchange={() => {}}
+            />
+          {/snippet}
+        </Field>
+
+        <!-- Where someone who skipped part of the setup goes looking for it. -->
+        <Field
+          label={t('onboarding.replay.label')}
+          description={t('onboarding.replay.description')}
+          layout="row"
+        >
+          {#snippet children({ descriptionId })}
+            <Button size="sm" onclick={replayOnboarding} disabled={replaying} aria-describedby={descriptionId}>
+              {t('onboarding.replay.action')}
+            </Button>
+          {/snippet}
+        </Field>
+        {#if replayError}<p class="error" role="alert">{t('onboarding.replay.failed')}</p>{/if}
+
+        <!-- Both pipelines download from Hugging Face, so the token is
+             General's rather than either one's. Write-only: the stored token
+             never comes back across the seam, so the box is empty on every
+             open and "a token is saved" is said in words under it. -->
+        <div class="block token">
+          <Field label={t('settings.models.token.label')} controlId="settings-hf-token">
+            {#snippet children()}
+              <div class="inline">
+                <TextInput
+                  id="settings-hf-token"
+                  type="password"
+                  value={tokenDraft}
+                  placeholder={t('settings.models.token.placeholder')}
+                  onchange={(value) => (tokenDraft = value)}
+                />
+                <Button disabled={tokenDraft.trim().length === 0} onclick={saveToken}>
+                  {t('settings.models.token.save')}
+                </Button>
+                <Button disabled={!catalogue?.hasToken} onclick={clearToken}>
+                  {t('settings.models.token.clear')}
+                </Button>
+              </div>
+              {#if tokenFailure}
+                <p class="line failed">{t(tokenFailure)}</p>
+              {:else if tokenNote}
+                <p class="line">{tokenNote}</p>
+                {#if tokenReason}
+                  <p class="line">{tokenReason}</p>
+                {/if}
+              {/if}
+            {/snippet}
+          </Field>
+        </div>
+      </div>
+    </div>
+
+    <!-- Detection. With no file rows it ends in the engine table, which holds
+         nothing focusable, so the scroller carries the tab stop. -->
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+    <div
+      class="panel"
+      role="tabpanel"
+      tabindex={detectionModels.length > 0 ? undefined : 0}
+      id={panelId('detection')}
+      aria-labelledby={tabId('detection')}
+      hidden={active !== 'detection'}
+    >
+      <div class="column">
+        <h2>{t('pipelines.detection')}</h2>
+
+        <div class="languages">
+          {#each LANGUAGES as language (language.id)}
+            <Field label={t(language.labelKey)} layout="row" controlId="settings-detector-{language.id}">
+              {#snippet children()}
+                <div class="pick">
+                  <Select
+                    id="settings-detector-{language.id}"
+                    options={detectorOptions(language.id)}
+                    value={session.detection[language.id] ?? SKIP}
+                    label={t('pipelines.detectorFor', { language: t(language.labelKey) })}
+                    onchange={(value) => setDetection(language.id, value || null)}
+                  />
+                </div>
+              {/snippet}
+            </Field>
+          {/each}
+        </div>
+
+        <EngineTable engines={DETECTORS} label={t('pipelines.detection')} stateOf={engineState} />
+
+        {@render fileList(detectionModels)}
+      </div>
+    </div>
+
+    <!-- Cleaning -->
+    <div
+      class="panel"
+      role="tabpanel"
+      id={panelId('cleaning')}
+      aria-labelledby={tabId('cleaning')}
+      hidden={active !== 'cleaning'}
+    >
+      <div class="column">
+        <h2>{t('pipelines.cleaning')}</h2>
+
+        <EngineTable
+          engines={CLEANERS}
+          label={t('pipelines.cleaning')}
+          stateOf={engineState}
+          isAvailable={(engine) => engine.ready || found(engine)}
+        />
+
+        {@render fileList(cleaningModels)}
+
+        <!-- An external FLUX install: where it lives, which backend runs it,
+             and which of its models. -->
+        <h3 class="sub">{t('settings.sidecar.heading')}</h3>
+        <div class="block flush">
+          <Field label={t('settings.sidecar.label')} controlId="settings-sidecar-path">
+            {#snippet children()}
+              <div class="inline">
+                <TextInput
+                  id="settings-sidecar-path"
+                  value={sidecarDraft ?? session.sidecarPath}
+                  onchange={(value) => (sidecarDraft = value)}
+                  onblur={commitSidecar}
+                  onkeydown={(/** @type {KeyboardEvent} */ event) => {
+                    if (event.key === 'Enter') commitSidecar()
+                  }}
+                />
+                <Button onclick={browseSidecar} disabled={choosing}>
+                  {t('shell.action.chooseFolder')}
+                </Button>
+              </div>
+              {#if session.sidecarPath && !capabilities.sidecar}
+                <p class="line">{t('settings.sidecar.notFound')}</p>
+              {/if}
+            {/snippet}
+          </Field>
+        </div>
+
+        {#if capabilities.sidecar}
+          <Field label={t('settings.fluxBackend.label')} layout="row">
             {#snippet children({ labelId })}
               <Segmented
                 options={fluxBackends}
@@ -1228,321 +1465,27 @@
               />
             {/snippet}
           </Field>
-        </div>
 
-        <div class="sidecar-field-wrap">
-          <Field
-            label={t('settings.sidecarModel.label')}
-            controlId="settings-sidecar-model"
-          >
+          <Field label={t('settings.sidecarModel.label')} layout="row" controlId="settings-sidecar-model">
             {#snippet children()}
-              <select
+              <Select
                 id="settings-sidecar-model"
-                class="sidecar-model-select"
+                fit
                 disabled={sidecarModels.length === 0}
-                value={session.fluxModel}
-                onchange={(e) => {
-                  setFluxModel(/** @type {HTMLSelectElement} */ (e.currentTarget).value)
+                options={sidecarChoices}
+                value={session.fluxModel || sidecarChoices[0].value}
+                onchange={(value) => {
+                  setFluxModel(value)
                   push()
                 }}
-              >
-                {#if sidecarModels.length === 0}
-                  <option value="">{t('settings.sidecarModel.noneFound')}</option>
-                {:else}
-                  {#each sidecarModels as model (model.id)}
-                    <option value={model.id}>{model.label}</option>
-                  {/each}
-                {/if}
-              </select>
+              />
             {/snippet}
           </Field>
-        </div>
-      {/if}
-
-
-      {#if catalogue}
-        <ul class="rows">
-          {#each catalogue.models as model (model.id)}
-            {@const status = statusOf(model.id, model.installed, model.sha256Ok)}
-            <li class="row">
-              <div class="row-text">
-                <span class="row-name">{t(model.kindKey)}</span>
-                <span class="row-meta">
-                  {t('models.value.size', { bytes: model.bytes })} ·
-                  {t(status.key, status.params)}{#if model.installed && model.readOnly}
-                    · {t('settings.models.status.readOnly')}{/if}
-                </span>
-                {#if failures[model.id]}
-                  <span class="row-error">{failureText(model.id)}</span>
-                {/if}
-                {#if notes[model.id]}
-                  <span class="row-error">{t(notes[model.id])}</span>
-                {/if}
-                <!-- The bytes a stopped download left, which the next
-                     Download resumes from. Not shown while one
-                     is running: the progress line above is already saying it,
-                     and better. -->
-                {#if model.partialBytes && !progress[model.id]}
-                  <span class="row-partial">
-                    {t('settings.models.status.partial', { bytes: model.partialBytes })}
-                  </span>
-                {/if}
-              </div>
-              <div class="row-actions">
-                {#if progress[model.id]}
-                  <Button size="sm" onclick={() => cancel(model.id)}>
-                    {t('settings.models.action.cancel')}
-                  </Button>
-                {:else}
-                  {#if model.installed}
-                    <Button size="sm" onclick={() => verify(model.id)}>
-                      {t('settings.models.action.verify')}
-                    </Button>
-                    <Button size="sm" disabled={model.readOnly} onclick={() => remove(model.id)}>
-                      {t('settings.models.action.delete')}
-                    </Button>
-                  {:else}
-                    <Button size="sm" onclick={() => download(model.id)}>
-                      {t('settings.models.action.download')}
-                    </Button>
-                  {/if}
-                  <!-- Offered beside either pair: a `.part` can outlive the
-                       weight being installed by hand, and it is still disk
-                       nobody asked to spend. -->
-                  {#if model.partialBytes}
-                    <Button size="sm" onclick={() => discard(model.id)}>
-                      {t('settings.models.action.discard')}
-                    </Button>
-                  {/if}
-                {/if}
-              </div>
-            </li>
-          {/each}
-
-          <!-- The runtime. Not a catalogue row - it is an archive that gets
-               unpacked - but it does say how large its download is: the sizes
-               are on the package table now, read from each host's own
-               `Content-Length`. The build reported is the one
-               that *would* be fetched, which is the chosen flavour rather than
-               whatever is on disk: nothing short of loading the library can
-               tell what an installed one is. -->
-          <li class="row">
-            <div class="row-text">
-              <span class="row-name">{t('settings.models.runtime.label')}</span>
-              <span class="row-meta">
-                {#if catalogue.runtime.available}
-                  {#if catalogue.runtime.bytes}
-                    {t('models.value.size', { bytes: catalogue.runtime.bytes })} ·
-                  {/if}
-                  {catalogue.runtime.version} · {catalogue.runtime.flavour} ·
-                  {t(statusOf(RUNTIME_ID, catalogue.runtime.installed, null).key,
-                    statusOf(RUNTIME_ID, catalogue.runtime.installed, null).params)}{#if catalogue.runtime.installed && catalogue.runtime.readOnly}
-                    · {t('settings.models.status.readOnly')}{/if}
-                {:else}
-                  {t('settings.models.runtime.unavailable')}
-                {/if}
-              </span>
-              {#if failures[RUNTIME_ID]}
-                <span class="row-error">{failureText(RUNTIME_ID)}</span>
-              {/if}
-              {#if notes[RUNTIME_ID]}
-                <span class="row-error">{t(notes[RUNTIME_ID])}</span>
-              {/if}
-              <!-- Which build is actually here, said only when it is not the
-                   one the row names. -->
-              {#if installedNote}
-                <span class="row-partial">{installedNote}</span>
-              {/if}
-              <!-- The runtime's own remainder is its archives, in the download
-                   directory it was given. -->
-              {#if catalogue.runtime.partialBytes && !progress[RUNTIME_ID]}
-                <span class="row-partial">
-                  {t('settings.models.status.partial', { bytes: catalogue.runtime.partialBytes })}
-                </span>
-              {/if}
-            </div>
-            <div class="row-actions">
-              {#if progress[RUNTIME_ID]}
-                <Button size="sm" onclick={() => cancel(RUNTIME_ID)}>
-                  {t('settings.models.action.cancel')}
-                </Button>
-              {:else}
-                {#if catalogue.runtime.partialBytes}
-                  <Button size="sm" onclick={() => discard(RUNTIME_ID)}>
-                    {t('settings.models.action.discard')}
-                  </Button>
-                {/if}
-                {#if catalogue.runtime.installed}
-                  <Button
-                    size="sm"
-                    disabled={catalogue.runtime.readOnly}
-                    onclick={() => remove(RUNTIME_ID)}
-                  >
-                    {t('settings.models.action.delete')}
-                  </Button>
-                {/if}
-                <!-- Offered over an installed runtime **only where there is a
-                     choice**: fetching the chosen build over the top of the one
-                     that is there is the only way to switch, and on a platform
-                     with one build it would be a button that re-downloads what
-                     the machine already has. -->
-                {#if !catalogue.runtime.installed || catalogue.runtime.flavours.length > 1}
-                  <Button
-                    size="sm"
-                    disabled={!catalogue.runtime.available}
-                    onclick={() => download(RUNTIME_ID)}
-                  >
-                    {t('settings.models.action.download')}
-                  </Button>
-                {/if}
-              {/if}
-            </div>
-          </li>
-        </ul>
-
-        <!-- The flavour picker. Drawn only where the platform
-             publishes more than one build, which is Windows and Linux x64;
-             macOS and Linux aarch64 have one archive each and a select with
-             one option in it is a control that only asks a question it has
-             already answered. -->
-        {#if catalogue.runtime.flavours.length > 1}
-          <div class="flavour">
-            <Field
-              label={t('settings.models.runtime.flavour')}
-              controlId="settings-runtime-flavour"
-            >
-              {#snippet children()}
-                <select
-                  id="settings-runtime-flavour"
-                  class="sidecar-model-select"
-                  value={catalogue.runtime.flavour}
-                  onchange={(e) =>
-                    chooseFlavour(/** @type {HTMLSelectElement} */ (e.currentTarget).value)}
-                >
-                  {#each catalogue.runtime.flavours as build (build.id)}
-                    <option value={build.id}>
-                      {build.id} · {build.ortVersion} ·
-                      {t('models.value.size', { bytes: build.bytes })}
-                    </option>
-                  {/each}
-                </select>
-              {/snippet}
-            </Field>
-            {#if flavourNeeds}
-              <p class="note flavour-note">{flavourNeeds}</p>
-            {/if}
-          </div>
         {/if}
-
-        {#if catalogue.modelsDir}
-          <p class="path">{t('settings.models.folder', { path: catalogue.modelsDir })}</p>
-        {/if}
-      {:else}
-        <p class="note">{t('settings.models.unavailable')}</p>
-      {/if}
-
-      <!-- Four of the six weights are on Hugging Face, which rate-limits
-           anonymous downloads. The field is write-only: the stored token never
-           comes back across the seam, so this box is empty on every open and
-           "a token is saved" is said in words beside it. -->
-      <div class="token">
-        <Field
-          label={t('settings.models.token.label')}
-          controlId="settings-hf-token"
-        >
-          {#snippet children()}
-            <div class="token-row">
-              <TextInput
-                id="settings-hf-token"
-                type="password"
-                value={tokenDraft}
-                placeholder={t('settings.models.token.placeholder')}
-                onchange={(value) => (tokenDraft = value)}
-              />
-              <Button disabled={tokenDraft.trim().length === 0} onclick={saveToken}>
-                {t('settings.models.token.save')}
-              </Button>
-              <Button disabled={!catalogue?.hasToken} onclick={clearToken}>
-                {t('settings.models.token.clear')}
-              </Button>
-            </div>
-            {#if tokenFailure}
-              <div class="token-note failed">{t(tokenFailure)}</div>
-            {:else if tokenNote}
-              <div class="token-note">{tokenNote}</div>
-              <!-- And what the store did, where it said. A
-                   second line rather than a fourth variant of the first: the
-                   two answer different questions, and this one reads the same
-                   whether or not a token has been saved yet. -->
-              {#if tokenReason}
-                <div class="token-note">{tokenReason}</div>
-              {/if}
-            {/if}
-          {/snippet}
-        </Field>
       </div>
     </div>
 
-    <!-- Acceleration. `listAccelerators` has been registered, mirrored in the
-         mock and typed at the seam, and nothing called it: the only
-         way to force a provider was to edit settings.json by hand. -->
-    <!-- The panel's tail is the placement table and a note, neither of which
-         holds a focusable descendant, so the scroller carries the tab stop. -->
-    <!-- `tabindex` because this panel's **tail** holds no focusable
-         descendant, so without it its last inch is pointer-only (WCAG 2.1.1).
-         Only this panel and About are like that; the other three each end in a
-         control, so tabbing already reaches their bottom. -->
-    <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-    <div
-      class="panel"
-      role="tabpanel"
-      tabindex="0"
-      id={panelId('acceleration')}
-      aria-labelledby={tabId('acceleration')}
-      hidden={active !== 'acceleration'}
-    >
-      <h3 class="panel-heading">{t('settings.section.acceleration')}</h3>
-
-      <Field label={t('settings.accel.label')} controlId="settings-accelerator">
-        {#snippet children()}
-          <select
-            id="settings-accelerator"
-            class="sidecar-model-select"
-            value={acceleratorValue}
-            onchange={(e) =>
-              chooseAccelerator(/** @type {HTMLSelectElement} */ (e.currentTarget).value)}
-          >
-            <!-- The note is on the option's face, not only in its tooltip: a
-                 caveat a pointer has to hover to find is one a keyboard user
-                 never sees, and this one is the difference between a measured
-                 choice and a guess. -->
-            {#each acceleratorOptions as option (option.id)}
-              <option value={option.id} disabled={option.disabled} title={option.note}>
-                {option.label}{option.note ? `: ${option.note}` : ''}
-              </option>
-            {/each}
-          </select>
-        {/snippet}
-      </Field>
-
-      {#if accelFailure}
-        <p class="note">{t('settings.accel.unreadable')}</p>
-      {/if}
-
-      {#if accelerators && accelerators.models.length > 0}
-        <ul class="rows">
-          {#each accelerators.models as row (row.modelKey)}
-            <li class="row">
-              <div class="row-text">
-                <span class="row-name">{t(row.modelKey)}</span>
-                <span class="row-meta">{placementOf(row)}</span>
-              </div>
-            </li>
-          {/each}
-        </ul>
-      {/if}
-    </div>
-
+    <!-- Cloud: the component is the tab, unchanged; only its container moved. -->
     <div
       class="panel"
       role="tabpanel"
@@ -1550,10 +1493,164 @@
       aria-labelledby={tabId('inference')}
       hidden={active !== 'inference'}
     >
-      <h3 class="panel-heading">{t('settings.section.inference')}</h3>
-      <InferenceSettings />
+      <div class="column">
+        <h2>{t('settings.section.inference')}</h2>
+        <InferenceSettings />
+      </div>
     </div>
 
+    <!-- Performance. Its tail is the placement list, which holds nothing
+         focusable, so the scroller carries the tab stop. -->
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+    <div
+      class="panel"
+      role="tabpanel"
+      tabindex="0"
+      id={panelId('performance')}
+      aria-labelledby={tabId('performance')}
+      hidden={active !== 'performance'}
+    >
+      <div class="column">
+        <h2>{t('settings.section.performance')}</h2>
+
+        {#if catalogue}
+          <!-- The runtime is an archive that gets unpacked, not a catalogue
+               row. The build named is the one a Download would fetch. -->
+          <ul class="rows">
+            <li class="row">
+              <div class="row-text">
+                <span class="row-name">{t('settings.models.runtime.label')}</span>
+                <span class="row-meta">
+                  {#if catalogue.runtime.available}
+                    {#if catalogue.runtime.bytes}
+                      {t('models.value.size', { bytes: catalogue.runtime.bytes })} ·
+                    {/if}
+                    {catalogue.runtime.version} · {catalogue.runtime.flavour} ·
+                    {t(statusOf(RUNTIME_ID, catalogue.runtime.installed, null).key,
+                      statusOf(RUNTIME_ID, catalogue.runtime.installed, null).params)}{#if catalogue.runtime.installed && catalogue.runtime.readOnly}
+                      · {t('settings.models.status.readOnly')}{/if}
+                  {:else}
+                    {t('settings.models.runtime.unavailable')}
+                  {/if}
+                </span>
+                {#if failures[RUNTIME_ID]}
+                  <span class="row-error">{failureText(RUNTIME_ID)}</span>
+                {/if}
+                {#if notes[RUNTIME_ID]}
+                  <span class="row-error">{t(notes[RUNTIME_ID])}</span>
+                {/if}
+                <!-- Which build is actually here, said only when it is not the
+                     one the row names. -->
+                {#if installedNote}
+                  <span class="row-partial">{installedNote}</span>
+                {/if}
+                {#if catalogue.runtime.partialBytes && !progress[RUNTIME_ID]}
+                  <span class="row-partial">
+                    {t('settings.models.status.partial', { bytes: catalogue.runtime.partialBytes })}
+                  </span>
+                {/if}
+              </div>
+              <div class="row-actions">
+                {#if progress[RUNTIME_ID]}
+                  <Button size="sm" onclick={() => cancel(RUNTIME_ID)}>
+                    {t('settings.models.action.cancel')}
+                  </Button>
+                {:else}
+                  {#if catalogue.runtime.partialBytes}
+                    <Button size="sm" onclick={() => discard(RUNTIME_ID)}>
+                      {t('settings.models.action.discard')}
+                    </Button>
+                  {/if}
+                  {#if catalogue.runtime.installed}
+                    <Button
+                      size="sm"
+                      disabled={catalogue.runtime.readOnly}
+                      onclick={() => remove(RUNTIME_ID)}
+                    >
+                      {t('settings.models.action.delete')}
+                    </Button>
+                  {/if}
+                  <!-- Over an installed runtime only where there is a choice of
+                       build: elsewhere it would re-download what is there. -->
+                  {#if !catalogue.runtime.installed || catalogue.runtime.flavours.length > 1}
+                    <Button
+                      size="sm"
+                      disabled={!catalogue.runtime.available}
+                      onclick={() => download(RUNTIME_ID)}
+                    >
+                      {t('settings.models.action.download')}
+                    </Button>
+                  {/if}
+                {/if}
+              </div>
+            </li>
+          </ul>
+
+          <!-- Only where the platform publishes more than one build: a select
+               with one option only asks a question it has already answered. -->
+          {#if catalogue.runtime.flavours.length > 1}
+            <Field label={t('settings.models.runtime.flavour')} layout="row" controlId="settings-runtime-flavour">
+              {#snippet children()}
+                <Select
+                  id="settings-runtime-flavour"
+                  fit
+                  options={catalogue.runtime.flavours.map((build) => ({
+                    value: build.id,
+                    label: `${build.id} · ${build.ortVersion} · ${t('models.value.size', { bytes: build.bytes })}`,
+                  }))}
+                  value={catalogue.runtime.flavour}
+                  onchange={chooseFlavour}
+                />
+              {/snippet}
+            </Field>
+            {#if flavourNeeds}
+              <p class="line">{flavourNeeds}</p>
+            {/if}
+          {/if}
+
+          {#if catalogue.modelsDir}
+            <p class="path">{t('settings.models.folder', { path: catalogue.modelsDir })}</p>
+          {/if}
+        {:else}
+          <p class="note">{t('settings.models.unavailable')}</p>
+        {/if}
+
+        <div class="accel">
+          <Field label={t('settings.accel.label')} layout="row" controlId="settings-accelerator">
+            {#snippet children()}
+              <!-- The note is on the option's face as well as its tooltip: a
+                   caveat only a hover can find is one a keyboard never sees. -->
+              <Select
+                id="settings-accelerator"
+                fit
+                options={acceleratorChoices}
+                value={acceleratorValue}
+                onchange={chooseAccelerator}
+              />
+            {/snippet}
+          </Field>
+        </div>
+
+        {#if accelFailure}
+          <p class="line">{t('settings.accel.unreadable')}</p>
+        {/if}
+
+        {#if accelerators && accelerators.models.length > 0}
+          <ul class="rows">
+            {#each accelerators.models as row (row.modelKey)}
+              <li class="row">
+                <div class="row-text">
+                  <span class="row-name">{t(row.modelKey)}</span>
+                  <span class="row-meta">{placementOf(row)}</span>
+                </div>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </div>
+    </div>
+
+    <!-- Shortcuts -->
     <div
       class="panel"
       role="tabpanel"
@@ -1561,15 +1658,15 @@
       aria-labelledby={tabId('shortcuts')}
       hidden={active !== 'shortcuts'}
     >
-      <h3 class="panel-heading">{t('settings.section.shortcuts')}</h3>
-      <ShortcutSheet headingLevel="h4" />
+      <div class="column">
+        <h2>{t('settings.section.shortcuts')}</h2>
+        <ShortcutSheet headingLevel="h3" />
+      </div>
     </div>
 
     <!-- About ends in the written offer of source and the cloud terms, so its
-         scroller carries the tab stop as well. It is a GPL-3.0 obligation and
-         this dialog is its only route. -->
-    <!-- Focusable for the same reason the Acceleration panel is: it ends in
-         prose rather than in a control. -->
+         scroller carries the tab stop. It is a GPL-3.0 obligation and this
+         screen is its only route. -->
     <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
     <div
       class="panel"
@@ -1579,71 +1676,98 @@
       aria-labelledby={tabId('about')}
       hidden={active !== 'about'}
     >
-      <h3 class="panel-heading">{t('settings.section.about')}</h3>
-      <AboutSection />
+      <div class="column">
+        <h2>{t('settings.section.about')}</h2>
+        <AboutSection />
+      </div>
     </div>
   </div>
-
-
-  {#snippet buttons()}
-    <Button variant="primary" onclick={() => closeModal('done')}>{t('shell.action.done')}</Button>
-  {/snippet}
-</Modal>
+</Screen>
 
 <style>
-  /* The strip and the panels run to the dialog's own edges rather than to the
-     text column's, so the strip's hairline reads as a divider across the head
-     and a panel's scrollbar sits where the modal's own used to. The `--s-6`
-     the modal body pads with is given back inside each of them. */
-  .tabs {
-    margin: 6px calc(var(--s-6) * -1) 0;
-  }
-
-  .strip {
+  .settings {
+    flex: 1;
+    min-height: 0;
     display: flex;
-    gap: var(--s-5);
-    padding: 0 var(--s-6);
-    border-bottom: 1px solid var(--line);
   }
 
-  /* Weight does not change with selection: a bold label is wider than the same
-     word in regular, and the four tabs beside the selected one would step
-     sideways on every press. Colour and the rule under it carry the state.
-     `--t2` at rest rather than the `--t3` a static label would take, for the
-     reason `Segmented` gives about its idle chips - this is a control. */
-  .tab {
-    position: relative;
-    padding: 0 4px var(--s-3);
+  /* ---- sidebar ---------------------------------------------------------- */
+
+  .side {
+    flex: none;
+    width: 212px;
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-6);
+    padding: var(--s-4) var(--s-3);
+    background: var(--sb);
+    border-right: 1px solid var(--line);
+    overflow-y: auto;
+  }
+
+  .side-head {
+    display: flex;
+    align-items: center;
+    gap: var(--s-2);
+  }
+  .back {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
     border: none;
+    border-radius: var(--r-lg);
     background: none;
-    font: inherit;
-    font-size: 11.5px;
     color: var(--t2);
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+  }
+  .back:hover { background: var(--accent-soft); color: var(--text) }
+  .back:active { transform: scale(.96) }
+  h1 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: -.005em;
+  }
+
+  .tabs {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  /* Weight never changes with selection; the fill and the icon's colour carry
+     it, so a label never shifts under the pointer. */
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: var(--s-3);
+    height: 30px;
+    padding: 0 var(--s-3);
+    border: none;
+    border-radius: var(--r-chip);
+    background: none;
+    color: var(--t2);
+    font: inherit;
+    font-size: 12.5px;
+    text-align: left;
     white-space: nowrap;
     cursor: pointer;
-    transition: color var(--dur-fast) var(--ease);
+    transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
   }
-  .tab:hover { color: var(--text) }
-  .tab.on { color: var(--text) }
-  .tab.on::after {
-    content: '';
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: -1px;
-    height: 2px;
-    border-radius: var(--r-pill);
-    background: var(--accent);
-  }
-  .tab:focus-visible { outline-offset: -1px }
+  .tab:hover { background: var(--accent-soft); color: var(--text) }
+  .tab.on { background: var(--accent-soft); color: var(--text) }
+  .tab.on :global(svg) { color: var(--accent) }
+  .tab:focus-visible { outline-offset: -2px }
+  .tab-label { overflow: hidden; text-overflow: ellipsis }
 
-  /* One fixed height for every panel, so the dialog does not resize under the
-     pointer as tabs swap. Capped in pixels so a tall screen does not get a
-     dialog it has to look up and down, proportional below the cap so a short
-     one never needs the modal's own scrollbar underneath this one. */
+  /* ---- content ---------------------------------------------------------- */
+
   .panel {
-    height: min(52vh, 460px);
-    padding: var(--s-4) var(--s-6) var(--s-3);
+    flex: 1;
+    min-width: 0;
     overflow-y: auto;
     overscroll-behavior: contain;
     scrollbar-gutter: stable;
@@ -1651,53 +1775,82 @@
   .panel:focus-visible { outline-offset: -2px }
   .panel[hidden] { display: none }
 
-  /* The selected tab is this heading on screen; printing the word again an
-     inch below it would be an echo, not a heading. It stays in the markup so
-     the outline is real - h2 title, h3 panel, h4 shortcut groups - and so the
-     sheet's own headings have something to hang from. */
-  .panel-heading {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    margin: -1px;
-    padding: 0;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
+  .column {
+    max-width: 680px;
+    margin: 0 auto;
+    padding: var(--s-8) var(--s-6) 64px;
   }
 
-  /* The Models panel opens on a sentence rather than on a row, so it needs the
-     gap under it that a `Field` brings with it. */
+  h2 {
+    margin: 0 0 var(--s-6);
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: -.01em;
+    line-height: 1.2;
+  }
+  .sub {
+    margin: var(--s-8) 0 var(--s-2);
+    font-size: 12.5px;
+    font-weight: 600;
+  }
 
-  .sidecar-field-wrap {
-    padding-top: var(--s-3);
-    padding-bottom: var(--s-2);
+  /* Rows at screen scale: the Field row's 32px floor was set for a 560px
+     dialog. */
+  .column :global(.field.row .line) { min-height: 40px }
+  .column :global(.field.row .label) { font-size: 12.5px }
+
+  .block {
+    padding: var(--s-3) 0 var(--s-5);
     border-bottom: 1px solid var(--line);
   }
-  .sidecar-row {
+  .block.flush { padding-top: 0 }
+  .theme { container-type: inline-size; padding-top: 0 }
+  /* Six swatches: one row of six where they fit, two rows of three where
+     they do not, never five and one. */
+  .theme :global(.picker) { grid-template-columns: repeat(6, minmax(0, 1fr)) }
+  @container (max-width: 520px) {
+    .theme :global(.picker) { grid-template-columns: repeat(3, minmax(0, 1fr)) }
+  }
+  .token { border-bottom: none; padding-top: var(--s-6) }
+
+  .check {
+    width: 15px;
+    height: 15px;
+    margin: 0;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+
+  .inline {
     display: flex;
     align-items: center;
     gap: var(--s-2);
     width: 100%;
   }
-  .sidecar-row :global(> *:first-child) {
+  .inline :global(> *:first-child) {
     flex: 1;
     min-width: 0;
   }
-  /* The Models and Acceleration lists. One row is a name and a meta line on
-     the left and its buttons on the right; the meta line is `--t3` like every
-     other secondary line in this dialog, and the whole row keeps the hairline
-     the sidecar fields already use so the section reads as one table. */
+
+  .languages { margin-bottom: var(--s-8) }
+  /* One width for the three pickers, so a language with a longer engine name
+     does not make its row look different from the others. */
+  .pick { width: 15rem; max-width: 100% }
+
+  .accel { margin-top: var(--s-6) }
+
+  /* One row is a name and a meta line on the left and its buttons on the
+     right, with the hairline every row on this screen uses. */
   .rows {
-    margin: var(--s-2) 0 0;
+    margin: 0;
     padding: 0;
     list-style: none;
   }
   .row {
     display: flex;
     align-items: center;
-    gap: var(--s-3);
-    padding: var(--s-2) 0;
+    gap: var(--s-4);
+    padding: var(--s-3) 0;
     border-bottom: 1px solid var(--line);
   }
   .row-text {
@@ -1708,104 +1861,71 @@
     min-width: 0;
   }
   .row-name {
-    font-size: 12px;
+    font-size: 12.5px;
     color: var(--text);
   }
-  .row-meta {
-    font-size: 10.5px;
+  .row-meta,
+  .row-partial {
+    font-size: 11px;
     color: var(--t3);
     line-height: 1.4;
   }
-  /* `--t2` rather than `--t3`: a failure is the one line in this section the
-     reader has to act on, and `--t3` is under 4.5:1 against `--panel` in dark. */
+  /* `--t2` rather than `--t3`: a failure is the one line the reader has to act
+     on, and `--t3` is under 4.5:1 against the dark field. */
   .row-error {
-    font-size: 10.5px;
+    font-size: 11px;
     color: var(--t2);
     line-height: 1.4;
     word-break: break-word;
-  }
-  /* The kept bytes, and the build that is here rather than the one chosen.
-     Neither is a failure and neither is the row's own subject, so they take
-     `--t3` with the meta line rather than the `--t2` a failure gets. */
-  .row-partial {
-    font-size: 10.5px;
-    color: var(--t3);
-    line-height: 1.4;
   }
   .row-actions {
     display: flex;
     flex: none;
     gap: var(--s-2);
   }
-  .note {
-    margin: 0 0 var(--s-2);
-    font-size: 10.5px;
+
+  .note,
+  .line {
+    margin: var(--s-2) 0 0;
+    font-size: 11px;
     color: var(--t3);
     line-height: 1.45;
+    max-width: 68ch;
   }
-  /* A path is data, not copy: it must be selectable and must not be broken by
-     the interface's own word wrapping in a way that makes it untypable. */
-  .path {
+  .note { margin-top: var(--s-6) }
+  .line.failed,
+  .error { color: var(--warn) }
+  .error {
     margin: var(--s-2) 0 0;
-    font-size: 10.5px;
+    font-size: 11px;
+    line-height: 1.45;
+  }
+
+  /* A path is data: selectable, and broken anywhere rather than overflowing. */
+  .path {
+    margin: var(--s-3) 0 0;
+    font-size: 11px;
     color: var(--t3);
     line-height: 1.4;
     word-break: break-all;
     user-select: text;
   }
-  .flavour { padding-top: var(--s-3) }
-  .flavour-note { margin: var(--s-2) 0 0 }
-  .token { padding-top: var(--s-3) }
-  .token-row {
-    display: flex;
-    align-items: center;
-    gap: var(--s-2);
-    width: 100%;
-  }
-  .token-row :global(> *:first-child) {
-    flex: 1;
-    min-width: 0;
-  }
-    /* The one token note that is a failure the user has to act on. */
-  .token-note.failed { color: var(--warn) }
-  .token-note {
-    margin-top: var(--s-2);
-    font-size: 10.5px;
-    color: var(--t3);
-    line-height: 1.4;
-  }
 
-  .sidecar-status-note {
-    margin-top: var(--s-2);
-    font-size: 10.5px;
-    color: var(--t3);
-    line-height: 1.4;
+  /* A narrow window keeps the list and drops its words: the icons stay, and
+     the labels remain the tabs' accessible names. */
+  @media (max-width: 720px) {
+    .side { width: 52px; padding-inline: var(--s-2) }
+    .side-head h1,
+    .tab-label {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
+    .tab { justify-content: center; padding: 0 }
+    .back { margin-inline: auto }
+    .column { padding-inline: var(--s-5) }
   }
-  .sidecar-model-select {
-    width: 100%;
-    height: 28px;
-    padding: 0 var(--s-2);
-    border: 1px solid var(--line2);
-    border-radius: var(--r-md);
-    background: var(--panel);
-    color: var(--text);
-    font: inherit;
-    font-size: 11.5px;
-    cursor: pointer;
-    transition:
-      background var(--dur-fast) var(--ease),
-      border-color var(--dur-fast) var(--ease);
-  }
-  .sidecar-model-select:hover:not(:disabled) {
-    border-color: var(--accent);
-  }
-  .sidecar-model-select:focus-visible {
-    outline: none;
-    border-color: var(--accent);
-  }
-  .sidecar-model-select:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
 </style>

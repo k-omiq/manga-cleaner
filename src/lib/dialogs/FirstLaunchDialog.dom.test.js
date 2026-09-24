@@ -1,5 +1,5 @@
 /**
- * The setup a first launch opens, mounted: the six steps over the real
+ * The setup a first launch opens, mounted: the nine steps over the real
  * session, the real stores and a hand-written seam stub.
  *
  * The session and capabilities are the real modules, so a setting the setup
@@ -24,45 +24,37 @@ import { app, closeAllModals, pushModal } from '../state/app.svelte.js'
 import { capabilities } from '../state/capabilities.svelte.js'
 import {
   session,
-  setAccelerator,
   setCloseToTray,
   setCloudAllowed,
-  setFluxBackend,
+  setDetection,
   setFluxModel,
-  setReadingDirection,
   setSidecarPath,
+  setTheme,
 } from '../state/session.svelte.js'
 import FirstLaunchDialog from './FirstLaunchDialog.svelte'
 import SettingsDialog from './SettingsDialog.svelte'
-import { DEFAULT_FLUX_MODEL, RUNTIME_ID } from './firstlaunch.js'
+import { DEFAULT_FLUX_MODEL, FIRST_LAUNCH_STEPS, RUNTIME_ID } from './firstlaunch.js'
 import {
   configureFirstLaunchCloud,
   dismissFirstLaunch,
   firstLaunch,
   offerFirstLaunch,
-  pauseFirstLaunchDownloads,
+  pauseFile,
   resetFirstLaunch,
+  resumeFile,
   setFirstLaunchStep,
   startFirstLaunchDownloads,
 } from './firstlaunch.svelte.js'
 
 /** Each step's heading, in the order the steps come. */
-const HEADINGS = [
-  'onboarding.welcome.heading',
-  'onboarding.models.heading',
-  'onboarding.defaults.heading',
-  'onboarding.cloud.heading',
-  'onboarding.behavior.heading',
-  'onboarding.done.heading',
-]
+const HEADINGS = FIRST_LAUNCH_STEPS.map((step) => `onboarding.${step}.heading`)
 
 /** Sizes small enough to add up by eye. */
-const REQUIRED_BYTES = 95 + 4 + 1 + 11
+const DETECTION_BYTES = 95 + 4 + 1 + 11
 const RUNTIME_BYTES = 32
 const REDRAW_BYTES = 207
-const READER_BYTES = 343 + 117 + 1
-/** What Download costs with the recommended ticks. */
-const PRICE = REQUIRED_BYTES + RUNTIME_BYTES + REDRAW_BYTES
+/** What Download costs with the default choices. */
+const PRICE = DETECTION_BYTES + RUNTIME_BYTES + REDRAW_BYTES
 
 /** The spec `pushModal({kind: 'settings'})` would have handed Settings. */
 const SPEC = {
@@ -122,8 +114,9 @@ function view({ runtimeInstalled = false } = {}) {
       readOnly: false,
       downloading: false,
       version: '1.28.0',
-      flavour: 'cpu',
+      flavour: 'stock',
       flavours: [],
+      platform: 'macos-arm64',
       installedFlavour: null,
       installedVersion: null,
       partialBytes: null,
@@ -185,12 +178,11 @@ beforeEach(() => {
   backend = makeBackend()
   setBackend(/** @type {any} */ (backend))
   setCloseToTray(false)
-  setReadingDirection('rtl')
+  setTheme('system')
   setCloudAllowed(false)
-  setAccelerator('auto')
   setFluxModel('')
-  setFluxBackend('auto')
   setSidecarPath('')
+  for (const language of ['ja', 'zh', 'ko']) setDetection(language, 'ctd-rtdetr')
   session.firstLaunchOffered = false
   capabilities.sidecar = false
 })
@@ -212,7 +204,7 @@ function open(step = 'welcome', answer = view()) {
 
 /** @param {ReturnType<typeof render>} rendered */
 function heading(rendered) {
-  return rendered.getByRole('heading', { level: 3 })
+  return rendered.getByRole('heading', { level: 1 })
 }
 
 /**
@@ -223,71 +215,78 @@ async function press(rendered, name) {
   await fireEvent.click(rendered.getByRole('button', { name }))
 }
 
-/** A download ending well, as the backend reports it. @param {string} id */
-function finish(id) {
-  backend.emit({ type: 'model-progress', id, downloaded: 1, total: 1, done: true, error: null })
+/**
+ * A download ending, as the backend reports it: well, or with its error.
+ *
+ * @param {string} id
+ * @param {string|null} [error]
+ */
+function finish(id, error = null) {
+  backend.emit({ type: 'model-progress', id, downloaded: 1, total: 1, done: true, error })
 }
 
-describe('the six steps', () => {
-  it('come in order, forward and back, with one choice on each', async () => {
+describe('the nine steps', () => {
+  it('come in order, forward and back, and walking through changes nothing', async () => {
     const rendered = open()
-    const seen = [heading(rendered).textContent]
-    expect(rendered.getByText(t('onboarding.stepOf', { current: 1, total: 6 }))).toBeTruthy()
-    // Nothing to go back to on the first step.
+    const seen = [heading(rendered).textContent?.trim()]
+    // The cover has one way in and no footer.
     expect(rendered.queryByRole('button', { name: t('onboarding.action.back') })).toBeNull()
+    expect(rendered.getByRole('link', { name: t('onboarding.welcome.source') }).getAttribute('href')).toBe(
+      'https://github.com/k-omiq/manga-cleaner',
+    )
 
     await press(rendered, t('onboarding.action.start'))
-    expect(firstLaunch.step).toBe('models')
+    expect(firstLaunch.step).toBe('theme')
     await press(rendered, t('onboarding.action.back'))
     expect(firstLaunch.step).toBe('welcome')
-
     await press(rendered, t('onboarding.action.start'))
-    seen.push(heading(rendered).textContent)
-    await press(rendered, t('onboarding.action.notNow'))
-    seen.push(heading(rendered).textContent)
-    await press(rendered, t('onboarding.action.next'))
-    seen.push(heading(rendered).textContent)
-    await press(rendered, t('onboarding.action.notNow'))
-    seen.push(heading(rendered).textContent)
-    await press(rendered, t('onboarding.action.next'))
-    seen.push(heading(rendered).textContent)
+
+    // theme, token (skipped), background, detection, cleaning, cloud (not now), dependencies
+    for (const action of [
+      'onboarding.action.next',
+      'onboarding.action.skipStep',
+      'onboarding.action.next',
+      'onboarding.action.next',
+      'onboarding.action.next',
+      'onboarding.action.notNow',
+    ]) {
+      seen.push(heading(rendered).textContent?.trim())
+      await press(rendered, t(action))
+    }
+    seen.push(heading(rendered).textContent?.trim())
+    expect(firstLaunch.step).toBe('dependencies')
+    setFirstLaunchStep('downloads')
+    await waitFor(() => expect(heading(rendered).textContent?.trim()).toBe(t('onboarding.downloads.heading')))
+    seen.push(heading(rendered).textContent?.trim())
 
     expect(seen).toEqual(HEADINGS.map((key) => t(key)))
-    expect(rendered.getByText(t('onboarding.stepOf', { current: 6, total: 6 }))).toBeTruthy()
-    // Walking through with the defaults fetches nothing and changes nothing.
     expect(backend.downloadRuntime).not.toHaveBeenCalled()
     expect(backend.downloadModel).not.toHaveBeenCalled()
     expect(backend.writeSettings).not.toHaveBeenCalled()
   })
 
-  it('put focus on each heading, where Enter presses the primary action', async () => {
+  it('put focus on each heading, where Enter presses the primary action but never Download', async () => {
     const rendered = open()
     await waitFor(() => expect(document.activeElement).toBe(heading(rendered)))
     await fireEvent.keyDown(heading(rendered), { key: 'Enter' })
-    expect(firstLaunch.step).toBe('models')
+    expect(firstLaunch.step).toBe('theme')
     await waitFor(() => expect(document.activeElement).toBe(heading(rendered)))
-    expect(heading(rendered).textContent).toBe(t('onboarding.models.heading'))
-
-    // Download is withheld from Enter: a key pressed twice on the step before
-    // must not start a transfer of hundreds of megabytes.
-    await fireEvent.keyDown(heading(rendered), { key: 'Enter' })
-    expect(firstLaunch.step).toBe('models')
-    expect(backend.downloadRuntime).not.toHaveBeenCalled()
-
-    await press(rendered, t('onboarding.action.notNow'))
-    await waitFor(() => expect(document.activeElement).toBe(heading(rendered)))
-    // Enter on a control belongs to the control, and a held key is not a press.
-    await fireEvent.keyDown(rendered.getByRole('button', { name: t('onboarding.action.back') }), { key: 'Enter' })
+    // A held key is not a press, and Enter on a control belongs to it.
     await fireEvent.keyDown(heading(rendered), { key: 'Enter', repeat: true })
-    expect(firstLaunch.step).toBe('defaults')
+    await fireEvent.keyDown(rendered.getByRole('button', { name: t('onboarding.action.back') }), { key: 'Enter' })
+    expect(firstLaunch.step).toBe('theme')
+
+    setFirstLaunchStep('dependencies')
+    await waitFor(() => expect(document.activeElement).toBe(heading(rendered)))
     await fireEvent.keyDown(heading(rendered), { key: 'Enter' })
-    expect(firstLaunch.step).toBe('cloud')
+    expect(firstLaunch.step).toBe('dependencies')
+    expect(backend.downloadRuntime).not.toHaveBeenCalled()
   })
 })
 
 describe('leaving early', () => {
   it('Skip setup closes it from any step and records that it was offered', async () => {
-    const rendered = open('defaults')
+    const rendered = open('detection')
     await press(rendered, t('onboarding.action.skip'))
     expect(firstLaunch.open).toBe(false)
     expect(session.firstLaunchOffered).toBe(true)
@@ -300,190 +299,226 @@ describe('leaving early', () => {
   })
 
   it('Escape closes it the same way', async () => {
-    open('behavior')
+    open('background')
     await fireEvent.keyDown(window, { key: 'Escape' })
     expect(firstLaunch.open).toBe(false)
     expect(session.firstLaunchOffered).toBe(true)
   })
 })
 
-describe('the recommended choices', () => {
-  it('are already made when the setup opens', async () => {
-    const rendered = open('models')
-    const required = /** @type {HTMLInputElement} */ (rendered.getByLabelText(t('onboarding.models.required.label')))
-    const redraw = /** @type {HTMLInputElement} */ (rendered.getByLabelText(t('models.kind.inpainter')))
-    const reader = /** @type {HTMLInputElement} */ (rendered.getByLabelText(t('models.kind.ocr')))
-    // Cleaning needs every required file, so there is no box to clear.
-    expect([required.checked, required.disabled]).toEqual([true, true])
-    expect([redraw.checked, redraw.disabled]).toEqual([true, false])
-    expect([reader.checked, reader.disabled]).toEqual([false, false])
-    expect(rendered.getByRole('button', { name: t('onboarding.models.download', { bytes: PRICE }) })).toBeTruthy()
-
-    // The reader is three files and one tick.
-    await fireEvent.click(reader)
-    expect([firstLaunch.selection.ocrEncoder, firstLaunch.selection.ocrDecoder, firstLaunch.selection.ocrVocab]).toEqual(
-      [true, true, true],
-    )
-    expect(
-      rendered.getByRole('button', { name: t('onboarding.models.download', { bytes: PRICE + READER_BYTES }) }),
-    ).toBeTruthy()
-
-    setFirstLaunchStep('defaults')
-    await waitFor(() => expect(heading(rendered).textContent).toBe(t('onboarding.defaults.heading')))
-    expect(/** @type {HTMLSelectElement} */ (rendered.getByLabelText(t('settings.accel.label'))).value).toBe('auto')
-    // Asking the runtime maps its library, which its own download has to be
-    // able to replace, so a machine without it is not asked.
-    expect(backend.listAccelerators).not.toHaveBeenCalled()
-    expect(rendered.getByText(t('onboarding.defaults.accel.later'))).toBeTruthy()
-
-    setFirstLaunchStep('behavior')
-    await waitFor(() => expect(heading(rendered).textContent).toBe(t('onboarding.behavior.heading')))
-    expect(/** @type {HTMLInputElement} */ (rendered.getByLabelText(t('settings.background.label'))).checked).toBe(false)
-    expect(rendered.getByRole('radio', { name: t('settings.direction.rtl') }).getAttribute('aria-checked')).toBe('true')
-    expect(backend.writeSettings).not.toHaveBeenCalled()
+describe('the setting steps', () => {
+  it('apply a theme the moment it is picked, and send it to the backend', async () => {
+    const rendered = open('theme')
+    await fireEvent.click(rendered.getByRole('radio', { name: t('settings.theme.jade') }))
+    expect(session.theme).toBe('jade')
+    await waitFor(() => expect(backend.writeSettings).toHaveBeenCalledWith(expect.objectContaining({ theme: 'jade' })))
   })
 
-  it('include the recommended AI redraw model when a helper is installed', async () => {
-    capabilities.sidecar = true
-    backend.sidecarAvailable.mockResolvedValue({ available: true, reasonKey: null })
-    backend.listSidecarModels.mockResolvedValue([
-      { id: 'other', label: 'Other model' },
-      { id: DEFAULT_FLUX_MODEL, label: 'FLUX.2 klein 4B' },
-    ])
-    const rendered = open('defaults')
+  it('save a Hugging Face key to the backend alone, or let it be skipped', async () => {
+    const rendered = open('token')
+    expect(rendered.getByRole('button', { name: t('onboarding.action.skipStep') })).toBeTruthy()
+    await fireEvent.input(rendered.getByLabelText(t('onboarding.token.label')), { target: { value: 'hf_test' } })
+    await press(rendered, t('onboarding.token.save'))
+    await waitFor(() => expect(backend.writeSettings).toHaveBeenCalledWith({ hfToken: 'hf_test' }))
+    expect(firstLaunch.step).toBe('background')
+    expect(JSON.stringify(session)).not.toContain('hf_test')
+  })
 
-    await waitFor(() => expect(session.fluxModel).toBe(DEFAULT_FLUX_MODEL))
-    // Written through, because the backend's own fallback need not be a
-    // model this helper has.
-    expect(backend.writeSettings).toHaveBeenLastCalledWith(expect.objectContaining({ fluxModel: DEFAULT_FLUX_MODEL }))
-    const model = /** @type {HTMLSelectElement} */ (rendered.getByLabelText(t('settings.sidecarModel.label')))
-    await waitFor(() => expect(model.value).toBe(DEFAULT_FLUX_MODEL))
+  it('say when a key could not be saved, and stay on the step', async () => {
+    backend.writeSettings.mockRejectedValueOnce(new Error('keychain locked'))
+    const rendered = open('token')
+    await fireEvent.input(rendered.getByLabelText(t('onboarding.token.label')), { target: { value: 'hf_test' } })
+    await press(rendered, t('onboarding.token.save'))
+    expect((await rendered.findByRole('alert')).textContent).toBe(t('onboarding.token.failed'))
+    expect(firstLaunch.step).toBe('token')
+  })
+
+  it('say what quitting on close costs, and store the choice in both places', async () => {
+    const rendered = open('background')
+    expect(rendered.getByText(/Downloads and cleaning stop/)).toBeTruthy()
+    await fireEvent.click(rendered.getByRole('radio', { name: new RegExp(t('onboarding.background.keep')) }))
+    await waitFor(() => expect(backend.writeSettings).toHaveBeenCalledWith(expect.objectContaining({ closeToTray: true })))
+    expect(session.closeToTray).toBe(true)
+  })
+
+  it('take a choice back, and say so, when the backend refuses it', async () => {
+    backend.writeSettings.mockRejectedValueOnce(new Error('disk full'))
+    const rendered = open('background')
+    await fireEvent.click(rendered.getByRole('radio', { name: new RegExp(t('onboarding.background.keep')) }))
+    expect((await rendered.findByRole('alert')).textContent).toBe(t('onboarding.saveFailed'))
+    expect(session.closeToTray).toBe(false)
   })
 })
 
-describe('the download step', () => {
-  it('fetches the runtime first, pauses the transfer in flight, and resumes where it stopped', async () => {
-    const rendered = open('models')
-    await press(rendered, t('onboarding.models.download', { bytes: PRICE }))
+describe('the pipelines', () => {
+  it('drop a skipped language, and every detection file once all three are skipped', async () => {
+    const rendered = open('detection')
+    expect(rendered.getByText('RT-DETR v2 + COO + SAM-TS')).toBeTruthy()
+    for (const language of ['Japanese', 'Chinese', 'Korean']) {
+      await fireEvent.change(rendered.getByLabelText(t('pipelines.detectorFor', { language })), { target: { value: '' } })
+    }
+    setFirstLaunchStep('dependencies')
+    // The runtime and the cleaner; no detection file.
+    await waitFor(() =>
+      expect(rendered.getByText(t('onboarding.dependencies.total', { count: 2, bytes: RUNTIME_BYTES + REDRAW_BYTES }))).toBeTruthy(),
+    )
+  })
+
+  it('add the Japanese reader only for Japanese', async () => {
+    const rendered = open('detection')
+    const japanese = /** @type {HTMLSelectElement} */ (rendered.getByLabelText(t('pipelines.detectorFor', { language: 'Japanese' })))
+    const korean = /** @type {HTMLSelectElement} */ (rendered.getByLabelText(t('pipelines.detectorFor', { language: 'Korean' })))
+    expect([...japanese.options].map((option) => option.value)).toContain('ctd-rtdetr-ocr')
+    expect([...korean.options].map((option) => option.value)).not.toContain('ctd-rtdetr-ocr')
+  })
+
+  it('draw cleaners that cannot be fetched as disabled, and FLUX as the helper\'s', async () => {
+    const rendered = open('cleaning')
+    expect(/** @type {HTMLInputElement} */ (rendered.getByLabelText(/Qwen-Image-Edit-2511/)).disabled).toBe(true)
+    expect(/** @type {HTMLInputElement} */ (rendered.getByLabelText(/LaMa Manga/)).checked).toBe(true)
+    expect(rendered.getAllByText(t('pipelines.status.needsHelper')).length).toBeGreaterThan(0)
+    expect(rendered.getByRole('button', { name: t('shell.action.chooseFolder') })).toBeTruthy()
+  })
+
+  it('mark FLUX models the helper lists, and pick the recommended one', async () => {
+    capabilities.sidecar = true
+    backend.listSidecarModels.mockResolvedValue([{ id: DEFAULT_FLUX_MODEL, label: 'FLUX.2 Klein 4B' }])
+    const rendered = open('cleaning')
+    await waitFor(() => expect(rendered.getByText(t('pipelines.status.found'))).toBeTruthy())
+    await waitFor(() => expect(session.fluxModel).toBe(DEFAULT_FLUX_MODEL))
+    expect(rendered.queryByRole('button', { name: t('shell.action.chooseFolder') })).toBeNull()
+  })
+})
+
+describe('the dependencies step', () => {
+  it('names the platform the backend reported, the runtime build, and what the choices cost', async () => {
+    const rendered = open('dependencies')
+    expect(rendered.getByText(t('onboarding.dependencies.body', { platform: t('onboarding.dependencies.platform.macArm') }))).toBeTruthy()
+    expect(rendered.getByText('1.28.0')).toBeTruthy()
+    expect(rendered.getByText(t('onboarding.dependencies.afterRuntime'))).toBeTruthy()
+    expect(rendered.getByText(t('onboarding.dependencies.total', { count: 6, bytes: PRICE }))).toBeTruthy()
+    // Download is the primary action and names its price.
+    expect(rendered.getByRole('button', { name: new RegExp(t('onboarding.dependencies.start')) })).toBeTruthy()
+  })
+
+  it('says what a build needs installed by hand', async () => {
+    const answer = view()
+    answer.runtime.flavour = 'cuda12'
+    answer.runtime.flavours = [{ id: 'cuda12', ortVersion: '1.28.0', bytes: 1, isDefault: false, userInstalled: ['CUDA 12', 'cuDNN 9'] }]
+    const rendered = open('dependencies', answer)
+    expect(rendered.getByText(t('onboarding.dependencies.needs', { items: 'CUDA 12, cuDNN 9' }))).toBeTruthy()
+  })
+
+  it('asks the runtime for its graphics acceleration once it is installed', async () => {
+    const rendered = open('dependencies', view({ runtimeInstalled: true }))
+    await waitFor(() => expect(backend.listAccelerators).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(rendered.getByText(t('onboarding.dependencies.cpuOnly'))).toBeTruthy())
+  })
+})
+
+describe('the downloads', () => {
+  it('fetch the runtime first, pause one file, carry on, and resume it in its place', async () => {
+    const rendered = open('dependencies')
+    await press(rendered, new RegExp(t('onboarding.dependencies.start')))
+    expect(firstLaunch.step).toBe('downloads')
     await waitFor(() => expect(backend.downloadRuntime).toHaveBeenCalledTimes(1))
-    expect(backend.downloadModel).not.toHaveBeenCalled()
-    expect(session.firstLaunchOffered).toBe(true)
+    // The choices are kept where the rest of the app reads them.
+    expect(session.detection).toEqual({ ja: 'ctd-rtdetr', zh: 'ctd-rtdetr', ko: 'ctd-rtdetr' })
 
-    const status = () => rendered.getByRole('status').textContent
-    await waitFor(() =>
-      expect(status()).toBe(t('onboarding.models.run.downloading', { nameKey: 'settings.models.runtime.label' })),
-    )
-    backend.emit({ type: 'model-progress', id: RUNTIME_ID, downloaded: 16, total: 32, done: false })
-    await waitFor(() =>
-      expect(rendered.getByRole('progressbar').getAttribute('aria-valuenow')).toBe(
-        String(Math.floor((16 / PRICE) * 100)),
-      ),
-    )
-
-    // The setup goes on while it runs, and the bar is there on the way back.
-    expect(rendered.getByText(t('onboarding.models.background'))).toBeTruthy()
-    await press(rendered, t('onboarding.action.next'))
-    expect(firstLaunch.step).toBe('defaults')
-    expect(firstLaunch.running).toBe(true)
-    await press(rendered, t('onboarding.action.back'))
-    expect(rendered.getByRole('progressbar')).toBeTruthy()
-
-    await press(rendered, t('onboarding.models.pause'))
+    await fireEvent.click(rendered.getByRole('button', { name: t('onboarding.downloads.pause', { name: t('settings.models.runtime.label') }) }))
     expect(backend.cancelDownload).toHaveBeenCalledWith({ id: RUNTIME_ID })
-    backend.emit({ type: 'model-progress', id: RUNTIME_ID, downloaded: 16, total: 32, done: true, error: 'cancelled' })
-    await waitFor(() => expect(status()).toBe(t('onboarding.models.run.paused')))
+    finish(RUNTIME_ID, 'cancelled')
+    await waitFor(() => expect(backend.downloadModel).toHaveBeenCalledWith({ id: 'textDetector' }))
+    expect(firstLaunch.status[RUNTIME_ID]).toBe('paused')
 
-    await press(rendered, t('onboarding.models.resume'))
+    resumeFile(RUNTIME_ID)
+    finish('textDetector')
     await waitFor(() => expect(backend.downloadRuntime).toHaveBeenCalledTimes(2))
     finish(RUNTIME_ID)
-    const weights = ['textDetector', 'scriptGate', 'scriptGateLabels', 'balloonDetector', 'inpainter']
-    for (const id of weights) {
-      await waitFor(() => expect(backend.downloadModel).toHaveBeenLastCalledWith({ id }))
+    for (const id of ['balloonDetector', 'scriptGate', 'scriptGateLabels', 'inpainter']) {
+      await waitFor(() => expect(backend.downloadModel).toHaveBeenCalledWith({ id }))
       finish(id)
     }
-    await waitFor(() => expect(status()).toBe(t('onboarding.models.run.done')))
-    // The reader was not ticked, so nothing of it was fetched.
-    expect(backend.downloadModel.mock.calls.map(([spec]) => spec.id)).toEqual(weights)
-    expect(rendered.getByLabelText(t('onboarding.models.required.label')).closest('li')?.textContent).toContain(
-      t('onboarding.models.status.installed'),
-    )
+    await waitFor(() => expect(firstLaunch.running).toBe(false))
+    expect(Object.values(firstLaunch.status).every((status) => status === 'done')).toBe(true)
+
+    await press(rendered, t('home.action.newProject'))
+    expect(firstLaunch.open).toBe(false)
+    await waitFor(() => expect(app.modals.map((modal) => modal.kind)).toEqual(['newProject']))
   })
 
-  it('keeps a run still in flight when the setup is opened again', async () => {
-    open('models')
-    const run = startFirstLaunchDownloads()
-    await waitFor(() => expect(backend.downloadRuntime).toHaveBeenCalled())
-    const plan = firstLaunch.plan
+  it('mark a failed file, move on, and offer it again', async () => {
+    const rendered = open('dependencies')
+    startFirstLaunchDownloads()
+    setFirstLaunchStep('downloads')
+    await waitFor(() => expect(backend.downloadRuntime).toHaveBeenCalledTimes(1))
+    finish(RUNTIME_ID, 'network down')
+    await waitFor(() => expect(backend.downloadModel).toHaveBeenCalledWith({ id: 'textDetector' }))
+    expect(firstLaunch.status[RUNTIME_ID]).toBe('failed')
+    expect((await rendered.findByRole('alert')).textContent).toBe('network down')
+    await fireEvent.click(rendered.getByRole('button', { name: t('onboarding.downloads.retry', { name: t('settings.models.runtime.label') }) }))
+    expect(firstLaunch.status[RUNTIME_ID]).toBe('waiting')
+    expect(firstLaunch.errors[RUNTIME_ID]).toBeUndefined()
+  })
 
+  it('pause everything, then resume everything', async () => {
+    const rendered = open('dependencies')
+    startFirstLaunchDownloads()
+    setFirstLaunchStep('downloads')
+    await waitFor(() => expect(backend.downloadRuntime).toHaveBeenCalledTimes(1))
+    await press(rendered, t('onboarding.downloads.pauseAll'))
+    finish(RUNTIME_ID, 'cancelled')
+    await waitFor(() => expect(firstLaunch.running).toBe(false))
+    expect(backend.downloadModel).not.toHaveBeenCalled()
+    await press(rendered, t('onboarding.downloads.resumeAll'))
+    await waitFor(() => expect(backend.downloadRuntime).toHaveBeenCalledTimes(2))
+  })
+
+  it('store a detection choice at once, with nothing to download', async () => {
+    const rendered = open('detection')
+    await fireEvent.change(rendered.getByLabelText(t('pipelines.detectorFor', { language: 'Korean' })), { target: { value: '' } })
+    expect(session.detection.ko).toBeNull()
+  })
+
+  it('never fetch a file that arrived through Settings before the press', async () => {
+    open('theme')
+    finish('textDetector')
+    startFirstLaunchDownloads()
+    await waitFor(() => expect(backend.downloadRuntime).toHaveBeenCalledTimes(1))
+    finish(RUNTIME_ID)
+    await waitFor(() => expect(backend.downloadModel).toHaveBeenCalledWith({ id: 'balloonDetector' }))
+    expect(backend.downloadModel).not.toHaveBeenCalledWith({ id: 'textDetector' })
+  })
+
+  it('leave a paused file paused when Download is pressed again', async () => {
+    open('dependencies')
+    startFirstLaunchDownloads()
+    await waitFor(() => expect(backend.downloadRuntime).toHaveBeenCalledTimes(1))
+    await pauseFile('inpainter')
+    expect(firstLaunch.status.inpainter).toBe('paused')
+    startFirstLaunchDownloads()
+    expect(firstLaunch.status.inpainter).toBe('paused')
+  })
+
+  it('keep going after the setup is closed', async () => {
+    open('dependencies')
+    startFirstLaunchDownloads()
+    await waitFor(() => expect(backend.downloadRuntime).toHaveBeenCalledTimes(1))
     dismissFirstLaunch()
-    expect(offerFirstLaunch(view({ runtimeInstalled: true }), { force: true })).toBe(true)
-    // A new plan would quote bytes already on their way.
-    expect(firstLaunch.plan).toBe(plan)
-    expect(firstLaunch.running).toBe(true)
-
-    await pauseFirstLaunchDownloads()
-    backend.emit({ type: 'model-progress', id: RUNTIME_ID, downloaded: 0, total: 32, done: true, error: 'cancelled' })
-    await run
-    expect(firstLaunch.paused).toBe(true)
-  })
-})
-
-describe('a setting changed in the setup', () => {
-  it('goes through the session setter and on to the backend, as Settings sends it', async () => {
-    const rendered = open('behavior')
-    await fireEvent.click(rendered.getByLabelText(t('settings.background.label')))
-    await waitFor(() => expect(backend.writeSettings).toHaveBeenCalledTimes(1))
-    expect(session.closeToTray).toBe(true)
-    expect(backend.writeSettings).toHaveBeenLastCalledWith(
-      expect.objectContaining({ closeToTray: true, readingDirection: 'rtl', cloudEngines: 'blocked' }),
-    )
-
-    await fireEvent.click(rendered.getByRole('radio', { name: t('settings.direction.ltr') }))
-    await waitFor(() => expect(backend.writeSettings).toHaveBeenCalledTimes(2))
-    expect(session.readingDirection).toBe('ltr')
-    expect(backend.writeSettings).toHaveBeenLastCalledWith(
-      expect.objectContaining({ closeToTray: true, readingDirection: 'ltr' }),
-    )
+    finish(RUNTIME_ID)
+    await waitFor(() => expect(backend.downloadModel).toHaveBeenCalledWith({ id: 'textDetector' }))
+    expect(session.firstLaunchOffered).toBe(true)
   })
 
-  it('is taken back, and the step says so, when the backend refuses it', async () => {
-    const rendered = open('behavior')
-    backend.writeSettings.mockRejectedValueOnce(new Error('disk full'))
-    const tray = /** @type {HTMLInputElement} */ (rendered.getByLabelText(t('settings.background.label')))
-    await fireEvent.click(tray)
-
-    await waitFor(() => expect(rendered.getByRole('alert').textContent).toBe(t('onboarding.saveFailed')))
-    expect(session.closeToTray).toBe(false)
-    expect(tray.checked).toBe(false)
-  })
-
-  it('asks the runtime for its processors once it is here, and writes the one chosen', async () => {
-    // The backend marks whichever preference it was last sent.
-    backend.listAccelerators.mockImplementation(async () =>
-      accelerators(backend.writeSettings.mock.lastCall?.[0]?.accelerator ?? 'auto'),
-    )
-    const rendered = open('defaults', view({ runtimeInstalled: true }))
-    const accel = /** @type {HTMLSelectElement} */ (rendered.getByLabelText(t('settings.accel.label')))
-    await waitFor(() => expect(accel.options).toHaveLength(3))
-    expect([...accel.options].map((option) => [option.value, option.disabled])).toEqual([
-      ['auto', false],
-      ['cpu', false],
-      ['coreml', true],
-    ])
-    expect(accel.value).toBe('auto')
-
-    await fireEvent.change(accel, { target: { value: 'cpu' } })
-    await waitFor(() => expect(backend.listAccelerators).toHaveBeenCalledTimes(2))
-    expect(session.accelerator).toBe('cpu')
-    expect(backend.writeSettings).toHaveBeenLastCalledWith(expect.objectContaining({ accelerator: 'cpu' }))
-    await waitFor(() => expect(accel.value).toBe('cpu'))
-
-    // A refused change puts the picker back on the value in force.
-    backend.writeSettings.mockRejectedValueOnce(new Error('disk full'))
-    await fireEvent.change(accel, { target: { value: 'auto' } })
-    await waitFor(() => expect(rendered.getByRole('alert').textContent).toBe(t('onboarding.saveFailed')))
-    expect(session.accelerator).toBe('cpu')
-    expect(accel.value).toBe('cpu')
+  it('keep a run in flight when the setup is opened again', async () => {
+    open('dependencies')
+    startFirstLaunchDownloads()
+    await waitFor(() => expect(backend.downloadRuntime).toHaveBeenCalledTimes(1))
+    dismissFirstLaunch()
+    expect(offerFirstLaunch(view(), { force: true })).toBe(true)
+    expect(firstLaunch.status[RUNTIME_ID]).toBe('active')
+    finish(RUNTIME_ID)
+    await waitFor(() => expect(backend.downloadModel).toHaveBeenCalledWith({ id: 'textDetector' }))
   })
 })
 
@@ -492,7 +527,7 @@ describe('the cloud step', () => {
     const rendered = open('cloud')
     expect(rendered.getByText(t('onboarding.cloud.consent'))).toBeTruthy()
     await press(rendered, t('onboarding.action.notNow'))
-    expect(firstLaunch.step).toBe('behavior')
+    expect(firstLaunch.step).toBe('dependencies')
     expect(session.cloudAllowed).toBe(false)
     expect(backend.writeSettings).not.toHaveBeenCalled()
   })
@@ -518,14 +553,7 @@ describe('the cloud step', () => {
     expect(rendered.queryByTestId('provisioner')).toBeNull()
     expect(rendered.getByRole('status').textContent).toBe(t('onboarding.cloud.ready', { name: 'Beam (mc-ab12cd)' }))
     await press(rendered, t('onboarding.action.next'))
-    expect(firstLaunch.step).toBe('behavior')
-
-    setFirstLaunchStep('done')
-    await waitFor(() =>
-      expect(rendered.container.querySelector('dl')?.textContent).toContain(
-        t('onboarding.done.value.cloudOnNamed', { name: 'Beam (mc-ab12cd)' }),
-      ),
-    )
+    expect(firstLaunch.step).toBe('dependencies')
   })
 
   it('keeps an endpoint that did not answer its first check, leaves cloud cleaning off, and offers no second setup', async () => {
@@ -542,14 +570,7 @@ describe('the cloud step', () => {
     // A second setup would be a second installation in the account.
     expect(rendered.queryByRole('button', { name: t('onboarding.cloud.setUp') })).toBeNull()
     await press(rendered, t('onboarding.action.next'))
-    expect(firstLaunch.step).toBe('behavior')
-
-    setFirstLaunchStep('done')
-    await waitFor(() =>
-      expect(rendered.container.querySelector('dl')?.textContent).toContain(
-        t('onboarding.done.value.cloudOffSaved', { name: 'Beam (mc-ab12cd)' }),
-      ),
-    )
+    expect(firstLaunch.step).toBe('dependencies')
   })
 
   it('Escape closes the provisioner first, and a refused permission is said rather than shown as on', async () => {
@@ -567,7 +588,7 @@ describe('the cloud step', () => {
 
     // Once it has finished, Continue is the dialog's as well as the provisioner's.
     await press(rendered, t('onboarding.action.next'))
-    expect(firstLaunch.step).toBe('behavior')
+    expect(firstLaunch.step).toBe('dependencies')
     await press(rendered, t('onboarding.action.back'))
     expect(rendered.getByRole('alert').textContent).toBe(t('onboarding.cloud.saveFailed'))
   })
@@ -606,31 +627,6 @@ describe('the cloud step', () => {
   })
 })
 
-describe('the last step', () => {
-  it('reads back what is in force and starts a new project', async () => {
-    const rendered = open('done')
-    expect(rendered.getByText(t('onboarding.done.bodyMissing'))).toBeTruthy()
-    const summary = /** @type {HTMLElement} */ (rendered.container.querySelector('dl')).textContent
-    for (const value of [
-      t('onboarding.done.value.notDownloaded'),
-      t('settings.accel.auto'),
-      t('onboarding.done.value.cloudOff'),
-      t('onboarding.done.value.trayQuit'),
-      t('settings.direction.rtl'),
-    ]) {
-      expect(summary).toContain(value)
-    }
-    // Nothing is left to skip.
-    expect(rendered.queryByRole('button', { name: t('onboarding.action.skip') })).toBeNull()
-    expect(rendered.getByRole('button', { name: t('onboarding.action.close') })).toBeTruthy()
-
-    await press(rendered, t('home.action.newProject'))
-    expect(firstLaunch.open).toBe(false)
-    expect(session.firstLaunchOffered).toBe(true)
-    await waitFor(() => expect(app.modals.map((modal) => modal.kind)).toEqual(['newProject']))
-  })
-})
-
 describe('Run setup again', () => {
   it('opens the setup from Settings > General over a fresh catalogue, with Settings closed', async () => {
     session.firstLaunchOffered = true
@@ -642,7 +638,7 @@ describe('Run setup again', () => {
     await waitFor(() => expect(firstLaunch.open).toBe(true))
     expect(backend.listModels).toHaveBeenCalledTimes(1)
     expect(firstLaunch.step).toBe('welcome')
-    expect(firstLaunch.plan?.required.map((row) => row.id)).toContain(RUNTIME_ID)
+    expect(firstLaunch.plan?.files[RUNTIME_ID]).toBeTruthy()
     // The setup is drawn only while the modal stack is empty.
     expect(app.modals).toHaveLength(0)
   })

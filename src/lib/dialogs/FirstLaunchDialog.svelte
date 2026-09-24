@@ -1,98 +1,115 @@
 <script>
   /**
-   * The setup a first launch opens, and Settings' "Run setup again".
+   * The setup a first launch opens, and Settings' "Run setup again", as a
+   * full-window screen.
    *
-   * Six steps, one choice each (`FIRST_LAUNCH_STEPS`), every one of them
-   * skippable. This file is the frame around them: the step heading, Back,
-   * the one primary action, the quiet Skip, and the keyboard. What a step
+   * Nine steps, one choice each (`FIRST_LAUNCH_STEPS`). This file is the frame
+   * around them: the progress bar, the step heading, Back, at most one button
+   * beside the primary, the quiet Skip setup, and the keyboard. What a step
    * shows is its own component in `onboarding/`, and everything that has to
-   * outlive a mount - the plan, the download run, what the cloud setup did -
-   * is the store in `firstlaunch.svelte.js`, because a dialog raised over
-   * this one unmounts it (`App.svelte`).
+   * outlive a mount - the plan, the choices, the download run, what the cloud
+   * setup did - is the store in `firstlaunch.svelte.js`, because a dialog
+   * raised over this screen unmounts it (`App.svelte`).
    *
    * Every way out goes through `dismissFirstLaunch`, which records that the
-   * offer was made. Escape follows the Modal's rule and the backdrop does not
-   * close: a stray click must not end a setup halfway. While the provisioner
-   * is working in the user's account there is no way out here at all, only
-   * its own Cancel.
+   * offer was made. Escape is one of them. While the provisioner is working in
+   * the user's account there is no way out here at all, only its own Cancel.
    */
   import { tick } from 'svelte'
-  import { Button, Modal } from '../ui/index.js'
+  import { Button, Screen } from '../ui/index.js'
+  import Icon from '../icons/Icon.svelte'
   import { t } from '../i18n/index.js'
   import { session } from '../state/session.svelte.js'
   import { openNewProject } from '../home/actions.js'
   import { FIRST_LAUNCH_STEPS } from './firstlaunch.js'
   import {
+    chosenBytes,
     closeFirstLaunchProvisioner,
     dismissFirstLaunch,
+    finishedFiles,
     firstLaunch,
     nextFirstLaunchStep,
     openFirstLaunchProvisioner,
-    pendingBytes,
-    pendingQueue,
+    pauseAll,
     prevFirstLaunchStep,
+    resumeAll,
+    saveFirstLaunchToken,
     startFirstLaunchDownloads,
+    chosenFiles,
   } from './firstlaunch.svelte.js'
-  import ModelsStep from './onboarding/ModelsStep.svelte'
-  import DefaultsStep from './onboarding/DefaultsStep.svelte'
+  import WelcomeStep from './onboarding/WelcomeStep.svelte'
+  import ThemeStep from './onboarding/ThemeStep.svelte'
+  import TokenStep from './onboarding/TokenStep.svelte'
+  import BackgroundStep from './onboarding/BackgroundStep.svelte'
+  import DetectionStep from './onboarding/DetectionStep.svelte'
+  import CleaningStep from './onboarding/CleaningStep.svelte'
   import CloudStep from './onboarding/CloudStep.svelte'
-  import BehaviorStep from './onboarding/BehaviorStep.svelte'
-  import DoneStep from './onboarding/DoneStep.svelte'
+  import DependenciesStep from './onboarding/DependenciesStep.svelte'
+  import DownloadsStep from './onboarding/DownloadsStep.svelte'
 
   /** Whole keys chosen between, never built, so the catalogue test sees each one. */
   const HEADINGS = {
     welcome: 'onboarding.welcome.heading',
-    models: 'onboarding.models.heading',
-    defaults: 'onboarding.defaults.heading',
+    theme: 'onboarding.theme.heading',
+    token: 'onboarding.token.heading',
+    background: 'onboarding.background.heading',
+    detection: 'onboarding.detection.heading',
+    cleaning: 'onboarding.cleaning.heading',
     cloud: 'onboarding.cloud.heading',
-    behavior: 'onboarding.behavior.heading',
-    done: 'onboarding.done.heading',
+    dependencies: 'onboarding.dependencies.heading',
+    downloads: 'onboarding.downloads.heading',
   }
 
-  const headingId = $props.id()
+  /** Steps that hold a table, and so get the wider column. */
+  const WIDE = ['detection', 'cleaning', 'dependencies', 'downloads']
+
   const step = $derived(firstLaunch.step)
-  const position = $derived(FIRST_LAUNCH_STEPS.indexOf(/** @type {any} */ (step)) + 1)
+  /** Welcome is the cover, not a step, so the bar counts from the one after it. */
+  const position = $derived(FIRST_LAUNCH_STEPS.indexOf(/** @type {any} */ (step)))
+  const total = FIRST_LAUNCH_STEPS.length - 1
 
   /** @type {HTMLElement|undefined} */
   let heading = $state()
 
-  /**
-   * Whether Download is the models step's primary action: nothing is
-   * fetching, nothing is paused or failed (those have their own button on
-   * the step), and something ticked is still missing.
-   */
-  const offerDownload = $derived(
-    !firstLaunch.running && !firstLaunch.paused && !firstLaunch.failure && pendingQueue().length > 0,
-  )
+  /** What the chosen files still need from the network, installed ones aside. */
+  const pending = $derived.by(() => {
+    const done = finishedFiles()
+    return chosenFiles().filter((id) => !firstLaunch.plan?.files[id]?.installed && !done[id])
+  })
+
+  /** The download step's rows: what was already on disk is not a download. */
+  const queue = $derived(firstLaunch.queue.filter((id) => !firstLaunch.plan?.files[id]?.installed))
+  const anyPausable = $derived(queue.some((id) => ['waiting', 'active'].includes(firstLaunch.status[id])))
+  const anyResumable = $derived(queue.some((id) => ['paused', 'failed'].includes(firstLaunch.status[id])))
+  const allDone = $derived(queue.every((id) => firstLaunch.status[id] === 'done'))
 
   /**
-   * @typedef {{label: string, run: () => unknown, enter?: boolean}} Action
+   * @typedef {{label: string, run: () => unknown, enter?: boolean, icon?: string}} Action
    *
    * What the footer offers on this step: Back or not, at most one button
    * beside the primary, and the primary itself. `enter` is whether Enter on
-   * the heading may press the primary. It is withheld from Download, so a
-   * key pressed twice on the step before cannot start a transfer of hundreds
-   * of megabytes.
+   * the heading may press the primary. It is withheld from Download, so a key
+   * pressed twice on the step before cannot start a transfer of hundreds of
+   * megabytes.
    */
   const actions = $derived.by(() => {
     /** @type {Action} */
     const next = { label: t('onboarding.action.next'), run: nextFirstLaunchStep, enter: true }
-    if (step === 'welcome') {
-      return {
-        back: false,
-        secondary: null,
-        primary: { label: t('onboarding.action.start'), run: nextFirstLaunchStep, enter: true },
+    if (step === 'token') {
+      const hasToken = firstLaunch.plan?.hasToken === true
+      // Empty and nothing saved, Skip is the step's primary action, so the
+      // first footer button a Tab reaches is never mistaken for it.
+      if (firstLaunch.tokenDraft.trim()) {
+        return {
+          back: true,
+          secondary: hasToken ? null : { label: t('onboarding.action.skipStep'), run: nextFirstLaunchStep },
+          primary: { label: t('onboarding.token.save'), run: saveToken, enter: true },
+        }
       }
-    }
-    if (step === 'models' && offerDownload) {
       return {
         back: true,
-        secondary: { label: t('onboarding.action.notNow'), run: nextFirstLaunchStep },
-        primary: {
-          label: t('onboarding.models.download', { bytes: pendingBytes() }),
-          run: startFirstLaunchDownloads,
-          enter: false,
-        },
+        secondary: null,
+        primary: hasToken ? next : { label: t('onboarding.action.skipStep'), run: nextFirstLaunchStep, enter: true },
       }
     }
     if (step === 'cloud' && firstLaunch.provisioning) {
@@ -112,15 +129,46 @@
         primary: { label: t('onboarding.action.notNow'), run: nextFirstLaunchStep, enter: true },
       }
     }
-    if (step === 'done') {
+    if (step === 'dependencies' && pending.length > 0) {
       return {
         back: true,
         secondary: null,
-        primary: { label: t('home.action.newProject'), run: startProject, enter: true },
+        primary: {
+          label: `${t('onboarding.dependencies.start')} · ${t('models.value.size', { bytes: chosenBytes() })}`,
+          run: beginDownloads,
+          enter: false,
+          icon: 'download',
+        },
+      }
+    }
+    if (step === 'downloads') {
+      return {
+        back: true,
+        secondary: anyPausable
+          ? { label: t('onboarding.downloads.pauseAll'), run: pauseAll, icon: 'pause' }
+          : anyResumable
+            ? { label: t('onboarding.downloads.resumeAll'), run: resumeAll, icon: 'play' }
+            : null,
+        primary: allDone
+          ? { label: t('home.action.newProject'), run: startProject, enter: true }
+          : {
+              label: firstLaunch.running ? t('onboarding.downloads.later') : t('onboarding.downloads.close'),
+              run: dismissFirstLaunch,
+              enter: true,
+            },
       }
     }
     return { back: true, secondary: null, primary: next }
   })
+
+  async function saveToken() {
+    if (await saveFirstLaunchToken()) nextFirstLaunchStep()
+  }
+
+  function beginDownloads() {
+    startFirstLaunchDownloads()
+    nextFirstLaunchStep()
+  }
 
   function leaveProvisioner() {
     closeFirstLaunchProvisioner()
@@ -129,8 +177,8 @@
 
   /**
    * Close the setup, then raise New project over whatever it was opened on.
-   * The tick lets the setup's Modal hand focus back before the next dialog
-   * takes it, so closing that one returns focus to a real element.
+   * The tick lets the screen hand focus back before the next dialog takes it,
+   * so closing that one returns focus to a real element.
    */
   async function startProject() {
     dismissFirstLaunch()
@@ -149,21 +197,17 @@
   })
 
   /**
-   * Enter presses the primary action, but only from the heading or the
-   * dialog itself. Anywhere else Enter already belongs to the focused
-   * control, and taking it from a button or a select would change what that
-   * control does.
+   * Enter presses the primary action, but only from the heading. Anywhere
+   * else Enter already belongs to the focused control, and taking it from a
+   * button or a select would change what that control does.
    *
    * @param {KeyboardEvent} event
    */
   function onkeydown(event) {
     if (event.key !== 'Enter' || event.repeat || event.isComposing || event.defaultPrevented) return
     if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
-    const target = event.target
-    if (!(target instanceof HTMLElement) || !heading) return
-    const fromFrame = target === heading || (target.getAttribute('role') === 'dialog' && target.contains(heading))
-    if (!fromFrame) return
-    const primary = actions.primary
+    if (!heading || event.target !== heading) return
+    const primary = step === 'welcome' ? { run: nextFirstLaunchStep, enter: true } : actions.primary
     if (!primary?.enter) return
     event.preventDefault()
     primary.run()
@@ -172,101 +216,182 @@
 
 <svelte:window {onkeydown} />
 
-<Modal
-  title={t('onboarding.title')}
-  meta={t('onboarding.stepOf', { current: position, total: FIRST_LAUNCH_STEPS.length })}
-  width={640}
-  blocking
+<Screen
+  label={t('onboarding.title')}
   onclose={firstLaunch.provisionerBusy
     ? undefined
     : firstLaunch.provisioning
       ? closeFirstLaunchProvisioner
       : dismissFirstLaunch}
 >
-  {#key step}
-    <section class="step" aria-labelledby={headingId}>
-      <h3 class="heading" id={headingId} tabindex="-1" bind:this={heading}>{t(HEADINGS[step])}</h3>
-      {#if step === 'welcome'}
-        <p class="lead">{t('onboarding.welcome.body')}</p>
-        <p class="lead">{t('onboarding.welcome.local')}</p>
-        <p class="note">{t('onboarding.welcome.steps')}</p>
-      {:else if step === 'models'}
-        <ModelsStep />
-      {:else if step === 'defaults'}
-        <DefaultsStep />
-      {:else if step === 'cloud'}
-        <CloudStep />
-      {:else if step === 'behavior'}
-        <BehaviorStep />
-      {:else}
-        <DoneStep />
-      {/if}
-    </section>
-  {/key}
+  {#if step !== 'welcome'}
+    <div
+      class="progress"
+      role="progressbar"
+      aria-label={t('onboarding.progressLabel')}
+      aria-valuetext={t('onboarding.stepOf', { current: position, total })}
+      aria-valuemin={1}
+      aria-valuemax={total}
+      aria-valuenow={position}
+    >
+      {#each FIRST_LAUNCH_STEPS.slice(1) as name, index (name)}
+        <span class:on={index < position}></span>
+      {/each}
+    </div>
+  {/if}
 
-  {#snippet footnote()}
-    <Button variant="plain" size="sm" disabled={firstLaunch.provisionerBusy} onclick={dismissFirstLaunch}>
-      {step === 'done' ? t('onboarding.action.close') : t('onboarding.action.skip')}
-    </Button>
-  {/snippet}
+  <main class="stage">
+    {#key step}
+      <section class="step" class:wide={WIDE.includes(step)} class:welcome={step === 'welcome'}>
+        <h1 class="heading" class:hero={step === 'welcome'} tabindex="-1" bind:this={heading}>
+          {t(HEADINGS[/** @type {keyof typeof HEADINGS} */ (step)])}
+        </h1>
+        {#if step === 'welcome'}
+          <WelcomeStep />
+        {:else if step === 'theme'}
+          <ThemeStep />
+        {:else if step === 'token'}
+          <TokenStep onsubmit={saveToken} />
+        {:else if step === 'background'}
+          <BackgroundStep />
+        {:else if step === 'detection'}
+          <DetectionStep />
+        {:else if step === 'cleaning'}
+          <CleaningStep />
+        {:else if step === 'cloud'}
+          <CloudStep />
+        {:else if step === 'dependencies'}
+          <DependenciesStep />
+        {:else}
+          <DownloadsStep />
+        {/if}
+      </section>
+    {/key}
+  </main>
 
-  {#snippet buttons()}
-    {#if actions.back}
-      <Button onclick={prevFirstLaunchStep}>{t('onboarding.action.back')}</Button>
-    {/if}
-    {#if actions.secondary}
-      <Button onclick={actions.secondary.run}>{actions.secondary.label}</Button>
-    {/if}
-    {#if actions.primary}
-      <Button variant="primary" onclick={actions.primary.run}>{actions.primary.label}</Button>
-    {/if}
-  {/snippet}
-</Modal>
+  {#if step !== 'welcome'}
+    <footer class="foot">
+      <div class="foot-inner" class:wide={WIDE.includes(step)}>
+        {#if step !== 'downloads'}
+          <Button variant="plain" size="sm" disabled={firstLaunch.provisionerBusy} onclick={dismissFirstLaunch}>
+            {t('onboarding.action.skip')}
+          </Button>
+        {/if}
+        <span class="spacer"></span>
+        {#if actions.back}
+          <Button onclick={prevFirstLaunchStep}>{t('onboarding.action.back')}</Button>
+        {/if}
+        {#if actions.secondary}
+          <Button onclick={actions.secondary.run}>
+            {#if actions.secondary.icon}<Icon name={actions.secondary.icon} size={13} />{/if}
+            {actions.secondary.label}
+          </Button>
+        {/if}
+        {#if actions.primary}
+          <Button variant="primary" onclick={actions.primary.run}>
+            {#if actions.primary.icon}<Icon name={actions.primary.icon} size={13} />{/if}
+            {actions.primary.label}
+          </Button>
+        {/if}
+      </div>
+    </footer>
+  {/if}
+</Screen>
 
 <style>
-  /* A floor rather than a fixed height: the dialog keeps roughly one size
-     from step to step instead of jumping with each step's content, and a
-     short screen still gets the Modal's own scrolling body. */
+  .progress {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    display: flex;
+    gap: 3px;
+    padding: 14px 18px 0;
+  }
+  .progress span {
+    flex: 1;
+    height: 3px;
+    border-radius: var(--r-pill);
+    background: var(--line2);
+    transition: background var(--dur-slow) var(--ease);
+  }
+  .progress span.on { background: var(--accent) }
+
+  .stage {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    justify-content: center;
+    padding: clamp(48px, 12vh, 120px) 24px 32px;
+  }
+
   .step {
     display: flex;
     flex-direction: column;
-    gap: var(--s-4);
-    min-height: 288px;
-    padding: var(--s-2) 0 var(--s-2);
+    width: 100%;
+    max-width: 520px;
     animation: mcIn var(--dur-slow) var(--ease);
   }
+  .step.wide { max-width: 680px }
+  .step.welcome { padding-top: clamp(0px, 8vh, 80px) }
 
   .heading {
-    margin: 0 0 var(--s-1);
-    font-size: 17px;
+    margin: 0 0 var(--s-6);
+    font-size: 22px;
     font-weight: 600;
-    line-height: 1.3;
+    letter-spacing: -.01em;
+    line-height: 1.2;
     color: var(--text);
+  }
+  .heading.hero {
+    margin-bottom: var(--s-5);
+    font-size: clamp(28px, 4vw, 38px);
+    letter-spacing: -.02em;
+    line-height: 1.1;
   }
   /* The heading takes focus only so a screen reader starts there. It is not a
      control, and a ring around it would read as one. */
   .heading:focus { outline: none }
 
-  /* The steps' shared type, set here so the six read as one piece. Each step
-     component uses these classes rather than restating them. */
+  /* The steps' shared type, set here so the nine read as one piece. Each step
+     uses these classes rather than restating them. */
   .step :global(.lead) {
-    margin: 0;
-    max-width: 58ch;
+    margin: calc(-1 * var(--s-3)) 0 var(--s-7);
+    max-width: 52ch;
     font-size: 13px;
     line-height: 1.55;
     color: var(--t2);
   }
   .step :global(.note) {
-    margin: 0;
+    margin: var(--s-3) 0 0;
     max-width: 62ch;
-    font-size: 11.5px;
+    font-size: 12px;
     line-height: 1.5;
     color: var(--t2);
   }
   .step :global(.alert) {
-    margin: 0;
-    font-size: 11.5px;
+    margin: var(--s-3) 0 0;
+    font-size: 12px;
     line-height: 1.5;
     color: var(--warn);
   }
+
+  .foot {
+    display: flex;
+    justify-content: center;
+    padding: var(--s-5) 24px;
+    border-top: 1px solid var(--line);
+    background: var(--bg);
+  }
+  .foot-inner {
+    display: flex;
+    align-items: center;
+    gap: var(--s-3);
+    width: 100%;
+    max-width: 520px;
+  }
+  .foot-inner.wide { max-width: 680px }
+  .foot :global(.btn) { gap: var(--s-2) }
+  .spacer { flex: 1 }
 </style>

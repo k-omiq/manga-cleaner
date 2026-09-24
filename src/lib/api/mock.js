@@ -1962,6 +1962,8 @@ export function createMockBackend(options = {}) {
           readOnly: false,
           downloading: state.downloads.has(MOCK_RUNTIME_ID),
           partialBytes: state.partials.get(MOCK_RUNTIME_ID) ?? null,
+          // The machine the mock reports is an Apple silicon one.
+          platform: 'macos-arm64',
           ...runtimeFlavour(),
           // What is *installed*, which the native side reads from a record the
           // install writes beside the libraries. The mock has

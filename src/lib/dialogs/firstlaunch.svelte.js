@@ -1,23 +1,16 @@
 /**
- * The first-launch offer's *state*, and the download run it drives.
+ * The setup's *state*, and the download run it drives.
  *
- * Why a module and not the component: the dialog can leave the screen while
- * the run is going on. It is mounted beside the modal stack rather than on it,
- * so a dialog raised over it takes the screen - and when the
- * offer held its own progress, waiters and selection, that unmount abandoned a
- * transfer's report mid-run and came back with the ticks reset and the bytes
- * quoted again from the boot snapshot. Everything that must outlive a mount
- * therefore lives here: the plan, the selection, what has arrived, what
- * failed, and the sequence itself. `FirstLaunchDialog.svelte` only draws it.
- *
- * The subscription is owned here too, for the same reason, and it is opened
- * with the offer and closed with it rather than with a component.
+ * Why a module and not the component: the downloads must outlive the screen.
+ * Finishing the setup while files are still arriving leaves them arriving, a
+ * dialog raised over the setup unmounts it (`App.svelte`), and Settings reads
+ * the same `model-progress` channel. Everything that must outlive a mount
+ * lives here: the plan, the choices, each file's status, the run, and what the
+ * cloud setup did. `FirstLaunchDialog.svelte` and its steps only draw it.
  *
  * **It adds no seam method.** The run is `downloadRuntime` and then
- * `downloadModel` per row, one at a time, with progress arriving on the
- * process-wide `model-progress` channel Settings reads as well. The settings
- * the later steps change go through the session's own setters and
- * `writeSettings`, which is the path Settings takes.
+ * `downloadModel` per file, one at a time. Pause is `cancelDownload`: the
+ * backend keeps the `.part`, and the next request resumes it with a `Range`.
  */
 
 import { getBackend } from '../api/backend.js'
@@ -26,49 +19,49 @@ import {
   markFirstLaunchOffered,
   session,
   setCloudAllowed,
+  setDetection,
   setFluxModel,
 } from '../state/session.svelte.js'
 import { setDialogOutsideStack } from '../shortcuts.js'
 import { capabilities, loadCapabilities } from '../state/capabilities.svelte.js'
+import { LANGUAGES } from '../model/pipelines.js'
 import {
   RUNTIME_ID,
   FIRST_LAUNCH_STEPS,
   defaultFluxModel,
-  downloadQueue,
   firstLaunchPlan,
-  initialSelection,
-  plannedBytes,
+  missingBytes,
+  neededFiles,
   runtimeReady,
 } from './firstlaunch.js'
 
-/**
- * The offer, as the dialog reads it.
- *
- * `open` is what `App.svelte` mounts on and what the keyboard layer is told
- * about; everything else is what the dialog draws.
- */
+/** @typedef {'waiting'|'active'|'paused'|'done'|'failed'} FileStatus */
+
 export const firstLaunch = $state({
   open: false,
-  /** Which of `FIRST_LAUNCH_STEPS` is on screen. @type {string} */
+  /** @type {string} */
   step: 'welcome',
   /** @type {import('./firstlaunch.js').FirstLaunchPlan|null} */
   plan: null,
-  /** Which ids the press will fetch. @type {Record<string, boolean>} */
-  selection: {},
-  /** What each download has reported while it runs. @type {Record<string, {downloaded: number, total: number|null}>} */
+  /** Language id → detector id, or null to skip the language. @type {Record<string, string|null>} */
+  detection: {},
+  /** Cleaner id → wanted. @type {Record<string, boolean>} */
+  cleaners: {},
+  /** The files the run is fetching, in order. @type {string[]} */
+  queue: [],
+  /** @type {Record<string, FileStatus>} */
+  status: {},
+  /** @type {Record<string, {downloaded: number, total: number|null}>} */
   progress: {},
-  /** The ids that have arrived since the offer opened. @type {Record<string, boolean>} */
-  finished: {},
-  /** The failure that stopped the sequence, if one did. @type {{id: string, message: string}|null} */
-  failure: null,
-  /** Whether the sequence ended because the user cancelled the transfer in flight. */
-  stopped: false,
-  paused: false,
-  /** Whether the whole queue arrived. */
-  sequenceDone: false,
+  /** @type {Record<string, string>} */
+  errors: {},
   running: false,
-  /** The id being fetched, which is the one Cancel would stop. @type {string|null} */
+  /** The id being fetched. @type {string|null} */
   current: null,
+  /** The Hugging Face key being typed. Never stored here once it is saved. */
+  tokenDraft: '',
+  /** Whether the last save of that key was refused. */
+  tokenFailed: false,
   /** Whether the cloud step is showing the provisioner rather than its two lines. */
   provisioning: false,
   /**
@@ -80,9 +73,7 @@ export const firstLaunch = $state({
   /**
    * The cloud GPU a setup in this offer finished, as much of it as the step
    * says back, and whether it answered its first check. Never the endpoint or
-   * a credential: the provisioner keeps those. Kept whether or not it
-   * answered, so the step does not offer a second setup, which would be a
-   * second installation in the account.
+   * a credential: the provisioner keeps those.
    *
    * @type {{provider: 'modal'|'beam', name: string|null, healthy: boolean}|null}
    */
@@ -97,58 +88,31 @@ export const firstLaunch = $state({
   sidecarModels: [],
 })
 
-/**
- * One resolver per id in flight, settled by the single `done` event every
- * download ends with - a file that arrived, a failure, or a cancellation, all
- * three through the same path.
- *
- * @type {Map<string, (error: string|null) => void>}
- */
-const waiting = new Map()
-
-/** Torn down with the offer. @type {(() => void)|null} */
+/** @type {(() => void) | null} */
 let unsubscribe = null
+/** @type {Map<string, (error: string|null) => void>} */
+const waiting = new Map()
+/** Ids the user paused while their start was still in flight. */
+const pauseRequested = new Set()
 
 /**
- * Whether Cancel was pressed. Held outside the run because a press can land in
- * the window between asking for a download and being told it started, which is
- * exactly where a cancellation used to be lost.
- */
-let cancelRequested = false
-
-/**
- * Open the offer over a catalogue answer.
+ * Open the setup over a catalogue answer.
  *
- * Idempotent: a second call while it is open changes nothing, because the plan
- * the user is looking at - and the run underneath it - must not be rebuilt by
- * a stray relaunch of the check.
- *
- * `force` is Settings' "Run setup again": without it an offer already made is
- * not made twice. A replay while an earlier run is still fetching keeps that
- * run and its plan, because rebuilding the plan under it would quote bytes
- * already on their way and drop the waiters the run is parked on.
+ * Idempotent while open. `force` is Settings' "Run setup again": without it
+ * an offer already made is not made twice. A replay while an earlier run is
+ * still fetching keeps that run's queue and statuses.
  *
  * @param {import('../api/backend.js').ModelsView} view
  * @param {{force?: boolean}} [options]
- * @returns {boolean} whether the offer is now open
+ * @returns {boolean} whether it is now open
  */
 export function offerFirstLaunch(view, { force = false } = {}) {
   if (firstLaunch.open) return true
   if (!force && session.firstLaunchOffered) return false
-  if (!firstLaunch.running) {
-    const plan = firstLaunchPlan(view)
-    firstLaunch.plan = plan
-    firstLaunch.selection = initialSelection(plan)
-    firstLaunch.progress = {}
-    firstLaunch.finished = {}
-    firstLaunch.failure = null
-    firstLaunch.stopped = false
-    firstLaunch.paused = false
-    firstLaunch.sequenceDone = false
-    firstLaunch.current = null
-    cancelRequested = false
-  }
+  firstLaunch.plan = firstLaunchPlan(view)
   firstLaunch.step = FIRST_LAUNCH_STEPS[0]
+  firstLaunch.tokenDraft = ''
+  firstLaunch.tokenFailed = false
   firstLaunch.provisioning = false
   firstLaunch.provisionerBusy = false
   firstLaunch.cloud = null
@@ -156,12 +120,24 @@ export function offerFirstLaunch(view, { force = false } = {}) {
   firstLaunch.accelerators = null
   firstLaunch.acceleratorsFailed = false
   firstLaunch.sidecarModels = []
-  listen()
+  // Detection starts from what is stored. The cleaners keep an earlier
+  // offer's answer while its run is still fetching, so a replay does not tick
+  // back a model that run was told to leave out.
+  firstLaunch.detection = Object.fromEntries(
+    LANGUAGES.map((language) => [language.id, session.detection?.[language.id] ?? null]),
+  )
+  if (!firstLaunch.running) {
+    firstLaunch.cleaners = { 'lama-manga': true }
+    firstLaunch.queue = []
+    firstLaunch.status = {}
+    firstLaunch.progress = {}
+    firstLaunch.errors = {}
+  }
   firstLaunch.open = true
-  // The offer is a dialog the shortcut table cannot see, because it is not on
-  // the modal stack. Telling the table is what stops `,` opening Settings
-  // underneath it.
+  // The setup is not on the modal stack, so the shortcut table cannot see it.
+  // Telling it is what stops `,` opening Settings underneath.
   setDialogOutsideStack(true)
+  listen()
   return true
 }
 
@@ -181,16 +157,15 @@ export function prevFirstLaunchStep() {
 }
 
 /**
- * Close it, and remember that the user was asked.
- *
- * Every way out comes here - Skip setup, Escape, and the last step's button -
- * because what the flag records is that the offer was *made*. A run still in
- * flight is not cancelled by closing: the transfers belong to the backend and
- * Settings › Models is watching the same events.
+ * Close the setup and remember it was offered. Every way out comes here. A
+ * run in flight keeps going: the transfers belong to the backend, and
+ * Settings watches the same events.
  */
 export function dismissFirstLaunch() {
   markFirstLaunchOffered()
   firstLaunch.open = false
+  firstLaunch.tokenDraft = ''
+  firstLaunch.tokenFailed = false
   firstLaunch.provisioning = false
   firstLaunch.provisionerBusy = false
   setDialogOutsideStack(false)
@@ -198,153 +173,214 @@ export function dismissFirstLaunch() {
 }
 
 /**
- * Tick or clear one of the optional engines.
+ * Choose a language's detector, or `null` to skip it. Stored at once, as
+ * Settings stores it: a setup whose files are all here never reaches a
+ * Download press, and the choice must not wait for one.
  *
- * @param {string} id
- * @param {boolean} wanted
+ * @param {string} language
+ * @param {string|null} detectorId
  */
-export function setFirstLaunchTick(id, wanted) {
-  firstLaunch.selection = { ...firstLaunch.selection, [id]: wanted }
+export function chooseDetector(language, detectorId) {
+  firstLaunch.detection = { ...firstLaunch.detection, [language]: detectorId }
+  setDetection(language, detectorId)
+}
+
+/** @param {string} id @param {boolean} wanted */
+export function chooseCleaner(id, wanted) {
+  firstLaunch.cleaners = { ...firstLaunch.cleaners, [id]: wanted }
+}
+
+/** The files the current choices need, runtime first. @returns {string[]} */
+export function chosenFiles() {
+  const plan = firstLaunch.plan
+  return plan ? neededFiles(plan, firstLaunch.detection, firstLaunch.cleaners) : []
+}
+
+/** Bytes the current choices still cost. */
+export function chosenBytes() {
+  const plan = firstLaunch.plan
+  return plan ? missingBytes(plan, chosenFiles(), doneMap()) : 0
 }
 
 /**
- * The selection minus whatever has already arrived.
+ * Commit the choices and start fetching.
  *
- * The plan is the boot snapshot and its `installed` flags are as old as it is,
- * so a row fetched a minute ago is still `installed: false` there - and a
- * button that went on promising 333 MB after four of the six had arrived would
- * be quoting a price for goods already delivered. The tick itself is left
- * alone: the selection is what the user asked for and this is what is left of
- * it.
- *
- * @returns {Record<string, boolean>}
+ * The queue is rebuilt from the choices. What already arrived stays done, so
+ * going back a step and forward again never refetches a file; what was paused
+ * or failed goes again, because this press is a start.
  */
-export function pendingSelection() {
-  return Object.fromEntries(
-    Object.entries(firstLaunch.selection).map(([id, wanted]) => [
-      id,
-      wanted && firstLaunch.finished[id] !== true,
-    ]),
-  )
+export function startFirstLaunchDownloads() {
+  const plan = firstLaunch.plan
+  if (!plan) return
+  markFirstLaunchOffered()
+  for (const language of LANGUAGES) setDetection(language.id, firstLaunch.detection[language.id] ?? null)
+  const ids = chosenFiles()
+  /** @type {Record<string, FileStatus>} */
+  const status = {}
+  for (const id of ids) {
+    const before = firstLaunch.status[id]
+    if (plan.files[id]?.installed || before === 'done') status[id] = 'done'
+    // A file the user paused stays paused until they resume it; a failed one
+    // goes again, because this press is a start.
+    else if (before === 'active' || before === 'paused') status[id] = before
+    else status[id] = 'waiting'
+  }
+  firstLaunch.errors = {}
+  // A file dropped from the choices while it was downloading is paused, not
+  // abandoned: its `.part` stays for the next time it is wanted.
+  const dropped = firstLaunch.current && !ids.includes(firstLaunch.current) ? firstLaunch.current : null
+  if (dropped) status[dropped] = 'active'
+  firstLaunch.queue = ids
+  firstLaunch.status = status
+  if (dropped) pauseFile(dropped)
+  run()
 }
 
-/** What the press would fetch, in order. @returns {string[]} */
-export function pendingQueue() {
-  return firstLaunch.plan ? downloadQueue(firstLaunch.plan, pendingSelection()) : []
+/** @param {string} id */
+export async function pauseFile(id) {
+  const status = firstLaunch.status[id]
+  if (status === 'waiting') {
+    setStatus(id, 'paused')
+    return
+  }
+  if (status !== 'active') return
+  pauseRequested.add(id)
+  setStatus(id, 'paused')
+  await getBackend().cancelDownload({ id })
 }
 
-/** What the press promises, in bytes. @returns {number} */
-export function pendingBytes() {
-  return firstLaunch.plan ? plannedBytes(firstLaunch.plan, pendingSelection()) : 0
+/** @param {string} id */
+export function resumeFile(id) {
+  const status = firstLaunch.status[id]
+  if (status !== 'paused' && status !== 'failed') return
+  pauseRequested.delete(id)
+  const { [id]: _gone, ...errors } = firstLaunch.errors
+  firstLaunch.errors = errors
+  setStatus(id, 'waiting')
+  run()
+}
+
+export async function pauseAll() {
+  for (const id of firstLaunch.queue) if (firstLaunch.status[id] === 'waiting') setStatus(id, 'paused')
+  if (firstLaunch.current) await pauseFile(firstLaunch.current)
+}
+
+export function resumeAll() {
+  for (const id of firstLaunch.queue) {
+    const status = firstLaunch.status[id]
+    if (status === 'paused' || status === 'failed') setStatus(id, 'waiting')
+  }
+  firstLaunch.errors = {}
+  pauseRequested.clear()
+  run()
 }
 
 /**
- * The press.
+ * The run: one file at a time, in queue order, until nothing is waiting.
  *
- * The flag is set here as well as on `Not now`, because what it records is
- * that the user was asked.
- *
- * Three orderings in this loop are load-bearing, and each of them was a race
- * before it was written this way:
- *
+ * Three orderings are load-bearing:
  * 1. **The waiter is registered before the download is asked for.** A `done`
  *    event can beat the `invoke` reply - a cached file verifies in
- *    microseconds - and a waiter registered afterwards would wait for an event
- *    that has already been and gone.
- * 2. **`alreadyRunning` waits.** It means another window is fetching this very
- *    artefact, and that transfer ends with the same single `done` event; not
- *    waiting for it moved on to the next download while the one before it was
- *    still writing, which is the parallelism this sequence exists to avoid.
- *    `alreadyInstalled` is the opposite - nothing is in flight and no event
- *    will ever come - so its waiter is discarded and the row is marked here.
- * 3. **A Cancel pressed while the start is in flight is honoured after it.**
- *    `cancelDownload` for an id the backend has not begun answers `false` and
- *    is lost, so the press is remembered and re-sent once there is a transfer
- *    to stop.
+ *    microseconds.
+ * 2. **`alreadyRunning` waits.** Another window is fetching this very file,
+ *    and that transfer ends with the same single `done` event.
+ * 3. **A pause pressed while the start is in flight is honoured after it.**
+ *    `cancelDownload` for an id the backend has not begun is lost.
+ *
+ * A failure marks its file and moves on: each row says what went wrong and
+ * offers its own retry.
  */
-export async function startFirstLaunchDownloads() {
-  if (firstLaunch.running || !firstLaunch.plan) return
-  markFirstLaunchOffered()
-  firstLaunch.failure = null
-  firstLaunch.stopped = false
-  firstLaunch.paused = false
-  firstLaunch.sequenceDone = false
+async function run() {
+  if (firstLaunch.running) return
   firstLaunch.running = true
-  cancelRequested = false
   listen()
   const backend = getBackend()
   try {
-    // What is left of the selection: a second press after a cancellation
-    // starts where the first one stopped rather than fetching what arrived.
-    for (const id of pendingQueue()) {
+    for (let id = nextWaiting(); id; id = nextWaiting()) {
       firstLaunch.current = id
-      const arrival = waitForDone(id)
-      /** @type {import('../api/backend.js').DownloadStart} */
-      let outcome
+      setStatus(id, 'active')
       try {
-        outcome = id === RUNTIME_ID
-          ? await backend.downloadRuntime()
-          : await backend.downloadModel({ id })
-      } catch (error) {
-        discard(id)
-        firstLaunch.failure = { id, message: String(error) }
-        return
+        await fetchOne(backend, id)
+      } finally {
+        pauseRequested.delete(id)
       }
-      if (outcome === 'alreadyInstalled') {
-        discard(id)
-        firstLaunch.finished = { ...firstLaunch.finished, [id]: true }
-        continue
-      }
-      // A press that landed while this download was being asked for.
-      if (cancelRequested) await backend.cancelDownload({ id })
-      const error = await arrival
-      // A cancellation is a failure the user chose, so it is not reported as
-      // one: the run stops and says where the rest of them live.
-      if (error === 'cancelled') {
-        firstLaunch.stopped = true
-        firstLaunch.paused = true
-        return
-      }
-      if (error) {
-        firstLaunch.failure = { id, message: error }
-        return
-      }
+      // The channel was closed under the run (`resetFirstLaunch`): no event
+      // can reach the next file's waiter, so there is nothing to wait for.
+      if (!unsubscribe) break
     }
-    firstLaunch.sequenceDone = true
   } finally {
     firstLaunch.current = null
     firstLaunch.running = false
-    cancelRequested = false
-    // A download changes which engines the editor may offer, which is the
-    // whole point of the press.
+    // A download changes which engines the editor may offer.
     await loadCapabilities()
-    // A run that outlived the dialog has nothing left to report to.
-    if (!firstLaunch.open) stopListening()
+    // Re-read after the await: a resume in that gap started a new run, and
+    // the channel is its channel now.
+    if (!firstLaunch.open && !firstLaunch.running) stopListening()
   }
 }
 
 /**
- * Stop the transfer in flight. Its `done` event ends the sequence.
+ * One file, start to `done` event.
  *
- * The request is remembered whether or not there is something to cancel yet,
- * because the press can arrive before the backend has answered that it
- * started one.
+ * @param {import('../api/backend.js').Backend} backend
+ * @param {string} id
  */
-export async function cancelFirstLaunchDownload() {
-  if (!firstLaunch.running) return
-  cancelRequested = true
-  const id = firstLaunch.current
-  if (!id) return
-  await getBackend().cancelDownload({ id })
+async function fetchOne(backend, id) {
+  const arrival = waitForDone(id)
+  /** @type {import('../api/backend.js').DownloadStart} */
+  let outcome
+  try {
+    outcome = id === RUNTIME_ID ? await backend.downloadRuntime() : await backend.downloadModel({ id })
+  } catch (error) {
+    discard(id)
+    fail(id, String(error))
+    return
+  }
+  if (outcome === 'alreadyInstalled') {
+    discard(id)
+    setStatus(id, 'done')
+    return
+  }
+  if (pauseRequested.has(id)) await backend.cancelDownload({ id })
+  const error = await arrival
+  if (error === 'cancelled') {
+    if (firstLaunch.status[id] === 'active') setStatus(id, 'paused')
+    return
+  }
+  if (error) fail(id, error)
+  else setStatus(id, 'done')
 }
 
-/** Pause the active transfer. The backend keeps its partial file for resume. */
-export async function pauseFirstLaunchDownloads() {
-  await cancelFirstLaunchDownload()
+/** @returns {string|undefined} */
+function nextWaiting() {
+  return firstLaunch.queue.find((id) => firstLaunch.status[id] === 'waiting')
+}
+
+/** @param {string} id @param {FileStatus} status */
+function setStatus(id, status) {
+  firstLaunch.status = { ...firstLaunch.status, [id]: status }
+}
+
+/** @param {string} id @param {string} message */
+function fail(id, message) {
+  setStatus(id, 'failed')
+  firstLaunch.errors = { ...firstLaunch.errors, [id]: message }
+}
+
+/** The ids that are on disk now, from the plan or from this run. @returns {Record<string, boolean>} */
+export function finishedFiles() {
+  return doneMap()
+}
+
+/** @returns {Record<string, boolean>} */
+function doneMap() {
+  return Object.fromEntries(
+    Object.entries(firstLaunch.status).filter(([, status]) => status === 'done').map(([id]) => [id, true]),
+  )
 }
 
 /* ------------------------------------------------------------------ */
-/* The settings the later steps change                                 */
+/* The settings the steps change                                       */
 /* ------------------------------------------------------------------ */
 
 /**
@@ -374,12 +410,33 @@ export async function saveFirstLaunchSetting(apply, next, previous) {
 }
 
 /**
+ * Save the typed Hugging Face key. It goes to the backend alone - the
+ * keychain, or the settings file where there is none - and never into the
+ * session, which is written to local storage.
+ *
+ * @returns {Promise<boolean>} whether it was kept
+ */
+export async function saveFirstLaunchToken() {
+  const value = firstLaunch.tokenDraft.trim()
+  if (!value) return false
+  firstLaunch.tokenFailed = false
+  try {
+    await getBackend().writeSettings({ hfToken: value })
+  } catch {
+    firstLaunch.tokenFailed = true
+    return false
+  }
+  firstLaunch.tokenDraft = ''
+  if (firstLaunch.plan) firstLaunch.plan.hasToken = true
+  return true
+}
+
+/**
  * Ask the runtime which processors it can run on, when it can be asked
- * (`runtimeReady`). Until then the defaults step offers Automatic alone and
- * says why.
+ * (`runtimeReady`). Until then the dependencies step says when it will know.
  */
 export async function loadFirstLaunchAccelerators() {
-  if (!runtimeReady(firstLaunch.plan, firstLaunch.finished, firstLaunch.current)) return
+  if (!runtimeReady(firstLaunch.plan, doneMap(), firstLaunch.current)) return
   try {
     firstLaunch.accelerators = await getBackend().listAccelerators()
     firstLaunch.acceleratorsFailed = false
@@ -419,11 +476,8 @@ export function openFirstLaunchProvisioner() {
 }
 
 /**
- * Back to the two lines, which say what the setup did if it finished.
- *
- * The provisioner goes with them, so nothing is left to be busy: a
- * provisioner that closed itself mid-run must not leave the setup with no
- * way out.
+ * Back to the two lines, which say what the setup did if it finished. The
+ * provisioner goes with them, so nothing is left to be busy.
  */
 export function closeFirstLaunchProvisioner() {
   firstLaunch.provisioning = false
@@ -450,12 +504,8 @@ export function setFirstLaunchProvisionerBusy(busy) {
  *
  * Only for an endpoint that answered its first check. One that did not is
  * kept and said back, so the step does not offer the setup again, but the
- * permission stays as it was: on, it would promise cloud cleaning nobody has
- * seen work. The person tests it and turns it on in Settings > Cloud.
- *
- * An answer that names no saved profile has left nothing to run on, so the
- * permission stays as it was: on alone, it would promise cloud cleaning that
- * cannot happen.
+ * permission stays as it was. An answer that names no saved profile has left
+ * nothing to run on, so the permission stays as it was then too.
  *
  * @param {{provider?: string, profileId?: string, name?: string, healthy?: boolean}|null|undefined} info
  */
@@ -486,17 +536,25 @@ function listen() {
       }
       return
     }
-    const { [event.id]: _gone, ...rest } = firstLaunch.progress
-    firstLaunch.progress = rest
-    if (!event.error) firstLaunch.finished = { ...firstLaunch.finished, [event.id]: true }
+    // Progress is kept on a pause, so the bar holds where it stopped. A
+    // success is marked here rather than after the run's await, so the bar
+    // never drops to empty in between - and so a file Settings finished for
+    // us is not fetched again when the queue reaches it.
+    if (!event.error) {
+      // Marked whether or not it is queued yet: a file Settings finished
+      // while the setup was on an earlier step must not be fetched again.
+      setStatus(event.id, 'done')
+      const { [event.id]: _gone, ...rest } = firstLaunch.progress
+      firstLaunch.progress = rest
+    }
     waiting.get(event.id)?.(event.error ?? null)
     waiting.delete(event.id)
   })
 }
 
 function stopListening() {
-  // A sequence parked on a `done` event that will now never reach it would
-  // hold its promise for the life of the page.
+  // A run parked on a `done` event that will now never come would hold its
+  // promise for the life of the page.
   for (const resolve of waiting.values()) resolve('cancelled')
   waiting.clear()
   unsubscribe?.()
@@ -518,25 +576,23 @@ function discard(id) {
   waiting.delete(id)
 }
 
-/**
- * Put the module back as it was. **Tests only** - an application opens the
- * offer once and closes it once.
- */
+/** Put the module back as it was. **Tests only.** */
 export function resetFirstLaunch() {
   stopListening()
-  cancelRequested = false
+  pauseRequested.clear()
   firstLaunch.open = false
   firstLaunch.step = 'welcome'
   firstLaunch.plan = null
-  firstLaunch.selection = {}
+  firstLaunch.detection = {}
+  firstLaunch.cleaners = {}
+  firstLaunch.queue = []
+  firstLaunch.status = {}
   firstLaunch.progress = {}
-  firstLaunch.finished = {}
-  firstLaunch.failure = null
-  firstLaunch.stopped = false
-  firstLaunch.paused = false
-  firstLaunch.sequenceDone = false
+  firstLaunch.errors = {}
   firstLaunch.running = false
   firstLaunch.current = null
+  firstLaunch.tokenDraft = ''
+  firstLaunch.tokenFailed = false
   firstLaunch.provisioning = false
   firstLaunch.provisionerBusy = false
   firstLaunch.cloud = null
