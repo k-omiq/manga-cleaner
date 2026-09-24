@@ -5,6 +5,11 @@ Provides durable, atomic tracking of provisioning progress and allocated cloud r
 - Resumable stage transitions without duplicate resource allocation.
 - Invariant: Zero raw credentials or secret tokens written to journal files on disk.
 - Ownership tagging on all recorded cloud resources for safe verified teardown.
+
+The desktop may kill the helper at any moment (cancel kills the process group), so
+the pipeline writes a resource here before it asks the provider to create it, and a
+step is marked done only after its side effect finished. A later `resume` then skips
+finished steps and repeats unfinished ones, which are all idempotent.
 """
 
 from dataclasses import asdict, dataclass, field
@@ -14,9 +19,9 @@ import os
 from pathlib import Path
 import re
 import sys
-import tempfile
 from typing import Any, Dict, List, Optional, Set
 
+from provisioner.progress import STEPS
 from provisioner.protocol import (
     ALLOWLISTED_PROVIDERS,
     ERR_SECURITY_VIOLATION,
@@ -24,11 +29,9 @@ from provisioner.protocol import (
     HEX_HASH_REGEX,
     IDENTIFIER_REGEX,
     ProtocolError,
-    validate_hash,
-    validate_https_url,
     validate_identifier,
 )
-from provisioner.redaction import redact_data
+from provisioner.redaction import is_sensitive_key, redact_data, redact_string
 
 JOURNAL_SCHEMA_VERSION = "1.0.0"
 MAX_JOURNAL_BYTES = 256 * 1024  # 256 KiB safety limit
@@ -62,92 +65,83 @@ VALID_STAGES: Set[str] = {
     STAGE_CLEANED_UP,
 }
 
-LEGAL_TRANSITIONS: Dict[str, Set[str]] = {
-    STAGE_PLANNED: {
-        STAGE_SEEDING,
-        STAGE_SEEDED,
-        STAGE_DEPLOYING,
-        STAGE_DEPLOYED,
-        STAGE_DISCOVERED,
-        STAGE_FAILED,
-        STAGE_CLEANUP_PLANNED,
-    },
-    STAGE_SEEDING: {
-        STAGE_SEEDING,
-        STAGE_SEEDED,
-        STAGE_DEPLOYING,
-        STAGE_DEPLOYED,
-        STAGE_FAILED,
-        STAGE_CLEANUP_PLANNED,
-    },
-    STAGE_SEEDED: {
-        STAGE_DEPLOYING,
-        STAGE_DEPLOYED,
-        STAGE_DISCOVERED,
-        STAGE_FAILED,
-        STAGE_CLEANUP_PLANNED,
-    },
-    STAGE_DEPLOYING: {
-        STAGE_DEPLOYING,
-        STAGE_DEPLOYED,
-        STAGE_DISCOVERED,
-        STAGE_CREDENTIAL_CREATED,
-        STAGE_FAILED,
-        STAGE_CLEANUP_PLANNED,
-    },
-    STAGE_DEPLOYED: {
-        STAGE_DISCOVERED,
-        STAGE_CREDENTIAL_CREATED,
-        STAGE_FAILED,
-        STAGE_CLEANUP_PLANNED,
-    },
-    STAGE_DISCOVERED: {
-        STAGE_CREDENTIAL_CREATED,
-        STAGE_VALIDATED,
-        STAGE_FAILED,
-        STAGE_CLEANUP_PLANNED,
-    },
-    STAGE_CREDENTIAL_CREATED: {
-        STAGE_VALIDATED,
-        STAGE_COMPLETED,
-        STAGE_FAILED,
-        STAGE_CLEANUP_PLANNED,
-    },
-    STAGE_VALIDATED: {
-        STAGE_COMPLETED,
-        STAGE_FAILED,
-        STAGE_CLEANUP_PLANNED,
-    },
-    STAGE_COMPLETED: {
-        STAGE_CLEANUP_PLANNED,
-        STAGE_CLEANED_UP,
-    },
-    STAGE_FAILED: {
-        STAGE_SEEDING,
-        STAGE_SEEDED,
-        STAGE_DEPLOYING,
-        STAGE_DEPLOYED,
-        STAGE_DISCOVERED,
-        STAGE_CREDENTIAL_CREATED,
-        STAGE_VALIDATED,
-        STAGE_COMPLETED,
-        STAGE_CLEANUP_PLANNED,
-        STAGE_CLEANED_UP,
-        STAGE_FAILED,
-    },
-    STAGE_CLEANUP_PLANNED: {
-        STAGE_CLEANED_UP,
-        STAGE_CLEANUP_PLANNED,
-        STAGE_FAILED,
-    },
-    STAGE_CLEANED_UP: set(),
+# The order the apply pipeline passes through, which is the IC-2 step order:
+# volume..deploy, weights, token, endpoint, health.
+PIPELINE_ORDER: Dict[str, int] = {
+    STAGE_PLANNED: 0,
+    STAGE_DEPLOYING: 1,
+    STAGE_DEPLOYED: 2,
+    STAGE_SEEDING: 3,
+    STAGE_SEEDED: 4,
+    STAGE_CREDENTIAL_CREATED: 5,
+    STAGE_DISCOVERED: 6,
+    STAGE_VALIDATED: 7,
+    STAGE_COMPLETED: 8,
 }
+
+_STATE_KEY_REGEX = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
+_GPU_REGEX = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+MAX_STATE_ENTRIES = 32
+MAX_STATE_VALUE_CHARS = 2048
 
 _COUNTER = 0
 
 
 def _get_utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def transition_allowed(current: str, new: str) -> bool:
+    """The stage machine. Only cleanup leaves the pipeline for good."""
+    if new == current:
+        return True
+    if current == STAGE_CLEANED_UP:
+        return False
+    if current == STAGE_CLEANUP_PLANNED:
+        # A cleanup that stopped half way is finished by another cleanup_apply, never
+        # resumed: some of what the pipeline built may already be gone.
+        return new == STAGE_CLEANED_UP
+    if new == STAGE_CLEANUP_PLANNED:
+        return True
+    if new == STAGE_CLEANED_UP or new == STAGE_PLANNED:
+        return False
+    if new == STAGE_FAILED:
+        return True
+    if new == STAGE_COMPLETED:
+        # Completed means the health check passed in this run.
+        return current == STAGE_VALIDATED
+    if current == STAGE_FAILED:
+        return new in PIPELINE_ORDER
+    if current == STAGE_COMPLETED:
+        # resume at completed issues a fresh runtime credential.
+        return new == STAGE_CREDENTIAL_CREATED
+    return PIPELINE_ORDER[new] > PIPELINE_ORDER[current]
+
+
+def _check_state_value(key: str, value: Any) -> None:
+    if not isinstance(key, str) or not _STATE_KEY_REGEX.match(key) or is_sensitive_key(key):
+        raise ProtocolError(ERR_VALIDATION, f"Invalid provider_state key in journal: '{key}'")
+    if value is None or isinstance(value, (bool, int)):
+        return
+    if not isinstance(value, str) or len(value) > MAX_STATE_VALUE_CHARS:
+        raise ProtocolError(ERR_VALIDATION, f"Invalid provider_state value for '{key}'")
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ProtocolError(ERR_SECURITY_VIOLATION, f"Control character in provider_state value for '{key}'")
+
+
+def _check_options(options: Any) -> Dict[str, Any]:
+    if not isinstance(options, dict):
+        raise ProtocolError(ERR_VALIDATION, "Field 'options' in journal must be a dictionary")
+    extra = set(options) - {"gpu", "idle_seconds"}
+    if extra:
+        raise ProtocolError(ERR_VALIDATION, f"Unknown options in journal: {sorted(extra)}")
+    gpu = options.get("gpu")
+    if gpu is not None and (not isinstance(gpu, str) or not _GPU_REGEX.match(gpu)):
+        raise ProtocolError(ERR_VALIDATION, "Invalid 'options.gpu' in journal")
+    idle = options.get("idle_seconds")
+    if idle is not None and (isinstance(idle, bool) or not isinstance(idle, int) or not 0 < idle <= 86400):
+        raise ProtocolError(ERR_VALIDATION, "Invalid 'options.idle_seconds' in journal")
+    return dict(options)
 
 
 @dataclass
@@ -176,6 +170,7 @@ class ResourceRecord:
         resource_type = data.get("resource_type")
         if not resource_type or not isinstance(resource_type, str):
             raise ProtocolError(ERR_VALIDATION, "Missing or invalid 'resource_type' in resource record")
+        validate_identifier("resource_type", resource_type)
 
         provider = data.get("provider")
         if not provider or not isinstance(provider, str) or provider not in ALLOWLISTED_PROVIDERS:
@@ -239,12 +234,19 @@ class InstallationRecord:
     app_name: str
     resources: List[ResourceRecord]
     endpoint_url: Optional[str] = None
+    # A pointer to the credential resource, never the credential itself.
     runtime_credential_ref: Optional[Dict[str, Any]] = None
     compatibility_status: Optional[str] = None
     setup_credential_forgotten: bool = False
     created_at_utc: str = field(default_factory=_get_utc_now)
     updated_at_utc: str = field(default_factory=_get_utc_now)
     last_error: Optional[str] = None
+    # The approved gpu and idle_seconds; resume always uses these.
+    options: Dict[str, Any] = field(default_factory=dict)
+    # Provider ids a later run needs (environment, call ids, URLs). Never secrets.
+    provider_state: Dict[str, Any] = field(default_factory=dict)
+    # Pipeline steps whose side effects finished; resume skips them.
+    completed_steps: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -263,6 +265,9 @@ class InstallationRecord:
             "created_at_utc": self.created_at_utc,
             "updated_at_utc": self.updated_at_utc,
             "last_error": self.last_error,
+            "options": dict(self.options),
+            "provider_state": dict(self.provider_state),
+            "completed_steps": list(self.completed_steps),
         }
 
     @classmethod
@@ -357,6 +362,22 @@ class InstallationRecord:
         if last_error is not None and not isinstance(last_error, str):
             raise ProtocolError(ERR_VALIDATION, "Field 'last_error' must be a string or null")
 
+        options = _check_options(data.get("options", {}))
+
+        provider_state = data.get("provider_state", {})
+        if not isinstance(provider_state, dict) or len(provider_state) > MAX_STATE_ENTRIES:
+            raise ProtocolError(ERR_VALIDATION, "Field 'provider_state' in journal must be a small dictionary")
+        for key, value in provider_state.items():
+            _check_state_value(key, value)
+
+        completed_steps = data.get("completed_steps", [])
+        if (
+            not isinstance(completed_steps, list)
+            or any(step not in STEPS for step in completed_steps)
+            or len(set(completed_steps)) != len(completed_steps)
+        ):
+            raise ProtocolError(ERR_VALIDATION, "Field 'completed_steps' in journal is invalid")
+
         return cls(
             schema_version=data["schema_version"],
             installation_id=installation_id,
@@ -373,6 +394,9 @@ class InstallationRecord:
             created_at_utc=created_at_utc,
             updated_at_utc=updated_at_utc,
             last_error=last_error,
+            options=options,
+            provider_state=dict(provider_state),
+            completed_steps=list(completed_steps),
         )
 
 
@@ -396,8 +420,8 @@ class InstallationJournal:
     @property
     def record(self) -> InstallationRecord:
         if self._record is None:
-            self.load_or_initialize(plan_hash="", approved_plan_hash="", app_name="")
-        return self._record  # type: ignore
+            self._record = self.load()
+        return self._record
 
     def _check_symlink_hazards(self) -> None:
         """Fail closed if installation directory or journal file is a symbolic link."""
@@ -462,16 +486,23 @@ class InstallationJournal:
         self._record = InstallationRecord.from_dict(data)
         return self._record
 
-    def load_or_initialize(
+    def initialize(
         self,
         plan_hash: str,
         approved_plan_hash: str,
         app_name: str,
+        options: Optional[Dict[str, Any]] = None,
+        provider_state: Optional[Dict[str, Any]] = None,
     ) -> InstallationRecord:
-        """Load existing journal or initialize a new record."""
-        if self.exists():
-            return self.load()
+        """Write a new record at stage planned, with its first provider_state, in one save.
 
+        Refuses to replace an existing journal.
+        """
+        if self.exists():
+            raise ProtocolError(ERR_VALIDATION, f"Installation '{self.installation_id}' already has a journal")
+        state = dict(provider_state or {})
+        for key, value in state.items():
+            _check_state_value(key, value)
         now = _get_utc_now()
         self._record = InstallationRecord(
             schema_version=JOURNAL_SCHEMA_VERSION,
@@ -484,9 +515,23 @@ class InstallationJournal:
             resources=[],
             created_at_utc=now,
             updated_at_utc=now,
+            options=_check_options(dict(options or {})),
+            provider_state={key: value for key, value in state.items() if value is not None},
         )
         self.save()
         return self._record
+
+    def load_or_initialize(
+        self,
+        plan_hash: str,
+        approved_plan_hash: str,
+        app_name: str,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> InstallationRecord:
+        """Load existing journal or initialize a new record."""
+        if self.exists():
+            return self.load()
+        return self.initialize(plan_hash, approved_plan_hash, app_name, options)
 
     def save(self) -> None:
         """Atomically persist record to disk with fsync and directory sync."""
@@ -499,9 +544,14 @@ class InstallationJournal:
 
         self._check_symlink_hazards()
 
-        # Invariant: verify no raw credentials in record dict
+        # No secret reaches the disk: secret-named keys and every known secret value
+        # are redacted throughout. Token-shape guessing runs only over the free-text
+        # error, because ids, names and the endpoint URL must round-trip exactly and a
+        # user-chosen workspace or environment name can look like a token.
         record_dict = self._record.to_dict()
-        sanitized_dict = redact_data(record_dict)
+        sanitized_dict = redact_data(record_dict, patterns=False)
+        if isinstance(sanitized_dict.get("last_error"), str):
+            sanitized_dict["last_error"] = redact_string(sanitized_dict["last_error"])
 
         payload = json.dumps(sanitized_dict, indent=2, sort_keys=True).encode("utf-8")
         if len(payload) > MAX_JOURNAL_BYTES:
@@ -524,16 +574,16 @@ class InstallationJournal:
             mode = 0o600
             fd = os.open(str(tmp_path), flags, mode)
             try:
-                with open(fd, "wb", closefd=True) as f:
-                    f.write(payload)
-                    f.flush()
-                    os.fsync(f.fileno())
-            except Exception:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+                f = open(fd, "wb", closefd=True)
+            except BaseException:
+                # Only here is fd still ours: once the file object exists it closes fd,
+                # also when a write fails, and the number may already be reused.
+                os.close(fd)
                 raise
+            with f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
 
             # Atomic replace
             self._check_symlink_hazards()
@@ -568,18 +618,19 @@ class InstallationJournal:
                 f"Invalid state machine stage: '{new_stage}'",
             )
         rec = self.record
-        current_stage = rec.stage
-
-        allowed_next = LEGAL_TRANSITIONS.get(current_stage, set())
-        if new_stage != current_stage and new_stage not in allowed_next:
+        if not transition_allowed(rec.stage, new_stage):
             raise ProtocolError(
                 ERR_VALIDATION,
-                f"Illegal state transition from '{current_stage}' to '{new_stage}'",
+                f"Illegal state transition from '{rec.stage}' to '{new_stage}'",
             )
-
         rec.stage = new_stage
         rec.last_error = error
         self.save()
+
+    def advance(self, stage: str) -> None:
+        """Move the pipeline forward to `stage`; a step repeated on resume leaves it."""
+        if transition_allowed(self.record.stage, stage):
+            self.transition_to(stage)
 
     def record_resource(
         self,
@@ -589,8 +640,9 @@ class InstallationJournal:
         stage_created: str,
         ownership_tags: Optional[Dict[str, str]] = None,
     ) -> ResourceRecord:
-        """Record an allocated cloud resource if not already present."""
+        """Record a cloud resource (before creating it, when its name is known in advance)."""
         validate_identifier("resource_id", resource_id)
+        validate_identifier("resource_type", resource_type)
         validate_identifier("name", name)
 
         rec = self.record
@@ -620,18 +672,54 @@ class InstallationJournal:
         self.save()
         return new_resource
 
+    def remove_resource(self, resource_type: str, name: str) -> None:
+        rec = self.record
+        kept = [r for r in rec.resources if not (r.resource_type == resource_type and r.name == name)]
+        if len(kept) != len(rec.resources):
+            rec.resources = kept
+            ref = rec.runtime_credential_ref or {}
+            if ref.get("resource_type") == resource_type and ref.get("name") == name:
+                rec.runtime_credential_ref = None
+            self.save()
+
     def has_resource(self, resource_type: str, name: str) -> bool:
         """Check if resource was already created in this installation."""
         rec = self.record
         return any(r.resource_type == resource_type and r.name == name for r in rec.resources)
 
-    def get_resource(self, resource_type: str) -> Optional[ResourceRecord]:
-        """Find first resource of specified type."""
-        rec = self.record
-        for r in rec.resources:
-            if r.resource_type == resource_type:
+    def get_resource(self, resource_type: str, name: Optional[str] = None) -> Optional[ResourceRecord]:
+        """Find the first resource of a type (and name, when given)."""
+        for r in self.record.resources:
+            if r.resource_type == resource_type and (name is None or r.name == name):
                 return r
         return None
+
+    def step_done(self, step: str) -> bool:
+        return step in self.record.completed_steps
+
+    def mark_step_done(self, step: str) -> None:
+        if step not in STEPS:
+            raise ProtocolError(ERR_VALIDATION, f"Unknown pipeline step: '{step}'")
+        if step not in self.record.completed_steps:
+            self.record.completed_steps.append(step)
+            self.save()
+
+    def get_state(self, key: str, default: Any = None) -> Any:
+        return self.record.provider_state.get(key, default)
+
+    def set_state(self, **values: Any) -> None:
+        state = dict(self.record.provider_state)
+        for key, value in values.items():
+            _check_state_value(key, value)
+            if value is None:
+                state.pop(key, None)
+            else:
+                state[key] = value
+        if len(state) > MAX_STATE_ENTRIES:
+            raise ProtocolError(ERR_VALIDATION, "Too many provider_state entries")
+        if state != self.record.provider_state:
+            self.record.provider_state = state
+            self.save()
 
     def forget_setup_credential(self) -> None:
         """Record that setup credential was safely wiped from local session."""
@@ -640,37 +728,5 @@ class InstallationJournal:
         self.save()
 
     def can_resume(self) -> bool:
-        """Check if the installation can be resumed from its current stage."""
-        rec = self.record
-        return rec.stage not in {STAGE_COMPLETED, STAGE_CLEANED_UP}
-
-    def next_action(self) -> str:
-        """Determine next action needed based on durable stage."""
-        rec = self.record
-        if rec.stage == STAGE_PLANNED:
-            return "seed"
-        elif rec.stage in {STAGE_SEEDING, STAGE_SEEDED}:
-            if not self.has_resource("volume", f"mc-{self.provider}-vol-{self.installation_id}"):
-                return "seed"
-            return "deploy"
-        elif rec.stage in {STAGE_DEPLOYING, STAGE_DEPLOYED}:
-            if not self.has_resource("app", self.record.app_name) and not self.has_resource(
-                "service", self.record.app_name
-            ):
-                return "deploy"
-            return "discover_endpoint"
-        elif rec.stage == STAGE_DISCOVERED:
-            return "create_runtime_credential"
-        elif rec.stage == STAGE_CREDENTIAL_CREATED:
-            return "validate_compatibility"
-        elif rec.stage == STAGE_VALIDATED:
-            return "complete"
-        elif rec.stage == STAGE_COMPLETED:
-            return "ready"
-        elif rec.stage == STAGE_FAILED:
-            return "repair"
-        elif rec.stage == STAGE_CLEANUP_PLANNED:
-            return "cleanup"
-        elif rec.stage == STAGE_CLEANED_UP:
-            return "cleaned_up"
-        return "unknown"
+        """Anything short of cleanup can be resumed; at completed, resume re-issues the credential."""
+        return self.record.stage not in {STAGE_CLEANUP_PLANNED, STAGE_CLEANED_UP}

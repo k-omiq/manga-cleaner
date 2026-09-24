@@ -54,6 +54,8 @@ const stores = vi.hoisted(() => ({
     runtime: true,
     autoClean: true,
   },
+  cloud: { checked: true, configured: true },
+  openCloudSettings: vi.fn(),
   setToolParam: vi.fn(),
   startRun: vi.fn(),
   cancelRun: vi.fn(),
@@ -84,6 +86,12 @@ vi.mock('../state/session.svelte.js', () => ({
 }))
 
 vi.mock('../state/capabilities.svelte.js', () => ({ capabilities: stores.capabilities }))
+
+vi.mock('../state/cloud.svelte.js', () => ({
+  cloud: stores.cloud,
+  cloudUsable: () => stores.session.cloudAllowed && stores.cloud.configured,
+  openCloudSettings: stores.openCloudSettings,
+}))
 
 // Imported after the mocks so the component picks the stubs up.
 const { default: ToolBar } = await import('./ToolBar.svelte')
@@ -352,6 +360,21 @@ describe('a gated option says what it is costing the user', () => {
       expect(view.getByText(t('editor.state.cloudBlocked'))).not.toBeNull()
     } finally {
       stores.session.cloudAllowed = true
+    }
+  })
+
+  it('disables the cloud engine while no endpoint is set up, and offers the way to set one up', async () => {
+    stores.cloud.configured = false
+    try {
+      const { view } = mountTool(toolSpec('contentAwareFill'))
+      const group = view.getByLabelText(t('tools.param.engine'))
+      const cells = [...group.querySelectorAll('[role="radio"]')]
+      expect(/** @type {HTMLButtonElement} */ (cells[1]).disabled).toBe(true)
+      expect(view.getByText(t('tools.option.engineCloudNotReady'))).not.toBeNull()
+      await fireEvent.click(view.getByRole('button', { name: t('tools.option.engineCloudSettings') }))
+      expect(stores.openCloudSettings).toHaveBeenCalledTimes(1)
+    } finally {
+      stores.cloud.configured = true
     }
   })
 

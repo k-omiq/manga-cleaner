@@ -1026,33 +1026,16 @@ describe('inference config and cloud secrets in mock backend', () => {
     expect(JSON.stringify(cleanRead)).not.toContain('injected')
   })
 
-  it('secret operations explicitly refuse / reject in browser mock without timer hang', async () => {
+  it('secret operations answer from a session-only store without a timer hang', async () => {
     const { backend } = makeBackend()
+    const key = { provider: 'beam', profileId: 'beam-1', role: 'runtime' }
 
-    await expect(
-      backend.storeCloudSecret({
-        provider: 'beam',
-        profileId: 'beam-1',
-        role: 'runtime',
-        secret: 'raw-secret',
-      }),
-    ).rejects.toThrow(/unavailable in browser mock/)
-
-    await expect(
-      backend.deleteCloudSecret({
-        provider: 'beam',
-        profileId: 'beam-1',
-        role: 'runtime',
-      }),
-    ).rejects.toThrow(/unavailable in browser mock/)
-
-    await expect(
-      backend.getCloudSecretSummary({
-        provider: 'beam',
-        profileId: 'beam-1',
-        role: 'runtime',
-      }),
-    ).rejects.toThrow(/unavailable in browser mock/)
+    expect(await settle(backend.storeCloudSecret({ ...key, secret: 'raw-secret' }))).toMatchObject({
+      present: true,
+      backend: 'session',
+    })
+    expect(await settle(backend.getCloudSecretSummary(key))).toMatchObject({ present: true })
+    expect(await settle(backend.deleteCloudSecret(key))).toMatchObject({ present: false })
   })
 
   it('pins immutable model revision in getCloudModelInfo and default consent recipe', async () => {
@@ -1079,7 +1062,7 @@ describe('inference config and cloud secrets in mock backend', () => {
     )
 
     const info = await settle(backend.getCloudModelInfo({ provider: 'modal', profileId: 'm1' }))
-    expect(info.pinnedModelRevision).toBe('0123456789abcdef0123456789abcdef01234567')
+    expect(info.pinnedModelRevision).toBe('45e9cc76cb70f84473ce5c6c2e2282d0ef3c6ecd')
     expect(info.pinnedModelRevision).not.toBe('main')
 
     await settle(backend.writeSettings({ cloudEngines: 'allowed' }))
@@ -1089,7 +1072,7 @@ describe('inference config and cloud secrets in mock backend', () => {
         intent: { action: 'applyTool', tool: 'contentAwareFill' },
       }),
     )
-    expect(proposal.recipe.model_revision).toBe('0123456789abcdef0123456789abcdef01234567')
+    expect(proposal.recipe.model_revision).toBe('45e9cc76cb70f84473ce5c6c2e2282d0ef3c6ecd')
     expect(proposal.recipe.model_revision).not.toBe('main')
   })
 

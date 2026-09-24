@@ -1,224 +1,272 @@
 <script>
   /**
-   * The first-launch download offer.
+   * The setup a first launch opens, and Settings' "Run setup again".
    *
-   * The weights and the ONNX Runtime are downloaded after install rather than
-   * bundled, and until this dialog existed the only
-   * route to them was a Settings section the user had to know about: a fresh
-   * install opened an editor whose Auto clean button was disabled with a
-   * sentence naming Settings, and whose engine pickers showed two rungs instead
-   * of five. Correct, and not the same as being asked.
+   * Six steps, one choice each (`FIRST_LAUNCH_STEPS`), every one of them
+   * skippable. This file is the frame around them: the step heading, Back,
+   * the one primary action, the quiet Skip, and the keyboard. What a step
+   * shows is its own component in `onboarding/`, and everything that has to
+   * outlive a mount - the plan, the download run, what the cloud setup did -
+   * is the store in `firstlaunch.svelte.js`, because a dialog raised over
+   * this one unmounts it (`App.svelte`).
    *
-   * **It adds no seam method.** Everything goes through the seven the model
-   * manager already uses, and progress arrives on the same process-wide
-   * `model-progress` channel Settings listens to. Two dialogs hearing one
-   * stream is the ordinary case that channel was built for.
-   *
-   * **This component holds nothing.** The plan, the ticks, the progress and
-   * the sequence all live in `firstlaunch.svelte.js`, because the offer can
-   * lose the screen to a dialog raised over it while a 200 MB transfer is in
-   * flight - and a run whose state was in the component would
-   * come back with the ticks reset and the bytes quoted again. What is left
-   * here is the drawing of it.
+   * Every way out goes through `dismissFirstLaunch`, which records that the
+   * offer was made. Escape follows the Modal's rule and the backdrop does not
+   * close: a stray click must not end a setup halfway. While the provisioner
+   * is working in the user's account there is no way out here at all, only
+   * its own Cancel.
    */
-  import { Button, Modal, SectionLabel } from '../ui/index.js'
+  import { tick } from 'svelte'
+  import { Button, Modal } from '../ui/index.js'
   import { t } from '../i18n/index.js'
-  import { labelKeyFor } from './firstlaunch.js'
+  import { session } from '../state/session.svelte.js'
+  import { openNewProject } from '../home/actions.js'
+  import { FIRST_LAUNCH_STEPS } from './firstlaunch.js'
   import {
-    cancelFirstLaunchDownload,
+    closeFirstLaunchProvisioner,
     dismissFirstLaunch,
     firstLaunch,
+    nextFirstLaunchStep,
+    openFirstLaunchProvisioner,
     pendingBytes,
     pendingQueue,
-    setFirstLaunchTick,
+    prevFirstLaunchStep,
     startFirstLaunchDownloads,
   } from './firstlaunch.svelte.js'
+  import ModelsStep from './onboarding/ModelsStep.svelte'
+  import DefaultsStep from './onboarding/DefaultsStep.svelte'
+  import CloudStep from './onboarding/CloudStep.svelte'
+  import BehaviorStep from './onboarding/BehaviorStep.svelte'
+  import DoneStep from './onboarding/DoneStep.svelte'
 
-  const plan = $derived(firstLaunch.plan)
-
-  /** What the primary button promises, and whether it has anything to fetch. */
-  const total = $derived(pendingBytes())
-  const queue = $derived(pendingQueue())
-
-  /**
-   * One row's line, as a key and its parameters. The same five states Settings
-   * draws, in the same words - this is the same list of files.
-   *
-   * @param {import('./firstlaunch.js').PlanRow} row
-   * @returns {{key: string, params?: Object}}
-   */
-  function statusOf(row) {
-    const inFlight = firstLaunch.progress[row.id]
-    if (inFlight) {
-      const percent = inFlight.total
-        ? Math.floor((inFlight.downloaded / inFlight.total) * 100)
-        : null
-      return percent === null
-        ? { key: 'settings.models.status.downloading' }
-        : { key: 'settings.models.status.downloadingPercent', params: { percent } }
-    }
-    if (row.installed || firstLaunch.finished[row.id]) {
-      return { key: 'settings.models.status.installed' }
-    }
-    if (firstLaunch.failure?.id === row.id) return { key: 'settings.models.status.failed' }
-    return { key: 'settings.models.status.missing' }
+  /** Whole keys chosen between, never built, so the catalogue test sees each one. */
+  const HEADINGS = {
+    welcome: 'onboarding.welcome.heading',
+    models: 'onboarding.models.heading',
+    defaults: 'onboarding.defaults.heading',
+    cloud: 'onboarding.cloud.heading',
+    behavior: 'onboarding.behavior.heading',
+    done: 'onboarding.done.heading',
   }
 
-  /** @param {import('./firstlaunch.js').PlanRow} row */
-  function metaOf(row) {
-    const status = statusOf(row)
-    const size = row.bytes > 0 ? `${t('models.value.size', { bytes: row.bytes })} · ` : ''
-    return `${size}${t(status.key, status.params)}`
+  const headingId = $props.id()
+  const step = $derived(firstLaunch.step)
+  const position = $derived(FIRST_LAUNCH_STEPS.indexOf(/** @type {any} */ (step)) + 1)
+
+  /** @type {HTMLElement|undefined} */
+  let heading = $state()
+
+  /**
+   * Whether Download is the models step's primary action: nothing is
+   * fetching, nothing is paused or failed (those have their own button on
+   * the step), and something ticked is still missing.
+   */
+  const offerDownload = $derived(
+    !firstLaunch.running && !firstLaunch.paused && !firstLaunch.failure && pendingQueue().length > 0,
+  )
+
+  /**
+   * @typedef {{label: string, run: () => unknown, enter?: boolean}} Action
+   *
+   * What the footer offers on this step: Back or not, at most one button
+   * beside the primary, and the primary itself. `enter` is whether Enter on
+   * the heading may press the primary. It is withheld from Download, so a
+   * key pressed twice on the step before cannot start a transfer of hundreds
+   * of megabytes.
+   */
+  const actions = $derived.by(() => {
+    /** @type {Action} */
+    const next = { label: t('onboarding.action.next'), run: nextFirstLaunchStep, enter: true }
+    if (step === 'welcome') {
+      return {
+        back: false,
+        secondary: null,
+        primary: { label: t('onboarding.action.start'), run: nextFirstLaunchStep, enter: true },
+      }
+    }
+    if (step === 'models' && offerDownload) {
+      return {
+        back: true,
+        secondary: { label: t('onboarding.action.notNow'), run: nextFirstLaunchStep },
+        primary: {
+          label: t('onboarding.models.download', { bytes: pendingBytes() }),
+          run: startFirstLaunchDownloads,
+          enter: false,
+        },
+      }
+    }
+    if (step === 'cloud' && firstLaunch.provisioning) {
+      // The provisioner draws its own buttons. Once it has finished, Continue
+      // is offered here too, so leaving does not depend on which button its
+      // last screen happens to have.
+      return {
+        back: false,
+        secondary: null,
+        primary: firstLaunch.cloud ? { label: t('onboarding.action.next'), run: leaveProvisioner } : null,
+      }
+    }
+    if (step === 'cloud' && !firstLaunch.cloud && !session.cloudAllowed) {
+      return {
+        back: true,
+        secondary: { label: t('onboarding.cloud.setUp'), run: openFirstLaunchProvisioner },
+        primary: { label: t('onboarding.action.notNow'), run: nextFirstLaunchStep, enter: true },
+      }
+    }
+    if (step === 'done') {
+      return {
+        back: true,
+        secondary: null,
+        primary: { label: t('home.action.newProject'), run: startProject, enter: true },
+      }
+    }
+    return { back: true, secondary: null, primary: next }
+  })
+
+  function leaveProvisioner() {
+    closeFirstLaunchProvisioner()
+    nextFirstLaunchStep()
+  }
+
+  /**
+   * Close the setup, then raise New project over whatever it was opened on.
+   * The tick lets the setup's Modal hand focus back before the next dialog
+   * takes it, so closing that one returns focus to a real element.
+   */
+  async function startProject() {
+    dismissFirstLaunch()
+    await tick()
+    openNewProject()
+  }
+
+  // A new step moves focus to its heading, so a screen reader starts where
+  // the user now is and Enter can press the step's primary action. Not while
+  // the provisioner is up: the cloud step puts focus inside it instead, and
+  // closing it brings focus back here.
+  $effect(() => {
+    void step
+    if (firstLaunch.provisioning) return
+    tick().then(() => heading?.focus())
+  })
+
+  /**
+   * Enter presses the primary action, but only from the heading or the
+   * dialog itself. Anywhere else Enter already belongs to the focused
+   * control, and taking it from a button or a select would change what that
+   * control does.
+   *
+   * @param {KeyboardEvent} event
+   */
+  function onkeydown(event) {
+    if (event.key !== 'Enter' || event.repeat || event.isComposing || event.defaultPrevented) return
+    if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+    const target = event.target
+    if (!(target instanceof HTMLElement) || !heading) return
+    const fromFrame = target === heading || (target.getAttribute('role') === 'dialog' && target.contains(heading))
+    if (!fromFrame) return
+    const primary = actions.primary
+    if (!primary?.enter) return
+    event.preventDefault()
+    primary.run()
   }
 </script>
 
-{#if plan}
-  <Modal title={t('models.firstLaunch.title')} width={460} onclose={dismissFirstLaunch}>
-    <p class="lede">{t('models.firstLaunch.description')}</p>
+<svelte:window {onkeydown} />
 
-    <section class="group">
-      <SectionLabel as="h3" text={t('models.firstLaunch.requiredLabel')} />
-      <p class="note">{t('models.firstLaunch.requiredNote', { bytes: plan.requiredBytes })}</p>
-      <!-- A platform with no published runtime keeps the weights on offer and
-           says why they are not enough on their own: they are exactly what an
-           offline install would need beside a hand-placed library, and hiding
-           them would leave the user with nothing to press and nothing to read. -->
-      {#if plan.runtimeUnavailable}
-        <p class="note">{t('models.firstLaunch.runtimeUnavailable')}</p>
-      {/if}
-      <!-- No ticks on this group: it is what Auto clean is made of, and a
-           checkbox beside four files that are useless apart would be a choice
-           with no second answer. -->
-      <ul class="rows">
-        {#each plan.required as row (row.id)}
-          <li class="row">
-            <span class="row-name">{t(row.labelKey)}</span>
-            <span class="row-meta">{metaOf(row)}</span>
-          </li>
-        {/each}
-      </ul>
-    </section>
-
-    {#if plan.optional.length > 0}
-      <section class="group">
-        <SectionLabel as="h3" text={t('models.firstLaunch.optionalLabel')} />
-        <p class="note">{t('models.firstLaunch.optionalNote')}</p>
-        <ul class="rows">
-          {#each plan.optional as row (row.id)}
-            <li class="row tickable">
-              <label class="tick">
-                <input
-                  type="checkbox"
-                  checked={firstLaunch.selection[row.id] === true}
-                  disabled={firstLaunch.running || firstLaunch.finished[row.id] === true}
-                  onchange={(e) =>
-                    setFirstLaunchTick(
-                      row.id,
-                      /** @type {HTMLInputElement} */ (e.currentTarget).checked,
-                    )}
-                />
-                <span class="row-name">{t(row.labelKey)}</span>
-              </label>
-              <span class="row-meta">{metaOf(row)}</span>
-            </li>
-          {/each}
-        </ul>
-      </section>
-    {/if}
-
-    {#if firstLaunch.failure}
-      <!-- `nameKey` is the row's own key, taken from the plan the queue was
-           built from; a null - an id this plan never drew - interpolates to
-           nothing rather than to the word `null`. -->
-      <p class="report warn">
-        {t('models.firstLaunch.failed', { nameKey: labelKeyFor(plan, firstLaunch.failure.id) })}
-      </p>
-      <p class="report detail">{firstLaunch.failure.message}</p>
-    {:else if firstLaunch.stopped}
-      <p class="report">{t('models.firstLaunch.stopped')}</p>
-    {:else if firstLaunch.sequenceDone}
-      <p class="report">{t('models.firstLaunch.done')}</p>
-    {/if}
-
-    {#snippet buttons()}
-      {#if firstLaunch.running}
-        <Button onclick={cancelFirstLaunchDownload}>{t('settings.models.action.cancel')}</Button>
-      {:else if firstLaunch.sequenceDone}
-        <Button variant="primary" onclick={dismissFirstLaunch}>{t('shell.action.done')}</Button>
+<Modal
+  title={t('onboarding.title')}
+  meta={t('onboarding.stepOf', { current: position, total: FIRST_LAUNCH_STEPS.length })}
+  width={640}
+  blocking
+  onclose={firstLaunch.provisionerBusy
+    ? undefined
+    : firstLaunch.provisioning
+      ? closeFirstLaunchProvisioner
+      : dismissFirstLaunch}
+>
+  {#key step}
+    <section class="step" aria-labelledby={headingId}>
+      <h3 class="heading" id={headingId} tabindex="-1" bind:this={heading}>{t(HEADINGS[step])}</h3>
+      {#if step === 'welcome'}
+        <p class="lead">{t('onboarding.welcome.body')}</p>
+        <p class="lead">{t('onboarding.welcome.local')}</p>
+        <p class="note">{t('onboarding.welcome.steps')}</p>
+      {:else if step === 'models'}
+        <ModelsStep />
+      {:else if step === 'defaults'}
+        <DefaultsStep />
+      {:else if step === 'cloud'}
+        <CloudStep />
+      {:else if step === 'behavior'}
+        <BehaviorStep />
       {:else}
-        <Button onclick={dismissFirstLaunch}>{t('models.firstLaunch.action.notNow')}</Button>
-        <!-- Disabled on an empty **queue**, not on a total of zero: a row whose
-             size the view could not state counts as 0 bytes and is still a
-             download worth starting. -->
-        <Button
-          variant="primary"
-          disabled={queue.length === 0}
-          onclick={startFirstLaunchDownloads}
-        >
-          {t('models.firstLaunch.action.download', { bytes: total })}
-        </Button>
+        <DoneStep />
       {/if}
-    {/snippet}
-  </Modal>
-{/if}
+    </section>
+  {/key}
+
+  {#snippet footnote()}
+    <Button variant="plain" size="sm" disabled={firstLaunch.provisionerBusy} onclick={dismissFirstLaunch}>
+      {step === 'done' ? t('onboarding.action.close') : t('onboarding.action.skip')}
+    </Button>
+  {/snippet}
+
+  {#snippet buttons()}
+    {#if actions.back}
+      <Button onclick={prevFirstLaunchStep}>{t('onboarding.action.back')}</Button>
+    {/if}
+    {#if actions.secondary}
+      <Button onclick={actions.secondary.run}>{actions.secondary.label}</Button>
+    {/if}
+    {#if actions.primary}
+      <Button variant="primary" onclick={actions.primary.run}>{actions.primary.label}</Button>
+    {/if}
+  {/snippet}
+</Modal>
 
 <style>
-  .lede {
-    margin: 0 0 var(--s-4);
-    font-size: 11.5px;
-    color: var(--t2);
-    line-height: 1.5;
-  }
-  .group { margin-top: var(--s-4) }
-  .group :global(h3) { margin-bottom: 4px }
-  .note {
-    margin: 0;
-    font-size: 10.5px;
-    color: var(--t3);
-    line-height: 1.45;
-  }
-  /* The same table Settings › Models draws, so the two read as one list of
-     files rather than as two lists of different things. */
-  .rows {
-    margin: var(--s-2) 0 0;
-    padding: 0;
-    list-style: none;
-  }
-  .row {
+  /* A floor rather than a fixed height: the dialog keeps roughly one size
+     from step to step instead of jumping with each step's content, and a
+     short screen still gets the Modal's own scrolling body. */
+  .step {
     display: flex;
-    align-items: center;
-    gap: var(--s-3);
-    padding: var(--s-2) 0;
-    border-bottom: 1px solid var(--line);
+    flex-direction: column;
+    gap: var(--s-4);
+    min-height: 288px;
+    padding: var(--s-2) 0 var(--s-2);
+    animation: mcIn var(--dur-slow) var(--ease);
   }
-  .row-name {
-    flex: 1;
-    min-width: 0;
-    font-size: 12px;
+
+  .heading {
+    margin: 0 0 var(--s-1);
+    font-size: 17px;
+    font-weight: 600;
+    line-height: 1.3;
     color: var(--text);
   }
-  .row-meta {
-    flex: none;
-    font-size: 10.5px;
-    color: var(--t3);
-    line-height: 1.4;
-  }
-  .tick {
-    display: flex;
-    align-items: center;
-    gap: var(--s-2);
-    flex: 1;
-    min-width: 0;
-    cursor: pointer;
-  }
-  .tickable .row-name { flex: 1 }
-  .report {
-    margin: var(--s-3) 0 0;
-    font-size: 10.5px;
+  /* The heading takes focus only so a screen reader starts there. It is not a
+     control, and a ring around it would read as one. */
+  .heading:focus { outline: none }
+
+  /* The steps' shared type, set here so the six read as one piece. Each step
+     component uses these classes rather than restating them. */
+  .step :global(.lead) {
+    margin: 0;
+    max-width: 58ch;
+    font-size: 13px;
+    line-height: 1.55;
     color: var(--t2);
-    line-height: 1.45;
   }
-  /* A failure is the one line here the reader has to act on. */
-  .report.warn { color: var(--warn) }
-  .report.detail { word-break: break-word }
+  .step :global(.note) {
+    margin: 0;
+    max-width: 62ch;
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--t2);
+  }
+  .step :global(.alert) {
+    margin: 0;
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--warn);
+  }
 </style>

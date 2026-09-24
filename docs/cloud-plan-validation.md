@@ -1,5 +1,7 @@
 # Cloud Integration Plan Validation Report (Beam & Modal)
 
+**Status:** Phase record of the P0 validation of the plan at commit `03fcaba`. The plan has since been carried out offline; see [features.md](features.md) (Cloud section), [cloud-frontend.md](cloud-frontend.md), [cloud-provisioning.md](cloud-provisioning.md), and [findings.md](findings.md).
+
 **Target Plan:** [`manga-cleaner-cloud-master-plan.md`](../manga-cleaner-cloud-master-plan.md) | **Commit:** `03fcaba` | **Status:** Structurally Aligned
 
 ## 1. Executive Verdict & Test Baseline
@@ -25,7 +27,7 @@
 - **Legacy Engine Assumptions:** [`src/lib/model/masks.js:155-157`](../src/lib/model/masks.js#L155-L157) (`reRunnable`) checks `mask.provenance.engine !== 'cloud'`, conflating engine identity with execution location.
 - **Null Cost Display Semantics:** [`src/lib/model/masks.js:64-78`](../src/lib/model/masks.js#L64-L78) (`provenanceFacts`) requires formatting handling for nullable `cloud.cost` without displaying raw `null`.
 
-## 4. Milestone Task & Acceptance Matrix (P0–P11)
+## 4. Milestone Task & Acceptance Matrix (P0 to P11)
 
 | Phase & Deps | Implementer Scope | Reviewer 1 Scope (Rust/Backend/Security) | Reviewer 2 Scope (Frontend/UX/Packaging) |
 |---|---|---|---|

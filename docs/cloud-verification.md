@@ -1,7 +1,7 @@
 # Manga Cleaner Cloud Verification Baseline & Architecture Decisions (P0 / P2a / P2b)
 
 **Commit:** `03fcaba` | **Branch:** `codex/cloud-integration` | **Role:** P2b IMPLEMENTER
-**Status:** Partial implementation. Current acceptance and actual test logs are tracked in [cloud-work-log.md](cloud-work-log.md); this document also contains architecture decisions that are not yet implemented.
+**Status:** Phase record of partial implementation. Current acceptance and actual test logs are tracked in [cloud-work-log.md](cloud-work-log.md); the architecture decisions it lists are now implemented offline (see [features.md](features.md) Cloud section, [cloud-frontend.md](cloud-frontend.md), [cloud-provisioning.md](cloud-provisioning.md), and [findings.md](findings.md)).
 
 ---
 
@@ -114,5 +114,5 @@
   - `src-tauri/src/library.rs`: implemented conservative bounded symbolic allowlist (`[a-zA-Z0-9._\-/]`, len <= 128, no URLs/userinfo/control/whitespace) in `sanitize_identifier`, documented lexical boundary guarantee (non-cryptographic secret detection), removed duplicate `ApiProvenance` docblock, and verified safe `"unknown"` fallback.
   - `crates/cleaner-core/src/project/mod.rs`: restored from HEAD to eliminate whole-file formatting churn; transplanted `FORMAT_VERSION = 3` / `OLDEST_READABLE_VERSION = 1` documentation, raw JSON v1 and v2 migration fixtures, v3 roundtrip tests, and non-inferring undo serialization tests.
   - `crates/cleaner-core/src/engines/render.rs` & `patch.rs`: explicit pinned `RenderRecipe` without fabricated defaults, serde-derived `ExecutionTarget`, and honest `cost: Option<f64>` serializing explicit `null`.
-  - Frontend Routing & UI: `cleanRegionAutomatically` capped at `lama` for all automatic paths, `masks.provenance.cloudCost` retained with `null` value for `'—'` readout, and DOM tests added for `CloudCostDialog`.
+  - Frontend Routing & UI: `cleanRegionAutomatically` capped at `lama` for all automatic paths, `masks.provenance.cloudCost` retained with a `null` value, shown as an unknown cost (`masks.value.cloudCostUnknown`), and DOM tests added for `CloudCostDialog`.
 - **Test Execution Ownership:** Full test execution (`cargo check`, `cargo test -p cleaner-core`, `cargo test -p manga-cleaner`, `cargo clippy`, `npm test`) is handed over to orchestrator. Source files have been pruned of EOF whitespace and prepared for verification.

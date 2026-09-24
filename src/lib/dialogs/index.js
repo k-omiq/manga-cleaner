@@ -25,8 +25,7 @@ import SettingsDialog from './SettingsDialog.svelte'
 import ShortcutsDialog from './ShortcutsDialog.svelte'
 import ExportDialog from './ExportDialog.svelte'
 import FormatConversionDialog from './FormatConversionDialog.svelte'
-import CloudTransmissionDialog from './CloudTransmissionDialog.svelte'
-import CloudCostDialog from './CloudCostDialog.svelte'
+import CloudConsentDialog from './CloudConsentDialog.svelte'
 
 /**
  * Null-prototype on purpose. `kind` is a plain string that reaches this table
@@ -38,8 +37,7 @@ const DIALOGS = Object.assign(Object.create(null), homeDialogs, {
   shortcuts: ShortcutsDialog,
   export: ExportDialog,
   formatConversion: FormatConversionDialog,
-  cloudTransmission: CloudTransmissionDialog,
-  cloudCost: CloudCostDialog,
+  cloudConsent: CloudConsentDialog,
 })
 
 /**

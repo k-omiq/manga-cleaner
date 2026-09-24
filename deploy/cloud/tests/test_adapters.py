@@ -1,901 +1,336 @@
-"""Integration and parity tests for Modal and Beam adapters, cold/warm lifecycle, and fault injection."""
+"""Provider apps: settings, what gets uploaded, and the real SDK objects they declare.
 
+The settings and staging tests need no SDK. The app import tests run only where the
+modal or beam package is installed; they build the decorators and images offline
+(lazy SDK objects, a loopback channel) and never contact a provider.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import importlib
 import json
+import os
+import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
-from typing import Dict, Tuple
-from unittest.mock import MagicMock, patch
+from typing import Dict, Iterator
+from contextlib import contextmanager
 
-
-from deploy.cloud.beam.app import BeamAppAdapter, build_beam_app, create_beam_gateway
-from deploy.cloud.common.contract import (
-    PROTOCOL_VERSION,
-    CloudProvider,
-    HealthResponse,
-    JobAcceptedResponse,
-    JobCancelResponse,
-    JobExecutionStatus,
-    JobRequestMetadata,
-    JobStatusResponse,
-    ModelInfoResponse,
-    PreEnqueueRejectionResponse,
-    ResultMetadata,
-    WarmupResponse,
-    compute_request_digest,
-    provisional_fixture_limits,
-    validate_cancel_response,
-    validate_health_response,
-    validate_job_accepted_response,
-    validate_job_request_metadata,
-    validate_model_info_response,
-    validate_png_header,
-    validate_response_binding,
-    validate_result_bytes,
-    validate_worker_result,
+from deploy.cloud.beam import settings as beam_settings
+from deploy.cloud.beam.settings import BeamSettings, resolve_weights_root, secret_name_for
+from deploy.cloud.beam.stage import IGNORE_FILE_CONTENTS, IGNORE_FILE_NAME, stage_app
+from deploy.cloud.common.contract import JobExecutionStatus, JobRequestMetadata
+from deploy.cloud.common.deployment import (
+    DEFAULT_IDLE_SECONDS,
+    ENV_INSTALLATION_ID,
+    JOB_TIMEOUT_SECONDS,
+    SEED_TIMEOUT_SECONDS,
+    parse_gpu,
+    parse_idle_seconds,
 )
-from deploy.cloud.common.api import CloudGateway
-from deploy.cloud.common.flux import FluxWorker, WorkerLifecycleState, encode_png_rgb8
-from deploy.cloud.common.handle_mapping import InMemoryHandleRegistry, JobRecord
+from deploy.cloud.common.handle_mapping import InMemoryHandleRegistry
 from deploy.cloud.common.manifest import (
-    MODEL_TEST_FLUX,
     RECIPE_TEST_SDNQ,
     REVISION_TEST_FLUX,
     ManifestFileRecord,
     ModelManifest,
-    get_default_model_info,
-    is_recipe_supported,
     verify_model_manifest,
 )
 from deploy.cloud.common.redact import REDACTED_PRESIGNED_URL, REDACTED_SECRET, redact_dict, redact_text
-from deploy.cloud.modal.app import ModalAppAdapter, build_modal_app, create_modal_gateway
-from deploy.cloud.tests.test_gateway import build_multipart_body
+from deploy.cloud.modal.settings import ModalSettings
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
 
 
-class TestCloudAdapters(unittest.TestCase):
-    def setUp(self):
-        with open(FIXTURES_DIR / "tiny_image.png", "rb") as f:
-            self.tiny_image_bytes = f.read()
-        with open(FIXTURES_DIR / "tiny_hint.png", "rb") as f:
-            self.tiny_hint_bytes = f.read()
-        with open(FIXTURES_DIR / "job_request_metadata.json", "r", encoding="utf-8") as f:
-            self.job_meta_dict = json.load(f)
-            self.job_meta_json = json.dumps(self.job_meta_dict)
-            self.job_meta = JobRequestMetadata.from_dict(self.job_meta_dict)
+def _installed(name: str) -> bool:
+    try:
+        importlib.import_module(name)
+    except ImportError:
+        return False
+    return True
 
-        self.limits = provisional_fixture_limits()
 
-        # Modal Adapter instance with explicit test credentials
-        self.modal_adapter = ModalAppAdapter(
-            token_id="modal-key-abc",
-            token_secret="modal-secret-xyz",
-            limits=self.limits,
+@contextmanager
+def patched_environ(values: Dict[str, str]) -> Iterator[None]:
+    saved = {key: os.environ.get(key) for key in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+class DeploymentKnobsTest(unittest.TestCase):
+    def test_idle_seconds_bounds(self) -> None:
+        self.assertEqual([parse_idle_seconds(v) for v in (60, "600", 120.0)], [60, 600, 120])
+        for bad in (59, 601, "soon", True, 90.5, None):
+            with self.assertRaises(ValueError):
+                parse_idle_seconds(bad)
+
+    def test_gpu_allowlists(self) -> None:
+        self.assertEqual(parse_gpu(" l40s ", ("L4", "A10", "L40S")), "L40S")
+        self.assertEqual(parse_gpu("rtx4090", beam_settings.GPU_ALLOWLIST), "RTX4090")
+        for bad in ("H100", "", None):
+            with self.assertRaises(ValueError):
+                parse_gpu(bad, ("L4", "A10", "L40S"))
+
+    def test_job_and_seed_timeouts(self) -> None:
+        self.assertEqual((JOB_TIMEOUT_SECONDS, SEED_TIMEOUT_SECONDS), (600, 3600))
+
+
+class ModalSettingsTest(unittest.TestCase):
+    def test_names_and_env_round_trip(self) -> None:
+        settings = ModalSettings.for_installation("mc-ab12cd", "mc-ab12cd", gpu="a10", idle_seconds=300)
+        self.assertEqual(
+            (settings.app_name, settings.volume_name, settings.dict_name, settings.gpu),
+            ("mc-ab12cd", "mc-ab12cd-weights", "mc-ab12cd-jobs", "A10"),
         )
-        self.modal_auth = {"Modal-Key": "modal-key-abc", "Modal-Secret": "modal-secret-xyz"}
+        self.assertIsNone(settings.environment)
+        self.assertEqual(ModalSettings.from_env(settings.to_env()), settings)
 
-        # Beam Adapter instance with explicit test credentials
-        self.beam_adapter = BeamAppAdapter(
-            bearer_token="beam-token-123",
-            limits=self.limits,
-        )
-        self.beam_auth = {"Authorization": "Bearer beam-token-123"}
+    def test_defaults(self) -> None:
+        settings = ModalSettings.from_env({ENV_INSTALLATION_ID: "mc-x1"})
+        self.assertEqual((settings.gpu, settings.idle_seconds, settings.app_name), ("L4", DEFAULT_IDLE_SECONDS, "mc-x1"))
 
-    def test_modal_and_beam_fixture_parity(self):
-        """Verify both Modal and Beam adapters produce exact matching fixture structures."""
-        # 1. Health
-        _, _, modal_health_raw = self.modal_adapter.handle_request("GET", "/health", self.modal_auth, b"")
-        modal_health = HealthResponse.from_dict(json.loads(modal_health_raw.decode("utf-8")))
-        self.assertEqual(modal_health.provider, "modal")
-        self.assertEqual(modal_health.status, "ok")
-
-        _, _, beam_health_raw = self.beam_adapter.handle_request("GET", "/health", self.beam_auth, b"")
-        beam_health = HealthResponse.from_dict(json.loads(beam_health_raw.decode("utf-8")))
-        self.assertEqual(beam_health.provider, "beam")
-        self.assertEqual(beam_health.status, "ok")
-
-        # 2. Model Info
-        _, _, modal_info_raw = self.modal_adapter.handle_request("GET", "/model-info", self.modal_auth, b"")
-        modal_info = ModelInfoResponse.from_dict(json.loads(modal_info_raw.decode("utf-8")))
-        _, _, beam_info_raw = self.beam_adapter.handle_request("GET", "/model-info", self.beam_auth, b"")
-        beam_info = ModelInfoResponse.from_dict(json.loads(beam_info_raw.decode("utf-8")))
-
-        self.assertEqual(modal_info.model_id, beam_info.model_id)
-        self.assertEqual(modal_info.model_revision, beam_info.model_revision)
-        self.assertEqual(modal_info.recipe_id, beam_info.recipe_id)
-        self.assertEqual(modal_info.preprocessing_version, beam_info.preprocessing_version)
-        self.assertFalse(modal_info.native_mask_conditioning)
-        self.assertFalse(beam_info.native_mask_conditioning)
-        self.assertEqual(modal_info.limits.max_width, beam_info.limits.max_width)
-
-    def test_cold_warm_worker_lifecycle(self):
-        """Test worker cold start vs pre-warmed execution."""
-        worker = FluxWorker(provider="modal", simulated_cold_start_delay=0.0)
-        self.assertFalse(worker.is_warm)
-        self.assertEqual(worker.state, WorkerLifecycleState.UNINITIALIZED)
-
-        # 1. Explicit warmup probe transitions to WARMED
-        warm_res = worker.warmup()
-        self.assertTrue(worker.is_warm)
-        self.assertEqual(worker.state, WorkerLifecycleState.WARMED)
-        self.assertEqual(worker.warmup_count, 1)
-
-        # 2. Subsequent inference executes on warm worker
-        rec = JobRecord(
-            app_handle="handle-test-warm",
-            native_handle="native-test-warm",
-            provider="modal",
-            job_id="job-1",
-            attempt_id="att-1",
-            request_digest=self.job_meta.request_digest,
-            recipe=self.job_meta.recipe,
-            width=16,
-            height=16,
-            seed=42,
-            steps=4,
-            guidance_scaled=350,
-        )
-        res_png, res_digest, cost = worker.infer(rec, self.tiny_image_bytes, self.tiny_hint_bytes)
-        validate_png_header(res_png, 16, 16, 2)
-        self.assertGreater(len(res_png), 0)
-        self.assertTrue(worker.is_warm)
-        self.assertEqual(worker.inference_count, 1)
-
-    def test_malformed_and_oversized_output_handling(self):
-        """Test worker fault injection and robust gateway failure handling."""
-        faulty_worker = FluxWorker(provider="modal")
-        faulty_gateway = CloudGateway(
-            provider=CloudProvider.MODAL,
-            limits=self.limits,
-            handle_registry=InMemoryHandleRegistry(),
-            worker=faulty_worker,
-            proxy_token_id="modal-key-abc",
-            proxy_token_secret="modal-secret-xyz",
-            auto_execute=True,
-        )
-
-        ct_header, multipart_body = build_multipart_body(
-            self.job_meta_json, self.tiny_image_bytes, self.tiny_hint_bytes
-        )
-        req_headers = {"Modal-Key": "modal-key-abc", "Modal-Secret": "modal-secret-xyz", "Content-Type": ct_header}
-
-        # 1. Inject OOM fault
-        faulty_worker.simulated_fault = "oom"
-        code, _, body = faulty_gateway.handle_http_request("POST", "/mc/v1/jobs", req_headers, multipart_body)
-        self.assertEqual(code, 202)
-        accepted = JobAcceptedResponse.from_dict(json.loads(body.decode("utf-8")))
-        handle = accepted.handle
-
-        code, _, body = faulty_gateway.handle_http_request("GET", f"/mc/v1/jobs/{handle}", req_headers, b"")
-        self.assertEqual(code, 200)
-        status_resp = JobStatusResponse.from_dict(json.loads(body.decode("utf-8")))
-        self.assertEqual(status_resp.status, JobExecutionStatus.FAILED.value)
-        self.assertIsNotNone(status_resp.error)
-        self.assertEqual(status_resp.error.error_code, "execution_failed")
-        self.assertIn("out of memory", status_resp.error.message.lower())
-
-        code, _, _ = faulty_gateway.handle_http_request("GET", f"/mc/v1/jobs/{handle}/result", req_headers, b"")
-        self.assertEqual(code, 409)
-
-        # 2. Inject corrupted_output fault
-        faulty_worker.simulated_fault = "corrupted_output"
-        job_meta_2_dict = dict(self.job_meta_dict)
-        job_meta_2_dict["job_id"] = "job-corrupt-001"
-        job_meta_2_dict["request_digest"] = compute_request_digest(JobRequestMetadata.from_dict(job_meta_2_dict))
-        ct_header2, body2 = build_multipart_body(
-            json.dumps(job_meta_2_dict), self.tiny_image_bytes, self.tiny_hint_bytes
-        )
-        req_headers2 = {"Modal-Key": "modal-key-abc", "Modal-Secret": "modal-secret-xyz", "Content-Type": ct_header2}
-
-        code, _, resp_body = faulty_gateway.handle_http_request("POST", "/mc/v1/jobs", req_headers2, body2)
-        self.assertEqual(code, 202)
-        accepted2 = JobAcceptedResponse.from_dict(json.loads(resp_body.decode("utf-8")))
-        self.assertEqual(accepted2.status, JobExecutionStatus.PENDING.value)
-        handle2 = accepted2.handle
-
-        code, _, resp_body = faulty_gateway.handle_http_request("GET", f"/mc/v1/jobs/{handle2}", req_headers2, b"")
-        self.assertEqual(code, 200)
-        status_resp2 = JobStatusResponse.from_dict(json.loads(resp_body.decode("utf-8")))
-        self.assertEqual(status_resp2.status, JobExecutionStatus.FAILED.value)
-        self.assertIsNotNone(status_resp2.error)
-        self.assertEqual(status_resp2.error.error_code, "execution_failed")
-        self.assertIsNone(status_resp2.result_digest)
-        self.assertIsNone(status_resp2.result_bytes)
-
-        code, _, _ = faulty_gateway.handle_http_request("GET", f"/mc/v1/jobs/{handle2}/result", req_headers2, b"")
-        self.assertEqual(code, 409)
-
-        # 3. Inject wrong_dimensions fault
-        faulty_worker.simulated_fault = "wrong_dimensions"
-        job_meta_3_dict = dict(self.job_meta_dict)
-        job_meta_3_dict["job_id"] = "job-dim-001"
-        job_meta_3_dict["request_digest"] = compute_request_digest(JobRequestMetadata.from_dict(job_meta_3_dict))
-        ct_header3, body3 = build_multipart_body(
-            json.dumps(job_meta_3_dict), self.tiny_image_bytes, self.tiny_hint_bytes
-        )
-        req_headers3 = {"Modal-Key": "modal-key-abc", "Modal-Secret": "modal-secret-xyz", "Content-Type": ct_header3}
-
-        code, _, resp_body = faulty_gateway.handle_http_request("POST", "/mc/v1/jobs", req_headers3, body3)
-        self.assertEqual(code, 202)
-        accepted3 = JobAcceptedResponse.from_dict(json.loads(resp_body.decode("utf-8")))
-        self.assertEqual(accepted3.status, JobExecutionStatus.PENDING.value)
-        handle3 = accepted3.handle
-
-        code, _, resp_body = faulty_gateway.handle_http_request("GET", f"/mc/v1/jobs/{handle3}", req_headers3, b"")
-        self.assertEqual(code, 200)
-        status_resp3 = JobStatusResponse.from_dict(json.loads(resp_body.decode("utf-8")))
-        self.assertEqual(status_resp3.status, JobExecutionStatus.FAILED.value)
-        self.assertIsNotNone(status_resp3.error)
-        self.assertEqual(status_resp3.error.error_code, "execution_failed")
-        self.assertIn("dimensions", status_resp3.error.message.lower())
-        self.assertIsNone(status_resp3.result_digest)
-        self.assertIsNone(status_resp3.result_bytes)
-
-        code, _, _ = faulty_gateway.handle_http_request("GET", f"/mc/v1/jobs/{handle3}/result", req_headers3, b"")
-        self.assertEqual(code, 409)
-
-    def test_corrupted_output_and_wrong_dimensions_modal_and_beam_simulation(self):
-        """Verify corrupted output and wrong dimensions fail in Modal and Beam adapter simulation paths."""
-        # 1. Modal simulate_function_call with corrupted_output
-        modal_worker = FluxWorker(provider="modal")
-        modal_adapter = ModalAppAdapter(
-            token_id="modal-key-abc",
-            token_secret="modal-secret-xyz",
-            worker=modal_worker,
-            limits=self.limits,
-        )
-        modal_worker.simulated_fault = "corrupted_output"
-        job_meta_corrupt = JobRequestMetadata.from_dict({
-            **self.job_meta_dict,
-            "job_id": "job-modal-sim-corrupt",
-            "request_digest": compute_request_digest(
-                JobRequestMetadata.from_dict({**self.job_meta_dict, "job_id": "job-modal-sim-corrupt"})
-            ),
-        })
-        native_id = modal_adapter.simulate_function_call(
-            job_meta=job_meta_corrupt,
-            img_bytes=self.tiny_image_bytes,
-            hint_bytes=self.tiny_hint_bytes,
-        )
-        rec = modal_adapter.handle_registry.get_by_native_handle(native_id)
-        self.assertIsNotNone(rec)
-        self.assertEqual(rec.status, JobExecutionStatus.FAILED)
-        self.assertIsNotNone(rec.error)
-        self.assertEqual(rec.error.error_code, "execution_failed")
-        self.assertIsNone(rec.result_data)
-        self.assertIsNone(rec.result_digest)
-
-        code, _, _ = modal_adapter.handle_request("GET", f"/mc/v1/jobs/{rec.app_handle}/result", self.modal_auth, b"")
-        self.assertEqual(code, 409)
-
-        # 2. Modal simulate_function_call with wrong_dimensions
-        modal_worker.simulated_fault = "wrong_dimensions"
-        job_meta_wrong_dim = JobRequestMetadata.from_dict({
-            **self.job_meta_dict,
-            "job_id": "job-modal-sim-dim",
-            "request_digest": compute_request_digest(
-                JobRequestMetadata.from_dict({**self.job_meta_dict, "job_id": "job-modal-sim-dim"})
-            ),
-        })
-        native_id_dim = modal_adapter.simulate_function_call(
-            job_meta=job_meta_wrong_dim,
-            img_bytes=self.tiny_image_bytes,
-            hint_bytes=self.tiny_hint_bytes,
-        )
-        rec_dim = modal_adapter.handle_registry.get_by_native_handle(native_id_dim)
-        self.assertIsNotNone(rec_dim)
-        self.assertEqual(rec_dim.status, JobExecutionStatus.FAILED)
-        self.assertIsNotNone(rec_dim.error)
-        self.assertEqual(rec_dim.error.error_code, "execution_failed")
-        self.assertIn("dimensions", rec_dim.error.message.lower())
-        self.assertIsNone(rec_dim.result_data)
-
-        code, _, _ = modal_adapter.handle_request("GET", f"/mc/v1/jobs/{rec_dim.app_handle}/result", self.modal_auth, b"")
-        self.assertEqual(code, 409)
-
-        # 3. Beam simulate_task_enqueue with corrupted_output
-        beam_worker = FluxWorker(provider="beam")
-        beam_adapter = BeamAppAdapter(
-            bearer_token="beam-token-123",
-            worker=beam_worker,
-            limits=self.limits,
-        )
-        beam_worker.simulated_fault = "corrupted_output"
-        job_meta_beam_corrupt = JobRequestMetadata.from_dict({
-            **self.job_meta_dict,
-            "job_id": "job-beam-sim-corrupt",
-            "request_digest": compute_request_digest(
-                JobRequestMetadata.from_dict({**self.job_meta_dict, "job_id": "job-beam-sim-corrupt"})
-            ),
-        })
-        beam_task_id = beam_adapter.simulate_task_enqueue(
-            job_meta=job_meta_beam_corrupt,
-            img_bytes=self.tiny_image_bytes,
-            hint_bytes=self.tiny_hint_bytes,
-        )
-        beam_rec = beam_adapter.handle_registry.get_by_native_handle(beam_task_id)
-        self.assertIsNotNone(beam_rec)
-        self.assertEqual(beam_rec.status, JobExecutionStatus.FAILED)
-        self.assertIsNotNone(beam_rec.error)
-        self.assertEqual(beam_rec.error.error_code, "execution_failed")
-        self.assertIsNone(beam_rec.result_data)
-
-        code, _, _ = beam_adapter.handle_request("GET", f"/mc/v1/jobs/{beam_rec.app_handle}/result", self.beam_auth, b"")
-        self.assertEqual(code, 409)
-
-        # 4. Beam simulate_task_enqueue with wrong_dimensions
-        beam_worker.simulated_fault = "wrong_dimensions"
-        job_meta_beam_dim = JobRequestMetadata.from_dict({
-            **self.job_meta_dict,
-            "job_id": "job-beam-sim-dim",
-            "request_digest": compute_request_digest(
-                JobRequestMetadata.from_dict({**self.job_meta_dict, "job_id": "job-beam-sim-dim"})
-            ),
-        })
-        beam_task_dim_id = beam_adapter.simulate_task_enqueue(
-            job_meta=job_meta_beam_dim,
-            img_bytes=self.tiny_image_bytes,
-            hint_bytes=self.tiny_hint_bytes,
-        )
-        beam_dim_rec = beam_adapter.handle_registry.get_by_native_handle(beam_task_dim_id)
-        self.assertIsNotNone(beam_dim_rec)
-        self.assertEqual(beam_dim_rec.status, JobExecutionStatus.FAILED)
-        self.assertIsNotNone(beam_dim_rec.error)
-        self.assertEqual(beam_dim_rec.error.error_code, "execution_failed")
-        self.assertIn("dimensions", beam_dim_rec.error.message.lower())
-        self.assertIsNone(beam_dim_rec.result_data)
-
-        code, _, _ = beam_adapter.handle_request("GET", f"/mc/v1/jobs/{beam_dim_rec.app_handle}/result", self.beam_auth, b"")
-        self.assertEqual(code, 409)
-
-    def test_valid_output_modal_and_beam_simulation(self):
-        """Verify conforming worker output succeeds and is fully retrievable across Modal and Beam."""
-        # 1. Modal valid simulation
-        modal_worker = FluxWorker(provider="modal")
-        modal_adapter = ModalAppAdapter(
-            token_id="modal-key-abc",
-            token_secret="modal-secret-xyz",
-            worker=modal_worker,
-            limits=self.limits,
-        )
-        job_meta_valid = JobRequestMetadata.from_dict({
-            **self.job_meta_dict,
-            "job_id": "job-modal-sim-valid",
-            "request_digest": compute_request_digest(
-                JobRequestMetadata.from_dict({**self.job_meta_dict, "job_id": "job-modal-sim-valid"})
-            ),
-        })
-        native_id = modal_adapter.simulate_function_call(
-            job_meta=job_meta_valid,
-            img_bytes=self.tiny_image_bytes,
-            hint_bytes=self.tiny_hint_bytes,
-        )
-        rec = modal_adapter.handle_registry.get_by_native_handle(native_id)
-        self.assertIsNotNone(rec)
-        self.assertEqual(rec.status, JobExecutionStatus.COMPLETED)
-        self.assertIsNone(rec.error)
-        self.assertIsNotNone(rec.result_data)
-        self.assertIsNotNone(rec.result_digest)
-
-        code, headers, body = modal_adapter.handle_request("GET", f"/mc/v1/jobs/{rec.app_handle}/result", self.modal_auth, b"")
-        self.assertEqual(code, 200)
-        self.assertEqual(headers["Content-Type"], "image/png")
-        self.assertEqual(headers["X-MC-Result-Digest"], rec.result_digest)
-        validate_png_header(body, job_meta_valid.width, job_meta_valid.height, 2)
-
-        # 2. Beam valid simulation
-        beam_worker = FluxWorker(provider="beam")
-        beam_adapter = BeamAppAdapter(
-            bearer_token="beam-token-123",
-            worker=beam_worker,
-            limits=self.limits,
-        )
-        job_meta_beam_valid = JobRequestMetadata.from_dict({
-            **self.job_meta_dict,
-            "job_id": "job-beam-sim-valid",
-            "request_digest": compute_request_digest(
-                JobRequestMetadata.from_dict({**self.job_meta_dict, "job_id": "job-beam-sim-valid"})
-            ),
-        })
-        beam_task_id = beam_adapter.simulate_task_enqueue(
-            job_meta=job_meta_beam_valid,
-            img_bytes=self.tiny_image_bytes,
-            hint_bytes=self.tiny_hint_bytes,
-        )
-        beam_rec = beam_adapter.handle_registry.get_by_native_handle(beam_task_id)
-        self.assertIsNotNone(beam_rec)
-        self.assertEqual(beam_rec.status, JobExecutionStatus.COMPLETED)
-        self.assertIsNone(beam_rec.error)
-        self.assertIsNotNone(beam_rec.result_data)
-
-        code, headers, body = beam_adapter.handle_request("GET", f"/mc/v1/jobs/{beam_rec.app_handle}/result", self.beam_auth, b"")
-        self.assertEqual(code, 200)
-        self.assertEqual(headers["Content-Type"], "image/png")
-        self.assertEqual(headers["X-MC-Result-Digest"], beam_rec.result_digest)
-        validate_png_header(body, job_meta_beam_valid.width, job_meta_beam_valid.height, 2)
-
-
-    def test_result_retry_by_same_handle(self):
-        """Test downloading result multiple times returns identical bytes without duplicate inference."""
-        ct_header, multipart_body = build_multipart_body(
-            self.job_meta_json, self.tiny_image_bytes, self.tiny_hint_bytes
-        )
-        req_headers = dict(self.modal_auth)
-        req_headers["Content-Type"] = ct_header
-
-        # Submit job
-        _, _, body = self.modal_adapter.handle_request("POST", "/mc/v1/jobs", req_headers, multipart_body)
-        accepted = JobAcceptedResponse.from_dict(json.loads(body.decode("utf-8")))
-        handle = accepted.handle
-
-        # Initial inference count
-        initial_inf_count = self.modal_adapter.worker.inference_count
-
-        # First result download
-        code1, headers1, body1 = self.modal_adapter.handle_request(
-            "GET", f"/mc/v1/jobs/{handle}/result", self.modal_auth, b""
-        )
-        self.assertEqual(code1, 200)
-
-        # Second result download
-        code2, headers2, body2 = self.modal_adapter.handle_request(
-            "GET", f"/mc/v1/jobs/{handle}/result", self.modal_auth, b""
-        )
-        self.assertEqual(code2, 200)
-
-        # Third result download
-        code3, headers3, body3 = self.modal_adapter.handle_request(
-            "GET", f"/mc/v1/jobs/{handle}/result", self.modal_auth, b""
-        )
-        self.assertEqual(code3, 200)
-
-        # Byte content and digest headers must be identical
-        self.assertEqual(body1, body2)
-        self.assertEqual(body2, body3)
-        self.assertEqual(headers1["X-MC-Result-Digest"], headers2["X-MC-Result-Digest"])
-
-        # No new inference was run on result retries
-        self.assertEqual(self.modal_adapter.worker.inference_count, initial_inf_count)
-
-    def test_ambiguous_submit_and_no_blind_retry(self):
-        """Verify ambiguous submission handling and existing handle reuse on repeat submit."""
-        ct_header, multipart_body = build_multipart_body(
-            self.job_meta_json, self.tiny_image_bytes, self.tiny_hint_bytes
-        )
-        req_headers = dict(self.modal_auth)
-        req_headers["Content-Type"] = ct_header
-
-        # First submission
-        _, _, body1 = self.modal_adapter.handle_request("POST", "/mc/v1/jobs", req_headers, multipart_body)
-        accepted1 = JobAcceptedResponse.from_dict(json.loads(body1.decode("utf-8")))
-
-        # Repeated submission with the same job_id and attempt_id
-        _, _, body2 = self.modal_adapter.handle_request("POST", "/mc/v1/jobs", req_headers, multipart_body)
-        accepted2 = JobAcceptedResponse.from_dict(json.loads(body2.decode("utf-8")))
-
-        # Must return the SAME application handle rather than creating a second job
-        self.assertEqual(accepted1.handle, accepted2.handle)
-        self.assertEqual(accepted1.job_id, accepted2.job_id)
-        self.assertEqual(accepted1.attempt_id, accepted2.attempt_id)
-        self.assertEqual(accepted1.status, JobExecutionStatus.PENDING.value)
-        self.assertEqual(accepted2.status, JobExecutionStatus.PENDING.value)
-
-        # Inference count must remain exactly 1 without re-executing or billing
-        self.assertEqual(self.modal_adapter.worker.inference_count, 1)
-
-    def test_duplicate_submission_does_not_reexecute_or_bill(self):
-        """Verify duplicate (job_id, attempt_id) submissions return existing handle and inference_count stays 1."""
-        worker = FluxWorker(provider="beam", limits=self.limits)
-        adapter = BeamAppAdapter(bearer_token="beam-token-123", worker=worker, limits=self.limits)
-        auth = {"Authorization": "Bearer beam-token-123"}
-
-        ct_header, multipart_body = build_multipart_body(
-            self.job_meta_json, self.tiny_image_bytes, self.tiny_hint_bytes
-        )
-        headers = dict(auth)
-        headers["Content-Type"] = ct_header
-
-        self.assertEqual(worker.inference_count, 0)
-
-        # 1. Initial submission
-        code1, _, body1 = adapter.handle_request("POST", "/mc/v1/jobs", headers, multipart_body)
-        self.assertEqual(code1, 202)
-        accepted1 = JobAcceptedResponse.from_dict(json.loads(body1.decode("utf-8")))
-        self.assertEqual(accepted1.status, "pending")
-        self.assertEqual(worker.inference_count, 1)
-
-        # 2. Duplicate submission with exact same job_id & attempt_id
-        code2, _, body2 = adapter.handle_request("POST", "/mc/v1/jobs", headers, multipart_body)
-        self.assertEqual(code2, 202)
-        accepted2 = JobAcceptedResponse.from_dict(json.loads(body2.decode("utf-8")))
-        self.assertEqual(accepted2.handle, accepted1.handle)
-        self.assertEqual(accepted2.status, "pending")
-        # Critical invariant: inference_count MUST stay 1
-        self.assertEqual(worker.inference_count, 1)
-
-    def test_execute_worker_job_honors_cancel_requested_and_terminal_states(self):
-        """execute_worker_job must honor cancel_requested and terminal states and never run or overwrite them."""
-        from deploy.cloud.common.api import execute_worker_job
-
-        registry = InMemoryHandleRegistry()
-        worker = FluxWorker(provider="modal", limits=self.limits)
-
-        # 1. Job with cancel_requested = True before execution
-        record1 = registry.register_job(
-            job_meta=self.job_meta,
-            native_handle="native-cancel-test-1",
-            app_handle="handle-cancel-1",
-            provider="modal",
-        )
-        registry.request_cancel("handle-cancel-1")
-        self.assertTrue(record1.cancel_requested)
-
-        ran1 = execute_worker_job(
-            handle_registry=registry,
-            worker=worker,
-            record=record1,
-            img_bytes=self.tiny_image_bytes,
-            hint_bytes=self.tiny_hint_bytes,
-            limits=self.limits,
-            auto_execute=True,
-        )
-        self.assertFalse(ran1)
-        self.assertEqual(worker.inference_count, 0)
-        self.assertEqual(record1.status, JobExecutionStatus.PENDING)
-
-        # 2. Job already completed
-        record2 = JobRecord(
-            app_handle="handle-term-comp",
-            native_handle="native-term-comp",
-            provider="modal",
-            job_id="job-comp-1",
-            attempt_id="att-comp-1",
-            request_digest=self.job_meta.request_digest,
-            recipe=self.job_meta.recipe,
-            width=16,
-            height=16,
-            seed=42,
-            steps=4,
-            guidance_scaled=350,
-            status=JobExecutionStatus.COMPLETED,
-        )
-        ran2 = execute_worker_job(
-            handle_registry=registry,
-            worker=worker,
-            record=record2,
-            img_bytes=self.tiny_image_bytes,
-            hint_bytes=self.tiny_hint_bytes,
-            limits=self.limits,
-            auto_execute=True,
-        )
-        self.assertFalse(ran2)
-        self.assertEqual(worker.inference_count, 0)
-        self.assertEqual(record2.status, JobExecutionStatus.COMPLETED)
-
-        # 3. Job already failed
-        record3 = JobRecord(
-            app_handle="handle-term-fail",
-            native_handle="native-term-fail",
-            provider="modal",
-            job_id="job-fail-1",
-            attempt_id="att-fail-1",
-            request_digest=self.job_meta.request_digest,
-            recipe=self.job_meta.recipe,
-            width=16,
-            height=16,
-            seed=42,
-            steps=4,
-            guidance_scaled=350,
-            status=JobExecutionStatus.FAILED,
-        )
-        ran3 = execute_worker_job(
-            handle_registry=registry,
-            worker=worker,
-            record=record3,
-            img_bytes=self.tiny_image_bytes,
-            hint_bytes=self.tiny_hint_bytes,
-            limits=self.limits,
-            auto_execute=True,
-        )
-        self.assertFalse(ran3)
-        self.assertEqual(worker.inference_count, 0)
-        self.assertEqual(record3.status, JobExecutionStatus.FAILED)
-
-    def test_presigned_url_redaction_beam_and_gcs_x_goog(self):
-        """Verify Beam, S3, and GCS X-Goog signed URLs are completely redacted in text and dictionaries."""
-        # 1. GCS X-Goog signed URL
-        gcs_signed_url = (
-            "https://storage.googleapis.com/manga-bucket/output/clean.png?"
-            "X-Goog-Algorithm=GOOG4-RSA-SHA256&"
-            "X-Goog-Credential=service-account%40proj.iam.gserviceaccount.com&"
-            "X-Goog-Date=20260921T120000Z&"
-            "X-Goog-Expires=3600&"
-            "X-Goog-SignedHeaders=host&"
-            "X-Goog-Signature=abcdef1234567890secretgoogsignature"
-        )
-        redacted_gcs = redact_text(f"Fetched artifact from {gcs_signed_url}")
-        self.assertNotIn("secretgoogsignature", redacted_gcs)
-        self.assertNotIn("service-account", redacted_gcs)
-        self.assertIn(REDACTED_PRESIGNED_URL, redacted_gcs)
-
-        # 2. GCS GoogleAccessId style signed URL
-        gcs_legacy_url = "https://storage.googleapis.com/bucket/out.png?GoogleAccessId=acc@proj.iam.gserviceaccount.com&Signature=legacysecret123"
-        redacted_legacy = redact_text(f"URL: {gcs_legacy_url}")
-        self.assertNotIn("legacysecret123", redacted_legacy)
-        self.assertIn(REDACTED_PRESIGNED_URL, redacted_legacy)
-
-        # 3. S3 / Beam presigned URL
-        presigned_link = "https://storage.beam.cloud/v2/outputs/crop123.png?X-Amz-Signature=secret999&X-Amz-Credential=AKIAEXAMPLE"
-        redacted_s3 = redact_text(f"Task completed. Download at {presigned_link}")
-        self.assertNotIn("secret999", redacted_s3)
-        self.assertIn(REDACTED_PRESIGNED_URL, redacted_s3)
-
-        # 4. Dictionary redaction
-        d = {
-            "gcs_signed_url": gcs_signed_url,
-            "nested": {"url_text": f"GCS link: {gcs_signed_url}"},
-        }
-        redacted_d = redact_dict(d)
-        self.assertEqual(redacted_d["gcs_signed_url"], REDACTED_SECRET)
-        self.assertNotIn("secretgoogsignature", str(redacted_d))
-
-    def test_presigned_url_redaction_beam(self):
-        """Verify Beam presigned storage URLs are redacted from logs and never returned in API responses."""
-        presigned_link = "https://storage.beam.cloud/v2/outputs/crop123.png?X-Amz-Signature=secret999&X-Amz-Credential=AKIAEXAMPLE"
-
-        # Native task enqueue simulation with internal storage URL
-        native_task_id = self.beam_adapter.simulate_task_enqueue(
-            job_meta=self.job_meta,
-            img_bytes=self.tiny_image_bytes,
-            hint_bytes=self.tiny_hint_bytes,
-            presigned_storage_url=presigned_link,
-        )
-
-        record = self.beam_adapter.handle_registry.get_by_native_handle(native_task_id)
-        self.assertIsNotNone(record)
-        handle = record.app_handle
-
-        # 1. API status polling response does NOT leak presigned URL
-        _, _, status_raw = self.beam_adapter.handle_request("GET", f"/mc/v1/jobs/{handle}", self.beam_auth, b"")
-        status_text = status_raw.decode("utf-8")
-        self.assertNotIn("secret999", status_text)
-        self.assertNotIn("storage.beam.cloud", status_text)
-
-        # 2. Serialized snapshot dict does NOT contain the URL
-        rec_dict = record.to_dict()
-        self.assertNotIn("internal_storage_ref", rec_dict)
-
-        # 3. Text redaction utility replaces presigned URL
-        sanitized_log = redact_text(f"Task completed. Download at {presigned_link}")
-        self.assertNotIn("secret999", sanitized_log)
-        self.assertIn(REDACTED_PRESIGNED_URL, sanitized_log)
-
-    def test_lazy_sdk_imports_and_unsupported_live_actions(self):
-        """Verify SDK imports are lazy/optional and live actions raise explicit refusal."""
-        from deploy.cloud.modal.app import _MODAL_SDK_AVAILABLE, ModalAppAdapter
-        from deploy.cloud.beam.app import _BEAM_SDK_AVAILABLE, BeamAppAdapter
-
-        # Calling live deploy without platform authorization raises NotImplementedError
-        with self.assertRaises(NotImplementedError):
-            ModalAppAdapter.deploy_live()
-
-        with self.assertRaises(NotImplementedError):
-            BeamAppAdapter.deploy_live()
-
-    def test_build_modal_app_fails_closed_even_with_mocked_sdk(self):
-        """Verify build_modal_app fails closed before resource definitions even if Modal SDK is mocked available."""
-        mock_modal = MagicMock()
-        with patch("deploy.cloud.modal.app._MODAL_SDK_AVAILABLE", True), patch(
-            "deploy.cloud.modal.app.modal", mock_modal
-        ):
-            with self.assertRaises(NotImplementedError):
-                build_modal_app()
-
-            # Verify fail-closed behavior before any resource definitions
-            mock_modal.App.assert_not_called()
-            mock_modal.Volume.from_name.assert_not_called()
-            mock_modal.Image.debian_slim.assert_not_called()
-
-        # When Modal SDK is not available, building app raises RuntimeError
-        with patch("deploy.cloud.modal.app._MODAL_SDK_AVAILABLE", False), patch(
-            "deploy.cloud.modal.app.modal", None
-        ):
-            with self.assertRaises(RuntimeError):
-                build_modal_app()
-
-    def test_build_beam_app_fails_closed_even_with_mocked_sdk(self):
-        """Verify build_beam_app fails closed before resource definitions even if Beam SDK is mocked available."""
-        mock_beam = MagicMock()
-        with patch("deploy.cloud.beam.app._BEAM_SDK_AVAILABLE", True), patch(
-            "deploy.cloud.beam.app.beam", mock_beam
-        ):
-            with self.assertRaises(NotImplementedError):
-                build_beam_app()
-
-            # Verify fail-closed behavior before any resource constructor calls
-            mock_beam.Volume.assert_not_called()
-            mock_beam.App.assert_not_called()
-            mock_beam.task_queue.assert_not_called()
-            mock_beam.endpoint.assert_not_called()
-
-        # When Beam SDK is not available, building app raises RuntimeError
-        with patch("deploy.cloud.beam.app._BEAM_SDK_AVAILABLE", False), patch(
-            "deploy.cloud.beam.app.beam", None
-        ):
-            with self.assertRaises(RuntimeError):
-                build_beam_app()
-
-    def test_factory_requires_secrets_and_adapter_no_default_credentials(self):
-        """Verify production gateway creation requires secrets and adapters have no default hardcoded secrets."""
-        # Unconfigured Modal adapter rejects unauthenticated requests
-        unconfigured_modal = ModalAppAdapter()
-        code, _, _ = unconfigured_modal.handle_request("GET", "/health", {}, b"")
-        self.assertEqual(code, 401)
-
-        # Unconfigured Beam adapter rejects unauthenticated requests
-        unconfigured_beam = BeamAppAdapter()
-        code, _, _ = unconfigured_beam.handle_request("GET", "/health", {}, b"")
-        self.assertEqual(code, 401)
-
-        # Gateway factories require secrets or auth_validator
+    def test_bad_values_fail_the_import(self) -> None:
         with self.assertRaises(ValueError):
-            create_modal_gateway()
-
+            ModalSettings.from_env({"MC_MODAL_GPU": "H100"})
         with self.assertRaises(ValueError):
-            create_beam_gateway()
+            ModalSettings.from_env({"MC_MODAL_IDLE_SECONDS": "5"})
 
-        # Gateway factories succeed when secrets are provided
-        gw_modal = create_modal_gateway(token_id="k", token_secret="s")
-        self.assertIsInstance(gw_modal, CloudGateway)
 
-        gw_beam = create_beam_gateway(bearer_token="b")
-        self.assertIsInstance(gw_beam, CloudGateway)
-
-    def test_in_memory_handle_mapping_records(self):
-        """Verify handle registry mapping, query methods, and state transitions."""
-        registry = InMemoryHandleRegistry()
-        record = registry.register_job(
-            job_meta=self.job_meta,
-            native_handle="native-fc-12345",
-            app_handle="handle-test-modal-999",
-            provider="modal",
+class BeamSettingsTest(unittest.TestCase):
+    def test_names_and_env_round_trip(self) -> None:
+        settings = BeamSettings.for_installation("mc-ab12cd", "mc-ab12cd", gpu="a10g", idle_seconds=90)
+        self.assertEqual(
+            settings.deployment_names,
+            {"seed": "mc-ab12cd-seed", "worker": "mc-ab12cd-worker", "gateway": "mc-ab12cd-gateway"},
         )
-        self.assertEqual(record.app_handle, "handle-test-modal-999")
-        self.assertEqual(record.status, JobExecutionStatus.PENDING)
+        self.assertEqual((settings.volume_name, settings.map_name), ("mc-ab12cd-weights", "mc-ab12cd-jobs"))
+        self.assertEqual((settings.secret_name, settings.gpu), ("MC_MC_AB12CD_TOKEN", "A10G"))
+        env = settings.to_env()
+        self.assertNotIn(beam_settings.ENV_WORKER_URL, env, "Beam rejects empty values")
+        self.assertEqual(BeamSettings.from_env(env), settings)
+        with_url = settings.with_worker_url("https://mc-ab12cd-worker-abc.app.beam.cloud")
+        self.assertEqual(BeamSettings.from_env(with_url.to_env()), with_url)
 
-        # Lookup by app handle
-        by_app = registry.get_by_app_handle("handle-test-modal-999")
-        self.assertEqual(by_app, record)
+    def test_values_beam_cannot_carry_are_refused(self) -> None:
+        settings = BeamSettings.for_installation("mc-ab12cd", "mc-ab12cd")
+        with self.assertRaises(ValueError):
+            settings.with_worker_url("https://x?a=b").to_env()
+        with self.assertRaises(ValueError):
+            settings.with_worker_url("has space").to_env()
 
-        # Lookup by native handle
-        by_native = registry.get_by_native_handle("native-fc-12345")
-        self.assertEqual(by_native, record)
+    def test_secret_names_are_env_names(self) -> None:
+        self.assertEqual(secret_name_for("mc-my-books-1a2b3c4d"), "MC_MC_MY_BOOKS_1A2B3C4D_TOKEN")
+        self.assertRegex(secret_name_for("mc--x.y"), r"^[A-Z_][A-Z0-9_]*$")
 
-        # Lookup by job & attempt ID
-        by_id = registry.get_by_job_attempt(self.job_meta.job_id, self.job_meta.attempt_id)
-        self.assertEqual(by_id, record)
+    def test_weights_root_prefers_the_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self.assertEqual(resolve_weights_root("vol", cwd=base), base / "weights")
+            (base / "weights").mkdir()
+            self.assertEqual(resolve_weights_root("vol", cwd=base), base / "weights")
 
-        # Update status to RUNNING
-        registry.update_status("handle-test-modal-999", JobExecutionStatus.RUNNING)
-        self.assertEqual(record.status, JobExecutionStatus.RUNNING)
-        self.assertIsNotNone(record.started_at)
 
-        # Complete with result
-        registry.store_result(
-            app_handle="handle-test-modal-999",
-            result_data=self.tiny_image_bytes,
-            result_digest=self.job_meta.image_sha256,
-            reported_cost_usd=0.0012,
-        )
-        self.assertEqual(record.status, JobExecutionStatus.COMPLETED)
-        self.assertEqual(record.result_bytes, len(self.tiny_image_bytes))
-
-    def test_manifest_verification(self):
-        """Verify model manifest file checks, hash verification, and missing file detection."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-
-            # Create dummy model file
-            model_file = tmp_path / "model.safetensors"
-            model_content = b"DUMMY_MODEL_WEIGHT_BYTES_1234567890"
-            model_file.write_bytes(model_content)
-
-            import hashlib
-            model_sha = hashlib.sha256(model_content).hexdigest()
-
-            manifest = ModelManifest(
-                model_id="test-model",
-                model_revision=REVISION_TEST_FLUX,
-                recipe_id=RECIPE_TEST_SDNQ,
-                preprocessing_version="1.0.0",
-                files=[
-                    ManifestFileRecord(
-                        relative_path="model.safetensors",
-                        sha256=model_sha,
-                        size_bytes=len(model_content),
-                    ),
-                    ManifestFileRecord(
-                        relative_path="config.json",
-                        sha256="0000000000000000000000000000000000000000000000000000000000000000",
-                        size_bytes=100,
-                    ),
-                ],
-                total_bytes=len(model_content) + 100,
-                native_mask_conditioning=False,
+class BeamStagingTest(unittest.TestCase):
+    def test_stage_holds_only_what_the_containers_import(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "stage"
+            module = stage_app(target)
+            self.assertEqual(module, target / "mc_beam_app.py")
+            self.assertEqual(module.read_bytes(), (REPO_ROOT / "deploy" / "cloud" / "beam" / "app.py").read_bytes())
+            files = sorted(str(p.relative_to(target)) for p in target.rglob("*") if p.is_file())
+            common = sorted(
+                f"deploy/cloud/common/{p.name}" for p in (REPO_ROOT / "deploy" / "cloud" / "common").glob("*.py")
             )
+            expected = sorted(
+                [
+                    IGNORE_FILE_NAME,
+                    "mc_beam_app.py",
+                    "deploy/__init__.py",
+                    "deploy/cloud/__init__.py",
+                    "deploy/cloud/beam/__init__.py",
+                    "deploy/cloud/beam/backend.py",
+                    "deploy/cloud/beam/settings.py",
+                ]
+                + common
+            )
+            self.assertEqual(files, expected)
+            self.assertEqual((target / IGNORE_FILE_NAME).read_text(encoding="utf-8"), IGNORE_FILE_CONTENTS)
+            for path in files:
+                self.assertNotIn("tests", path)
+                self.assertNotIn("modal", path)
 
-            # 1. Verification with missing config.json -> invalid
-            report = verify_model_manifest(tmp_path, manifest)
+
+class SharedUtilitiesTest(unittest.TestCase):
+    def test_presigned_urls_are_redacted(self) -> None:
+        gcs = (
+            "https://storage.googleapis.com/bucket/out.png?X-Goog-Algorithm=GOOG4-RSA-SHA256&"
+            "X-Goog-Credential=sa%40proj.iam.gserviceaccount.com&X-Goog-Signature=abcdef1234567890secretsig"
+        )
+        s3 = "https://storage.beam.cloud/v2/outputs/crop.png?X-Amz-Signature=secret999&X-Amz-Credential=AKIAEXAMPLE"
+        legacy = "https://storage.googleapis.com/b/o.png?GoogleAccessId=a@p.iam.gserviceaccount.com&Signature=legacy123"
+        for url, secret in ((gcs, "secretsig"), (s3, "secret999"), (legacy, "legacy123")):
+            redacted = redact_text(f"Fetched {url} ok")
+            self.assertNotIn(secret, redacted)
+            self.assertIn(REDACTED_PRESIGNED_URL, redacted)
+        nested = redact_dict({"gcs_signed_url": gcs, "nested": {"note": f"link {gcs}"}})
+        self.assertEqual(nested["gcs_signed_url"], REDACTED_SECRET)
+        self.assertNotIn("secretsig", json.dumps(nested))
+
+    def test_manifest_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = b"weights-bytes"
+            (root / "model.safetensors").write_bytes(model)
+            files = [
+                ManifestFileRecord("model.safetensors", hashlib.sha256(model).hexdigest(), len(model)),
+                ManifestFileRecord("config.json", hashlib.sha256(b"X" * 100).hexdigest(), 100),
+            ]
+            manifest = ModelManifest("test-model", REVISION_TEST_FLUX, RECIPE_TEST_SDNQ, "1.0.0", files, len(model) + 100)
+            report = verify_model_manifest(root, manifest)
             self.assertFalse(report["valid"])
-            self.assertIn("config.json", report["missing_files"])
-            self.assertIn("model.safetensors", report["verified_files"])
+            self.assertEqual((report["missing_files"], report["verified_files"]), (["config.json"], ["model.safetensors"]))
+            (root / "config.json").write_bytes(b"Y" * 100)
+            self.assertEqual(verify_model_manifest(root, manifest)["corrupted_files"], ["config.json"])
+            (root / "config.json").write_bytes(b"X" * 100)
+            self.assertTrue(verify_model_manifest(root, manifest)["valid"])
 
-            # 2. Add config.json with matching hash -> valid
-            config_file = tmp_path / "config.json"
-            config_content = b"X" * 100
-            config_sha = hashlib.sha256(config_content).hexdigest()
-            config_file.write_bytes(config_content)
+    def test_handle_registry_records(self) -> None:
+        meta = JobRequestMetadata.from_dict(json.loads((FIXTURES_DIR / "job_request_metadata.json").read_text()))
+        image = (FIXTURES_DIR / "tiny_image.png").read_bytes()
+        registry = InMemoryHandleRegistry()
+        record = registry.register_job(job_meta=meta, native_handle="native-1", app_handle="handle-1", provider="modal")
+        self.assertIs(registry.get_by_native_handle("native-1"), record)
+        self.assertIs(registry.get_by_job_attempt(meta.job_id, meta.attempt_id), record)
+        registry.update_status("handle-1", JobExecutionStatus.RUNNING)
+        self.assertIsNotNone(record.started_at)
+        registry.store_result(app_handle="handle-1", result_data=image, result_digest=meta.image_sha256)
+        self.assertEqual((record.status, record.result_bytes), (JobExecutionStatus.COMPLETED, len(image)))
 
-            complete_manifest = ModelManifest(
-                model_id="test-model",
-                model_revision=REVISION_TEST_FLUX,
-                recipe_id=RECIPE_TEST_SDNQ,
-                preprocessing_version="1.0.0",
-                files=[
-                    ManifestFileRecord("model.safetensors", model_sha, len(model_content)),
-                    ManifestFileRecord("config.json", config_sha, len(config_content)),
-                ],
-                total_bytes=len(model_content) + len(config_content),
-                native_mask_conditioning=False,
-            )
-            report2 = verify_model_manifest(tmp_path, complete_manifest)
-            self.assertTrue(report2["valid"])
-            self.assertEqual(len(report2["missing_files"]), 0)
-            self.assertEqual(len(report2["corrupted_files"]), 0)
 
-    def test_modal_simulate_function_call_duplicate_returns_same_native_handle(self):
-        """Modal simulate_function_call for existing (job_id, attempt_id) returns existing native handle."""
-        modal_adapter = ModalAppAdapter(
-            token_id="modal-key-abc",
-            token_secret="modal-secret-xyz",
-            limits=self.limits,
-        )
-        native_id1 = modal_adapter.simulate_function_call(
-            job_meta=self.job_meta,
-            img_bytes=self.tiny_image_bytes,
-            hint_bytes=self.tiny_hint_bytes,
-        )
-        native_id2 = modal_adapter.simulate_function_call(
-            job_meta=self.job_meta,
-            img_bytes=self.tiny_image_bytes,
-            hint_bytes=self.tiny_hint_bytes,
-        )
-        self.assertEqual(native_id1, native_id2)
-        rec = modal_adapter.handle_registry.get_by_native_handle(native_id1)
-        self.assertIsNotNone(rec)
-        self.assertEqual(rec.native_handle, native_id1)
+@unittest.skipUnless(_installed("modal"), "modal is not installed")
+class ModalAppImportTest(unittest.TestCase):
+    """deploy.cloud.modal.app declares the app offline; nothing here talks to Modal."""
 
-    def test_beam_simulate_task_enqueue_duplicate_returns_same_native_handle(self):
-        """Beam simulate_task_enqueue for existing (job_id, attempt_id) returns existing native handle."""
-        beam_adapter = BeamAppAdapter(
-            bearer_token="beam-token-123",
-            limits=self.limits,
-        )
-        task_id1 = beam_adapter.simulate_task_enqueue(
-            job_meta=self.job_meta,
-            img_bytes=self.tiny_image_bytes,
-            hint_bytes=self.tiny_hint_bytes,
-        )
-        task_id2 = beam_adapter.simulate_task_enqueue(
-            job_meta=self.job_meta,
-            img_bytes=self.tiny_image_bytes,
-            hint_bytes=self.tiny_hint_bytes,
-        )
-        self.assertEqual(task_id1, task_id2)
-        rec = beam_adapter.handle_registry.get_by_native_handle(task_id1)
-        self.assertIsNotNone(rec)
-        self.assertEqual(rec.native_handle, task_id1)
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory()
+        settings = ModalSettings.for_installation("mc-ab12cd", "mc-ab12cd", gpu="l40s", idle_seconds=240)
+        env = {
+            **settings.to_env(),
+            "MODAL_CONFIG_PATH": str(Path(cls._tmp.name) / "absent.toml"),
+            "MODAL_SERVER_URL": "http://127.0.0.1:9",
+        }
+        sys.modules.pop("deploy.cloud.modal.app", None)
+        with patched_environ(env), warnings.catch_warnings():
+            warnings.simplefilter("error")
+            cls.module = importlib.import_module("deploy.cloud.modal.app")
+        cls.settings = settings
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        sys.modules.pop("deploy.cloud.modal.app", None)
+        cls._tmp.cleanup()
+
+    def test_app_layout(self) -> None:
+        app = self.module.app
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            functions = sorted(app.registered_functions)
+            classes = sorted(app.registered_classes)
+        self.assertEqual(app.name, "mc-ab12cd")
+        self.assertEqual(functions, ["Worker.*", "gateway", "seed_weights"])
+        self.assertEqual(classes, ["Worker"])
+        self.assertEqual(self.module.SETTINGS, self.settings)
+
+    def test_only_the_deploy_sources_are_uploaded(self) -> None:
+        shipped = self.module._not_shipped
+        for kept in ("__init__.py", "cloud/__init__.py", "cloud/common/api.py", "cloud/modal/backend.py"):
+            self.assertFalse(shipped(Path(kept)), kept)
+        for dropped in (
+            "cloud/tests/test_gateway.py",
+            "cloud/fixtures/tiny_image.png",
+            "cloud/beam/app.py",
+            "cloud/common/__pycache__/api.cpython-312.pyc",
+            "cloud/modal/notes.md",
+        ):
+            self.assertTrue(shipped(Path(dropped)), dropped)
+
+
+@unittest.skipUnless(_installed("beam"), "beam-client is not installed")
+class BeamAppImportTest(unittest.TestCase):
+    """The staged Beam module builds its decorators offline against a loopback channel."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from beta9.abstractions.base import set_channel
+        from beta9.channel import Channel
+        from beta9.config import ConfigContext
+
+        cls._tmp = tempfile.TemporaryDirectory()
+        settings = BeamSettings.for_installation("mc-ab12cd", "mc-ab12cd", gpu="rtx5090", idle_seconds=180)
+        env = {**settings.to_env(), "CONFIG_PATH": str(Path(cls._tmp.name) / "absent.ini")}
+        stage = Path(cls._tmp.name) / "stage"
+        stage_app(stage)
+        previous_cwd = os.getcwd()
+        with patched_environ(env), warnings.catch_warnings():
+            warnings.simplefilter("error")
+            # Same channel shape the provisioner builds: no reconnect subscription, and a
+            # config so the decorators never look for a config file. Nothing calls out.
+            channel = Channel(addr="127.0.0.1:9", token="offline-test", retry=(lambda state: None, False))
+            channel.config = ConfigContext(token="offline-test", gateway_host="127.0.0.1", gateway_port=9)
+            set_channel(channel=channel)
+            os.chdir(stage)
+            # os.getcwd() is the resolved path, which is what Beam maps handlers against.
+            sys.path.insert(0, os.getcwd())
+            try:
+                cls.module = importlib.import_module("mc_beam_app")
+            finally:
+                sys.path.pop(0)
+                os.chdir(previous_cwd)
+        cls.settings = settings
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        from beta9.abstractions.base import unset_channel
+
+        unset_channel()
+        sys.modules.pop("mc_beam_app", None)
+        cls._tmp.cleanup()
+
+    def test_handlers(self) -> None:
+        seed, render, gateway = (getattr(self.module, name).parent for name in ("seed", "render", "gateway"))
+        self.assertEqual((seed.name, render.name, gateway.name), ("mc-ab12cd-seed", "mc-ab12cd-worker", "mc-ab12cd-gateway"))
+        self.assertEqual(render.gpu, "RTX5090")
+        self.assertFalse(seed.gpu)
+        self.assertFalse(gateway.gpu)
+        self.assertEqual((render.keep_warm_seconds, render.task_policy.max_retries), (180, 0))
+        self.assertEqual((render.task_policy.timeout, seed.task_policy.timeout), (600, 3600))
+        self.assertTrue(all(h.authorized for h in (seed, render, gateway)))
+        self.assertEqual(render.on_start, "mc_beam_app:load_worker")
+        self.assertEqual([s.name for s in gateway.secrets], ["MC_MC_AB12CD_TOKEN"])
+        for handler in (seed, render):
+            self.assertEqual([(v.name, v.mount_path) for v in handler.volumes], [("mc-ab12cd-weights", "./weights")])
+        self.assertEqual(gateway.volumes, [])
+        self.assertIn("MC_BEAM_GPU=RTX5090", gateway.env)
+
+    def test_gpu_image_pins(self) -> None:
+        steps = [(step.type, step.command) for step in self.module.gpu_image.build_steps]
+        self.assertIn(("shell", self.module.TORCH_INSTALL), steps)
+        self.assertIn("torch==2.13.0", self.module.TORCH_INSTALL)
+        self.assertIn("https://download.pytorch.org/whl/cu129", self.module.TORCH_INSTALL)
+        for requirement in self.module.GPU_REQUIREMENTS:
+            self.assertIn(("pip", requirement), steps)
 
 
 if __name__ == "__main__":

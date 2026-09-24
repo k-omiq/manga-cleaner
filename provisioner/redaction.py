@@ -60,22 +60,29 @@ SAFE_KEY_SUFFIXES = (
     "_ref",
 )
 
+# A token prefix only starts a token when it is not the tail of a longer name:
+# "studio-ws--mc-app.modal.run" is a Modal host for the workspace "studio-ws".
+_TOKEN_START = r"(?<![\w.-])"
+
 # Patterns for known token structures in strings
 TOKEN_REGEX_PATTERNS = [
     # Modal token secret: as- followed by alphanumeric/underscore/hyphen
-    (re.compile(r"\b(as-[a-zA-Z0-9_-]{8,})\b"), "as-[REDACTED]"),
+    (re.compile(_TOKEN_START + r"(as-[a-zA-Z0-9_-]{8,})\b"), "as-[REDACTED]"),
     # Modal token ID: ak- followed by alphanumeric/underscore/hyphen
-    (re.compile(r"\b(ak-[a-zA-Z0-9_-]{8,})\b"), "ak-[REDACTED]"),
+    (re.compile(_TOKEN_START + r"(ak-[a-zA-Z0-9_-]{8,})\b"), "ak-[REDACTED]"),
+    # Modal proxy token secret. The matching wk- token ID is not a secret and stays
+    # readable: the journal keeps it so cleanup can delete the token.
+    (re.compile(_TOKEN_START + r"(ws-[a-zA-Z0-9_-]{8,})\b"), "ws-[REDACTED]"),
     # Beam token: b9_ followed by alphanumeric/underscore/hyphen
-    (re.compile(r"\b(b9_[a-zA-Z0-9_-]{8,})\b"), "b9_[REDACTED]"),
+    (re.compile(_TOKEN_START + r"(b9_[a-zA-Z0-9_-]{8,})\b"), "b9_[REDACTED]"),
     # Beam token variant: beam_ followed by alphanumeric/underscore/hyphen
-    (re.compile(r"\b(beam_[a-zA-Z0-9_-]{8,})\b"), "beam_[REDACTED]"),
+    (re.compile(_TOKEN_START + r"(beam_[a-zA-Z0-9_-]{8,})\b"), "beam_[REDACTED]"),
     # HTTP Authorization: Bearer <token>
     (re.compile(r"(Bearer\s+)[a-zA-Z0-9_\-\.]{8,}", re.IGNORECASE), r"\1[REDACTED]"),
     # Key-value secret assignments (e.g. token=xyz or "secret": "xyz")
     (
         re.compile(
-            r'((?:token|secret|password|api_key|access_token|api_token|auth_token|beam_token|modal_token_secret)\s*[:=]\s*["\']?)[a-zA-Z0-9_\-\.]{6,}(["\']?)',
+            r'((?:token|secret|password|api_key|access_token|api_token|auth_token|beam_token|modal_token_secret)["\']?\s*[:=]\s*["\']?)[a-zA-Z0-9_\-\.]{6,}(["\']?)',
             re.IGNORECASE,
         ),
         r"\1[REDACTED]\2",
@@ -137,8 +144,9 @@ def is_sensitive_key(key: str) -> bool:
 def redact_string(
     text: str,
     additional_secrets: Optional[Set[str]] = None,
+    patterns: bool = True,
 ) -> str:
-    """Redact known secret patterns and registered secrets from a string."""
+    """Redact registered secrets and, unless `patterns` is False, token-shaped text."""
     if not isinstance(text, str) or not text:
         return text
 
@@ -153,9 +161,9 @@ def redact_string(
         if secret in result:
             result = result.replace(secret, REDACTED_CREDENTIAL)
 
-    # Redact regex patterns
-    for pattern, replacement in TOKEN_REGEX_PATTERNS:
-        result = pattern.sub(replacement, result)
+    if patterns:
+        for pattern, replacement in TOKEN_REGEX_PATTERNS:
+            result = pattern.sub(replacement, result)
 
     return result
 
@@ -163,8 +171,13 @@ def redact_string(
 def redact_data(
     data: Any,
     additional_secrets: Optional[Set[str]] = None,
+    patterns: bool = True,
 ) -> Any:
-    """Recursively traverse and redact sensitive data in dictionaries, lists, and values."""
+    """Recursively redact secret-named keys, registered secrets and (with `patterns`) token-shaped text.
+
+    Records that must round-trip exactly, like the journal, pass patterns=False: a
+    user-chosen workspace or environment name can look like a token.
+    """
     if data is None:
         return None
 
@@ -173,7 +186,7 @@ def redact_data(
         return data
 
     if isinstance(data, str):
-        return redact_string(data, additional_secrets)
+        return redact_string(data, additional_secrets, patterns)
 
     if isinstance(data, dict):
         redacted_dict: Dict[str, Any] = {}
@@ -193,20 +206,20 @@ def redact_data(
                 if isinstance(v, str):
                     redacted_dict[k] = REDACTED_CREDENTIAL
                 elif isinstance(v, dict):
-                    redacted_dict[k] = redact_data(v, additional_secrets)
+                    redacted_dict[k] = redact_data(v, additional_secrets, patterns)
                 elif isinstance(v, list):
                     redacted_dict[k] = [
-                        REDACTED_CREDENTIAL if isinstance(item, str) else redact_data(item, additional_secrets)
+                        REDACTED_CREDENTIAL if isinstance(item, str) else redact_data(item, additional_secrets, patterns)
                         for item in v
                     ]
                 else:
                     redacted_dict[k] = REDACTED_CREDENTIAL
             else:
-                redacted_dict[k] = redact_data(v, additional_secrets)
+                redacted_dict[k] = redact_data(v, additional_secrets, patterns)
         return redacted_dict
 
     if isinstance(data, (list, tuple, set)):
-        items = [redact_data(item, additional_secrets) for item in data]
+        items = [redact_data(item, additional_secrets, patterns) for item in data]
         if isinstance(data, tuple):
             return tuple(items)
         if isinstance(data, set):
@@ -214,6 +227,6 @@ def redact_data(
         return items
 
     if isinstance(data, Exception):
-        return redact_string(str(data), additional_secrets)
+        return redact_string(str(data), additional_secrets, patterns)
 
     return data

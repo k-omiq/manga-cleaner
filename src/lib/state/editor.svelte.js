@@ -41,7 +41,7 @@ const AUTOSAVE_DEBOUNCE_MS = 250
 const HISTORY_RETRY_MS = 50
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-/** Tool ids, in the order the `1`–`6` shortcuts and the tool rail use. */
+/** Tool ids, in the order the `1` to `6` shortcuts and the tool rail use. */
 export const TOOLS = /** @type {const} */ ([
   'autoClean',
   'brush',
@@ -57,14 +57,15 @@ export const TOOLS = /** @type {const} */ ([
  *
  * This is the enforcement of the ruling in `src/lib/editor/tools.js` - a batch
  * run is local-only - and it lives here, at the one call site that sends, so
- * that it holds however the settings are configured. The run protocol has no
- * `needs-confirmation` step, so a run that could reach the cloud rung would
- * spend without the transmission statement or the
- * cost confirmation. Cloud stays reachable per region through
- * Content-aware fill, which carries the whole flow.
+ * that it holds however the settings are configured. Every cloud render asks
+ * for consent first, one request at a time
+ * (`src/lib/editor/cloudflow.svelte.js`), and the run protocol has no step
+ * that could ask, so a run that could reach the cloud would send pages
+ * without it. The cloud stays reachable per region, from Content-aware fill
+ * and from a Layers row, each of which asks.
  *
- * If `runClean` ever grows the confirmation protocol, this constant is what
- * gives way - not the gate in `src/lib/editor/cloudflow.svelte.js`.
+ * If `runClean` ever grows a consent step, this constant is what gives way -
+ * not the gate in `src/lib/editor/cloudflow.svelte.js`.
  */
 export const LOCAL_CEILING = 'lama'
 
@@ -1122,7 +1123,7 @@ export function reportFitScale(scale) {
 /**
  * Choose a tool. Selecting one also opens and raises the tool window - a tool
  * whose parameters are hidden behind a second action is a tool the user has to
- * pick twice. Both routes in (the rail and the `1`–`6` keys) come through
+ * pick twice. Both routes in (the rail and the `1` to `6` keys) come through
  * here, so neither has to remember.
  *
  * @param {string} tool

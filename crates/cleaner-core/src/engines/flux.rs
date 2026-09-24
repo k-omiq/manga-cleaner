@@ -91,7 +91,7 @@ pub use crate::engines::model::write_bound;
 ///   excess variance** - a visible dark blotch - where this instruction landed
 ///   within **2 levels of mean and 1 of variance**.
 /// * On the balloon, the content prompt was clean **at `SEED` 1 and at no other
-///   seed tried**: seeds 2–5 came back 35 to 94 levels dark with invented
+///   seed tried**: seeds 2 to 5 came back 35 to 94 levels dark with invented
 ///   texture. This instruction held within ±6 levels at every one of the five.
 ///   A prompt whose only good result is the seed we happen to have frozen is a
 ///   prompt that has not worked.
@@ -107,7 +107,7 @@ pub use crate::engines::model::write_bound;
 pub const PROMPT: &str = "Remove all text.";
 
 /// Denoising steps. Four, which is the distilled Klein models' own range
-/// (1–12) at the fast end of it - this rung already costs ten to sixty seconds
+/// (1 to 12) at the fast end of it - this rung already costs ten to sixty seconds
 /// a region and it is reached one region at a time by hand.
 ///
 /// **Swept**: eight was tried against four at the winning prompt and
@@ -136,6 +136,30 @@ pub const SEED: u64 = 1;
 /// its FLUX.2 Klein inpainter - the one holding the model this rung holds -
 /// fixes guidance at 1.0 as well.
 pub const GUIDANCE: f32 = 1.0;
+
+/// The sampling knobs as the cloud wire carries them.
+///
+/// The cloud rung runs the same model under the same recipe as the local one,
+/// so a job request must carry these constants rather than numbers of its own:
+/// a remote patch rendered at a different seed or guidance is a patch whose
+/// provenance cannot be reproduced locally. The wire has no float field, so
+/// guidance travels scaled by 100 and the gateway divides it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireSampling {
+    pub seed: u64,
+    pub steps: u32,
+    pub guidance_scaled: u32,
+}
+
+/// [`SEED`], [`STEPS`] and [`GUIDANCE`] in wire form. Every job request and
+/// journal intent is built from this, so the recipe has one source.
+pub fn wire_sampling() -> WireSampling {
+    WireSampling {
+        seed: SEED,
+        steps: STEPS,
+        guidance_scaled: (GUIDANCE * 100.0).round() as u32,
+    }
+}
 
 /// The crop's dimensions are snapped up to a multiple of this.
 ///
@@ -573,6 +597,24 @@ mod tests {
     /// The crop is centred on the region, is a multiple of the latent stride,
     /// and is **sized to the region** - proportional context, clamped at both
     /// ends, and no floor at the engine context.
+    #[test]
+    fn the_wire_sampling_is_the_local_recipe() {
+        // The cloud gateway divides guidance_scaled by 100, so this is the
+        // local 1.0 arriving as 1.0 and not the 3.5 the wire once carried.
+        let wire = wire_sampling();
+        assert_eq!(wire.seed, SEED);
+        assert_eq!(wire.steps, STEPS);
+        assert_eq!(wire.guidance_scaled, 100);
+        assert_eq!(
+            wire,
+            WireSampling {
+                seed: 1,
+                steps: 4,
+                guidance_scaled: 100
+            }
+        );
+    }
+
     #[test]
     fn a_crop_is_centred_snapped_and_tight_around_the_region() {
         // A line of dialogue. Half of 40 is 20, under the floor, so the context

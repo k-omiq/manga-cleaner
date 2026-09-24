@@ -49,10 +49,10 @@ describe('toolSpendsCloud', () => {
   })
 
   // Auto clean used to carry an engine ceiling whose upper rung was the cloud,
-  // and a run at that ceiling spent without the transmission statement or the
-  // cost confirmation, because `needs-confirmation` lives on `applyTool` and
-  // `runClean` has no equivalent. The rung is gone and a run is local-only;
-  // this is the assertion that says so, whatever it is passed.
+  // and a run at that ceiling sent pages to it without the consent each cloud
+  // render asks for first, because `needs-confirmation` lives on `applyTool`
+  // and `runClean` has no equivalent. The rung is gone and a run is
+  // local-only; this is the assertion that says so, whatever it is passed.
   it('is false for Auto clean, which can no longer reach the cloud rung', () => {
     expect(toolSpendsCloud('autoClean', { engineCeiling: 'cloud' })).toBe(false)
     expect(toolSpendsCloud('autoClean', { engineCeiling: 'lama' })).toBe(false)

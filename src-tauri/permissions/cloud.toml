@@ -66,10 +66,25 @@ commands.allow = [
     "reconcile_cloud_recovery",
 ]
 
+[[permission]]
+identifier = "allow-provision-commands"
+description = "Enables cloud provisioner helper operations for infrastructure lifecycle and probing."
+commands.allow = [
+    "run_cloud_provisioner",
+    "provision_inspect",
+    "provision_plan",
+    "provision_apply",
+    "provision_resume",
+    "provision_cleanup",
+    "provision_probe",
+    "cancel_cloud_provisioner",
+]
+
 [[set]]
 identifier = "default"
 description = "Default application and cloud inference permissions"
 permissions = [
     "allow-app-commands",
     "allow-inference-commands",
+    "allow-provision-commands",
 ]

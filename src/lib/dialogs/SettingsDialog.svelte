@@ -105,7 +105,8 @@
    * and mounted on its own by `?`.
    */
   import { Button, Field, Modal, Segmented, TextInput } from '../ui/index.js'
-  import { onMount } from 'svelte'
+  import Icon from '../icons/Icon.svelte'
+  import { onMount, untrack } from 'svelte'
   import { closeModal, modalWidth } from '../state/app.svelte.js'
   import { getBackend } from '../api/backend.js'
   import { chooseFolder } from '../api/folder.js'
@@ -115,7 +116,7 @@
     backendSettingsPatch,
     session,
     setAccelerator,
-    setCloudAllowed,
+    setCloseToTray,
     setFluxBackend,
     setFluxModel,
     setOriginalView,
@@ -126,6 +127,7 @@
   import ShortcutSheet from './ShortcutSheet.svelte'
   import AboutSection from './AboutSection.svelte'
   import InferenceSettings from './InferenceSettings.svelte'
+  import { offerFirstLaunch } from './firstlaunch.svelte.js'
 
   /** @type {{ spec: import('../state/app.svelte.js').ModalSpec }} */
   let { spec } = $props()
@@ -161,6 +163,20 @@
     await getBackend().writeSettings(backendSettingsPatch())
     await loadCapabilities()
     await loadModels()
+  }
+
+  let backgroundError = $state(false)
+
+  async function updateCloseToTray(input) {
+    const enabled = input.checked
+    backgroundError = false
+    try {
+      await getBackend().writeSettings({ closeToTray: enabled })
+      setCloseToTray(enabled)
+    } catch {
+      backgroundError = true
+      input.checked = session.closeToTray
+    }
   }
 
   /* ---------- Models ---------- */
@@ -249,6 +265,30 @@
       catalogue = await getBackend().listModels(options)
     } catch {
       catalogue = null
+    }
+  }
+
+  let replayError = $state(false)
+  let replaying = $state(false)
+
+  /**
+   * "Run setup again": the offer a first launch makes, over a fresh catalogue
+   * so the download step shows what is here now. Settings closes first,
+   * because the setup is drawn beside the modal stack and only while the
+   * stack is empty (`App.svelte`).
+   */
+  async function replayOnboarding() {
+    if (replaying) return
+    replaying = true
+    replayError = false
+    try {
+      const view = await getBackend().listModels()
+      closeModal(null)
+      offerFirstLaunch(view, { force: true })
+    } catch {
+      replayError = true
+    } finally {
+      replaying = false
     }
   }
 
@@ -859,10 +899,6 @@
     { value: 'rtl', label: t('settings.direction.rtl') },
     { value: 'ltr', label: t('settings.direction.ltr') },
   ]
-  const cloud = [
-    { value: 'allowed', label: t('settings.cloud.allowed') },
-    { value: 'blocked', label: t('settings.cloud.blocked') },
-  ]
   const originalViews = [
     { value: 'hold', label: t('settings.originalView.hold') },
     { value: 'pinned', label: t('settings.originalView.pinned') },
@@ -912,15 +948,19 @@
    * and the panel's own `h3` are one string and cannot drift apart.
    */
   const TABS = [
-    { id: 'general', labelKey: 'settings.section.general' },
-    { id: 'models', labelKey: 'settings.section.models' },
-    { id: 'acceleration', labelKey: 'settings.section.acceleration' },
-    { id: 'inference', labelKey: 'settings.section.inference' },
-    { id: 'shortcuts', labelKey: 'settings.section.shortcuts' },
-    { id: 'about', labelKey: 'settings.section.about' },
+    { id: 'general', labelKey: 'settings.section.general', icon: 'settings' },
+    { id: 'models', labelKey: 'settings.section.models', icon: 'layers' },
+    { id: 'acceleration', labelKey: 'settings.section.acceleration', icon: 'cpu' },
+    { id: 'inference', labelKey: 'settings.section.inference', icon: 'cloud' },
+    { id: 'shortcuts', labelKey: 'settings.section.shortcuts', icon: 'keyboard' },
+    { id: 'about', labelKey: 'settings.section.about', icon: 'info' },
   ]
 
-  let active = $state('general')
+  // A caller may open Settings on a tab (`openCloudSettings` asks for Cloud).
+  // Read once: after that the strip owns it.
+  let active = $state(
+    untrack(() => (TABS.some((tab) => tab.id === spec?.props?.tab) ? spec.props.tab : 'general')),
+  )
 
   const uid = $props.id()
   /** @param {string} id */
@@ -998,10 +1038,12 @@
           id={tabId(tab.id)}
           aria-selected={tab.id === active}
           aria-controls={panelId(tab.id)}
+          aria-label={t(tab.labelKey)}
+          title={t(tab.labelKey)}
           tabindex={tab.id === active ? 0 : -1}
           onclick={() => select(tab.id)}
           onkeydown={onstripkeydown}
-        >{t(tab.labelKey)}</button>
+        ><Icon name={tab.icon} size={17} /></button>
       {/each}
     </div>
 
@@ -1029,6 +1071,24 @@
       </Field>
 
       <Field
+        label={t('settings.background.label')}
+        description={t('settings.background.description')}
+        layout="row"
+        controlId="settings-close-to-tray"
+      >
+        {#snippet children({ descriptionId })}
+          <input
+            id="settings-close-to-tray"
+            type="checkbox"
+            aria-describedby={descriptionId}
+            checked={session.closeToTray}
+            onchange={(event) => updateCloseToTray(/** @type {HTMLInputElement} */ (event.currentTarget))}
+          />
+        {/snippet}
+      </Field>
+      {#if backgroundError}<p role="alert">{t('settings.background.saveFailed')}</p>{/if}
+
+      <Field
         label={t('settings.direction.label')}
         layout="row"
       >
@@ -1045,21 +1105,15 @@
         {/snippet}
       </Field>
 
+      <!-- The cloud permission has one switch, on the Cloud tab beside the
+           endpoints it governs. This row says where it stands and goes there. -->
       <Field
         label={t('settings.cloud.label')}
-        description={t('settings.cloud.description')}
+        description={session.cloudAllowed ? t('settings.cloud.descriptionOn') : t('settings.cloud.descriptionOff')}
         layout="row"
       >
-        {#snippet children({ labelId })}
-          <Segmented
-            options={cloud}
-            value={session.cloudAllowed ? 'allowed' : 'blocked'}
-            labelledBy={labelId}
-            onchange={(value) => {
-              setCloudAllowed(value === 'allowed')
-              push()
-            }}
-          />
+        {#snippet children()}
+          <Button size="sm" onclick={() => select('inference', { focus: true })}>{t('settings.cloud.open')}</Button>
         {/snippet}
       </Field>
 
@@ -1094,6 +1148,21 @@
           />
         {/snippet}
       </Field>
+
+      <!-- Last in General, where someone who skipped part of the setup goes
+           looking for it. -->
+      <Field
+        label={t('onboarding.replay.label')}
+        description={t('onboarding.replay.description')}
+        layout="row"
+      >
+        {#snippet children({ descriptionId })}
+          <Button onclick={replayOnboarding} disabled={replaying} aria-describedby={descriptionId}>
+            {t('onboarding.replay.action')}
+          </Button>
+        {/snippet}
+      </Field>
+      {#if replayError}<p role="alert">{t('onboarding.replay.failed')}</p>{/if}
     </div>
 
     <!-- Models. The weights and the ONNX Runtime are downloaded after install;
@@ -1544,7 +1613,7 @@
      reason `Segmented` gives about its idle chips - this is a control. */
   .tab {
     position: relative;
-    padding: 0 0 var(--s-3);
+    padding: 0 4px var(--s-3);
     border: none;
     background: none;
     font: inherit;

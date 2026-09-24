@@ -37,7 +37,8 @@ import { cloudRefused } from './cloudflow.svelte.js'
 import { draft, clearDraft, setCloneOffset } from './draft.svelte.js'
 import { AI_STROKE_PX, cloneOffset, paintedStroke } from './gesture.js'
 import { paintParamsOf } from './paint.js'
-import { SOLID } from './tools.js'
+import { renderRegionInCloud } from './toolapply.svelte.js'
+import { SOLID, TOOL_SPECS, toolSpendsCloud } from './tools.js'
 
 export { paintParamsOf }
 
@@ -251,18 +252,23 @@ async function createMask(spec, extraParams) {
 
   // The same refusal the other two ways into the seam make, so the gate is on
   // all three rather than on the two that happen to need it today. No
-  // `DRAWING_TOOLS` parameter carries `cloud: true` at the moment - the two
-  // that do belong to Auto clean and Content-aware fill, neither of which
-  // draws - so this cannot fire; one cloud option added to a drawing tool's
-  // specs would otherwise be a silent hole.
+  // `DRAWING_TOOLS` parameter carries `cloud: true` at the moment - the one
+  // that does belongs to Content-aware fill, which does not draw - so this
+  // cannot fire; one cloud option added to a drawing tool's specs would
+  // otherwise be a silent hole.
   if (cloudRefused(spec.tool, params)) return false
 
+  // `createRegion` always renders on this machine: consent is bound to a
+  // stored region, and a drawn one is not stored until this call returns. So a
+  // gesture pointed at the cloud makes its region locally first, and the cloud
+  // renders it after one consent, as the second of two undoable edits.
+  const cloud = toolSpendsCloud(spec.tool, params)
   const result = await getBackend().createRegion({
     chapterId: chapter.id,
     pageIndex: page.index,
     bbox: spec.bbox,
     tool: spec.tool,
-    params,
+    params: cloud ? withoutCloud(spec.tool, params) : params,
   })
   if (!result) return false
 
@@ -281,7 +287,26 @@ async function createMask(spec, extraParams) {
     { region: null, pageStatus: before },
     { region: created, pageStatus: result.pageStatus },
   )
+  if (cloud) void renderRegionInCloud(created.id, spec.tool, paramsOf(spec.tool))
   return true
+}
+
+/**
+ * The parameters with every cloud choice taken out, so the backend's own
+ * default renders the region instead.
+ *
+ * @param {string} tool
+ * @param {Record<string, unknown>} params
+ * @returns {Record<string, unknown>}
+ */
+function withoutCloud(tool, params) {
+  const local = { ...params }
+  const spec = TOOL_SPECS.find((candidate) => candidate.id === tool)
+  for (const param of spec?.params ?? []) {
+    if (param.kind !== 'choice') continue
+    if (param.options.some((option) => option.cloud && option.value === local[param.key])) delete local[param.key]
+  }
+  return local
 }
 
 /* ------------------------------------------------------------------ */

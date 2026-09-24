@@ -17,11 +17,11 @@
 import { createJournal, pushEntry, redoEntry, undoEntry, viewOf } from '../model/journal.js'
 import { reviewReason } from '../model/review.js'
 import { aboutInfo, buildChapter, buildFixtures, buildProject, defaultSettings } from './fixtures.js'
-import { CLOUD_COST } from './provenance.js'
+import { cloudAttemptId, sha256Hex } from './attempt.js'
+import { commitMask } from './provenance.js'
 import { createRng } from './rng.js'
 import { createRunner } from './runner.js'
 import {
-  applyCloudToRegion,
   applyToolToRegion,
   cleanRegionAnyway,
   cleanRegionAutomatically,
@@ -29,6 +29,7 @@ import {
   createHandRegion,
   deleteRegionMask,
   isQueueable,
+  rerunNeedsCloud,
   rerunRegionMask,
 } from './tools.js'
 
@@ -38,6 +39,7 @@ const DEFAULT_TIMING = Object.freeze({
   openChapter: 220,
   export: 700,
   cloud: 900,
+  provision: 350,
   region: 70,
   pageTail: 150,
   noticeStagger: 260,
@@ -63,8 +65,38 @@ const EXPORT_FORMATS = Object.freeze({
   CBZ: 'cbz',
 })
 
-/** Pinned immutable cloud model revision for FLUX Schnell / SDNQ recipes. */
-export const PINNED_CLOUD_MODEL_REVISION = '0123456789abcdef0123456789abcdef01234567'
+/**
+ * The cloud recipe a gateway advertises on `/model-info` (IC-6), pinned to an
+ * immutable model revision. The native side reads these from the gateway;
+ * the mock answers them itself.
+ */
+export const PINNED_CLOUD_MODEL_ID = 'Disty0/FLUX.2-klein-4B-SDNQ-4bit-dynamic'
+export const PINNED_CLOUD_MODEL_REVISION = '45e9cc76cb70f84473ce5c6c2e2282d0ef3c6ecd'
+export const PINNED_CLOUD_RECIPE_ID = 'mc-flux2-klein-edit-v1'
+export const CLOUD_PREPROCESSING_VERSION = '1.0.0'
+
+/**
+ * The GPUs a mock plan offers, per provider. A real plan says which ones the
+ * helper accepts; these stand in for that list, and Beam has no serverless L4.
+ */
+export const MOCK_PROVISION_GPUS = Object.freeze({
+  modal: Object.freeze({ options: Object.freeze(['L4', 'A10', 'L40S']), fallback: 'L4' }),
+  beam: Object.freeze({ options: Object.freeze(['RTX4090', 'A10G', 'RTX5090']), fallback: 'RTX4090' }),
+})
+
+/** The steps an `apply` walks through, in the order the helper reports them (IC-2). */
+export const PROVISION_APPLY_STEPS = Object.freeze([
+  'validate',
+  'volume',
+  'state',
+  'secret',
+  'image',
+  'deploy',
+  'weights',
+  'token',
+  'endpoint',
+  'health',
+])
 
 /** @param {string} value */
 function isAbsolutePath(value) {
@@ -117,7 +149,21 @@ export function createMockBackend(options = {}) {
     projects: fixtures.projects,
     settings: defaultSettings(),
     inferenceConfig: defaultInferenceConfig(),
-    session: { cloudAcknowledged: false, spendConfirmed: false },
+    /**
+     * Which cloud secrets this session holds, as `provider:profileId:role`.
+     * Presence only: the value is never kept, because nothing here needs it.
+     *
+     * @type {Set<string>}
+     */
+    secrets: new Set(),
+    /** Interactive cloud renders in flight, by attempt id. @type {Map<string, any>} */
+    cloudJobs: new Map(),
+    /** Whether a render has run this session: the first one pays the cold start. */
+    cloudWarm: false,
+    /** Installations the mock provisioner knows, by `provider:installationId`. @type {Map<string, any>} */
+    installations: new Map(),
+    /** The provisioner run in flight, if any. @type {any} */
+    provisionRun: null,
     /** Profile mutation epochs keyed by profileId. @type {Map<string, number>} */
     profileEpochs: new Map(),
     /** Cached consent proposals. @type {Map<string, any>} */
@@ -165,6 +211,20 @@ export function createMockBackend(options = {}) {
 
   /** @type {Set<(event: Object) => void>} */
   const handlers = new Set()
+  /** `provision://progress` listeners (IC-2). @type {Set<(payload: Object) => void>} */
+  const provisionListeners = new Set()
+  /** `cloud://attempt` listeners (IC-3). @type {Set<(payload: Object) => void>} */
+  const attemptListeners = new Set()
+  const emitTo = (listeners, payload) => {
+    for (const listener of listeners) listener(structuredClone(payload))
+  }
+  /** Resolves to an unlisten function, as Tauri's `listen` does. */
+  const listenOn = (listeners, handler) => {
+    listeners.add(handler)
+    return Promise.resolve(() => {
+      listeners.delete(handler)
+    })
+  }
   let noticeCounter = 0
   let projectCounter = 0
   let handCounter = 0
@@ -661,12 +721,567 @@ export function createMockBackend(options = {}) {
     return 'started'
   }
 
+  /* ---------- cloud targets and secrets ---------- */
+
+  const secretKey = (provider, profileId, role) => `${provider}:${profileId}:${role}`
+
+  const requireSecretSpec = ({ provider, profileId, role } = {}) => {
+    if (provider !== 'modal' && provider !== 'beam') throw new Error(`unknown cloud provider '${provider}'`)
+    if (typeof profileId !== 'string' || profileId.trim() === '') throw new Error('profileId is required')
+    if (!['setup', 'runtime', 'model_download'].includes(role)) throw new Error(`unknown secret role '${role}'`)
+    return { provider, profileId, role }
+  }
+
+  const secretSummary = ({ provider, profileId, role }) => ({
+    provider,
+    profileId,
+    role,
+    present: state.secrets.has(secretKey(provider, profileId, role)),
+    backend: 'session',
+  })
+
+  const profileOf = (provider, profileId) =>
+    (provider === 'beam'
+      ? state.inferenceConfig.beamProfiles?.[profileId]
+      : state.inferenceConfig.modalProfiles?.[profileId]) ?? null
+
+  /**
+   * Replace the inference configuration, advancing every profile's epoch and
+   * dropping cached proposals and grants, so consent given against the old
+   * configuration cannot be spent against the new one.
+   */
+  const replaceInferenceConfig = (projected) => {
+    const ids = new Set([
+      ...Object.keys(state.inferenceConfig.beamProfiles || {}),
+      ...Object.keys(state.inferenceConfig.modalProfiles || {}),
+      ...Object.keys(projected.beamProfiles || {}),
+      ...Object.keys(projected.modalProfiles || {}),
+    ])
+    for (const id of ids) {
+      state.profileEpochs.set(id, (state.profileEpochs.get(id) ?? 1) + 1)
+    }
+    state.cachedProposals.clear()
+    state.cachedGrants.clear()
+    state.inferenceConfig = projected
+  }
+
+  /* ---------- interactive cloud renders ---------- */
+
+  /**
+   * The phases a render reports (IC-3) and how long the mock stays in each, as
+   * a share of `timing.cloud`. The first render of a session also waits in
+   * `queued` for a cold start, the way a provider brings a GPU up from zero.
+   */
+  const CLOUD_PHASES = Object.freeze([
+    ['preparing', 0.2],
+    ['submitting', 0.3],
+    ['queued', 0.6],
+    ['running', 1.5],
+    ['downloading', 0.3],
+    ['compositing', 0.2],
+  ])
+  const COLD_START_SHARE = 2.5
+
+  /**
+   * The permission check every cloud-capable command makes first, as
+   * `region.rs` makes it: refused with `notice.cloud.blocked`, before any
+   * event, when the switch is off.
+   */
+  const cloudBlocked = () => {
+    if (state.settings.cloudEngines === 'allowed') return false
+    notify('notice.cloud.blocked', {}, 'warn')
+    return true
+  }
+
+  /**
+   * The checks the native render makes before it spends anything: a live and
+   * unspent grant, the target it was granted for still selected, a recipe and
+   * an intent, and a runtime secret for that target. Rejections are the native
+   * side's stable codes, thrown for `renderWithGrant` to report.
+   */
+  const claimCloudGrant = (params) => {
+    const nonce = params?.grantNonce
+    const grant = typeof nonce === 'string' ? state.cachedGrants.get(nonce) : null
+    if (!grant || timers.now() > grant.expiresAtMs) throw new Error('consent_invalid')
+    if ((grant.usedAttempts ?? 0) >= (grant.allowedAttempts ?? 1)) throw new Error('consent_invalid')
+    if (!params.recipe || !params.intent) throw new Error('invalid_request')
+    const selected = state.inferenceConfig.selectedTarget
+    const target = params.executionTarget
+    if (!target || target.type !== selected.type || target.profile_id !== selected.profile_id) {
+      throw new Error('target_changed')
+    }
+    const profile = profileOf(target.type, target.profile_id)
+    if (!profile) throw new Error('profile_missing')
+    if (!state.secrets.has(secretKey(target.type, target.profile_id, 'runtime'))) {
+      throw new Error('credential_missing')
+    }
+    grant.usedAttempts = (grant.usedAttempts ?? 0) + 1
+    return { profile }
+  }
+
+  /**
+   * One cloud render with the grant `params` carries, answered the way
+   * `region.rs#render_in_cloud` answers: `{mask}` when it committed, or
+   * `{phase, code}` when it stopped - `failed`, `cancelled` or `unknown`.
+   * Every ending is also a `cloud://attempt` event, the grant's own refusals
+   * included, so a render the interface is waiting on never goes quiet. An
+   * endpoint whose address says `offline` or `unreachable` fails at submit,
+   * the same knob `checkCloudConnection` reads.
+   */
+  const renderWithGrant = (params, found, commit) => {
+    const nonce = String(params.grantNonce)
+    const attemptId = cloudAttemptId(nonce)
+    const job = {
+      attemptId,
+      regionId: found.region.id,
+      chapterId: found.chapter.id,
+      pageIndex: found.page.index,
+      startedAt: timers.now(),
+      cancelled: false,
+      timer: null,
+      step: null,
+      // The phase last reported, which is what a cancel is answered by.
+      phase: 'preparing',
+    }
+    const report = (phase, errorCode = null) => {
+      job.phase = phase
+      emitTo(attemptListeners, {
+        attemptId,
+        regionId: job.regionId,
+        chapterId: job.chapterId,
+        pageIndex: job.pageIndex,
+        phase,
+        elapsedMs: Math.max(0, timers.now() - job.startedAt),
+        errorCode,
+      })
+    }
+    // A render already running under this id is the one being watched: the
+    // native side refuses a second one before a single event goes out.
+    if (state.cloudJobs.has(attemptId)) return Promise.resolve({ phase: 'failed', code: 'attempt_busy' })
+    report('preparing')
+    let profile
+    try {
+      ;({ profile } = claimCloudGrant(params))
+    } catch (error) {
+      const code = error instanceof Error ? error.message : 'consent_invalid'
+      report('failed', code)
+      return Promise.resolve({ phase: 'failed', code })
+    }
+    state.cloudJobs.set(attemptId, job)
+    const unreachable = /offline|unreachable/.test(profile.endpointUrl)
+    const phases = CLOUD_PHASES.filter(([phase]) => phase !== 'preparing').map(([phase, share]) => [
+      phase,
+      Math.round(timing.cloud * (phase === 'queued' && !state.cloudWarm ? share + COLD_START_SHARE : share)),
+    ])
+    const preparing = Math.round(timing.cloud * CLOUD_PHASES[0][1])
+    return new Promise((resolve) => {
+      let index = 0
+      const end = (phase, code) => {
+        state.cloudJobs.delete(attemptId)
+        report(phase, code)
+        resolve({ phase, code })
+      }
+      job.step = () => {
+        job.timer = null
+        if (job.cancelled) return end('cancelled', 'cancelled')
+        if (index < phases.length) {
+          const [phase, ms] = phases[index]
+          index += 1
+          if (phase === 'queued' && unreachable) return end('failed', 'gateway_unreachable')
+          report(phase)
+          job.timer = timers.setTimeout(job.step, ms)
+          return
+        }
+        state.cloudJobs.delete(attemptId)
+        state.cloudWarm = true
+        const mask = commit(cloudRecordFor(attemptId, params.executionTarget, params.recipe))
+        report('committed')
+        resolve({ mask })
+      }
+      job.timer = timers.setTimeout(job.step, preparing)
+    })
+  }
+
+  /** Does this request name a cloud engine or target, as `region.rs` reads one? */
+  const wantsCloud = (params = {}) =>
+    params?.engine === 'cloud' ||
+    ['executionTarget', 'target'].some(
+      (key) => params?.[key] !== undefined && params[key]?.type !== 'local',
+    )
+
+  /**
+   * The record `inference/service.rs` writes beside a cloud render's patch,
+   * which is what marks a mask as the cloud's. No cost: the endpoint does not
+   * report one.
+   *
+   * @param {string} attemptId
+   * @param {{type: string, profile_id: string}|null|undefined} target
+   * @param {any} [recipe]
+   */
+  const cloudRecordFor = (attemptId, target, recipe) => ({
+    provider: target?.type === 'beam' ? 'beam' : 'modal',
+    profile_id: target?.profile_id ?? null,
+    job_id: `job-${attemptId.slice(4, 20)}`,
+    request_id: `req-${attemptId.slice(4, 20)}`,
+    attempt_id: attemptId,
+    recipe_id: recipe?.recipe_id ?? PINNED_CLOUD_RECIPE_ID,
+    model: recipe?.model_id ?? PINNED_CLOUD_MODEL_ID,
+    model_revision: recipe?.model_revision ?? PINNED_CLOUD_MODEL_REVISION,
+    tier: null,
+    cost: null,
+    duration_ms: null,
+  })
+
+  /**
+   * A render's result on its region: FLUX, reconstructed, cleaned, with the
+   * cloud record beside it, as the native side commits one.
+   */
+  const commitCloudResult = (found, cloud, tool) => {
+    const mask = commitMask(found.region, toolContext, {
+      engine: 'flux',
+      fillMode: 'reconstruct',
+      ...(tool ? { tool } : {}),
+    })
+    mask.provenance.cloud = cloud
+    if (found.page.status === 'unclean') found.page.status = 'cleaned'
+    return mask
+  }
+
+  /* ---------- the cloud provisioner ---------- */
+
+  const PROVISION_PROTOCOL = '1.0.0'
+  const MODEL_WEIGHTS_BYTES = 5_475_930_180
+
+  const helperSuccess = (op, requestId, data) => ({
+    protocol_version: PROVISION_PROTOCOL,
+    request_id: requestId || `req-mock-${op}`,
+    success: true,
+    data,
+    error: null,
+  })
+
+  const helperFailure = (op, requestId, code, message) => ({
+    protocol_version: PROVISION_PROTOCOL,
+    request_id: requestId || `req-mock-${op}`,
+    success: false,
+    data: null,
+    error: { code, message, actionable_guidance: null, remedy_steps: [] },
+  })
+
+  const credentialsPresent = (provider, credentials = {}) =>
+    provider === 'modal'
+      ? Boolean(credentials.token_id?.trim?.() && credentials.token_secret?.trim?.())
+      : Boolean((credentials.token ?? credentials.beam_token)?.trim?.())
+
+  const credentialsDenied = (credentials = {}) =>
+    Object.values(credentials).some((value) => typeof value === 'string' && value.includes('denied'))
+
+  const installationKey = (provider, installationId) => `${provider}:${installationId}`
+
+  const isInstallationId = (value) => typeof value === 'string' && /^[a-z0-9][a-z0-9-]{2,40}$/.test(value)
+
+  /** What a plan for these choices creates, in the shape the helper answers. */
+  const planFor = (provider, installationId, options = {}) => {
+    const gpus = MOCK_PROVISION_GPUS[provider]
+    const gpu = options.gpu ?? gpus.fallback
+    const idleSeconds = options.idle_seconds ?? 120
+    if (!gpus.options.includes(gpu)) {
+      return { error: ['ERR_VALIDATION_ERROR', `GPU '${gpu}' is not offered for ${provider}`] }
+    }
+    if (!Number.isInteger(idleSeconds) || idleSeconds < 60 || idleSeconds > 600) {
+      return { error: ['ERR_VALIDATION_ERROR', 'idle_seconds must be an integer from 60 to 600'] }
+    }
+    const resources =
+      provider === 'modal'
+        ? [
+            { type: 'volume', name: `mc-weights-${installationId}`, purpose: 'Model weights' },
+            { type: 'dict', name: `mc-jobs-${installationId}`, purpose: 'Job state' },
+            { type: 'app', name: `mc-${installationId}`, purpose: 'Gateway and GPU worker' },
+            { type: 'proxy_token', name: `mc-token-${installationId}`, purpose: 'Runtime access token' },
+          ]
+        : [
+            { type: 'volume', name: `mc-weights-${installationId}`, purpose: 'Model weights' },
+            { type: 'gateway', name: `mc-gateway-${installationId}`, purpose: 'Gateway' },
+            { type: 'worker', name: `mc-worker-${installationId}`, purpose: 'GPU worker' },
+          ]
+    const plan = {
+      plan_id: `plan-${provider}-${installationId}`,
+      installation_id: installationId,
+      provider,
+      app_name: `mc-${installationId}`,
+      target_environment: provider === 'modal' ? 'main' : 'default',
+      resource_allocation: {
+        gpu,
+        gpu_options: [...gpus.options],
+        idle_seconds: idleSeconds,
+        max_containers: 1,
+        model_weights_bytes: MODEL_WEIGHTS_BYTES,
+      },
+      resources_to_create: resources,
+      runtime_credential_kind: provider === 'modal' ? 'modal_proxy' : 'beam_bearer',
+      required_permissions: [],
+      estimated_monthly_cost: 'Billed by your provider. Nothing runs while idle.',
+      cost_notes: [
+        'GPU time is billed by the second while a job runs, plus the idle window before it scales down.',
+        'The gateway and the stored weights cost little or nothing while idle.',
+      ],
+      cleanup_plan_summary: resources.map((resource) => `Delete ${resource.type} '${resource.name}'`),
+      created_at_utc: new Date(timers.now()).toISOString(),
+    }
+    const { created_at_utc: _created, ...hashed } = plan
+    return { plan: { ...plan, plan_hash: sha256Hex(JSON.stringify(hashed)) } }
+  }
+
+  /** `?cloudSetupFail=deploy` fails the first apply at that step, so Resume can be tried in a browser. */
+  const setupFailKnob = new URLSearchParams(globalThis.location?.search ?? '').get('cloudSetupFail')
+
+  const emitProgress = (run, step, stepState, pct = null) =>
+    emitTo(provisionListeners, { op: run.op, provider: run.provider, step, state: stepState, pct })
+
+  /**
+   * Walk `steps` on timers, emitting IC-2 progress. Resolves to the step that
+   * failed, `'cancelled'`, or null when every step finished.
+   */
+  const walkSteps = (run, steps, { skip = new Set(), failAt = null } = {}) =>
+    new Promise((resolve) => {
+      let index = 0
+      const next = () => {
+        run.timer = null
+        if (run.cancelled) return resolve('cancelled')
+        if (index >= steps.length) return resolve(null)
+        const step = steps[index]
+        index += 1
+        if (skip.has(step)) {
+          emitProgress(run, step, 'skip')
+          return next()
+        }
+        run.current = step
+        emitProgress(run, step, 'start', step === 'weights' ? 0 : null)
+        let pct = 0
+        const tick = () => {
+          run.timer = null
+          if (run.cancelled) {
+            emitProgress(run, step, 'fail')
+            return resolve('cancelled')
+          }
+          if (step === failAt) {
+            emitProgress(run, step, 'fail')
+            return resolve(step)
+          }
+          if (step === 'weights' && pct < 100) {
+            pct += 25
+            emitProgress(run, step, 'start', pct)
+            run.timer = timers.setTimeout(tick, timing.provision)
+            return
+          }
+          emitProgress(run, step, 'done', step === 'weights' ? 100 : null)
+          run.done.add(step)
+          next()
+        }
+        run.timer = timers.setTimeout(tick, timing.provision)
+      }
+      next()
+    })
+
+  /**
+   * What `provision.rs` does with a helper's success (IC-1): keep the runtime
+   * credential out of the answer, hold it as the profile's runtime secret,
+   * save and select the profile, check its health.
+   */
+  const finishInstallation = (installation) => {
+    const { provider, installationId } = installation
+    const endpointUrl =
+      provider === 'modal'
+        ? `https://mock-workspace--mc-${installationId}-gateway.modal.run/mc/v1`
+        : `https://mc-${installationId}-gateway.app.beam.cloud/mc/v1`
+    const origin = new URL(endpointUrl).origin
+    const name = `${provider === 'modal' ? 'Modal' : 'Beam'} (${installationId})`
+    const now = timers.now()
+    const mapKey = provider === 'modal' ? 'modalProfiles' : 'beamProfiles'
+    const previous = state.inferenceConfig[mapKey]?.[installationId]
+    replaceInferenceConfig({
+      ...state.inferenceConfig,
+      selectedTarget: { type: provider, profile_id: installationId },
+      [mapKey]: {
+        ...(state.inferenceConfig[mapKey] ?? {}),
+        [installationId]: {
+          id: installationId,
+          name,
+          endpointUrl,
+          canonicalOrigin: origin,
+          canonicalOriginFingerprint: sha256Hex(origin),
+          createdAtMs: previous?.createdAtMs ?? now,
+          updatedAtMs: now,
+        },
+      },
+    })
+    state.secrets.add(secretKey(provider, installationId, 'runtime'))
+    installation.stage = 'completed'
+    installation.endpointUrl = endpointUrl
+    return {
+      installation_id: installationId,
+      provider,
+      stage: 'completed',
+      endpoint_url: endpointUrl,
+      gpu: installation.plan.resource_allocation.gpu,
+      idle_seconds: installation.plan.resource_allocation.idle_seconds,
+      model: {
+        model_id: PINNED_CLOUD_MODEL_ID,
+        model_revision: PINNED_CLOUD_MODEL_REVISION,
+        recipe_id: PINNED_CLOUD_RECIPE_ID,
+        preprocessing_version: CLOUD_PREPROCESSING_VERSION,
+      },
+      compatibility_status: 'compatible',
+      resources_created: installation.plan.resources_to_create.map(({ type, name: resourceName }) => ({
+        type,
+        name: resourceName,
+      })),
+      setup_credential_forgotten: true,
+      profile: { provider, profile_id: installationId, name, endpoint_url: endpointUrl },
+      health: { ok: true, status: 'reachable', latency_ms: 42 },
+      selected: true,
+    }
+  }
+
+  /** `apply` and `resume`: the staged pipeline, with progress, a stop and a resume point. */
+  const runInstallation = async (op, provider, params, installation) => {
+    const run = {
+      op,
+      provider,
+      cancelled: false,
+      timer: null,
+      current: null,
+      done: installation.done,
+    }
+    state.provisionRun = run
+    try {
+      const failAt =
+        params.simulate_fail_step ??
+        (setupFailKnob && !installation.failedOnce ? setupFailKnob : null)
+      const reissue = installation.stage === 'completed'
+      const skip = reissue
+        ? new Set(PROVISION_APPLY_STEPS.filter((step) => step !== 'token' && step !== 'health'))
+        : new Set(installation.done)
+      const outcome = await walkSteps(run, PROVISION_APPLY_STEPS, { skip, failAt })
+      if (outcome === 'cancelled') {
+        installation.stage = 'stopped'
+        return helperFailure(op, params.request_id, 'ERR_CANCELLED', 'Setup was stopped.')
+      }
+      if (outcome) {
+        installation.failedOnce = true
+        installation.stage = 'failed'
+        return helperFailure(op, params.request_id, 'ERR_EXECUTION_FAILED', `The ${outcome} step failed.`)
+      }
+      return helperSuccess(op, params.request_id, finishInstallation(installation))
+    } finally {
+      if (state.provisionRun === run) state.provisionRun = null
+    }
+  }
+
+  /** The cleanup plan for an installation: whatever it created, and nothing else. */
+  const cleanupPlanFor = (provider, installationId) => {
+    const installation = state.installations.get(installationKey(provider, installationId))
+    const resources = installation ? installation.plan.resources_to_create : []
+    const plan = {
+      plan_id: `cleanup-${provider}-${installationId}`,
+      installation_id: installationId,
+      provider,
+      resources_to_delete: resources.map((resource) => ({
+        resource_type: resource.type,
+        name: resource.name,
+      })),
+      foreign_resources_ignored: [],
+      persistent_storage_requires_explicit_confirmation: true,
+      created_at_utc: new Date(timers.now()).toISOString(),
+    }
+    const { created_at_utc: _created, ...hashed } = plan
+    return { ...plan, plan_hash: sha256Hex(JSON.stringify(hashed)) }
+  }
+
+  /* ---------- cloud recovery ---------- */
+
+  // FIXTURE KNOB: `?cloudRecovery=1` leaves two renders behind "from the last
+  // session", one finished and one whose submission nobody can vouch for, so
+  // the start-up recovery notice can be seen in a browser.
+  if (new URLSearchParams(globalThis.location?.search ?? '').has('cloudRecovery')) {
+    const chapter = state.projects[0]?.chapters[0]
+    const page = chapter?.pages.find((candidate) => candidate.regions.length > 1)
+    if (chapter && page) {
+      const [first, second] = page.regions
+      const leftOver = (region, phase) => ({
+        attemptId: cloudAttemptId(`grant-left-over-${region.id}`),
+        grantNonce: null,
+        phase,
+        status: phase === 'result_cached' ? 'completed' : 'unknown',
+        handle: phase === 'unknown' ? null : `handle-left-over-${region.id}`,
+        autoRetryable: false,
+        chapterId: chapter.id,
+        pageIndex: page.index,
+        regionId: region.id,
+        snapshot: { regionRevision: 1, sourceImageHash: 'src-hash' },
+        createdAtMs: timers.now(),
+      })
+      for (const record of [leftOver(first, 'result_cached'), leftOver(second, 'unknown')]) {
+        state.attemptJournal.set(record.attemptId, record)
+      }
+    }
+  }
+
+  /**
+   * `reconcile_cloud_recovery` with `apply` (IC-4): attach what finished,
+   * leave what is still running, and name what needs a person. Unknown
+   * submissions are never resubmitted.
+   */
+  const recoverCloudAttempts = () => {
+    const report = { attached: [], stillRunning: [], needsAttention: [] }
+    for (const record of state.attemptJournal.values()) {
+      if (record.phase === 'committed' || record.phase === 'reported') continue
+      const ref = {
+        attemptId: record.attemptId,
+        chapterId: record.chapterId ?? null,
+        pageIndex: record.pageIndex ?? null,
+        regionId: record.regionId ?? null,
+      }
+      if (record.phase === 'unknown') {
+        record.phase = 'reported'
+        report.needsAttention.push({ ...ref, reason: 'ambiguous' })
+      } else if (record.phase === 'accepted' || record.phase === 'cancel_requested') {
+        report.stillRunning.push(ref)
+      } else if (record.phase === 'result_cached' || record.status === 'completed') {
+        const found = record.regionId ? findRegion(record.regionId) : null
+        if (!found) {
+          record.phase = 'reported'
+          report.needsAttention.push({ ...ref, reason: 'stale' })
+          continue
+        }
+        commitCloudResult(
+          found,
+          cloudRecordFor(record.attemptId, state.inferenceConfig.selectedTarget, null),
+        )
+        record.phase = 'committed'
+        report.attached.push(ref)
+      } else if (record.phase === 'failed') {
+        record.phase = 'reported'
+        report.needsAttention.push({ ...ref, reason: 'failed' })
+      }
+    }
+    return report
+  }
+
   /* ---------- the adapter ---------- */
 
   return {
     subscribe(handler) {
       handlers.add(handler)
       return () => handlers.delete(handler)
+    },
+
+    onProvisionProgress(handler) {
+      return listenOn(provisionListeners, handler)
+    },
+
+    onCloudAttempt(handler) {
+      return listenOn(attemptListeners, handler)
     },
 
     async listProjects() {
@@ -943,42 +1558,29 @@ export function createMockBackend(options = {}) {
         await delay(timing.method)
         return { status: 'run-started', ...startRun({ scope: 'page', chapterId, pageIndex, ...params }) }
       }
+      const grant = typeof params.grantNonce === 'string'
+      if ((grant || wantsCloud(params)) && cloudBlocked()) {
+        await delay(timing.method)
+        return { status: 'blocked', errorCode: 'cloud_disabled' }
+      }
       const found = findRegion(regionId)
       if (!found) return { status: 'not-found' }
 
-      if (tool === 'contentAwareFill' && params.engine === 'cloud') {
-        if (state.settings.cloudEngines !== 'allowed') {
-          await delay(timing.method)
-          notify('notice.cloud.blocked', {}, 'warn')
-          return { status: 'blocked' }
-        }
-        if (params.acknowledgeTransmission) state.session.cloudAcknowledged = true
-        if (!state.session.cloudAcknowledged) {
-          return {
-            status: 'needs-confirmation',
-            confirmation: { kind: 'cloud-transmission', regionId, estimatedCost: CLOUD_COST },
-          }
-        }
-        const mustConfirmSpend =
-          !state.session.spendConfirmed || state.settings.confirmBeforeSpending
-        if (mustConfirmSpend && !params.confirmSpend) {
-          return {
-            status: 'needs-confirmation',
-            confirmation: { kind: 'cloud-cost', regionId, estimatedCost: CLOUD_COST },
-          }
-        }
-        state.session.spendConfirmed = true
-        const cloud = applyCloudToRegion(found.region, found.page, toolContext)
-        // The round trip is its own delay: the mask's `elapsedMs` records the
-        // real 3–15 s a cloud request costs, which nobody wants to sit through.
-        await delay(timing.cloud)
-        notifyAll(cloud.notices)
+      if (grant) {
+        await delay(timing.method)
+        const ended = await renderWithGrant(params, found, (cloud) => commitCloudResult(found, cloud, tool))
+        if (!ended.mask) return { status: ended.phase, errorCode: ended.code }
         return {
           status: 'applied',
           region: snapshot(found.region),
-          mask: snapshot(cloud.mask),
+          mask: snapshot(ended.mask),
           pageStatus: found.page.status,
         }
+      }
+      // A cloud engine with no grant: the interface's consent step comes first.
+      if (wantsCloud(params)) {
+        await delay(timing.method)
+        return { status: 'needs-confirmation' }
       }
 
       const applied = applyToolToRegion(found.region, found.page, toolContext, { tool, params })
@@ -1006,6 +1608,14 @@ export function createMockBackend(options = {}) {
      */
     async createRegion({ chapterId, pageIndex, bbox, tool, params = {} }) {
       await delay(timing.method)
+      // Always local, as the native command is: a cloud engine is refused while
+      // cloud is off, and otherwise dropped for the fill mode's local default.
+      // The interface asks for consent and applies the cloud to the new region.
+      if (wantsCloud(params)) {
+        if (cloudBlocked()) return null
+        const { engine: _cloud, executionTarget: _target, target: _named, ...local } = params
+        params = local
+      }
       const found = findChapter(chapterId)
       const page = found?.chapter.pages.find((candidate) => candidate.index === pageIndex)
       if (!page || !bbox) return null
@@ -1100,10 +1710,33 @@ export function createMockBackend(options = {}) {
       return snapshot(page.regions.find((r) => r.id === regionId))
     },
 
-    async rerunMask({ maskId, kind, engine }) {
+    async rerunMask({ maskId, kind, engine, params }) {
       await delay(timing.method)
       const found = findMask(maskId)
       if (!found) return null
+      // With a grant the region renders in the cloud; one that does not commit
+      // answers null, its code on the `cloud://attempt` event.
+      if (typeof params?.grantNonce === 'string') {
+        if (cloudBlocked()) return null
+        const ended = await renderWithGrant(params, found, (cloud) => commitCloudResult(found, cloud))
+        if (!ended.mask) return null
+        return {
+          region: snapshot(found.region),
+          mask: snapshot(ended.mask),
+          reopenTool: null,
+          pageStatus: found.page.status,
+        }
+      }
+      // No grant, and a re-run that would need the cloud: Clean with > Cloud,
+      // or a patch the cloud rendered run again as what it was (Try again, a
+      // step that lands where it is). `region.rs#rerun_mask` refuses it
+      // rather than run it here, as blocked while cloud is off, so the
+      // interface asks for consent first. A cloud patch re-run with a local
+      // engine is that choice, and runs here.
+      if (rerunNeedsCloud(found.region.mask, kind, engine)) {
+        if (!cloudBlocked()) notify('notice.mask.rerunFailed', { reasonKey: 'decline.reason.rungUnavailable' }, 'warn')
+        return null
+      }
       const result = rerunRegionMask(found.region, toolContext, { kind, engine })
       notifyAll(result.notices)
       return {
@@ -1452,10 +2085,16 @@ export function createMockBackend(options = {}) {
       return 'deleted'
     },
 
-    async cleanAnyway({ regionId, engine }) {
+    async cleanAnyway({ regionId, engine, params }) {
       await delay(timing.method)
       const found = findRegion(regionId)
       if (!found) return null
+      if (typeof params?.grantNonce === 'string') {
+        if (cloudBlocked()) return null
+        const ended = await renderWithGrant(params, found, (cloud) => commitCloudResult(found, cloud))
+        if (!ended.mask) return null
+        return { region: snapshot(found.region), mask: snapshot(ended.mask), pageStatus: found.page.status }
+      }
       const result = cleanRegionAnyway(found.region, found.page, toolContext, engine)
       notifyAll(result.notices)
       return {
@@ -1565,38 +2204,35 @@ export function createMockBackend(options = {}) {
     async writeInferenceConfig({ config }) {
       await delay(timing.method)
       const projected = projectPublicInferenceConfig(config)
-
-      // Advance profile epochs and invalidate cached proposals/grants for mutated/deleted profiles
-      const oldProfiles = new Set([
-        ...Object.keys(state.inferenceConfig.beamProfiles || {}),
-        ...Object.keys(state.inferenceConfig.modalProfiles || {}),
-      ])
-      const newProfiles = new Set([
-        ...Object.keys(projected.beamProfiles || {}),
-        ...Object.keys(projected.modalProfiles || {}),
-      ])
-      const allProfiles = new Set([...oldProfiles, ...newProfiles])
-      for (const id of allProfiles) {
-        const currentEpoch = state.profileEpochs.get(id) ?? 1
-        state.profileEpochs.set(id, currentEpoch + 1)
-      }
-      state.cachedProposals.clear()
-      state.cachedGrants.clear()
-
-      state.inferenceConfig = projected
+      replaceInferenceConfig(projected)
       return snapshot(state.inferenceConfig)
     },
 
-    async storeCloudSecret() {
-      throw new Error('Cloud secret operations are unavailable in browser mock')
+    /**
+     * A session-only secret store: it records that a secret was stored and
+     * never the secret, so the readiness check and the endpoint list can be
+     * exercised in a browser without a value ever sitting in page memory.
+     */
+    async storeCloudSecret(spec = {}) {
+      await delay(timing.method)
+      const key = requireSecretSpec(spec)
+      if (typeof spec.secret !== 'string' || spec.secret.trim() === '') {
+        throw new Error('secret must not be empty')
+      }
+      state.secrets.add(secretKey(key.provider, key.profileId, key.role))
+      return secretSummary(key)
     },
 
-    async deleteCloudSecret() {
-      throw new Error('Cloud secret operations are unavailable in browser mock')
+    async deleteCloudSecret(spec = {}) {
+      await delay(timing.method)
+      const key = requireSecretSpec(spec)
+      state.secrets.delete(secretKey(key.provider, key.profileId, key.role))
+      return secretSummary(key)
     },
 
-    async getCloudSecretSummary() {
-      throw new Error('Cloud secret operations are unavailable in browser mock')
+    async getCloudSecretSummary(spec = {}) {
+      await delay(timing.method)
+      return secretSummary(requireSecretSpec(spec))
     },
 
     async checkCloudConnection({ provider, profileId }) {
@@ -1612,6 +2248,10 @@ export function createMockBackend(options = {}) {
       }
       // Ordinary connection check: reachability of control-plane endpoint only.
       // Never triggers GPU work, worker warmup, or model downloads.
+      // A profile with no runtime token is not asked at all, as the native check does.
+      if (!state.secrets.has(secretKey(provider, profileId, 'runtime'))) {
+        return { ok: false, status: 'credential_missing', provider, profileId }
+      }
       if (profile.endpointUrl.includes('unreachable') || profile.endpointUrl.includes('offline')) {
         return {
           ok: false,
@@ -1643,9 +2283,11 @@ export function createMockBackend(options = {}) {
       }
       return {
         supportedProtocolVersion: '1.0.0',
-        pinnedModelId: 'flux-schnell',
+        pinnedModelId: PINNED_CLOUD_MODEL_ID,
         pinnedModelRevision: PINNED_CLOUD_MODEL_REVISION,
-        pinnedRecipeId: 'sdnq-v1',
+        pinnedRecipeId: PINNED_CLOUD_RECIPE_ID,
+        preprocessingVersion: CLOUD_PREPROCESSING_VERSION,
+        nativeMaskConditioning: false,
         limits: {
           maxDimensions: [2048, 2048],
           maxMegapixels: 4.19,
@@ -1673,6 +2315,19 @@ export function createMockBackend(options = {}) {
       }
 
       const proposalId = `prop-${rng.sha256().slice(0, 16)}`
+      // A crop around the region, not the page: the bounding box and a margin
+      // for context, clamped to the page, the way the native side cuts it.
+      const regionFound = spec.regionId ? findRegion(spec.regionId) : null
+      const cropRect = (() => {
+        const bbox = regionFound?.region?.bbox
+        if (!bbox) return { x: 0, y: 0, w: 256, h: 256 }
+        const margin = 32
+        const x = Math.max(0, Math.floor(bbox.x - margin))
+        const y = Math.max(0, Math.floor(bbox.y - margin))
+        const right = Math.min(regionFound.page.width ?? bbox.x + bbox.w + margin, Math.ceil(bbox.x + bbox.w + margin))
+        const bottom = Math.min(regionFound.page.height ?? bbox.y + bbox.h + margin, Math.ceil(bbox.y + bbox.h + margin))
+        return { x, y, w: Math.max(1, right - x), h: Math.max(1, bottom - y) }
+      })()
       const profileEpoch = state.profileEpochs.get(target.profile_id) ?? 1
       const proposal = {
         proposalId,
@@ -1686,11 +2341,11 @@ export function createMockBackend(options = {}) {
         sourceHash: rng.sha256(),
         maskHash: rng.sha256(),
         regionRevision: spec.regionRevision ?? 1,
-        rect: spec.rect ?? { x: 0, y: 0, w: 256, h: 256 },
+        rect: spec.rect ?? cropRect,
         recipe: recipe ?? {
-          recipe_id: 'sdnq-v1',
-          preprocessing_version: '1.0.0',
-          model_id: 'flux-schnell',
+          recipe_id: PINNED_CLOUD_RECIPE_ID,
+          preprocessing_version: CLOUD_PREPROCESSING_VERSION,
+          model_id: PINNED_CLOUD_MODEL_ID,
           model_revision: PINNED_CLOUD_MODEL_REVISION,
           native_mask_conditioning: false,
         },
@@ -1919,6 +2574,30 @@ export function createMockBackend(options = {}) {
     },
 
     async cancelCloudAttempt({ attemptId, handle }) {
+      const live = attemptId ? state.cloudJobs.get(attemptId) : null
+      if (live) {
+        // A result already downloaded is past cancelling, and the native
+        // side refuses the cancel as its journal says
+        // (`commands.rs#past_cancelling`).
+        if (live.phase === 'compositing') throw new Error('cannot cancel attempt: job is already completed')
+        // While the result downloads the cancel is asked for and comes too
+        // late: the render commits anyway, and its last event says so. That
+        // is the late cancel the interface shows as a result, not as
+        // cancelled. Before that the render notices at once rather than after
+        // its current phase, as the native loop checks its cancel flag
+        // between polls.
+        if (live.phase !== 'downloading') {
+          live.cancelled = true
+          if (live.timer !== null) {
+            timers.clearTimeout(live.timer)
+            live.timer = timers.setTimeout(live.step, 0)
+          }
+        }
+        // `commands.rs#cancel_cloud_attempt` for a render in this process:
+        // asked for, not confirmed. How it ended is the `cloud://attempt`
+        // event's to say.
+        return { handle: '', status: 'cancel_requested', acknowledged: false }
+      }
       await delay(timing.method)
       let record = null
       if (attemptId && state.attemptJournal.has(attemptId)) {
@@ -1947,6 +2626,7 @@ export function createMockBackend(options = {}) {
 
     async reconcileCloudRecovery(spec = {}) {
       await delay(timing.method)
+      if (spec.apply === true) return recoverCloudAttempts()
       const { attemptId, simulateStale, regionRevision, sourceImageHash } = spec
 
       let record = null
@@ -2035,6 +2715,135 @@ export function createMockBackend(options = {}) {
         attemptId: record.attemptId,
         message: 'Attempt reached terminal state.',
       }
+    },
+
+    /**
+     * The provisioning helper, simulated: the same ops, the same envelope, IC-2
+     * progress on timers and the IC-1 answer `provision.rs` gives the webview.
+     * Credentials are checked for presence and dropped; nothing keeps them.
+     */
+    async runCloudProvisioner(spec = {}) {
+      await delay(timing.method)
+      const { op = 'inspect', provider = 'modal', params = {} } = spec ?? {}
+      const requestId = params.request_id
+      if (params.simulateMissingHelper) {
+        return {
+          protocol_version: PROVISION_PROTOCOL,
+          request_id: requestId || 'req-missing-helper',
+          success: false,
+          data: null,
+          error: {
+            code: 'ERR_PROVIDER_UNAVAILABLE',
+            message: 'Cloud provisioner helper binary not found: no executable discovered in MANGA_CLEANER_PROVISIONER_BIN, Tauri resources, or dev environment',
+            actionable_guidance: 'Install or package the cloud provisioner helper binary, or set MANGA_CLEANER_PROVISIONER_BIN to its path.',
+            remedy_steps: [
+              'Set MANGA_CLEANER_PROVISIONER_BIN to the absolute path of the provisioner executable',
+              'Ensure Python 3 with the provisioner package is available at repository root during development',
+            ],
+          },
+        }
+      }
+      if (provider !== 'modal' && provider !== 'beam') {
+        return helperFailure(op, requestId, 'ERR_UNSUPPORTED_PROVIDER', `Unsupported provider '${provider}'`)
+      }
+      const credentials = params.credentials ?? {}
+      const installationId = params.installation_id
+      const needsCredentials = ['inspect', 'plan', 'apply', 'resume', 'cleanup_apply'].includes(op)
+      if (needsCredentials && !credentialsPresent(provider, credentials)) {
+        return helperFailure(op, requestId, 'ERR_VALIDATION_ERROR', 'Missing provider credentials')
+      }
+      if (needsCredentials && credentialsDenied(credentials)) {
+        return helperFailure(op, requestId, 'ERR_ACTIONABLE_MISSING_PERMISSION', 'The token was refused by the provider')
+      }
+      if (op !== 'inspect' && !isInstallationId(installationId)) {
+        return helperFailure(op, requestId, 'ERR_VALIDATION_ERROR', "Missing or invalid parameter: 'installation_id'")
+      }
+      const key = installationKey(provider, installationId)
+
+      switch (op) {
+        case 'inspect':
+          return helperSuccess(op, requestId, {
+            account_id: 'mock-account',
+            workspace_name: 'mock-workspace',
+            authenticated: true,
+            permissions_granted: ['apps', 'volumes', 'tokens'],
+            permissions_missing: [],
+            eligible: true,
+            actionable_remedy: null,
+            platform_supported: true,
+            platform_notes: '',
+          })
+        case 'plan': {
+          const { plan, error } = planFor(provider, installationId, params.options ?? {})
+          if (error) return helperFailure(op, requestId, ...error)
+          const existing = state.installations.get(key)
+          state.installations.set(key, {
+            provider,
+            installationId,
+            plan,
+            stage: existing?.stage === 'completed' ? 'completed' : 'planned',
+            done: existing?.done ?? new Set(),
+            failedOnce: existing?.failedOnce ?? false,
+          })
+          return helperSuccess(op, requestId, plan)
+        }
+        case 'apply':
+        case 'resume': {
+          const installation = state.installations.get(key)
+          if (!installation) {
+            return helperFailure(op, requestId, 'ERR_VALIDATION_ERROR', `No plan for installation '${installationId}'`)
+          }
+          if (op === 'apply' && params.approved_plan_hash !== installation.plan.plan_hash) {
+            return helperFailure(op, requestId, 'ERR_UNAPPROVED_PLAN', 'Approved plan hash mismatch')
+          }
+          if (state.provisionRun) {
+            return helperFailure(op, requestId, 'ERR_EXECUTION_FAILED', 'Another setup is already running')
+          }
+          return runInstallation(op, provider, params, installation)
+        }
+        case 'cleanup_plan': {
+          const plan = cleanupPlanFor(provider, installationId)
+          const installation = state.installations.get(key)
+          if (installation) installation.cleanupHash = plan.plan_hash
+          return helperSuccess(op, requestId, plan)
+        }
+        case 'cleanup_apply': {
+          const plan = cleanupPlanFor(provider, installationId)
+          if (params.approved_cleanup_plan_hash !== plan.plan_hash) {
+            return helperFailure(op, requestId, 'ERR_UNAPPROVED_PLAN', 'Approved cleanup plan hash mismatch')
+          }
+          const hasVolume = plan.resources_to_delete.some((resource) => resource.resource_type === 'volume')
+          if (hasVolume && params.confirm_delete_persistent_storage !== true) {
+            return helperFailure(op, requestId, 'ERR_VALIDATION_ERROR', 'Deleting the weights volume needs explicit confirmation')
+          }
+          const run = { op, provider, cancelled: false, timer: null, current: null, done: new Set() }
+          state.provisionRun = run
+          try {
+            const outcome = await walkSteps(run, ['validate', 'cleanup'])
+            if (outcome === 'cancelled') return helperFailure(op, requestId, 'ERR_CANCELLED', 'Cleanup was stopped.')
+          } finally {
+            if (state.provisionRun === run) state.provisionRun = null
+          }
+          state.installations.delete(key)
+          return helperSuccess(op, requestId, {
+            installation_id: installationId,
+            deleted: plan.resources_to_delete,
+            stage: 'cleaned_up',
+          })
+        }
+        case 'forget_credential':
+          return helperSuccess(op, requestId, { status: 'forgotten', setup_credential_cleared: true })
+        default:
+          return helperFailure(op, requestId, 'ERR_UNSUPPORTED_OPERATION', `Unsupported operation '${op}'`)
+      }
+    },
+
+    /** Stops the running setup; the journal keeps what finished, so Resume picks it up. */
+    async cancelCloudProvisioner() {
+      const run = state.provisionRun
+      if (!run) return { cancelled: false }
+      run.cancelled = true
+      return { cancelled: true }
     },
 
     async about() {

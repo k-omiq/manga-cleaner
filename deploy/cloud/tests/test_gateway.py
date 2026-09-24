@@ -41,6 +41,20 @@ from deploy.cloud.common.redact import REDACTED_SECRET, redact_text
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
 
+# Upper bound for every thread handoff below. A lock-ordering regression then fails
+# the test in seconds instead of hanging the whole suite.
+THREAD_TIMEOUT_SECONDS = 10.0
+
+
+def run_concurrently(test: unittest.TestCase, *targets) -> None:
+    """Run each target on its own daemon thread and fail if any does not finish in time."""
+    threads = [threading.Thread(target=target, daemon=True) for target in targets]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(THREAD_TIMEOUT_SECONDS)
+    test.assertFalse(any(t.is_alive() for t in threads), "a concurrent request did not finish")
+
 
 def build_multipart_body(
     metadata_json: str,
@@ -1006,20 +1020,18 @@ class TestCloudGateway(unittest.TestCase):
         req_headers2 = dict(self.modal_auth_headers)
         req_headers2["Content-Type"] = ct_header2
 
-        barrier = threading.Barrier(2)
+        barrier = threading.Barrier(2, timeout=THREAD_TIMEOUT_SECONDS)
         results = [None, None]
 
         def submit(idx, headers, body):
             barrier.wait()
             results[idx] = self.modal_gateway.handle_http_request("POST", "/mc/v1/jobs", headers, body)
 
-        t1 = threading.Thread(target=submit, args=(0, req_headers1, body1))
-        t2 = threading.Thread(target=submit, args=(1, req_headers2, body2))
-
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
+        run_concurrently(
+            self,
+            lambda: submit(0, req_headers1, body1),
+            lambda: submit(1, req_headers2, body2),
+        )
 
         status_codes = sorted([results[0][0], results[1][0]])
         self.assertEqual(status_codes, [202, 409])
@@ -1061,20 +1073,14 @@ class TestCloudGateway(unittest.TestCase):
         req_headers["Content-Type"] = ct_header
 
         initial_inference_count = self.worker.inference_count
-        barrier = threading.Barrier(2)
+        barrier = threading.Barrier(2, timeout=THREAD_TIMEOUT_SECONDS)
         results = [None, None]
 
         def submit(idx):
             barrier.wait()
             results[idx] = self.modal_gateway.handle_http_request("POST", "/mc/v1/jobs", req_headers, body)
 
-        t1 = threading.Thread(target=submit, args=(0,))
-        t2 = threading.Thread(target=submit, args=(1,))
-
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
+        run_concurrently(self, lambda: submit(0), lambda: submit(1))
 
         self.assertEqual(results[0][0], 202)
         self.assertEqual(results[1][0], 202)
@@ -1138,13 +1144,7 @@ class TestCloudGateway(unittest.TestCase):
             # Release req1 to finish its inference
             slow_worker.release_infer.set()
 
-        t1 = threading.Thread(target=req1)
-        t2 = threading.Thread(target=req2)
-
-        t1.start()
-        t2.start()
-        t1.join(timeout=5.0)
-        t2.join(timeout=5.0)
+        run_concurrently(self, req1, req2)
 
         # Both requests return HTTP 202 Accepted
         self.assertEqual(results[0][0], 202)
@@ -1273,13 +1273,7 @@ class TestCloudGateway(unittest.TestCase):
             # Signal cancel thread to resume
             barrier_transition_done.wait(timeout=5.0)
 
-        t_cancel = threading.Thread(target=cancel_caller)
-        t_worker = threading.Thread(target=worker_completer)
-
-        t_cancel.start()
-        t_worker.start()
-        t_cancel.join(timeout=5.0)
-        t_worker.join(timeout=5.0)
+        run_concurrently(self, cancel_caller, worker_completer)
 
         self.assertIsNotNone(cancel_response[0])
         code, _, resp_body = cancel_response[0]

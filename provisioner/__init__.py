@@ -1,63 +1,41 @@
-"""Manga Cleaner Cloud Provisioner Package (P1, P7, P8).
+"""Manga Cleaner cloud provisioner: the helper that sets up Modal or Beam.
 
-Provides:
-- Pinned candidate matrix and AST packaging probes (P1).
-- Versioned allowlisted helper protocol (P7/P8).
-- Resumable installation/resource journal with atomic durability (P7/P8).
-- Deterministic fake provider drivers for Modal and Beam.
-- Isolated configuration semantics (zero mutation of global CLI configs).
-- Credential redaction and non-billable compatibility checks.
+The desktop runs it once per operation (`python -m provisioner` or the frozen
+`manga-cleaner-provisioner` binary) with one JSON request on stdin; see cli.py for
+the stream contract and controller.py for the operations.
+
+This package init stays import-free: the CLI must isolate stdout and stderr and
+harden the environment before any provider SDK or the deploy package is imported.
 """
 
-from provisioner.cli import main, run_helper
-from provisioner.controller import ProvisioningController
-from provisioner.driver_base import (
-    AccountInspectionResult,
-    BaseProviderDriver,
-    CleanupPlan,
-    CompatibilityValidationResult,
-    DeploymentPlan,
-)
-from provisioner.fake_drivers import FakeBeamDriver, FakeModalDriver
-from provisioner.journal import InstallationJournal, InstallationRecord, ResourceRecord
-from provisioner.protocol import (
-    ERR_PROVIDER_UNAVAILABLE,
-    HELPER_PROTOCOL_VERSION,
-    HelperRequest,
-    HelperResponse,
-    ProtocolError,
-    make_error_response,
-    make_success_response,
-    parse_request,
-)
-from provisioner.real_drivers import RealBeamDriver, RealModalDriver
-from provisioner.redaction import redact_data, redact_string
+from importlib import import_module
+from typing import Any
 
-__version__ = "0.2.0"
-__all__ = [
-    "HELPER_PROTOCOL_VERSION",
-    "ERR_PROVIDER_UNAVAILABLE",
-    "ProvisioningController",
-    "InstallationJournal",
-    "InstallationRecord",
-    "ResourceRecord",
-    "BaseProviderDriver",
-    "FakeModalDriver",
-    "FakeBeamDriver",
-    "RealModalDriver",
-    "RealBeamDriver",
-    "AccountInspectionResult",
-    "DeploymentPlan",
-    "CleanupPlan",
-    "CompatibilityValidationResult",
-    "HelperRequest",
-    "HelperResponse",
-    "ProtocolError",
-    "parse_request",
-    "make_success_response",
-    "make_error_response",
-    "redact_data",
-    "redact_string",
-    "main",
-    "run_helper",
-]
+__version__ = "0.3.0"
+
+_EXPORTS = {
+    "ProvisioningController": "provisioner.controller",
+    "ModalDriver": "provisioner.modal_driver",
+    "BeamDriver": "provisioner.beam_driver",
+    "InstallationJournal": "provisioner.journal",
+    "InstallationRecord": "provisioner.journal",
+    "ResourceRecord": "provisioner.journal",
+    "HELPER_PROTOCOL_VERSION": "provisioner.protocol",
+    "ProtocolError": "provisioner.protocol",
+    "parse_request": "provisioner.protocol",
+    "make_success_response": "provisioner.protocol",
+    "make_error_response": "provisioner.protocol",
+    "redact_data": "provisioner.redaction",
+    "redact_string": "provisioner.redaction",
+    "main": "provisioner.cli",
+    "run_helper": "provisioner.cli",
+}
+
+__all__ = sorted(_EXPORTS) + ["__version__"]
+
+
+def __getattr__(name: str) -> Any:
+    module = _EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module 'provisioner' has no attribute '{name}'")
+    return getattr(import_module(module), name)

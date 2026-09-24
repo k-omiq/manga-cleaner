@@ -17,12 +17,14 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cleaner_core::cloud_wire::{
     compute_request_digest, JobExecutionStatus, JobRequestMetadata, ModelInfoResponse,
     ResultMetadata, WireRenderRecipe, PROTOCOL_VERSION,
 };
+use cleaner_core::engines::flux::wire_sampling;
 use cleaner_core::engines::render::{CloudProvider, ExecutionTarget, PreparedRender, RenderRecipe};
 use cleaner_core::fit::{self, EdgeMap};
 use cleaner_core::ingest::sha256_hex;
@@ -47,6 +49,10 @@ use crate::inference::secrets::{
     decode_modal_runtime_secret, encode_modal_runtime_secret, SecretKey, SecretManager, SecretRole,
     SecretSummary, SecretValue,
 };
+use crate::inference::service::{
+    self, attempt_id_for_nonce, CloudAttemptProgress, InferenceService, InferenceServiceError,
+    PollOptions, ProgressSink,
+};
 use crate::library::Library;
 use crate::run;
 
@@ -57,7 +63,7 @@ fn current_epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn get_app_journal_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn get_app_journal_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     use tauri::Manager;
     let data_dir = app
         .path()
@@ -66,12 +72,36 @@ fn get_app_journal_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(data_dir.join("cloud_attempts"))
 }
 
-fn get_app_journal(app: &tauri::AppHandle) -> Result<AttemptJournal, String> {
+pub(crate) fn get_app_journal(app: &tauri::AppHandle) -> Result<AttemptJournal, String> {
     let dir = get_app_journal_dir(app)?;
     Ok(AttemptJournal::new(
         dir,
         cleaner_core::cloud_wire::provisional_fixture_limits(),
     ))
+}
+
+/// The event an interactive cloud render reports its phases on (IC-3).
+pub const CLOUD_ATTEMPT_EVENT: &str = "cloud://attempt";
+
+/// Where the app's cloud renders report their phases: [`CLOUD_ATTEMPT_EVENT`].
+pub(crate) fn cloud_attempt_sink(app: &tauri::AppHandle) -> ProgressSink {
+    use tauri::Emitter;
+    let app = app.clone();
+    Arc::new(move |progress: &CloudAttemptProgress| {
+        // A window that is not listening does not make the render fail.
+        let _ = app.emit(CLOUD_ATTEMPT_EVENT, progress);
+    })
+}
+
+/// The service the app's commands render and recover through: the app's
+/// journal, with every render reporting to [`cloud_attempt_sink`].
+pub(crate) fn app_inference_service(app: &tauri::AppHandle) -> Result<InferenceService, String> {
+    let dir = get_app_journal_dir(app)?;
+    Ok(InferenceService::new(
+        dir,
+        cleaner_core::cloud_wire::provisional_fixture_limits(),
+    )
+    .with_progress(cloud_attempt_sink(app)))
 }
 
 /// Helper to resolve a profile's canonical origin fingerprint from stored app configuration.
@@ -430,6 +460,8 @@ pub struct CloudModelInfo {
     pub pinned_model_id: String,
     pub pinned_model_revision: String,
     pub pinned_recipe_id: String,
+    pub preprocessing_version: String,
+    pub native_mask_conditioning: bool,
     pub limits: CloudModelLimits,
 }
 
@@ -441,6 +473,8 @@ impl From<ModelInfoResponse> for CloudModelInfo {
             pinned_model_id: resp.model_id,
             pinned_model_revision: resp.model_revision,
             pinned_recipe_id: resp.recipe_id,
+            preprocessing_version: resp.preprocessing_version,
+            native_mask_conditioning: resp.native_mask_conditioning,
             limits: CloudModelLimits {
                 max_dimensions: [resp.limits.max_width, resp.limits.max_height],
                 max_megapixels,
@@ -464,12 +498,23 @@ pub fn write_inference_config(
     app: tauri::AppHandle,
     config: InferenceConfig,
 ) -> Result<InferenceConfig, String> {
+    let path = config::config_path(&app).map_err(|e| sanitize_config_write_error(&e))?;
+    write_inference_config_at(&path, config)
+}
+
+/// The one writer of `inference.json`, shared by the settings command and by
+/// provisioning (`crate::provision`), so every profile change goes through the
+/// same grant revocation and epoch bumps. Errors are already sanitized.
+pub(crate) fn write_inference_config_at(
+    path: &Path,
+    config: InferenceConfig,
+) -> Result<InferenceConfig, String> {
     let consent_svc = crate::inference::consent::ConsentService::global();
 
     // Read existing config to compute the union of old and incoming profiles.
     // If on-disk config is corrupted or unreadable, invalidate all authorization state globally
     // so we can self-heal / repair the configuration safely without aborting.
-    let (beam_ids, modal_ids, had_corrupted_disk) = match config::read_inference_config(&app) {
+    let (beam_ids, modal_ids, had_corrupted_disk) = match config::read_inference_config_from_path(path) {
         Ok(old_cfg) => {
             let mut beam: BTreeSet<String> = old_cfg.beam_profiles.keys().cloned().collect();
             beam.extend(config.beam_profiles.keys().cloned());
@@ -493,7 +538,7 @@ pub fn write_inference_config(
         consent_svc.invalidate_profile(CloudProvider::Modal, profile_id);
     }
 
-    let written = config::write_inference_config(&app, config)
+    let written = config::write_inference_config_to_path(path, config)
         .map_err(|e| sanitize_config_write_error(&e))?;
 
     if had_corrupted_disk {
@@ -618,6 +663,85 @@ pub fn get_cloud_secret_summary(
         .map_err(|_| "failed to query secret summary".to_string())
 }
 
+/// Status word and message for a gateway call that failed, shared by the
+/// connection check and [`verify_cloud_profile`] so both speak one vocabulary.
+fn connection_failure(err: &HttpTransportError) -> (&'static str, String) {
+    match *err {
+        HttpTransportError::UnexpectedStatus { status } if status == 401 || status == 403 => (
+            "unauthorized",
+            format!("gateway returned authorization failure status {status}"),
+        ),
+        HttpTransportError::UnexpectedStatus { status } => (
+            "http_error",
+            format!("gateway returned unexpected HTTP status {status}"),
+        ),
+        HttpTransportError::InvalidCredential | HttpTransportError::CredentialProviderMismatch => (
+            "credential_missing",
+            "runtime credential invalid or missing for target".to_string(),
+        ),
+        HttpTransportError::EndpointValidationFailed
+        | HttpTransportError::InvalidTarget
+        | HttpTransportError::InvalidProfileId => (
+            "configuration_error",
+            "endpoint validation failed for target".to_string(),
+        ),
+        HttpTransportError::ConnectionError
+        | HttpTransportError::Timeout
+        | HttpTransportError::DnsResolutionFailed
+        | HttpTransportError::DnsResolverBusy
+        | HttpTransportError::NonPublicIpRejected
+        | HttpTransportError::RedirectForbidden => (
+            "unreachable",
+            "gateway endpoint unreachable or connection timed out".to_string(),
+        ),
+        HttpTransportError::ContentTypeMismatch
+        | HttpTransportError::BodySizeLimitExceeded
+        | HttpTransportError::WireValidation
+        | HttpTransportError::JsonDeserialization
+        | HttpTransportError::ProviderMismatch
+        | HttpTransportError::InvalidHandle => (
+            "http_error",
+            "gateway protocol or response validation error".to_string(),
+        ),
+    }
+}
+
+/// The check provisioning runs on a profile it just saved: health, then model
+/// info. A gateway can answer `/health` before its model volume is usable, and
+/// the model-info call is the cheapest request that proves the runtime
+/// credential and the pinned model both work. Neither call starts GPU work.
+pub(crate) fn verify_cloud_profile(
+    config: &InferenceConfig,
+    provider: CloudProvider,
+    profile_id: &str,
+) -> CloudConnectionStatus {
+    let health = check_cloud_connection_for_config(config, provider, profile_id);
+    if !health.ok {
+        return health;
+    }
+    let model_info = build_client_for_profile(config, provider, profile_id)
+        .map_err(|_| None)
+        .and_then(|client| client.get_model_info().map_err(Some));
+    match model_info {
+        Ok(_) => health,
+        Err(err) => {
+            let (status, message) = match err {
+                Some(err) => connection_failure(&err),
+                None => (
+                    "credential_missing",
+                    "runtime credential invalid or missing for target".to_string(),
+                ),
+            };
+            CloudConnectionStatus {
+                ok: false,
+                status: status.to_string(),
+                message: Some(message),
+                ..health
+            }
+        }
+    }
+}
+
 /// Helper performing a safe, structured connection check against an in-memory configuration.
 ///
 /// Guarantees that errors never leak raw URLs, request bodies, local filesystem paths, or secrets.
@@ -673,50 +797,7 @@ pub fn check_cloud_connection_for_config(
             }
         }
         Err(err) => {
-            let (status, msg) = match err {
-                HttpTransportError::UnexpectedStatus { status }
-                    if status == 401 || status == 403 =>
-                {
-                    (
-                        "unauthorized",
-                        format!("gateway returned authorization failure status {status}"),
-                    )
-                }
-                HttpTransportError::UnexpectedStatus { status } => (
-                    "http_error",
-                    format!("gateway returned unexpected HTTP status {status}"),
-                ),
-                HttpTransportError::InvalidCredential
-                | HttpTransportError::CredentialProviderMismatch => (
-                    "credential_missing",
-                    "runtime credential invalid or missing for target".to_string(),
-                ),
-                HttpTransportError::EndpointValidationFailed
-                | HttpTransportError::InvalidTarget
-                | HttpTransportError::InvalidProfileId => (
-                    "configuration_error",
-                    "endpoint validation failed for target".to_string(),
-                ),
-                HttpTransportError::ConnectionError
-                | HttpTransportError::Timeout
-                | HttpTransportError::DnsResolutionFailed
-                | HttpTransportError::DnsResolverBusy
-                | HttpTransportError::NonPublicIpRejected
-                | HttpTransportError::RedirectForbidden => (
-                    "unreachable",
-                    "gateway endpoint unreachable or connection timed out".to_string(),
-                ),
-                HttpTransportError::ContentTypeMismatch
-                | HttpTransportError::BodySizeLimitExceeded
-                | HttpTransportError::WireValidation
-                | HttpTransportError::JsonDeserialization
-                | HttpTransportError::ProviderMismatch
-                | HttpTransportError::InvalidHandle => (
-                    "http_error",
-                    "gateway protocol or response validation error".to_string(),
-                ),
-            };
-
+            let (status, msg) = connection_failure(&err);
             CloudConnectionStatus {
                 ok: false,
                 status: status.to_string(),
@@ -1044,14 +1125,7 @@ pub async fn prepare_cloud_consent(
     simulate_blocked: Option<bool>,
 ) -> Result<ConsentProposalDto, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let cloud_allowed = crate::settings::read(&app)
-            .ok()
-            .and_then(|s| {
-                s.get("cloudEngines")
-                    .and_then(|v| v.as_str())
-                    .map(|v| v == "allowed")
-            })
-            .unwrap_or(false);
+        let cloud_allowed = crate::inference::cloud_allowed(&app);
 
         let config = crate::inference::config::read_inference_config(&app)
             .map_err(|e| sanitize_config_error(&e))?;
@@ -1123,14 +1197,7 @@ pub async fn confirm_cloud_consent(
     simulate_epoch_mismatch: Option<bool>,
 ) -> Result<GrantDto, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let cloud_allowed = crate::settings::read(&app)
-            .ok()
-            .and_then(|s| {
-                s.get("cloudEngines")
-                    .and_then(|v| v.as_str())
-                    .map(|v| v == "allowed")
-            })
-            .unwrap_or(false);
+        let cloud_allowed = crate::inference::cloud_allowed(&app);
 
         let config = crate::inference::config::read_inference_config(&app)
             .map_err(|e| sanitize_config_error(&e))?;
@@ -1267,7 +1334,7 @@ pub fn submit_cloud_attempt_inner(
     journal::validate_safe_id(attempt_id, "attempt_id")
         .map_err(sanitize_journal_error)?;
 
-    let derived_attempt_id = format!("att-{}", &sha256_hex(trimmed_nonce.as_bytes())[0..24]);
+    let derived_attempt_id = attempt_id_for_nonce(trimmed_nonce);
     if attempt_id != derived_attempt_id {
         return Err("caller attemptId does not match backend-derived attempt identity".to_string());
     }
@@ -1421,6 +1488,7 @@ pub fn submit_cloud_attempt_inner(
         "job-{}",
         &sha256_hex(format!("{}:{}", proposal.region_ids[0], proposal.page_index).as_bytes())[0..24]
     );
+    let sampling = wire_sampling();
 
     let req_meta = JobRequestMetadata {
         protocol_version: PROTOCOL_VERSION.to_string(),
@@ -1429,9 +1497,9 @@ pub fn submit_cloud_attempt_inner(
         recipe: wire_recipe,
         width: proposal.crop_bounds.w,
         height: proposal.crop_bounds.h,
-        seed: 42,
-        steps: 4,
-        guidance_scaled: 350,
+        seed: sampling.seed,
+        steps: sampling.steps,
+        guidance_scaled: sampling.guidance_scaled,
         image_sha256: proposal.crop_png_sha256.clone(),
         hint_sha256: proposal.hint_png_sha256.clone(),
         request_digest: String::new(),
@@ -1454,9 +1522,9 @@ pub fn submit_cloud_attempt_inner(
         native_mask_conditioning: proposal.recipe.native_mask_conditioning,
         width: proposal.crop_bounds.w,
         height: proposal.crop_bounds.h,
-        seed: 42,
-        steps: 4,
-        guidance_scaled: 350,
+        seed: sampling.seed,
+        steps: sampling.steps,
+        guidance_scaled: sampling.guidance_scaled,
         source_image_hash: proposal.source_hash.clone(),
         region_id: proposal.region_ids[0].clone(),
         region_revision: proposal.revision,
@@ -1533,11 +1601,17 @@ pub fn submit_cloud_attempt_inner(
     }
 }
 
-/// Private hardcoded fail-closed guard ensuring cloud execution is disabled in this build.
+/// Fail-closed guard in front of every paid dispatch: the user's cloud
+/// permission switch (`cloudEngines == "allowed"`), read by the caller.
 ///
-/// Guaranteed to fail closed with zero runtime, caller, or environment bypasses.
-fn guard_cloud_execution_enabled() -> Result<(), String> {
-    Err("cloud paid execution is not enabled in this build".to_string())
+/// Answers the stable code `cloud_disabled`, which the interface shows as its
+/// "cloud is off" notice. There is no build flag behind this: the switch is
+/// the only thing it stands for.
+fn guard_cloud_execution_enabled(cloud_allowed: bool) -> Result<(), String> {
+    if !cloud_allowed {
+        return Err("cloud_disabled".to_string());
+    }
+    Ok(())
 }
 
 /// Persist durable intent and submit cloud attempt (never auto-retried if ambiguous).
@@ -1553,13 +1627,10 @@ pub async fn submit_cloud_attempt(
     simulate_mode: Option<String>,
     snapshot: Option<serde_json::Value>,
 ) -> Result<CloudAttemptSubmissionDto, String> {
-    guard_cloud_execution_enabled()?;
-
     tauri::async_runtime::spawn_blocking(move || {
-        let cloud_allowed = crate::settings::read(&app)
-            .ok()
-            .and_then(|s| s.get("cloudEngines").and_then(|v| v.as_str()).map(|v| v == "allowed"))
-            .unwrap_or(false);
+        let cloud_allowed = crate::inference::cloud_allowed(&app);
+
+        guard_cloud_execution_enabled(cloud_allowed)?;
 
         let current_cfg = config::read_inference_config(&app)
             .map_err(|e| sanitize_config_error(&e))?;
@@ -1574,7 +1645,9 @@ pub async fn submit_cloud_attempt(
             proposal_id.as_deref(),
             target.as_ref(),
             recipe.as_ref(),
-            simulate_mode.as_deref(),
+            // A test hook: a release build never fakes an outcome for a
+            // grant it was given.
+            simulate_mode.as_deref().filter(|_| cfg!(debug_assertions)),
             snapshot.as_ref(),
         )
     })
@@ -2105,6 +2178,13 @@ pub fn cancel_cloud_attempt_inner(
 }
 
 /// Request nonterminal attempt cancellation with honest phase validation.
+///
+/// A render running in this process hears it first. Until the gateway has
+/// accepted the job there is no handle for the journal to cancel, so the
+/// render's own flag is what stops it, at its next safe point; the answer is
+/// then `cancel_requested`, unacknowledged, and the render's `cancelled`
+/// event is the confirmation. A render whose result is already downloaded
+/// is past cancelling and answers as the journal says.
 #[tauri::command]
 pub async fn cancel_cloud_attempt(
     app: tauri::AppHandle,
@@ -2112,17 +2192,39 @@ pub async fn cancel_cloud_attempt(
     handle: Option<String>,
 ) -> Result<CloudCancelResultDto, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        journal::validate_safe_id(&attempt_id, "attempt_id")
+            .map_err(sanitize_journal_error)?;
+        let live = service::request_render_cancel(&attempt_id);
         let journal = get_app_journal(&app)?;
         let current_cfg = config::read_inference_config(&app).ok();
-        cancel_cloud_attempt_inner(
+        match cancel_cloud_attempt_inner(
             &journal,
             current_cfg.as_ref(),
             &attempt_id,
             handle.as_deref(),
-        )
+        ) {
+            Err(_) if live && !past_cancelling(&journal, &attempt_id) => Ok(CloudCancelResultDto {
+                handle: String::new(),
+                status: "cancel_requested".to_string(),
+                acknowledged: false,
+            }),
+            outcome => outcome,
+        }
     })
     .await
     .map_err(|_| "async cancel attempt task failed".to_string())?
+}
+
+/// Whether an attempt is beyond what a cancel can stop: its result is
+/// downloaded, or it has ended.
+fn past_cancelling(journal: &AttemptJournal, attempt_id: &str) -> bool {
+    journal.get_record(attempt_id).is_ok_and(|record| {
+        record.is_terminal()
+            || matches!(
+                record.phase,
+                AttemptPhase::ResultCached { .. } | AttemptPhase::AttachmentPending { .. }
+            )
+    })
 }
 
 /// Helper to validate caller recovery arguments against authoritative attempt record.
@@ -2286,6 +2388,22 @@ pub fn reconcile_cloud_recovery_inner(
             }
         }
     };
+
+    // A render or a resumed wait in this process owns the attempt. Its
+    // `Dispatching` is a request in flight, not an interrupted one, and
+    // recovering it here would close as unknown a job the gateway is about to
+    // accept, with nobody left polling it.
+    if service::is_render_live(&id) {
+        return Ok(CloudRecoveryDecisionDto {
+            decision: "in_progress".to_string(),
+            attempt_id: Some(id),
+            handle: None,
+            result_digest: None,
+            patch_id: None,
+            auto_retryable: Some(false),
+            message: None,
+        });
+    }
 
     let (decision, record) = {
         let guard = journal.acquire_lock(&id)
@@ -2453,7 +2571,177 @@ pub fn reconcile_cloud_recovery_inner(
     }
 }
 
+/// One attempt in a recovery report: where its result belongs and, for one
+/// that needs a person, why (`ambiguous`, `stale` or `failed`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveredAttemptDto {
+    pub attempt_id: String,
+    pub chapter_id: Option<String>,
+    pub page_index: Option<u32>,
+    pub region_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+}
+
+impl RecoveredAttemptDto {
+    fn of(record: &AttemptRecord) -> Self {
+        Self {
+            attempt_id: record.attempt_id.clone(),
+            chapter_id: record.chapter_id.clone(),
+            page_index: record.page_index,
+            region_id: record.region_id.clone(),
+            reason: None,
+        }
+    }
+
+    fn because(self, reason: &'static str) -> Self {
+        Self {
+            reason: Some(reason),
+            ..self
+        }
+    }
+}
+
+/// What `reconcileCloudRecovery({apply: true})` did (IC-4).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudRecoveryReportDto {
+    pub attached: Vec<RecoveredAttemptDto>,
+    pub still_running: Vec<RecoveredAttemptDto>,
+    pub needs_attention: Vec<RecoveredAttemptDto>,
+}
+
+/// `reconcileCloudRecovery`'s answer: one attempt's decision, or with `apply`
+/// the report on every attempt the journal holds.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum CloudRecoveryResponse {
+    Decision(CloudRecoveryDecisionDto),
+    Report(CloudRecoveryReportDto),
+}
+
+/// Settle every attempt the journal holds that can be settled without the
+/// network, and name the accepted jobs still to be waited on.
+///
+/// A cached result is attached; an interrupted submission is closed as
+/// unknown and reported as `ambiguous`, never resubmitted; a result whose
+/// region has moved on stays cached and is reported as `stale`. An accepted
+/// job is reported as still running and returned with its job, for the caller
+/// to wait on without holding up the report. Attempts that have already ended
+/// are left out, and one a render in this process is working on is only
+/// listed: it is that render's to finish.
+pub fn recover_all_attempts(
+    service: &InferenceService,
+    job_path_of: &dyn Fn(&str) -> Option<PathBuf>,
+) -> (CloudRecoveryReportDto, Vec<(String, PathBuf)>) {
+    let mut report = CloudRecoveryReportDto::default();
+    let mut waits = Vec::new();
+    for attempt_id in service.journal().list_attempt_ids().unwrap_or_default() {
+        let Ok(record) = service.journal().get_record(&attempt_id) else {
+            continue;
+        };
+        let entry = RecoveredAttemptDto::of(&record);
+        if service::is_render_live(&attempt_id) {
+            report.still_running.push(entry);
+            continue;
+        }
+        if record.is_terminal() {
+            continue;
+        }
+        let job_path = record.chapter_id.as_deref().and_then(job_path_of);
+        match service.recover_attempt_locally(&attempt_id, job_path.as_deref()) {
+            Ok(RecoveryDecision::AlreadyCommitted { .. }) => report.attached.push(entry),
+            Ok(
+                RecoveryDecision::ResumePolling { .. } | RecoveryDecision::ResumeCancelPolling { .. },
+            ) => match job_path {
+                Some(path) => {
+                    report.still_running.push(entry);
+                    waits.push((attempt_id, path));
+                }
+                // Nowhere to put the result: waiting on it would only spend.
+                None => report.needs_attention.push(entry.because("stale")),
+            },
+            Ok(RecoveryDecision::AmbiguousUnknown { .. }) => {
+                report.needs_attention.push(entry.because("ambiguous"))
+            }
+            Ok(RecoveryDecision::CorruptedResultRetainedForInspection { .. }) => {
+                report.needs_attention.push(entry.because("failed"))
+            }
+            // Ended before this run looked at it: nothing to show.
+            Ok(RecoveryDecision::Terminal { .. }) => {}
+            // Attached by `recover_attempt_locally` itself; one that comes back
+            // unattached could not be.
+            Ok(
+                RecoveryDecision::ResultCachedReadyForAttach { .. }
+                | RecoveryDecision::AttachmentPendingVerification { .. },
+            ) => report.needs_attention.push(entry.because("stale")),
+            // Another command holds the attempt this instant; the next
+            // recovery sees it.
+            Err(InferenceServiceError::Journal(JournalError::AttemptLocked { .. })) => {}
+            Err(
+                InferenceServiceError::StaleAttachment(_)
+                | InferenceServiceError::Journal(JournalError::StaleAttachment { .. })
+                | InferenceServiceError::JobManifest(_)
+                | InferenceServiceError::Io(_),
+            ) => report.needs_attention.push(entry.because("stale")),
+            Err(_) => report.needs_attention.push(entry.because("failed")),
+        }
+    }
+    (report, waits)
+}
+
+/// `apply`: recover what is local now, and wait on accepted jobs in the
+/// background, each reporting on `cloud://attempt` like a render the user
+/// started. A job still running when its wait runs out stays accepted for the
+/// next recovery.
+fn reconcile_and_resume(app: &tauri::AppHandle) -> Result<CloudRecoveryReportDto, String> {
+    let service = app_inference_service(app)?;
+    let library = Library::for_app(app).ok();
+    let (mut report, waits) = recover_all_attempts(&service, &|chapter_id| {
+        library.as_ref()?.resolve_chapter(chapter_id).ok()
+    });
+    if waits.is_empty() {
+        return Ok(report);
+    }
+    let Ok(config) = config::read_inference_config(app) else {
+        // No profile to reach the gateway with: these cannot be waited on.
+        let waiting: Vec<String> = waits.into_iter().map(|(attempt_id, _)| attempt_id).collect();
+        let (unreachable, running) = std::mem::take(&mut report.still_running)
+            .into_iter()
+            .partition(|entry| waiting.contains(&entry.attempt_id));
+        report.still_running = running;
+        report.needs_attention.extend(
+            unreachable
+                .into_iter()
+                .map(|entry: RecoveredAttemptDto| entry.because("failed")),
+        );
+        return Ok(report);
+    };
+    for (attempt_id, job_path) in waits {
+        let app = app.clone();
+        let config = config.clone();
+        // A thread of its own rather than the blocking pool: a wait can last
+        // the whole interactive bound, and it should not hold a slot the
+        // commands need.
+        std::thread::spawn(move || {
+            if let Ok(service) = app_inference_service(&app) {
+                let _ = service.resume_cloud_render(
+                    &attempt_id,
+                    &job_path,
+                    &config,
+                    &PollOptions::interactive(),
+                );
+            }
+        });
+    }
+    Ok(report)
+}
+
 /// Evaluate crash discovery and attempt recovery against local project snapshot.
+///
+/// With `apply: true` it recovers instead of reporting one decision: see
+/// [`recover_all_attempts`]. The other arguments are then ignored.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn reconcile_cloud_recovery(
@@ -2465,8 +2753,12 @@ pub async fn reconcile_cloud_recovery(
     region_revision: Option<serde_json::Value>,
     source_image_hash: Option<String>,
     simulate_stale: Option<bool>,
-) -> Result<CloudRecoveryDecisionDto, String> {
+    apply: Option<bool>,
+) -> Result<CloudRecoveryResponse, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        if apply == Some(true) {
+            return reconcile_and_resume(&app).map(CloudRecoveryResponse::Report);
+        }
         let journal = get_app_journal(&app)?;
         let library = Library::for_app(&app).ok();
         reconcile_cloud_recovery_inner(
@@ -2480,6 +2772,7 @@ pub async fn reconcile_cloud_recovery(
             source_image_hash.as_deref(),
             simulate_stale,
         )
+        .map(CloudRecoveryResponse::Decision)
     })
     .await
     .map_err(|_| "async reconcile recovery task failed".to_string())?
@@ -4614,11 +4907,14 @@ mod tests {
 
     #[test]
     fn test_guard_cloud_execution_enabled_fails_closed() {
-        let res = guard_cloud_execution_enabled();
+        let res = guard_cloud_execution_enabled(false);
         assert!(res.is_err());
         let err = res.unwrap_err();
-        assert_eq!(err, "cloud paid execution is not enabled in this build");
+        assert_eq!(err, "cloud_disabled");
         assert!(!err.contains("/"));
         assert!(!err.contains("http"));
+
+        let res_ok = guard_cloud_execution_enabled(true);
+        assert!(res_ok.is_ok());
     }
 }

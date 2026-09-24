@@ -1,166 +1,199 @@
-"""Beam Cloud Deployment Template and Adapter.
+"""Beam app: CPU gateway, GPU worker and weights seeding.
 
-Provides the production-shaped Beam app template with CPU control gateway
-and task queue worker, plus an offline test adapter that exercises the
-application-owned `/mc/v1` contract without importing paid SDKs or incurring costs.
+The provisioner copies this file to the root of a clean staging directory as
+mc_beam_app.py (see stage.py), next to the subset of the deploy package it needs,
+exports the MC_BEAM_* variables (see settings.py), makes that directory the working
+directory and deploys the three handlers below. Beam uploads the directory and
+imports this module in each container. Every deployment carries the same variables,
+so a container rebuilds exactly the objects that were deployed.
+
+- `gateway` serves /mc/v1 on a small CPU container behind Beam's token check
+  (authorized=True). It keeps job documents in a beam.Map, so health and model-info
+  never start a GPU.
+- `render` is the GPU task queue. `load_worker` loads the pinned pipeline from the
+  weights volume once per container; each job runs once (retries=0) within the job
+  timeout, and the container scales to zero after the idle window.
+- `seed` downloads the pinned snapshot into the weights volume on a CPU container.
+  GPU containers never download.
 """
 
 from __future__ import annotations
 
-import logging
-import uuid
-from typing import Any, Callable, Dict, Optional, Tuple
+import os
+import time
+from typing import Any, Dict
 
-from deploy.cloud.common.contract import (
-    PROTOCOL_VERSION,
-    CloudProvider,
-    JobAcceptedResponse,
-    JobExecutionStatus,
-    JobRequestMetadata,
-    JobStatusResponse,
-    ModelInfoResponse,
-    ServiceLimits,
-    TypedError,
-    provisional_fixture_limits,
+import beam
+
+from deploy.cloud.beam.backend import (
+    BeamMapStore,
+    BeamWorkerDispatcher,
+    beam_worker_render,
+    make_http_enqueue,
 )
-from deploy.cloud.common.api import CloudGateway
-from deploy.cloud.common.flux import FluxWorker
-from deploy.cloud.common.handle_mapping import InMemoryHandleRegistry, JobRecord
-from deploy.cloud.common.manifest import get_default_model_info
-from deploy.cloud.common.redact import redact_text
+from deploy.cloud.beam.settings import WEIGHTS_MOUNT, BeamSettings, resolve_weights_root
+from deploy.cloud.common.deployment import JOB_TIMEOUT_SECONDS, SEED_TIMEOUT_SECONDS
+from deploy.cloud.common.manifest import get_production_model_info, production_limits
+from deploy.cloud.common.weights import run_seed
+from deploy.cloud.common.worker import WorkerRuntime
 
-logger = logging.getLogger("deploy.cloud.beam")
+SETTINGS = BeamSettings.from_env()
+DEPLOY_ENV = SETTINGS.to_env()
 
-# Lazy, optional import of the official Beam SDK
-try:
-    import beam  # type: ignore
-    _BEAM_SDK_AVAILABLE: bool = True
-except ImportError:
-    beam = None
-    _BEAM_SDK_AVAILABLE: bool = False
+PYTHON_VERSION = "python3.12"
+# torch comes from the CUDA 12.9 wheel index before the rest is installed, so pip
+# never swaps in a different torch build from PyPI.
+TORCH_INSTALL = (
+    "python3.12 -m pip install --no-cache-dir torch==2.13.0 --index-url https://download.pytorch.org/whl/cu129"
+)
+GPU_REQUIREMENTS = [
+    "diffusers==0.39.0",
+    "sdnq==0.2.4",
+    "transformers==5.15.0",
+    "accelerate==1.14.0",
+    "safetensors==0.8.0",
+    "huggingface-hub==1.24.0",
+    "pillow==12.3.0",
+    "numpy==2.4.6",
+]
+SEED_REQUIREMENTS = ["huggingface-hub==1.24.0"]
 
+# Beam volume writes can take up to a minute to reach another container, so the
+# worker looks for the seeded marker a few times before it reports weights_missing.
+MARKER_ATTEMPTS = 4
+MARKER_DELAY_SECONDS = 30.0
+GATEWAY_KEEP_WARM_SECONDS = 120
+GATEWAY_TIMEOUT_SECONDS = 120
 
-class BeamAppAdapter:
-    """Offline-testable Beam provider adapter implementing `/mc/v1`."""
+weights_volume = beam.Volume(name=SETTINGS.volume_name, mount_path=WEIGHTS_MOUNT)
 
-    def __init__(
-        self,
-        bearer_token: Optional[str] = None,
-        model_info: Optional[ModelInfoResponse] = None,
-        limits: Optional[ServiceLimits] = None,
-        handle_registry: Optional[InMemoryHandleRegistry] = None,
-        worker: Optional[FluxWorker] = None,
-        auth_validator: Optional[Callable[[Dict[str, str]], bool]] = None,
-        auto_execute: bool = True,
-    ):
-        self.provider = CloudProvider.BEAM
-        self.bearer_token = bearer_token
-        self.auth_validator = auth_validator
-        self.limits = limits or provisional_fixture_limits()
-        self.model_info = model_info or get_default_model_info("beam", limits=self.limits)
-        self.handle_registry = handle_registry or InMemoryHandleRegistry()
-        self.worker = worker or FluxWorker(provider="beam", limits=self.limits)
-        self.auto_execute = auto_execute
-
-        # Instantiate shared CPU Gateway bound to Beam bearer auth
-        self.gateway = CloudGateway(
-            provider=self.provider,
-            model_info=self.model_info,
-            limits=self.limits,
-            handle_registry=self.handle_registry,
-            worker=self.worker,
-            auth_validator=self.auth_validator,
-            bearer_token=self.bearer_token,
-            auto_execute=self.auto_execute,
-        )
-
-    def handle_request(
-        self,
-        method: str,
-        path: str,
-        headers: Dict[str, str],
-        body: bytes,
-    ) -> Tuple[int, Dict[str, str], bytes]:
-        """Dispatch HTTP request through the Beam-configured CPU gateway."""
-        return self.gateway.handle_http_request(method, path, headers, body)
-
-    def as_asgi_app(self) -> Callable:
-        """Expose ASGI 3.0 application for Beam web endpoint serving."""
-        return self.gateway.as_asgi_app()
-
-    def as_wsgi_app(self) -> Callable:
-        """Expose WSGI application callable."""
-        return self.gateway.as_wsgi_app()
-
-    def simulate_task_enqueue(
-        self,
-        job_meta: JobRequestMetadata,
-        img_bytes: bytes,
-        hint_bytes: bytes,
-        presigned_storage_url: Optional[str] = None,
-    ) -> str:
-        """Simulate native Beam task queue submission and return native task handle."""
-        native_task_id = f"task-{uuid.uuid4().hex}"
-        app_handle = f"handle-beam-{uuid.uuid4().hex}"
-        record = self.handle_registry.register_job(
-            job_meta=job_meta,
-            native_handle=native_task_id,
-            app_handle=app_handle,
-            provider="beam",
-        )
-        if presigned_storage_url:
-            record.internal_storage_ref = presigned_storage_url
-
-        self.gateway.execute_worker_job(
-            record,
-            img_bytes,
-            hint_bytes,
-            internal_storage_ref=presigned_storage_url,
-        )
-        return record.native_handle
-
-    @staticmethod
-    def deploy_live() -> None:
-        """Explicit refusal of unverified live cloud deployments."""
-        raise NotImplementedError(
-            "Live Beam deployment requires authorized platform credentials and explicit staging approval. "
-            "Offline verification mode only."
-        )
+gpu_image = (
+    beam.Image(python_version=PYTHON_VERSION)
+    .add_commands([TORCH_INSTALL])
+    .add_python_packages(GPU_REQUIREMENTS)
+    .with_envs({"HF_HUB_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1"})
+)
+seed_image = (
+    beam.Image(python_version=PYTHON_VERSION)
+    .add_python_packages(SEED_REQUIREMENTS)
+    .with_envs({"HF_HUB_DISABLE_TELEMETRY": "1", "HF_HUB_DISABLE_PROGRESS_BARS": "1"})
+)
+gateway_image = beam.Image(python_version=PYTHON_VERSION)
 
 
-def create_beam_gateway(
-    bearer_token: Optional[str] = None,
-    limits: Optional[ServiceLimits] = None,
-    auth_validator: Optional[Callable[[Dict[str, str]], bool]] = None,
-) -> CloudGateway:
-    """Factory helper creating a Beam-bound CloudGateway with required secrets validation."""
-    if not bearer_token and auth_validator is None:
-        raise ValueError(
-            "Production Beam gateway construction requires injected secrets (bearer_token) or auth_validator"
-        )
-    adapter = BeamAppAdapter(
-        bearer_token=bearer_token,
+def _store() -> BeamMapStore:
+    return BeamMapStore(beam.Map(name=SETTINGS.map_name))
+
+
+def _workspace_token() -> str:
+    # The provisioner stores the workspace token in this secret; Beam injects it as
+    # an environment variable of the same name.
+    return os.environ.get(SETTINGS.secret_name, "")
+
+
+def _stop_task(task_id: str) -> None:
+    from beta9.channel import Channel
+    from beta9.clients.gateway import GatewayServiceStub, StopTasksRequest
+
+    channel = Channel(addr=f"{SETTINGS.gateway_host}:{SETTINGS.gateway_port}", token=_workspace_token())
+    try:
+        response = GatewayServiceStub(channel).stop_tasks(StopTasksRequest(task_ids=[task_id]))
+    finally:
+        channel.close()
+    if not response.ok:
+        raise RuntimeError(response.err_msg or "Beam did not stop the task")
+
+
+def load_worker() -> WorkerRuntime:
+    # A missing snapshot is reported per job, not raised here: the container stays up
+    # and loads on its next job once the volume is seeded.
+    runtime = WorkerRuntime(
+        str(resolve_weights_root(SETTINGS.volume_name)),
+        marker_attempts=MARKER_ATTEMPTS,
+        marker_delay_seconds=MARKER_DELAY_SECONDS,
+    )
+    runtime.load()
+    return runtime
+
+
+@beam.task_queue(
+    name=SETTINGS.seed_name,
+    image=seed_image,
+    cpu=2.0,
+    memory="4Gi",
+    volumes=[weights_volume],
+    env=DEPLOY_ENV,
+    timeout=SEED_TIMEOUT_SECONDS,
+    retries=0,
+    workers=1,
+    keep_warm_seconds=10,
+    max_pending_tasks=4,
+    autoscaler=beam.QueueDepthAutoscaler(max_containers=1),
+    authorized=True,
+)
+def seed(context: Any = None) -> Dict[str, Any]:
+    # Idempotent: a seeded volume returns at once and a partial download resumes.
+    # Progress and the final state go to the Map, where the provisioner reads them.
+    return run_seed(str(resolve_weights_root(SETTINGS.volume_name)), _store())
+
+
+@beam.task_queue(
+    name=SETTINGS.worker_name,
+    image=gpu_image,
+    gpu=SETTINGS.gpu,
+    cpu=1.0,
+    memory="12Gi",
+    volumes=[weights_volume],
+    env=DEPLOY_ENV,
+    timeout=JOB_TIMEOUT_SECONDS,
+    retries=0,
+    workers=1,
+    keep_warm_seconds=SETTINGS.idle_seconds,
+    max_pending_tasks=16,
+    on_start=load_worker,
+    autoscaler=beam.QueueDepthAutoscaler(max_containers=1, tasks_per_container=1),
+    authorized=True,
+)
+def render(handle: str = "", context: Any = None) -> Dict[str, Any]:
+    runtime = getattr(context, "on_start_value", None) or load_worker()
+    return beam_worker_render(runtime, _store(), handle)
+
+
+@beam.asgi(
+    name=SETTINGS.gateway_name,
+    image=gateway_image,
+    cpu=0.5,
+    memory="1Gi",
+    env=DEPLOY_ENV,
+    secrets=[SETTINGS.secret_name],
+    workers=1,
+    concurrent_requests=32,
+    keep_warm_seconds=GATEWAY_KEEP_WARM_SECONDS,
+    timeout=GATEWAY_TIMEOUT_SECONDS,
+    autoscaler=beam.QueueDepthAutoscaler(max_containers=1),
+    authorized=True,
+)
+def gateway(context: Any = None):
+    # Starlette ships with Beam's container runtime, which needs an app it can add
+    # middleware and a lifespan to.
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+
+    from deploy.cloud.common.api import CloudGateway
+    from deploy.cloud.common.jobs import DispatchJobBackend
+
+    limits = production_limits()
+    store = _store()
+    dispatcher = BeamWorkerDispatcher(
+        store,
+        enqueue=make_http_enqueue(SETTINGS.worker_url, _workspace_token),
+        stop_task=_stop_task,
+    )
+    gateway_app = CloudGateway(
+        provider="beam",
+        model_info=get_production_model_info("beam"),
         limits=limits,
-        auth_validator=auth_validator,
+        backend=DispatchJobBackend("beam", store, dispatcher, limits, clock=time.time),
+        trust_edge_auth=True,
     )
-    return adapter.gateway
-
-
-def build_beam_app(
-    volume_name: str = "manga-cleaner-models",
-    mount_path: str = "/models",
-    bearer_token: Optional[str] = None,
-) -> Any:
-    """Explicit factory builder for Beam production app definition.
-
-    Fails closed before resource definitions to avoid advertising or deploying
-    a non-inferencing stub worker. Live deployment requires authorized platform
-    credentials and verified model pipeline.
-    """
-    if not _BEAM_SDK_AVAILABLE or beam is None:
-        raise RuntimeError("Beam SDK is not installed; cannot build Beam production app")
-
-    raise NotImplementedError(
-        "Live Beam deployment requires authorized platform credentials and verified model pipeline. "
-        "build_beam_app fails closed before resource definitions to prevent deploying an unverified stub."
-    )
+    return Starlette(routes=[Mount("/mc/v1", app=gateway_app.as_asgi_app())])

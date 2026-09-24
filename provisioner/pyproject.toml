@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "manga-cleaner-cloud-provisioner"
-version = "0.2.0"
-description = "Manga Cleaner Cloud Provisioner Helper Boundary (P7/P8)"
+version = "0.3.0"
+description = "Manga Cleaner cloud setup helper: provisions Modal or Beam from a pasted token"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
 modal = [
-    "modal==1.5.5",
+    "modal[api-proxy-support]==1.5.5",
 ]
 beam = [
     "beam-client==0.2.211",

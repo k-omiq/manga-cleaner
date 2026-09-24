@@ -7,7 +7,7 @@ All changes remain uncommitted. The original checkout is unchanged.
 ## Acceptance status
 
 Milestone count: **2 of 12 complete** (P0 and P2), **3 partial** (P1, P3,
-P4), **7 not complete** (P5–P11). This is an unweighted milestone count,
+P4), **7 not complete** (P5 to P11). This is an unweighted milestone count,
 not an estimate of effort spent. Offline subtasks do not satisfy live staging
 or installed-platform exit evidence.
 
@@ -50,7 +50,9 @@ or installed-platform exit evidence.
 - P3c2: profile settings UI is complete and both final external reviews approve.
   All 967 frontend tests and the production build pass. This is the next completed
   task requested by the user; work stopped here on 2026-09-20. No new tasks started.
-- P4–P11: not complete.
+- P4 to P11: not complete. On 2026-09-24 P5 to P9 were implemented offline;
+  P10 is not implemented and P11 is partial. Nothing has run live, so the
+  count above is unchanged. See the last section.
 
 No cloud deployment, account mutation, GPU operation, or model download has
 been authorized or performed in this continuation. A question requesting
@@ -72,7 +74,7 @@ staging profile/workspace names (not tokens) remains pending.
   `/tmp/manga-cloud-p3b2-final-review-onyx.json`; the security review found the
   epoch-check/issuance TOCTOU and poisoned-lock/config-repair gaps now fixed.
 - P3b2 post-fix re-reviews: `/tmp/manga-cloud-p3b2-rereview-vesper.json` and
-  `/tmp/manga-cloud-p3b2-rereview-onyx.json` (both approved with no P0–P3 findings).
+  `/tmp/manga-cloud-p3b2-rereview-onyx.json` (both approved with no P0 to P3 findings).
 
 Agent summaries are not acceptance evidence by themselves. Several agent runs
 returned early with background checks unfinished; those runs are not counted
@@ -128,22 +130,22 @@ No runtime credential entry or connection test is advertised.
 
 P3b2 is accepted after the post-fix two-reviewer cycle. No consent IPC or paid path is exposed. See `docs/cloud-consent.md`.
 
-P0 and P2 are complete; P1/P3/P4 are partial; P5–P11 are incomplete. There have
+P0 and P2 are complete; P1/P3/P4 are partial; P5 to P11 are incomplete. There have
 been no live deployments, account mutations, GPU requests, or model downloads.
 
 ## Continuation audit: 2026-09-22 (in progress; not a release checkpoint)
 
 The earlier status above is historical, not a current acceptance claim. The
 current branch is `codex/cloud-integration`; the complete pre-existing dirty
-worktree is preserved. The master plan defines P0–P11 and **does not define
+worktree is preserved. The master plan defines P0 to P11 and **does not define
 P12**. No checkpoint commit, push, deployment, GPU run, provider-account action,
 credential use, or packaging-platform verification has occurred in this turn.
 
 ### Agent evidence and disposition
 
 - Initial lifecycle implementer `1f89a549-4d51-493b-bbc9-e79029f877af`
-  (quasar): failed run—progress-only/background cargo operation. Retry
-  `33e3649f-a9bd-4ecf-92da-3c5499a8eca9` (zephyr): failed run—background
+  (quasar): failed run: progress-only/background cargo operation. Retry
+  `33e3649f-a9bd-4ecf-92da-3c5499a8eca9` (zephyr): failed run: background
   tasks and unverified counts. Solaris: authentication failure before a usable
   result. None is counted as verification. Implementer
   `ceb816cd-e0b9-423f-8cf1-badbccb4e80a` (nimbus) made synchronous source
@@ -218,7 +220,7 @@ credential use, or packaging-platform verification has occurred in this turn.
 rg -l -i --glob '!*.png' --glob '!Cargo.lock' '(-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9]{32,}|ghp_[A-Za-z0-9]{36}|xox[baprs]-[A-Za-z0-9-]{20,})' .
 ```
 
-The P3/P4 IPC re-review is bounded acceptance only; P1 and P5–P8 still have
+The P3/P4 IPC re-review is bounded acceptance only; P1 and P5 to P8 still have
 external provider/staging/physical-platform acceptance gaps. Remaining local
 gateway/provisioner source reviews, final post-change reruns, staged diff/secret
 scan, and checkpoint assessment remain open. Do not call the product ready.
@@ -276,7 +278,7 @@ scan, and checkpoint assessment remain open. Do not call the product ready.
 
 P5 and P6 cannot be called real cloud crops: `FluxWorker` is a synthetic
 RGB8 PNG simulator, native handle state is in-memory, and live builders are
-being made fail-closed. P7/P8 real drivers refuse live calls. P9–P11 depend
+being made fail-closed. P7/P8 real drivers refuse live calls. P9 to P11 depend
 on live/provider/physical-platform evidence; safe offline work remains under
 assessment. The plan contains **no P12 definition**.
 
@@ -335,7 +337,7 @@ results) is:
 | `cargo audit` | 0 | No vulnerability; eight allowed warnings remain. |
 | `git diff --check` | 0 | Tracked patch clean; staged/untracked verification pending. |
 
-Staging the previously untracked P1–P8 files exposed 59 whitespace findings:
+Staging the previously untracked P1 to P8 files exposed 59 whitespace findings:
 `git diff --cached --check` exited **2**. Separate formatting fixer
 `agy-axiom` `56feb16c-4978-4dc4-91f1-4a692d4a6639` completed a
 whitespace-only pass on 17 non-frontend files, verified with `git diff -w`;
@@ -359,7 +361,7 @@ scan for private-key headers and common cloud, GitHub, and Slack token shapes
 exited 1 with no matching paths. This is a
 bounded pattern scan, not a complete credential audit.
 
-### P1–P8 checkpoint boundary
+### P1 to P8 checkpoint boundary
 
 The locally testable portion is stable under the commands above, but the
 milestones are **not all complete** under the master plan's acceptance tests:
@@ -375,7 +377,7 @@ milestones are **not all complete** under the master plan's acceptance tests:
 | P7 | Modal fake-driver provisioner plan/journal/redaction tests | Authorized account, real driver, packaged helper, deployment and cleanup |
 | P8 | Beam fake-driver provisioner tests and Windows gating | Authorized account, native/WSL packaged path, real driver and cleanup |
 
-The next external action for P1/P5–P8 is to supply explicitly authorized
+The next external action for P1/P5 to P8 is to supply explicitly authorized
 staging accounts/credentials and supported test platforms; then run the
 master plan's CPU-only account/permission experiments and packaged-helper
 probe **before** any real provider resource creation or GPU work. No such
@@ -399,12 +401,12 @@ fallback code may convert those missing proofs into a ready/paid path.
 
 ## Post-checkpoint local work (2026-09-22; uncommitted)
 
-The P1–P8 offline-foundations checkpoint was committed on
+The P1 to P8 offline-foundations checkpoint was committed on
 `codex/cloud-integration` as `b16664a`, then amended for the backend
 fail-closed safety correction to `7afe0f1`, retaining message
 `feat(cloud): checkpoint offline P1-P8 foundations` (both commit commands
 exited 0). It was not pushed. The checkpoint is **not** evidence that P1,
-P3–P8 meet their external acceptance gates.
+P3 to P8 meet their external acceptance gates.
 
 P11 CPU-only CI increment: initial e-swarm implementer `agy-lumen`
 `03b1f5b3-b650-4347-81e5-24fa6b95ea60` returned an empty response after
@@ -500,7 +502,7 @@ drivers refuse live calls, and resource ownership/provider scopes are
 unverified. The safe local UI already offers public profile management,
 advanced endpoint entry, and clearly unavailable execution; adding a
 success-shaped setup wizard against fake drivers would mislead users.
-P10's explicit 20–60-page paid second pass depends on verified P5/P6 crops,
+P10's explicit 20 to 60-page paid second pass depends on verified P5/P6 crops,
 durable native handles, provider compatibility and staging authorization;
 only local-only and per-region fault foundations are verified. Enabling a
 chapter path before those dependencies would expose paid work and undermine
@@ -516,11 +518,11 @@ resource-scope experiments first, and arrange clean Apple Silicon macOS and
 Windows x64 packaged-app test hosts. After those prerequisites, implement
 the real drivers and run the P1 feasibility probes in the plan; only then
 seek separate approval for billable GPU deployment/inference and the
-staged P5–P11 acceptance tests. The owner must also define P12's scope and
+staged P5 to P11 acceptance tests. The owner must also define P12's scope and
 exit criteria. Until then the exact safe action is to leave the backend
 paid-submit guard in place and keep the P11 workflow uncommitted for review.
 
-## P9–P11 offline continuation (2026-09-22; uncommitted)
+## P9 to P11 offline continuation (2026-09-22; uncommitted)
 
 This continuation started at checkpoint `7afe0f1` on `codex/cloud-integration`.
 It preserved the pre-existing uncommitted `.github/workflows/ci.yml` and this
@@ -567,7 +569,7 @@ before any project read, grant use, journal write, or network operation.
   `agy-tundra` `07a17f05-4370-4217-bbcf-b8f2ae0df86d` (Escape), and
   `agy-lumen` `92026fa7-0299-4fbf-bad0-6065bb7a6ad2` (recovery copy).
   Both original reviewers re-reviewed the final diff in parallel, approved the
-  bounded local UX patch, and reported no remaining P0–P3 findings. Approval
+  bounded local UX patch, and reported no remaining P0 to P3 findings. Approval
   does not establish provider lifecycle readiness.
 - P10 implementer `agy-tundra` `52716064-b352-4fb4-a873-4af29c6c2859`
   timed out with a partial report while background checks were running; its
@@ -583,7 +585,7 @@ before any project read, grant use, journal write, or network operation.
   `agy-axiom` `9713ef8d-a971-4151-a463-e55cc289f179` replaced the entire
   misleading block with a narrow scope matrix. Both original completed
   reviewers, Zephyr and Nimbus, re-reviewed that final patch in parallel and
-  found no remaining P0–P3 issues within the unit-test boundary.
+  found no remaining P0 to P3 issues within the unit-test boundary.
 
 ### Personally completed local checks
 
@@ -607,3 +609,126 @@ exist. P11 remains incomplete until hosted CI, signed packaged helpers on clean
 macOS/Windows hosts, staging/GPU/recovery, token-scope, cleanup, and release
 evidence exist. The uncommitted CI and UI/test/log changes are reviewable local
 work only. The backend paid-submit guard stays closed.
+
+## Cloud unlock and completion pass (2026-09-24; uncommitted)
+
+The user asked for the cloud path to be unlocked, for a real automatic setup
+that needs only pasted keys, for full interface wiring, and for a simple
+first-launch setup. This pass did all four offline. Nothing ran against a real
+Modal or Beam account, and no cloud resource was created, changed or billed.
+
+### What changed
+
+- **Backend unlock:** `guard_cloud_execution_enabled` now checks only the
+  user's **Use a cloud GPU** switch (`cloud_disabled` when it is off). The
+  paid-submit hard stop is gone. `submit_cloud_attempt` honours its simulate
+  mode only in debug builds.
+- **Routing:** FLUX is always the local helper, whichever endpoint is
+  selected, and Cloud is its own choice. `edit()` refuses only an explicit
+  cloud choice. A cloud-provenance re-run goes to the cloud unless the user
+  names a local engine (`rerun_needs_cloud` in `src-tauri/src/region.rs`,
+  mirrored by `rerunNeedsCloud` in `src/lib/api/tools.js`). Clean anyway
+  always renders locally.
+- **Automatic setup:** `provisioner/` was rewritten around real Modal and Beam
+  drivers (`modal_driver.py`, `beam_driver.py`) with `inspect`, `plan`,
+  `apply`, `resume`, `cleanup_plan` and `cleanup_apply`, progress lines on
+  stderr, a resumable journal, and cleanup bound to the installation id. The
+  old probe, matrix, template and fake-driver code was deleted.
+  `test_sdk_fidelity.py` checks the fakes against the pinned SDKs (modal
+  1.5.5, beta9 0.1.268, beam-client 0.2.211). See
+  [cloud-provisioning.md](cloud-provisioning.md).
+- **Gateways:** `deploy/cloud/` holds the CPU gateway for `/mc/v1`, durable
+  job state, the GPU worker, weight seeding on CPU, and the Modal and Beam
+  adapters.
+- **Release:** `.github/scripts/build-cloud-provisioner.py` and a release
+  workflow step bundle the helper as an `externalBin`. Without it, setup fails
+  closed.
+- **Interface:** setup on the Cloud tab (`CloudProvisioner.svelte`), the
+  per-render consent dialog, the status card, recovery at start, and the
+  six-step first-launch setup. See [cloud-frontend.md](cloud-frontend.md) and
+  [features.md](features.md).
+- **Docs:** [cloud-provisioning.md](cloud-provisioning.md) is new.
+  [features.md](features.md), `README.md` and [findings.md](findings.md)
+  (eight new unmeasured items) are updated. The phase records (`cloud-api`,
+  `cloud-contract`, `cloud-consent`, `cloud-journal`, `cloud-security`,
+  `cloud-verification`, `cloud-plan-validation`) keep their history and now
+  say what is implemented since.
+
+### e-swarm and review disposition
+
+- Builders: two Claude subagents, one for the interface and one for the
+  provisioner and gateways. Both hit the session limit and were resumed.
+- Reviews: eight Gemini 3.8 Flash runs through the agy fleet (r1 to r8), and a
+  Claude reviewer for the provisioner core after r4 failed twice with a 503.
+  Six runs ran out the 25-minute print timeout with an empty answer; a second
+  "write now" turn on the same conversation returned each answer.
+  Conversations: r1 `1bb47c1c-2de3-41dd-aebd-fa8f87037906`, r2
+  `e6ed0a73-a362-44b4-96ea-deb97994ed0e`, r3
+  `f9e0d324-22d1-4cb8-91fb-e212cef48a34`, r5
+  `65ba874e-76dd-462a-9a66-e11ac9d2749c`, r6
+  `8ea745b0-a41e-4292-888e-b6474ce1f031`, r7
+  `6a424f94-0143-49a9-966f-d4fc51718705`, r8
+  `a3d90736-9027-4667-ae8e-c3eb6a716d31`. Doc sweep b1
+  `8632d1b6-677e-4c98-a7a1-44a4df699773`; its status lines were corrected by
+  hand where they claimed P10 and P11 were done.
+- Accepted and fixed:
+  - r1: Clean anyway with the cloud engine ran a local clean before consent.
+    Clean anyway is now local only; Clean with > Cloud is the way to the cloud.
+  - r1: closing an inline setup task moved focus to the wrong control. Focus
+    now returns to the control that opened it, or to the endpoints heading.
+  - r2, r3: the mock answered a live cancel with `acknowledged: true`. It now
+    matches the Tauri shape (`handle: ''`, `acknowledged: false`).
+  - r2, r3: `onconfigured` fired after a failed health check. It now carries
+    `healthy`, and both hosts turn the cloud permission on only when it is
+    true.
+  - r6: a Beam seed task that vanished, or ended without writing `done`,
+    made every Resume time out; a failed Beam map listing was reported as
+    already deleted. Both drivers now journal a seed's start before starting
+    it, wait on a seed that may still run, judge one gone only by the provider
+    or a stale heartbeat, and replace it at most once per run. Beam map cleanup
+    raises on a refused listing and verifies the map is empty.
+  - r7: three weight-seeding log lines wrote raw exception text. They are
+    redacted now, and the unused `RedactingLoggingFormatter` is gone.
+  - Claude provisioner-core review (8 findings, all accepted): the app passed
+    its whole environment to the helper, so `MODAL_SERVER_URL`,
+    `MC_BEAM_GATEWAY_*` or `PYTHONPATH` could redirect a pasted key; the helper
+    now starts with a cleared environment and an allowlist
+    (`HELPER_ENV_ALLOWLIST`, with a test that fails without the clearing). A
+    kill between two journal saves could lose the account id, which cleanup
+    needs; it is now written in the first save, filled in on resume, and
+    required by cleanup. A kill right after a seed started made Resume start a
+    second one (fixed with the r6 design). The journal closed a file
+    descriptor twice after a failed write. JSON-quoted key/value secrets
+    slipped past the redaction pattern. Four tests did not test what their
+    names said, and now do.
+- Kept by design: pasted tokens stay in memory while the setup dialog is open
+  after a failure, because Resume needs them and Modal shows its secret once.
+  They are cleared on success, on close and on unmount.
+- Dismissed after checking: r8's three Modal claims (`@modal.concurrent`,
+  `Dict.put(..., skip_if_exists=True)` and the callable `ignore`) are all
+  correct for modal 1.5.5, and Modal's own `_MountDir.get_files_to_upload`
+  ships the expected 17 files with `_not_shipped`. r6's `test_drivers.py:280`
+  finding: the Beam runtime credential is the user's own key by design. r5
+  found nothing.
+
+### Personally completed local checks
+
+| Command | Exit | Observed result |
+| --- | ---: | --- |
+| `npm test` | 0 | 57 files, 1,094 tests passed. |
+| `npm run build` | 0 | Vite production build, 351 modules transformed. |
+| `cargo clippy -p cleaner-core -p manga-cleaner --no-deps --all-targets -- -D warnings` | 0 | No warnings. |
+| `cargo test -p manga-cleaner` | 0 | 451 passed, 1 doc test ignored. |
+| `cargo test -p cleaner-core` | 0 | 586 passed, 2 ignored. |
+| `python3 -m unittest discover -q -s deploy/cloud/tests` | 0 | 182 ran, 11 skipped. |
+| `python3 -m unittest discover -q -s provisioner` | 0 | 132 ran, 7 skipped without the SDKs. |
+| Same, SDK venv (modal 1.5.5, beta9 0.1.268) and a scratch `HOME` | 0 | 132 ran, 0 skipped. |
+| `python3 -m compileall -q deploy/cloud provisioner` | 0 | Both trees byte-compiled. |
+| Dash scan of every changed and new file | 0 | No U+2014 or U+2013. |
+
+### Acceptance
+
+The milestone count does not change: every phase from P5 on still needs live
+evidence. P5 to P9 are implemented offline. P10 is not implemented: chapter
+runs stay local only. P11 is partial: CPU-only CI and the release step exist,
+and nothing has run end to end against a real account.

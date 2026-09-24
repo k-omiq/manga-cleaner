@@ -6,7 +6,9 @@ Enforces:
 3. Envelope schema validation with denial of unknown fields.
 4. Input bounds and rejection of path traversal, null bytes, or oversized payloads.
 5. Structured errors with actionable missing-permission guidance.
-6. Automatic credential redaction on all serialized responses.
+6. Automatic credential redaction on all serialized responses. The one exception is
+   the IC-1 carve-out: a successful apply or resume returns the runtime credential and
+   endpoint URL it just issued, inserted after redaction (see `make_success_response`).
 """
 
 from dataclasses import asdict, dataclass, field
@@ -59,6 +61,10 @@ ERR_ACTIONABLE_PERMISSION = "ERR_ACTIONABLE_MISSING_PERMISSION"
 ERR_PLATFORM_GATED = "ERR_PLATFORM_GATED"
 ERR_PROVIDER_UNAVAILABLE = "ERR_PROVIDER_UNAVAILABLE"
 ERR_EXECUTION_FAILED = "ERR_EXECUTION_FAILED"
+ERR_EXECUTION_TIMEOUT = "ERR_EXECUTION_TIMEOUT"
+
+# The only data fields a response may carry unredacted (IC-1).
+VERBATIM_FIELDS = frozenset({"runtime_credential", "endpoint_url"})
 
 IDENTIFIER_REGEX = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 HEX_HASH_REGEX = re.compile(r"^[a-fA-F0-9]{64}$")
@@ -98,6 +104,8 @@ class HelperResponse:
     success: bool
     data: Optional[Dict[str, Any]] = None
     error: Optional[Dict[str, Any]] = None
+    # IC-1 carve-out, merged into `data` after redaction. Never part of to_dict().
+    verbatim: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         res: Dict[str, Any] = {
@@ -115,6 +123,8 @@ class HelperResponse:
         """Serialize response to JSON with automatic credential redaction."""
         raw_dict = self.to_dict()
         sanitized = redact_data(raw_dict)
+        if self.success and self.verbatim and isinstance(sanitized.get("data"), dict):
+            sanitized["data"].update(self.verbatim)
         return json.dumps(sanitized, indent=2, sort_keys=True)
 
 
@@ -337,14 +347,23 @@ def _validate_param_values(val: Any, path: str = "params") -> None:
 def make_success_response(
     request_id: str,
     data: Dict[str, Any],
+    verbatim: Optional[Dict[str, Any]] = None,
 ) -> HelperResponse:
-    """Create a standardized success response."""
+    """Create a standardized success response.
+
+    `verbatim` is the IC-1 carve-out: the runtime credential and endpoint URL that a
+    successful apply or resume hands to the desktop. Everything else in `data` is
+    redacted as usual.
+    """
+    if verbatim is not None and not set(verbatim) <= VERBATIM_FIELDS:
+        raise ValueError(f"only {sorted(VERBATIM_FIELDS)} may skip redaction")
     return HelperResponse(
         protocol_version=HELPER_PROTOCOL_VERSION,
         request_id=request_id,
         success=True,
         data=data,
         error=None,
+        verbatim=dict(verbatim) if verbatim else None,
     )
 
 

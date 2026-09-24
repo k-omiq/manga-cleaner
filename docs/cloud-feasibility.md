@@ -1,5 +1,7 @@
 # Manga Cleaner Cloud Provisioner Feasibility Report (P1)
 
+> **Current state:** this is the P1 record. The provisioning drivers that replaced its probe, matrix, plans and templates are described in [cloud-provisioning.md](cloud-provisioning.md).
+
 **Status:** P1 Offline Preparation Complete (Candidate Matrix, AST Probes, Staging/Cleanup Plans Verified)
 **Target Plan:** [`manga-cleaner-cloud-master-plan.md`](../manga-cleaner-cloud-master-plan.md) § P1
 **Wire Specification:** [`docs/cloud-api.md`](cloud-api.md) (`/mc/v1` Wire Protocol)
@@ -45,11 +47,13 @@ All metadata, version tags, file sizes, and SHA256 hashes below were verified di
 
 ## 3. Source-Verified APIs vs. Click CLI Wrappers vs. Hosted Behaviors
 
+> **Superseded by the drivers.** The candidate matrix (`provisioner/matrix.py`) is removed. [`provisioner/modal_driver.py`](../provisioner/modal_driver.py) makes the Modal calls below; [`provisioner/beam_driver.py`](../provisioner/beam_driver.py) talks to the beta9 gRPC stubs over an explicit channel instead of `beam.client.client.Client`, and uses the user's own key as the runtime credential instead of a restricted token.
+
 ### 3.1 Modal Provider Analysis
 - **Callable SDK Methods (Source-Verified in `modal-1.5.5`):**
-  - [`modal.Client.from_credentials(token_id, token_secret) -> _Client`](../provisioner/matrix.py): Callable client constructor isolating credentials in memory. Avoids writing to `~/.modal.toml`.
-  - [`modal.App.deploy(client=client, name=..., ...)`](../provisioner/matrix.py): Callable programmatic deployment accepting an explicit injected client.
-  - [`modal.Workspace.from_context(client=client) -> _Workspace`](../provisioner/matrix.py): Callable workspace inspection.
+  - [`modal.Client.from_credentials(token_id, token_secret) -> _Client`](../provisioner/modal_driver.py): Callable client constructor isolating credentials in memory. Avoids writing to `~/.modal.toml`.
+  - [`modal.App.deploy(client=client, name=..., ...)`](../provisioner/modal_driver.py): Callable programmatic deployment accepting an explicit injected client.
+  - [`modal.Workspace.from_context(client=client) -> _Workspace`](../provisioner/modal_driver.py): Callable workspace inspection.
   - `workspace.proxy_tokens.create()`, `allow()`, `revoke()`, `delete()`: Callable webhook proxy token lifecycle management.
 - **Source CLI Commands (Click Command Wrappers):**
   - `modal token set`: Click command wrapper that mutates `~/.modal.toml`. MUST NOT be used by provisioner.
@@ -60,7 +64,7 @@ All metadata, version tags, file sizes, and SHA256 hashes below were verified di
 
 ### 3.2 Beam / Beta9 Provider Analysis
 - **Callable SDK Methods (Source-Verified in `beam-client-0.2.211` / `beta9-0.1.268`):**
-  - [`beam.client.client.Client(token=...)`](../provisioner/matrix.py): Callable client constructor inheriting from `beta9.client.client.Client`.
+  - `beam.client.client.Client(token=...)`: Callable client constructor inheriting from `beta9.client.client.Client`.
   - `beta9.config.SDKSettings(api_token=os.getenv("BEAM_TOKEN"))`: Callable settings initialization reading token from environment variable without touching disk.
 - **Source CLI Commands (Click Command Wrappers, NOT Callable SDK API):**
   - `beam configure`: Click Command wrapper in `beam/cli/configure.py` calling `save_config(...)` to mutate `~/.beam/config.ini`. MUST NOT be invoked.
@@ -75,6 +79,8 @@ All metadata, version tags, file sizes, and SHA256 hashes below were verified di
 
 ## 4. Platform Packaging Realities
 
+> **Superseded by the drivers.** The helper now ships frozen with its own Python 3.11 (see [cloud-provisioning.md](cloud-provisioning.md), section 7), and the Beam refusal on native Windows is dropped because the deploy path uses no POSIX-only code. Native Windows remains unverified live.
+
 | Platform / OS | Status | Verified Reality & Constraints |
 |---|---|---|
 | **macOS (Apple Silicon)** | Source-compatible / unverified | Pure Python wheels are installable. **Runtime Gate:** `modal` requires Python `>= 3.10`. The macOS host system Python is `/usr/bin/python3` (Python 3.9.6). Provisioner packaging must bundle a dedicated Python 3.10+ runtime; it cannot rely on macOS system Python. |
@@ -85,7 +91,9 @@ All metadata, version tags, file sizes, and SHA256 hashes below were verified di
 
 ## 5. CPU-Only Local Introspection & Source-Packaging Probe
 
-Implemented in [`provisioner/probe.py`](../provisioner/probe.py), the probe tests trusted cloud templates as nondeployable feasibility source samples.
+> **Superseded by the drivers.** `provisioner/probe.py` and `provisioner/templates/` are removed. The deployable apps are [`deploy/cloud/modal/app.py`](../deploy/cloud/modal/app.py) and [`deploy/cloud/beam/app.py`](../deploy/cloud/beam/app.py), and the packaging check is the frozen helper's `--self-check` run by [`.github/scripts/build-cloud-provisioner.py`](../.github/scripts/build-cloud-provisioner.py). The record below describes the removed probe.
+
+Implemented in `provisioner/probe.py` (removed), the probe tests trusted cloud templates as nondeployable feasibility source samples.
 
 ### 5.1 Probe Safeguards & Mechanism
 1. **Pre-Read Size Guard:** Inspects `stat().st_size` *before* reading file bytes. Files exceeding `100 KiB` are rejected immediately without content allocation.
@@ -98,14 +106,16 @@ Implemented in [`provisioner/probe.py`](../provisioner/probe.py), the probe test
 ### 5.2 Verification Evidence
 - **Log URI:** `/tmp/manga-cloud-p1-fixed-probe.log`
 - **Templates Verified:**
-  - `provisioner/templates/modal/app.py`: Valid syntax, 0 prohibited imports, minimal health stub present, sha256 `46a6433933eb6ef355f4c848c025025745fa4688b8a017e68d8558fdc092ebf3` (936 bytes).
-  - `provisioner/templates/beam/app.py`: Valid syntax, 0 prohibited imports, minimal health stub present, sha256 `9667d233956e3f93a1ea05a3209de6e63587a13c9f43d38967f7490c7acce922` (919 bytes).
+  - `provisioner/templates/modal/app.py` (removed): Valid syntax, 0 prohibited imports, minimal health stub present, sha256 `46a6433933eb6ef355f4c848c025025745fa4688b8a017e68d8558fdc092ebf3` (936 bytes).
+  - `provisioner/templates/beam/app.py` (removed): Valid syntax, 0 prohibited imports, minimal health stub present, sha256 `9667d233956e3f93a1ea05a3209de6e63587a13c9f43d38967f7490c7acce922` (919 bytes).
 
 ---
 
 ## 6. Minimal CPU-Only Staging & Cleanup Plans
 
-Formulated in [`provisioner/plans.py`](../provisioner/plans.py):
+> **Superseded by the drivers.** `provisioner/plans.py` is removed. The `plan` operation of [`provisioner/modal_driver.py`](../provisioner/modal_driver.py) and [`provisioner/beam_driver.py`](../provisioner/beam_driver.py) now plans the full installation (weights volume, GPU worker, CPU gateway, job state, runtime credential) and [`provisioner/controller.py`](../provisioner/controller.py) plans cleanup from the journal. The CPU-only staging plans below are the P1 record.
+
+Formulated in `provisioner/plans.py` (removed):
 
 ### 6.1 Invariants Maintained
 - **Strictly CPU-Only:** Zero GPU allocation, zero model weights, zero GPU idle retention settings.
@@ -130,7 +140,9 @@ Formulated in [`provisioner/plans.py`](../provisioner/plans.py):
 
 ## 7. Test Suite Execution & Evidence Logs
 
-Automated offline tests in [`provisioner/test_feasibility.py`](../provisioner/test_feasibility.py) verify matrix metadata, AST introspection, packaging failure modes, and plan invariants:
+> **Superseded by the drivers.** `provisioner/test_feasibility.py` is removed with the probe. The current tests are listed in [cloud-provisioning.md](cloud-provisioning.md), section 8.
+
+Automated offline tests in `provisioner/test_feasibility.py` (removed) verified matrix metadata, AST introspection, packaging failure modes, and plan invariants:
 
 - **Command Executed:** `python3 provisioner/test_feasibility.py`
 - **Total Tests:** 19
@@ -154,6 +166,8 @@ Automated offline tests in [`provisioner/test_feasibility.py`](../provisioner/te
 ---
 
 ## 8. Remaining Acceptance Gates & Explicit Blockers
+
+> **Current state:** gate 1 is met by the frozen helper, which bundles Python 3.11. Gate 2 is reduced to live verification: the Windows refusal is dropped. Gates 3 and 4 remain open and are listed under "Not verified live" in [cloud-provisioning.md](cloud-provisioning.md); the Beam driver uses the user's own key, so no restricted token is created.
 
 1. **macOS Python Interpreter Gate:** macOS system Python (`/usr/bin/python3`) is 3.9.6. `modal-1.5.5` requires Python `>= 3.10`. Packaging must bundle an isolated Python 3.10+ runtime.
 2. **Windows Native Packaging Blocker:** Beam officially documents Windows setup exclusively through WSL (`Ubuntu-22.04`). Native Windows packaging remains unverified without Windows test execution. Manual endpoint connection must remain available.

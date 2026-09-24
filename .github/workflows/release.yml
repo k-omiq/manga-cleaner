@@ -119,6 +119,9 @@ jobs:
         with:
           node-version: 20
           cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -129,6 +132,17 @@ jobs:
           workspaces: src-tauri
           key: ${{ matrix.target }}
       - run: npm ci
+
+      # Both provider SDKs and PyInstaller, every package pinned and hash-checked.
+      - name: Install pinned cloud helper build dependencies
+        shell: bash
+        run: python -m pip install --require-hashes -r provisioner/requirements.lock
+
+      # Freezes the helper, smoke tests it offline (self check, missing and
+      # unreachable credentials) and adds it to bundle.externalBin.
+      - name: Freeze and smoke-test cloud setup helper
+        shell: bash
+        run: python .github/scripts/build-cloud-provisioner.py '${{ matrix.target }}'
 
       # The ONNX Runtime the application downloads on first launch imports
       # MSVCP140.dll, MSVCP140_1.dll, VCRUNTIME140.dll and VCRUNTIME140_1.dll

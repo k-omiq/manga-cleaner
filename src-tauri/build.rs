@@ -1,4 +1,10 @@
 fn main() {
+    // `crate::provision` looks for the development sidecar under the name the
+    // release script gives it, which ends in the target triple.
+    println!(
+        "cargo:rustc-env=MC_TARGET_TRIPLE={}",
+        std::env::var("TARGET").expect("cargo sets TARGET for build scripts")
+    );
     let attributes = tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "diagnostics",
@@ -19,6 +25,14 @@ fn main() {
             "get_cloud_attempt_result",
             "cancel_cloud_attempt",
             "reconcile_cloud_recovery",
+            "run_cloud_provisioner",
+            "provision_inspect",
+            "provision_plan",
+            "provision_apply",
+            "provision_resume",
+            "provision_cleanup",
+            "provision_probe",
+            "cancel_cloud_provisioner",
             "list_projects",
             "create_project",
             "create_chapter",

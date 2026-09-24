@@ -1,18 +1,23 @@
 """Unit tests for the resumable installation and resource journal."""
 
 import json
+import os
 from pathlib import Path
+import stat
 import tempfile
 import unittest
+from unittest import mock
 
 from provisioner.journal import (
     MAX_JOURNAL_BYTES,
     STAGE_CLEANED_UP,
+    STAGE_CLEANUP_PLANNED,
     STAGE_COMPLETED,
     STAGE_CREDENTIAL_CREATED,
     STAGE_DEPLOYED,
     STAGE_DEPLOYING,
     STAGE_DISCOVERED,
+    STAGE_FAILED,
     STAGE_PLANNED,
     STAGE_SEEDED,
     STAGE_SEEDING,
@@ -20,6 +25,7 @@ from provisioner.journal import (
     InstallationJournal,
     InstallationRecord,
     ResourceRecord,
+    transition_allowed,
 )
 from provisioner.protocol import ERR_SECURITY_VIOLATION, ERR_VALIDATION, ProtocolError
 
@@ -55,17 +61,40 @@ class TestInstallationJournal(unittest.TestCase):
         self.assertEqual(loaded_rec.stage, STAGE_PLANNED)
         self.assertEqual(loaded_rec.app_name, "mc-app-inst-001")
 
+        # Only the user can read it, and a write that fails leaves the old journal: the
+        # new one goes to a temporary file that replaces the journal only when complete.
+        path = journal.journal_file
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        before = path.read_bytes()
+        journal.record.last_error = "a newer error"
+        closed = []
+        real_close = os.close
+
+        def close(fd):
+            closed.append(fd)
+            real_close(fd)
+
+        with mock.patch("provisioner.journal.os.fsync", side_effect=OSError("disk full")), mock.patch(
+            "provisioner.journal.os.close", side_effect=close
+        ):
+            with self.assertRaises(OSError):
+                journal.save()
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual([p.name for p in path.parent.iterdir()], ["journal.json"], "no temporary file is left")
+        self.assertEqual(closed, [], "the file object closes its descriptor; nothing closes it again")
+
     def test_stage_transitions(self):
         journal = InstallationJournal(self.root_path, "inst-stages", "beam")
         journal.load_or_initialize("b" * 64, "b" * 64, "mc-beam-svc")
 
+        # The IC-2 step order: deploy, then weights, token, endpoint, health.
         stages = [
-            STAGE_SEEDING,
-            STAGE_SEEDED,
             STAGE_DEPLOYING,
             STAGE_DEPLOYED,
-            STAGE_DISCOVERED,
+            STAGE_SEEDING,
+            STAGE_SEEDED,
             STAGE_CREDENTIAL_CREATED,
+            STAGE_DISCOVERED,
             STAGE_VALIDATED,
             STAGE_COMPLETED,
         ]
@@ -141,34 +170,95 @@ class TestInstallationJournal(unittest.TestCase):
         reloaded = InstallationJournal(self.root_path, "inst-forget", "modal").load()
         self.assertTrue(reloaded.setup_credential_forgotten)
 
-    def test_resume_decision_logic(self):
+    def test_resume_state_steps_options_and_provider_state(self):
         journal = InstallationJournal(self.root_path, "inst-resume-logic", "modal")
-        journal.load_or_initialize("f" * 64, "f" * 64, "mc-app-resume")
-
+        journal.initialize("f" * 64, "f" * 64, "mc-app-resume", {"gpu": "L4", "idle_seconds": 120})
         self.assertTrue(journal.can_resume())
-        self.assertEqual(journal.next_action(), "seed")
+        self.assertFalse(journal.step_done("volume"))
 
-        journal.transition_to(STAGE_SEEDING)
-        journal.record_resource("vol-1", "volume", "mc-modal-vol-inst-resume-logic", STAGE_SEEDING)
-        journal.transition_to(STAGE_SEEDED)
-        self.assertEqual(journal.next_action(), "deploy")
+        journal.mark_step_done("volume")
+        journal.mark_step_done("volume")
+        journal.set_state(environment_name="main", seed_call_id="fc-1")
+        journal.set_state(seed_call_id=None)
 
-        journal.record_resource("app-1", "app", "mc-app-resume", STAGE_DEPLOYING)
-        journal.transition_to(STAGE_DEPLOYED)
-        self.assertEqual(journal.next_action(), "discover_endpoint")
+        reloaded = InstallationJournal(self.root_path, "inst-resume-logic", "modal").load()
+        self.assertEqual(reloaded.completed_steps, ["volume"])
+        self.assertEqual(reloaded.provider_state, {"environment_name": "main"})
+        self.assertEqual(reloaded.options, {"gpu": "L4", "idle_seconds": 120})
 
-        journal.transition_to(STAGE_DISCOVERED)
-        self.assertEqual(journal.next_action(), "create_runtime_credential")
+        with self.assertRaises(ProtocolError):
+            journal.mark_step_done("not-a-step")
+        with self.assertRaises(ProtocolError):
+            journal.set_state(token_secret="ws-never")  # sensitive names are refused
+        with self.assertRaises(ProtocolError):
+            journal.set_state(seed_url="line\nbreak")
 
-        journal.transition_to(STAGE_CREDENTIAL_CREATED)
-        self.assertEqual(journal.next_action(), "validate_compatibility")
+    def test_initialize_refuses_to_replace_a_journal(self):
+        journal = InstallationJournal(self.root_path, "inst-once", "beam")
+        journal.initialize("f" * 64, "f" * 64, "mc-once")
+        with self.assertRaises(ProtocolError):
+            InstallationJournal(self.root_path, "inst-once", "beam").initialize("e" * 64, "e" * 64, "mc-once")
 
-        journal.transition_to(STAGE_VALIDATED)
-        self.assertEqual(journal.next_action(), "complete")
+    def test_transition_rules(self):
+        self.assertTrue(transition_allowed(STAGE_PLANNED, STAGE_DEPLOYING))
+        self.assertFalse(transition_allowed(STAGE_SEEDED, STAGE_DEPLOYING))
+        self.assertTrue(transition_allowed(STAGE_SEEDING, STAGE_FAILED))
+        self.assertTrue(transition_allowed(STAGE_FAILED, STAGE_DEPLOYING))
+        # resume at completed issues a fresh credential and nothing else goes back
+        self.assertTrue(transition_allowed(STAGE_COMPLETED, STAGE_CREDENTIAL_CREATED))
+        self.assertFalse(transition_allowed(STAGE_COMPLETED, STAGE_DEPLOYING))
+        self.assertTrue(transition_allowed(STAGE_COMPLETED, STAGE_CLEANUP_PLANNED))
+        # a started cleanup only finishes
+        self.assertFalse(transition_allowed(STAGE_CLEANUP_PLANNED, STAGE_FAILED))
+        self.assertFalse(transition_allowed(STAGE_CLEANUP_PLANNED, STAGE_DEPLOYING))
+        self.assertTrue(transition_allowed(STAGE_CLEANUP_PLANNED, STAGE_CLEANED_UP))
+        self.assertFalse(transition_allowed(STAGE_CLEANED_UP, STAGE_FAILED))
+        self.assertFalse(transition_allowed(STAGE_VALIDATED, STAGE_CLEANED_UP))
+        # completed only after the health check
+        self.assertTrue(transition_allowed(STAGE_VALIDATED, STAGE_COMPLETED))
+        self.assertFalse(transition_allowed(STAGE_SEEDED, STAGE_COMPLETED))
+        self.assertFalse(transition_allowed(STAGE_FAILED, STAGE_COMPLETED))
 
+    def test_advance_leaves_a_later_stage_alone(self):
+        journal = InstallationJournal(self.root_path, "inst-advance", "beam")
+        journal.initialize("a" * 64, "a" * 64, "mc-advance")
+        journal.advance(STAGE_SEEDED)
+        journal.advance(STAGE_DEPLOYING)  # a repeated earlier step does not move back
+        self.assertEqual(journal.record.stage, STAGE_SEEDED)
+        journal.advance(STAGE_VALIDATED)
         journal.transition_to(STAGE_COMPLETED)
+        journal.advance(STAGE_CREDENTIAL_CREATED)
+        self.assertEqual(journal.record.stage, STAGE_CREDENTIAL_CREATED)
+        journal.transition_to(STAGE_CLEANUP_PLANNED)
         self.assertFalse(journal.can_resume())
-        self.assertEqual(journal.next_action(), "ready")
+
+    def test_remove_resource_clears_the_credential_reference(self):
+        journal = InstallationJournal(self.root_path, "inst-remove", "modal")
+        journal.initialize("a" * 64, "a" * 64, "mc-remove")
+        journal.record_resource("wk-abc123", "proxy_token", "mc-remove-proxy-token", STAGE_CREDENTIAL_CREATED)
+        journal.record.runtime_credential_ref = {"resource_type": "proxy_token", "name": "mc-remove-proxy-token"}
+        journal.save()
+        journal.remove_resource("proxy_token", "mc-remove-proxy-token")
+        reloaded = InstallationJournal(self.root_path, "inst-remove", "modal").load()
+        self.assertEqual((reloaded.resources, reloaded.runtime_credential_ref), ([], None))
+
+    def test_tampered_new_fields_fail_closed(self):
+        journal = InstallationJournal(self.root_path, "inst-tamper", "modal")
+        journal.initialize("a" * 64, "a" * 64, "mc-tamper", {"gpu": "L4", "idle_seconds": 120})
+        good = json.loads(journal.journal_file.read_text(encoding="utf-8"))
+        for field, value in (
+            ("options", {"gpu": "L4; rm -rf", "idle_seconds": 120}),
+            ("options", {"gpu": "L4", "idle_seconds": True}),
+            ("options", {"extra": 1}),
+            ("completed_steps", ["volume", "volume"]),
+            ("completed_steps", ["launch"]),
+            ("provider_state", {"Bad-Key": "x"}),
+            ("provider_state", {"note": ["list"]}),
+        ):
+            data = dict(good, **{field: value})
+            journal.journal_file.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaises(ProtocolError, msg=f"{field}={value!r}"):
+                InstallationJournal(self.root_path, "inst-tamper", "modal").load()
 
     def test_oversized_journal_rejected(self):
         journal = InstallationJournal(self.root_path, "inst-huge", "modal")
@@ -182,6 +272,19 @@ class TestInstallationJournal(unittest.TestCase):
         with self.assertRaises(ProtocolError) as ctx:
             journal.load()
         self.assertEqual(ctx.exception.code, ERR_SECURITY_VIOLATION)
+
+    def test_names_that_look_like_tokens_round_trip(self):
+        """Ids, names and the endpoint URL survive the save exactly; the error text is still scrubbed."""
+        journal = InstallationJournal(self.root_path, "inst-names", "modal")
+        journal.initialize("a" * 64, "a" * 64, "mc-names")
+        journal.set_state(account_id="ws-0001-workspace", environment_name="as-staging-environment")
+        journal.record.endpoint_url = "https://studio-ws--mc-names-gateway.modal.run/mc/v1"
+        journal.transition_to(STAGE_FAILED, error="deploy failed for token ws-abcdefghijkl")
+        reloaded = InstallationJournal(self.root_path, "inst-names", "modal").load()
+        self.assertEqual(reloaded.provider_state["account_id"], "ws-0001-workspace")
+        self.assertEqual(reloaded.provider_state["environment_name"], "as-staging-environment")
+        self.assertEqual(reloaded.endpoint_url, "https://studio-ws--mc-names-gateway.modal.run/mc/v1")
+        self.assertEqual(reloaded.last_error, "deploy failed for token ws-[REDACTED]")
 
     def test_reject_unsafe_installation_id(self):
         for bad_id in ["../escape", "null\0byte", "slash/id", ""]:

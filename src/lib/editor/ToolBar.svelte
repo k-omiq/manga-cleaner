@@ -32,9 +32,10 @@
    * **Labels and controls, no prose.** The two sentences here are not
    * explanations of a tool but reasons a control is unavailable - a blocked
    * option's gate note and the run's own - and each appears only while
-   * something is blocked. Every cloud option is gated by `session.cloudAllowed`:
-   * a blocked rung is shown disabled and says why, rather than being hidden, so
-   * the user can see what the setting is costing them.
+   * something is blocked. Every cloud option is gated by `cloudUsable()`, the
+   * permission and a configured endpoint together: a blocked rung is shown
+   * disabled and says why, with the way to Settings > Cloud beside it, rather
+   * than being hidden, so the user can see what the setting is costing them.
    *
    * The run lives here because the cancel belongs where the run was started.
    * The Pages window shows the progress and grows no second cancel.
@@ -42,6 +43,7 @@
   import { untrack } from 'svelte'
   import { session, raiseWindow, setWindowBox } from '../state/session.svelte.js'
   import { capabilities } from '../state/capabilities.svelte.js'
+  import { cloud, cloudUsable, openCloudSettings } from '../state/cloud.svelte.js'
   import {
     editor,
     setToolParam,
@@ -147,9 +149,22 @@
         value: option.value,
         label: t(option.labelKey),
         icon: option.icon,
-        disabled: option.cloud && !session.cloudAllowed,
-        title: option.cloud && !session.cloudAllowed ? t('editor.state.cloudBlocked') : undefined,
+        disabled: option.cloud && !cloudUsable(),
+        title: option.cloud ? cloudNote() ?? undefined : undefined,
       }))
+  }
+
+  /**
+   * Why the Cloud engine cannot be chosen now, or null when it can. Nothing is
+   * said about readiness before it has been read once, so the note never
+   * claims an endpoint is missing that is merely not asked about yet.
+   *
+   * @returns {string|null}
+   */
+  function cloudNote() {
+    if (!session.cloudAllowed) return t('editor.state.cloudBlocked')
+    if (cloudUsable() || !cloud.checked) return null
+    return t('tools.option.engineCloudNotReady')
   }
 
   /**
@@ -167,8 +182,8 @@
    * @returns {string|null}
    */
   function gateNote(param) {
-    const gated = param.options.some((option) => option.cloud) && !session.cloudAllowed
-    if (gated) return t('editor.state.cloudBlocked')
+    const gated = param.options.some((option) => option.cloud) && cloudNote()
+    if (gated) return gated
     // Rung 3a's half of the same duty. `sidecarReasonKey` is null for the
     // ordinary machine that installed nothing - absence is silent - and carries
     // a `decline.reason.sidecar*` sentence only where something *is* installed
@@ -409,6 +424,11 @@
                 onchange={(next) => set(param.key, next)}
               />
               {#if note}<p class="gate" id={gateId}>{note}</p>{/if}
+              {#if note && param.options.some((option) => option.cloud)}
+                <Button size="sm" variant="soft" onclick={openCloudSettings}>
+                  {t('tools.option.engineCloudSettings')}
+                </Button>
+              {/if}
             {:else}
               {@const current = opts.find((option) => option.value === value)?.label ?? value}
               <Menu

@@ -1,32 +1,148 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte'
+/**
+ * Settings > Cloud against the mock backend (every delay zero): the way in
+ * from elsewhere in the app, the status line, the permission switch, the
+ * endpoint list and what each row does, the manual form, the recovery
+ * section, and the provisioner opened in place.
+ */
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/svelte'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-
 import { setBackend } from '../api/backend.js'
-import InferenceSettings, {
-  isOriginChanged,
-  isValidEndpointUrl,
-  isValidProfileId,
-  isValidProfileName,
-} from './InferenceSettings.svelte'
+import { createMockBackend } from '../api/mock.js'
+import { t } from '../i18n/index.js'
+import ModalHost from '../shell/ModalHost.svelte'
+import { app, clearNotices, closeAllModals, pushModal } from '../state/app.svelte.js'
+import { cloud, openCloudSettings, stopCloud } from '../state/cloud.svelte.js'
+import { session, setCloudAllowed } from '../state/session.svelte.js'
+import InferenceSettings, { isValidEndpointUrl, isValidProfileName } from './InferenceSettings.svelte'
+import { forgetUnfinished, setup } from './provisioning.svelte.js'
+
+const ZERO = { method: 0, openChapter: 0, export: 0, cloud: 0, provision: 0, region: 0, pageTail: 0, noticeStagger: 0 }
+const MODAL_KEY = 'settings.inference.provider.modal'
+const BEAM_KEY = 'settings.inference.provider.beam'
+
+/** An endpoint setup made: its id is the installation id. */
+const MADE = {
+  provider: /** @type {const} */ ('modal'),
+  id: 'mc-abc123',
+  name: 'Modal (mc-abc123)',
+  url: 'https://ws--mc-mc-abc123-gateway.modal.run/mc/v1',
+  token: true,
+  createdAtMs: 1,
+}
+/** An endpoint added by hand. */
+const MANUAL = {
+  provider: /** @type {const} */ ('beam'),
+  id: 'ep_manual',
+  name: 'Studio Beam',
+  url: 'https://studio.app.beam.cloud/mc/v1',
+  token: true,
+  createdAtMs: 2,
+}
+
+/** Local storage for the test: the node running the suite has none. */
+function memoryStorage() {
+  /** @type {Map<string, string>} */
+  const values = new Map()
+  return {
+    get length() {
+      return values.size
+    },
+    key: (/** @type {number} */ index) => [...values.keys()][index] ?? null,
+    getItem: (/** @type {string} */ key) => values.get(key) ?? null,
+    setItem: (/** @type {string} */ key, /** @type {string} */ value) => void values.set(key, String(value)),
+    removeItem: (/** @type {string} */ key) => void values.delete(key),
+    clear: () => values.clear(),
+  }
+}
+
+beforeEach(() => {
+  vi.stubGlobal('localStorage', memoryStorage())
+})
+
+afterEach(() => {
+  cleanup()
+  closeAllModals()
+  setup.run = null
+  forgetUnfinished()
+  stopCloud()
+  setCloudAllowed(false)
+  clearNotices()
+  setBackend(null)
+  vi.unstubAllGlobals()
+  vi.restoreAllMocks()
+})
+
+/**
+ * A mock backend holding these endpoints, with the permission as given.
+ *
+ * @param {{allowed?: boolean, endpoints?: Array<typeof MADE|typeof MANUAL>, selected?: {type: string, profile_id?: string}}} [options]
+ */
+async function seeded({ allowed = true, endpoints = [], selected = { type: 'local' } } = {}) {
+  const backend = createMockBackend({ timing: ZERO })
+  await backend.writeSettings({ cloudEngines: allowed ? 'allowed' : 'blocked' })
+  setCloudAllowed(allowed)
+  /** @type {any} */
+  const config = { schemaVersion: 1, selectedTarget: selected, modalProfiles: {}, beamProfiles: {} }
+  for (const ep of endpoints) {
+    config[ep.provider === 'beam' ? 'beamProfiles' : 'modalProfiles'][ep.id] = {
+      id: ep.id,
+      name: ep.name,
+      endpointUrl: ep.url,
+      canonicalOrigin: new URL(ep.url).origin,
+      canonicalOriginFingerprint: '',
+      createdAtMs: ep.createdAtMs,
+      updatedAtMs: ep.createdAtMs,
+    }
+  }
+  await backend.writeInferenceConfig({ config })
+  for (const ep of endpoints) {
+    if (!ep.token) continue
+    await backend.storeCloudSecret({
+      provider: ep.provider,
+      profileId: ep.id,
+      role: 'runtime',
+      secret: 'rt-secret',
+      ...(ep.provider === 'modal' ? { tokenId: 'rt-id' } : {}),
+    })
+  }
+  setBackend(backend)
+  return backend
+}
+
+/** @param {import('../api/backend.js').Backend} backend */
+function show(backend) {
+  return render(InferenceSettings, { props: { backend } })
+}
+
+/** @param {string} name */
+const button = (name) => /** @type {HTMLButtonElement} */ (screen.getByRole('button', { name }))
+
+/** The status line, by what it says. @param {string} text */
+const statusSays = (text) => waitFor(() => expect(screen.getAllByRole('status')[0].textContent?.trim()).toBe(text))
+
+/** One endpoint's row, by its name. @param {string} name */
+function row(name) {
+  return /** @type {HTMLElement} */ (screen.getByText(name, { selector: 'label' }).closest('li'))
+}
+
+/** @param {string} name */
+function defaultRadio(name) {
+  return /** @type {HTMLInputElement} */ (
+    screen.getByRole('radio', { name: t('settings.inference.endpoints.useDefault', { name }) })
+  )
+}
+
+/**
+ * @param {string} label
+ * @param {string} value
+ */
+async function fill(label, value) {
+  await fireEvent.input(screen.getByLabelText(label), { target: { value } })
+}
+
+const attentionHeading = () => screen.queryByRole('heading', { name: t('settings.inference.recovery.title') })
 
 describe('InferenceSettings helper validations', () => {
-  it('validates profile IDs correctly', () => {
-    expect(isValidProfileId('modal-prod-1')).toBe(true)
-    expect(isValidProfileId('beam_v2')).toBe(true)
-    expect(isValidProfileId('profile123')).toBe(true)
-    expect(isValidProfileId('a')).toBe(true)
-    expect(isValidProfileId('A'.repeat(64))).toBe(true)
-
-    expect(isValidProfileId('')).toBe(false)
-    expect(isValidProfileId(' modal-prod ')).toBe(false)
-    expect(isValidProfileId('-invalid-start')).toBe(false)
-    expect(isValidProfileId('_invalid-start')).toBe(false)
-    expect(isValidProfileId('has.dot')).toBe(false)
-    expect(isValidProfileId('has/slash')).toBe(false)
-    expect(isValidProfileId('has space')).toBe(false)
-    expect(isValidProfileId('A'.repeat(65))).toBe(false)
-  })
-
   it('validates profile names correctly', () => {
     expect(isValidProfileName('Production GPU')).toBe(true)
     expect(isValidProfileName('Worker-1')).toBe(true)
@@ -59,836 +175,491 @@ describe('InferenceSettings helper validations', () => {
     expect(isValidEndpointUrl('https://[::1]:8443/ep')).toBe(false)
     expect(isValidEndpointUrl('https://2130706433/')).toBe(false)
   })
+})
 
-  it('detects origin changes across endpoint URLs', () => {
-    expect(
-      isOriginChanged(
-        'https://modal-prod.run.modal.com/mc/v1',
-        'https://modal-prod.run.modal.com/mc/v2',
-      ),
-    ).toBe(false)
-    expect(
-      isOriginChanged(
-        'https://modal-prod.run.modal.com/mc/v1',
-        'https://modal-dev.run.modal.com/mc/v1',
-      ),
-    ).toBe(true)
-    expect(
-      isOriginChanged(
-        'https://api.beam.cloud/v1',
-        'https://api.beam.cloud:8443/v1',
-      ),
-    ).toBe(true)
+describe('the way in', () => {
+  /** @param {string} id */
+  const tab = (id) => screen.findByRole('tab', { name: t(`settings.section.${id}`) })
+
+  it('opens Settings on the Cloud tab when the app asks for it', async () => {
+    await seeded()
+    render(ModalHost)
+    openCloudSettings()
+    expect((await tab('inference')).getAttribute('aria-selected')).toBe('true')
+    expect((await tab('general')).getAttribute('aria-selected')).toBe('false')
+  })
+
+  it('opens on General when the tab asked for is not one it has', async () => {
+    await seeded()
+    render(ModalHost)
+    pushModal({ kind: 'settings', props: { tab: 'billing' } })
+    expect((await tab('general')).getAttribute('aria-selected')).toBe('true')
+    expect((await tab('inference')).getAttribute('aria-selected')).toBe('false')
   })
 })
 
-describe('InferenceSettings Component', () => {
-  let mockBackend
+describe('the status line and the permission switch', () => {
+  it('off: says nothing is sent; turning it on saves the permission and reads readiness again', async () => {
+    const backend = await seeded({ allowed: false })
+    const write = vi.spyOn(backend, 'writeSettings')
+    show(backend)
+    await statusSays(t('settings.inference.status.off'))
+    const on = screen.getByRole('radio', { name: t('settings.inference.permission.on') })
+    expect(on.getAttribute('aria-checked')).toBe('false')
 
-  const defaultMockConfig = {
-    schemaVersion: 1,
-    selectedTarget: { type: 'local' },
-    beamProfiles: {},
-    modalProfiles: {},
-  }
-
-  const populatedMockConfig = {
-    schemaVersion: 1,
-    selectedTarget: { type: 'modal', profile_id: 'modal-prod' },
-    beamProfiles: {
-      'beam-prod': {
-        id: 'beam-prod',
-        name: 'Beam Production',
-        endpointUrl: 'https://api.beam.cloud/v1/clean',
-        canonicalOrigin: 'https://api.beam.cloud',
-        canonicalOriginFingerprint: 'beamfp123',
-        createdAtMs: 1000,
-        updatedAtMs: 1000,
-      },
-    },
-    modalProfiles: {
-      'modal-prod': {
-        id: 'modal-prod',
-        name: 'Modal Production',
-        endpointUrl: 'https://modal-cleaner.run.modal.com/mc/v1',
-        canonicalOrigin: 'https://modal-cleaner.run.modal.com',
-        canonicalOriginFingerprint: 'modalfp123',
-        createdAtMs: 2000,
-        updatedAtMs: 2000,
-      },
-    },
-  }
-
-  beforeEach(() => {
-    mockBackend = {
-      readInferenceConfig: vi.fn().mockResolvedValue(structuredClone(defaultMockConfig)),
-      writeInferenceConfig: vi.fn().mockImplementation(async ({ config }) => structuredClone(config)),
-      storeCloudSecret: vi.fn().mockRejectedValue(new Error('no secret calls')),
-      deleteCloudSecret: vi.fn().mockRejectedValue(new Error('no secret calls')),
-      getCloudSecretSummary: vi.fn().mockRejectedValue(new Error('no secret calls')),
-      checkCloudConnection: vi.fn().mockResolvedValue({
-        ok: true,
-        status: 'reachable',
-        provider: 'modal',
-        profileId: 'modal-prod',
-        latencyMs: 38,
-      }),
-      reconcileCloudRecovery: vi.fn().mockResolvedValue({ decision: 'terminal' }),
-    }
-    setBackend(mockBackend)
+    await fireEvent.click(on)
+    await waitFor(() => expect(session.cloudAllowed).toBe(true))
+    expect(write).toHaveBeenLastCalledWith(expect.objectContaining({ cloudEngines: 'allowed' }))
+    expect(on.getAttribute('aria-checked')).toBe('true')
+    await statusSays(t('settings.inference.status.attention', { reasonKey: 'settings.inference.reason.none' }))
   })
 
-  afterEach(() => {
-    cleanup()
-    setBackend(null)
-    vi.clearAllMocks()
+  it('puts the switch back when the permission cannot be saved', async () => {
+    const backend = await seeded({ allowed: false })
+    vi.spyOn(backend, 'writeSettings').mockRejectedValueOnce(new Error('disk full'))
+    show(backend)
+    await fireEvent.click(screen.getByRole('radio', { name: t('settings.inference.permission.on') }))
+    await waitFor(() => expect(app.notices.some((notice) => notice.key === 'notice.cloud.permissionFailed')).toBe(true))
+    expect(session.cloudAllowed).toBe(false)
+    await statusSays(t('settings.inference.status.off'))
   })
 
-  it('loads configuration on mount and displays remote execution disclaimer', async () => {
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(mockBackend.readInferenceConfig).toHaveBeenCalledTimes(1)
-    })
-
-    const statusBox = container.querySelector('.disclaimer-box')
-    expect(statusBox).toBeTruthy()
-    expect(statusBox.textContent).toContain('Remote execution is unavailable in this build.')
-    await waitFor(() => expect(container.textContent).toContain('Default execution target'))
-    expect(container.textContent).toContain('Modal profiles')
-    expect(container.textContent).toContain('Beam profiles')
+  it('ready: names the default endpoint, and nothing needs attention', async () => {
+    const backend = await seeded({ endpoints: [MADE, MANUAL], selected: { type: 'modal', profile_id: MADE.id } })
+    show(backend)
+    await statusSays(t('settings.inference.status.ready', { name: MADE.name }))
+    expect(attentionHeading()).toBeNull()
+    // Settings has no line saying cloud execution is unavailable any more.
+    expect(document.body.textContent).not.toMatch(/unavailable/i)
   })
 
-  it('renders both provider profiles simultaneously when populated', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
+  it('needs attention: the default endpoint has no token, and adding one fixes it', async () => {
+    const backend = await seeded({ endpoints: [{ ...MADE, token: false }], selected: { type: 'modal', profile_id: MADE.id } })
+    const store = vi.spyOn(backend, 'storeCloudSecret')
+    show(backend)
+    await statusSays(t('settings.inference.status.attention', { reasonKey: 'settings.inference.reason.noSecret' }))
 
-    await waitFor(() => {
-      const rowNames = Array.from(container.querySelectorAll('.row-name')).map((el) => el.textContent)
-      expect(rowNames.some((n) => n.includes('Modal Production'))).toBe(true)
-      expect(rowNames.some((n) => n.includes('Beam Production'))).toBe(true)
-    })
-
-    const profileIds = Array.from(container.querySelectorAll('.profile-id')).map((el) => el.textContent)
-    expect(profileIds).toContain('(modal-prod)')
-    expect(profileIds).toContain('(beam-prod)')
-
-    const rowMetas = Array.from(container.querySelectorAll('.row-meta')).map((el) => el.textContent)
-    expect(rowMetas).toContain('https://modal-cleaner.run.modal.com/mc/v1')
-    expect(rowMetas).toContain('https://api.beam.cloud/v1/clean')
-  })
-
-  it('switches execution target and persists both providers', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
-    })
-
-    const select = container.querySelector('select.select')
-    expect(select).toBeTruthy()
-
-    // Switch to Beam target
-    await fireEvent.change(select, { target: { value: 'beam:beam-prod' } })
-
-    await waitFor(() => {
-      expect(mockBackend.writeInferenceConfig).toHaveBeenCalledWith({
-        config: expect.objectContaining({
-          schemaVersion: 1,
-          selectedTarget: { type: 'beam', profile_id: 'beam-prod' },
-          modalProfiles: expect.objectContaining({ 'modal-prod': expect.any(Object) }),
-          beamProfiles: expect.objectContaining({ 'beam-prod': expect.any(Object) }),
-        }),
-      })
-    })
-
-    // Wait for the first save to settle before the next user action.
-    await waitFor(() => {
-      expect(select.disabled).toBe(false)
-      expect(select.value).toBe('beam:beam-prod')
-    })
-    // Switch to Local target
-    await fireEvent.change(select, { target: { value: 'local' } })
-
-    await waitFor(() => {
-      expect(mockBackend.writeInferenceConfig).toHaveBeenCalledWith({
-        config: expect.objectContaining({
-          schemaVersion: 1,
-          selectedTarget: { type: 'local' },
-          modalProfiles: expect.objectContaining({ 'modal-prod': expect.any(Object) }),
-          beamProfiles: expect.objectContaining({ 'beam-prod': expect.any(Object) }),
-        }),
-      })
-    })
-  })
-
-  it('adds a new profile preserving existing profiles and selectedTarget', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
-    })
-
-    const addButtons = screen.getAllByRole('button', { name: 'Add profile' })
-    await fireEvent.click(addButtons[0]) // Modal add profile
-
-    const idInput = screen.getByPlaceholderText('e.g. modal-prod-1')
-    const nameInput = screen.getByPlaceholderText('e.g. Production GPU Worker')
-    const endpointInput = screen.getByPlaceholderText('https://…')
-
-    await fireEvent.input(idInput, { target: { value: 'modal-staging' } })
-    await fireEvent.input(nameInput, { target: { value: 'Modal Staging' } })
-    await fireEvent.input(endpointInput, {
-      target: { value: 'https://modal-staging.run.modal.com/mc/v1' },
-    })
-
-    const saveButton = screen.getByRole('button', { name: 'Save profile' })
-    await fireEvent.click(saveButton)
-
-    await waitFor(() => {
-      expect(mockBackend.writeInferenceConfig).toHaveBeenCalledWith({
-        config: expect.objectContaining({
-          schemaVersion: 1,
-          selectedTarget: { type: 'modal', profile_id: 'modal-prod' },
-          beamProfiles: expect.objectContaining({ 'beam-prod': expect.any(Object) }),
-          modalProfiles: expect.objectContaining({
-            'modal-prod': expect.any(Object),
-            'modal-staging': expect.objectContaining({
-              id: 'modal-staging',
-              name: 'Modal Staging',
-              endpointUrl: 'https://modal-staging.run.modal.com/mc/v1',
-            }),
-          }),
-        }),
-      })
-    })
-  })
-
-  it('validates profile input and refuses invalid fields', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
-    })
-
-    const addButtons = screen.getAllByRole('button', { name: 'Add profile' })
-    await fireEvent.click(addButtons[0])
-
-    const idInput = screen.getByPlaceholderText('e.g. modal-prod-1')
-    const nameInput = screen.getByPlaceholderText('e.g. Production GPU Worker')
-    const endpointInput = screen.getByPlaceholderText('https://…')
-    const saveButton = screen.getByRole('button', { name: 'Save profile' })
-
-    // Invalid ID: leading hyphen
-    await fireEvent.input(idInput, { target: { value: '-invalid-id' } })
-    await fireEvent.input(nameInput, { target: { value: 'Valid Name' } })
-    await fireEvent.input(endpointInput, { target: { value: 'https://api.modal.com/v1' } })
-    await fireEvent.click(saveButton)
-
-    const alertBox = container.querySelector('.form-error')
-    expect(alertBox).toBeTruthy()
-    expect(alertBox.textContent).toContain('Profile ID must be 1 to 64 ASCII')
-    expect(mockBackend.writeInferenceConfig).not.toHaveBeenCalled()
-
-    // Duplicate ID
-    await fireEvent.input(idInput, { target: { value: 'modal-prod' } })
-    await fireEvent.click(saveButton)
-    expect(alertBox.textContent).toContain('A profile with this ID already exists')
-    expect(mockBackend.writeInferenceConfig).not.toHaveBeenCalled()
-
-    // Invalid URL (insecure http)
-    await fireEvent.input(idInput, { target: { value: 'modal-new' } })
-    await fireEvent.input(endpointInput, { target: { value: 'http://insecure.modal.com/v1' } })
-    await fireEvent.click(saveButton)
-    expect(alertBox.textContent).toContain('Endpoint URL must be a valid HTTPS URL')
-    expect(mockBackend.writeInferenceConfig).not.toHaveBeenCalled()
-  })
-
-  it('displays warning when editing an endpoint URL with a new origin', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
-    })
-
-    const editButtons = screen.getAllByRole('button', { name: /^Edit / })
-    await fireEvent.click(editButtons[0])
-
-    const endpointInput = screen.getByPlaceholderText('https://…')
-    await fireEvent.input(endpointInput, {
-      target: { value: 'https://new-origin.modal.com/mc/v1' },
-    })
-
-    const warningBox = container.querySelector('.warning-note')
-    expect(warningBox).toBeTruthy()
-    expect(warningBox.textContent).toContain('Changing the endpoint URL changes the target origin.')
-
-    const saveButton = screen.getByRole('button', { name: 'Save profile' })
-    await fireEvent.click(saveButton)
-
-    await waitFor(() => {
-      expect(mockBackend.writeInferenceConfig).toHaveBeenCalledWith({
-        config: expect.objectContaining({
-          modalProfiles: expect.objectContaining({
-            'modal-prod': expect.objectContaining({
-              id: 'modal-prod',
-              endpointUrl: 'https://new-origin.modal.com/mc/v1',
-            }),
-          }),
-        }),
-      })
-    })
-  })
-
-  it('resets selectedTarget to local when deleting the currently selected profile', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
-    })
-
-    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
-    // Delete modal-prod, which is currently selectedTarget
-    await fireEvent.click(deleteButtons[0])
-
-    const confirmButton = screen.getByRole('button', { name: 'Confirm removal' })
-    await fireEvent.click(confirmButton)
-
-    await waitFor(() => {
-      expect(mockBackend.writeInferenceConfig).toHaveBeenCalledWith({
-        config: expect.objectContaining({
-          schemaVersion: 1,
-          selectedTarget: { type: 'local' },
-          modalProfiles: {},
-          beamProfiles: expect.objectContaining({ 'beam-prod': expect.any(Object) }),
-        }),
-      })
-    })
-
-    await waitFor(() => {
-      const statusBox = container.querySelector('.status-banner.success')
-      expect(statusBox).toBeTruthy()
-      expect(statusBox.textContent).toContain('Profile removed from local configuration.')
-    })
-  })
-
-  it('preserves selectedTarget when deleting an unselected profile', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelectorAll('.row-name').length).toBe(2)
-    })
-
-    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
-    // Delete beam-prod (modal-prod is the selected target)
-    await fireEvent.click(deleteButtons[1])
-
-    const confirmButton = screen.getByRole('button', { name: 'Confirm removal' })
-    await fireEvent.click(confirmButton)
-
-    await waitFor(() => {
-      expect(mockBackend.writeInferenceConfig).toHaveBeenCalledWith({
-        config: expect.objectContaining({
-          schemaVersion: 1,
-          selectedTarget: { type: 'modal', profile_id: 'modal-prod' },
-          beamProfiles: {},
-          modalProfiles: expect.objectContaining({ 'modal-prod': expect.any(Object) }),
-        }),
-      })
-    })
-
-    await waitFor(() => {
-      const statusBox = container.querySelector('.status-banner.success')
-      expect(statusBox).toBeTruthy()
-      expect(statusBox.textContent).toContain('Profile removed from local configuration.')
-    })
-  })
-
-  it('explains local-only scope upon removal request and does not write before confirmation', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
-    })
-
-    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
-    await fireEvent.click(deleteButtons[0])
-
-    const confirmCard = container.querySelector('.removal-confirm-card')
-    expect(confirmCard).toBeTruthy()
-    expect(confirmCard.textContent).toContain('Remove Modal Production (modal-prod)')
-    expect(confirmCard.textContent).toContain(
-      'Removing this profile deletes its endpoint configuration from local application settings only.',
+    const section = /** @type {HTMLElement} */ (
+      screen.getByRole('region', { name: t('settings.inference.recovery.title') })
     )
-    expect(confirmCard.textContent).toContain(
-      'This action does not revoke API tokens, delete secret-store entries, stop running services, or uninstall provider resources.',
-    )
-    expect(confirmCard.textContent).toContain(
-      'Status polling and result retrieval for any active remote attempts will be interrupted until this profile is restored.',
-    )
+    expect(within(section).getByText(t('settings.inference.recovery.noToken', { name: MADE.name }))).toBeTruthy()
+    expect(within(section).getByRole('button', { name: t('settings.inference.recovery.newToken') })).toBeTruthy()
 
-    // No backend write occurred without explicit confirmation
-    expect(mockBackend.writeInferenceConfig).not.toHaveBeenCalled()
-  })
+    await fireEvent.click(within(section).getByRole('button', { name: t('settings.inference.token.add') }))
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText(t('settings.inference.token.modalTokenId'))))
+    await fill(t('settings.inference.token.modalTokenId'), 'pt-id')
+    await fill(t('settings.inference.token.modalTokenSecret'), 'pt-secret')
+    await fireEvent.click(button(t('settings.inference.token.save')))
 
-  it('does nothing when profile removal confirmation is cancelled', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
-    })
-
-    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
-    await fireEvent.click(deleteButtons[0])
-
-    expect(container.querySelector('.removal-confirm-card')).toBeTruthy()
-
-    const cancelButton = screen.getByRole('button', { name: 'Cancel' })
-    await fireEvent.click(cancelButton)
-
-    // Confirmation card is dismissed
-    expect(container.querySelector('.removal-confirm-card')).toBeNull()
-
-    // No backend write occurred
-    expect(mockBackend.writeInferenceConfig).not.toHaveBeenCalled()
-
-    // Both profiles remain in the DOM
-    const profileIds = Array.from(container.querySelectorAll('.profile-id')).map((el) => el.textContent)
-    expect(profileIds).toContain('(modal-prod)')
-    expect(profileIds).toContain('(beam-prod)')
-  })
-
-  it('displays precise success copy stating local-only scope when removal succeeds', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
-    })
-
-    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
-    await fireEvent.click(deleteButtons[0])
-
-    const confirmButton = screen.getByRole('button', { name: 'Confirm removal' })
-    await fireEvent.click(confirmButton)
-
-    await waitFor(() => {
-      const statusBox = container.querySelector('.status-banner.success')
-      expect(statusBox).toBeTruthy()
-      expect(statusBox.textContent).toBe(
-        'Profile removed from local configuration. Remote resources, tokens, and secret-store entries were not modified.',
-      )
-    })
-  })
-
-  it('displays sanitized error message when profile removal fails to save', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    mockBackend.writeInferenceConfig.mockRejectedValueOnce(new Error('raw-backend-sensitive-error-url'))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
-    })
-
-    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
-    await fireEvent.click(deleteButtons[0])
-
-    const confirmButton = screen.getByRole('button', { name: 'Confirm removal' })
-    await fireEvent.click(confirmButton)
-
-    await waitFor(() => {
-      const errorBox = container.querySelector('.status-banner.error')
-      expect(errorBox).toBeTruthy()
-      expect(errorBox.textContent).toContain('Failed to save inference configuration.')
-    })
-    expect(container.textContent).not.toContain('raw-backend-sensitive-error-url')
-  })
-
-  it('handles read rejection then successful retry and write rejection with selector restoration', async () => {
-    // 1. Initial read rejection
-    mockBackend.readInferenceConfig.mockRejectedValueOnce(new Error('sensitive-connection-url-error'))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      const errorBox = container.querySelector('.status-banner.error')
-      expect(errorBox).toBeTruthy()
-      expect(errorBox.textContent).toContain('Failed to load inference configuration.')
-    })
-    expect(container.textContent).not.toContain('sensitive-connection-url-error')
-
-    // 2. Successful retry
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const retryButton = screen.getByRole('button', { name: 'Try again' })
-    await fireEvent.click(retryButton)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
-    })
-
-    const select = container.querySelector('select.select')
-    expect(select).toBeTruthy()
-    expect(select.value).toBe('modal:modal-prod')
-
-    // 3. Write target change rejection and verify selector DOM restoration
-    mockBackend.writeInferenceConfig.mockRejectedValueOnce(new Error('secret-write-token-failure'))
-    await fireEvent.change(select, { target: { value: 'beam:beam-prod' } })
-
-    await waitFor(() => {
-      const errorBox = container.querySelector('.status-banner.error')
-      expect(errorBox).toBeTruthy()
-      expect(errorBox.textContent).toContain('Failed to save inference configuration.')
-    })
-    expect(container.textContent).not.toContain('secret-write-token-failure')
-
-    // Verify rendered select.value in the DOM reverted back to persisted value ('modal:modal-prod')
-    const restoredSelect = container.querySelector('select.select')
-    expect(restoredSelect.value).toBe('modal:modal-prod')
-  })
-
-  it('performs zero secret operations and mounts no credential fields', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
-    })
-
-    expect(mockBackend.storeCloudSecret).not.toHaveBeenCalled()
-    expect(mockBackend.deleteCloudSecret).not.toHaveBeenCalled()
-    expect(mockBackend.getCloudSecretSummary).not.toHaveBeenCalled()
-
-    // Ensure no password or token inputs exist
-    expect(container.querySelectorAll('input[type="password"]').length).toBe(0)
-    expect(container.textContent).not.toContain('API Key')
-    expect(container.textContent).not.toContain('Bearer Token')
-  })
-
-  it('tests profile connection and displays accessible latency badge without triggering GPU work', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
-    })
-
-    const testButtons = screen.getAllByRole('button', { name: /Test connection for Modal Production/ })
-    expect(testButtons.length).toBeGreaterThan(0)
-
-    await fireEvent.click(testButtons[0])
-
-    expect(mockBackend.checkCloudConnection).toHaveBeenCalledWith({
+    await statusSays(t('settings.inference.status.ready', { name: MADE.name }))
+    expect(store).toHaveBeenCalledWith({
       provider: 'modal',
-      profileId: 'modal-prod',
+      profileId: MADE.id,
+      role: 'runtime',
+      secret: 'pt-secret',
+      tokenId: 'pt-id',
     })
+    await waitFor(() => expect(within(row(MADE.name)).getByText(t('settings.inference.token.saved'))).toBeTruthy())
+    expect(attentionHeading()).toBeNull()
+    expect(document.body.innerHTML).not.toContain('pt-secret')
+  })
+})
 
-    await waitFor(() => {
-      const statusEl = container.querySelector('.status-indicator.ok')
-      expect(statusEl).toBeTruthy()
-      expect(statusEl.textContent).toContain('Reachable (38 ms)')
+describe('the endpoint list', () => {
+  it('shows each endpoint with its provider, host, token and which one is the default', async () => {
+    const backend = await seeded({
+      endpoints: [MADE, { ...MANUAL, token: false }],
+      selected: { type: 'modal', profile_id: MADE.id },
     })
+    show(backend)
+    await waitFor(() => expect(within(row(MADE.name)).getByText(t('settings.inference.token.saved'))).toBeTruthy())
+
+    const made = row(MADE.name)
+    expect(within(made).getByText(t('settings.inference.endpoints.default'))).toBeTruthy()
+    expect(
+      within(made).getByText(
+        t('settings.inference.endpoints.meta', { providerKey: MODAL_KEY, host: 'ws--mc-mc-abc123-gateway.modal.run' }),
+      ),
+    ).toBeTruthy()
+    expect(defaultRadio(MADE.name).checked).toBe(true)
+
+    const manual = row(MANUAL.name)
+    expect(within(manual).queryByText(t('settings.inference.endpoints.default'))).toBeNull()
+    expect(
+      within(manual).getByText(t('settings.inference.endpoints.meta', { providerKey: BEAM_KEY, host: 'studio.app.beam.cloud' })),
+    ).toBeTruthy()
+    expect(within(manual).getByText(t('settings.inference.token.missing'))).toBeTruthy()
+    expect(defaultRadio(MANUAL.name).checked).toBe(false)
   })
 
-  it('handles connection test failure or unregistered command gracefully', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    mockBackend.checkCloudConnection.mockRejectedValueOnce(new Error('Tauri command not registered'))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
+  it('Test checks the connection and says what came back', async () => {
+    const backend = await seeded({
+      endpoints: [MADE, { ...MANUAL, token: false }],
+      selected: { type: 'modal', profile_id: MADE.id },
     })
+    show(backend)
+    await screen.findByText(MADE.name, { selector: 'label' })
 
-    const testButtons = screen.getAllByRole('button', { name: /Test connection for Modal Production/ })
-    await fireEvent.click(testButtons[0])
+    await fireEvent.click(within(row(MADE.name)).getByRole('button', { name: t('settings.inference.endpoints.test') }))
+    await waitFor(() => expect(within(row(MADE.name)).getByText(t('settings.inference.health.reachable'))).toBeTruthy())
+    expect(within(row(MADE.name)).getByText(t('settings.inference.health.latency', { latency: 42 }))).toBeTruthy()
 
-    await waitFor(() => {
-      const statusEl = container.querySelector('.status-indicator.unavail')
-      expect(statusEl).toBeTruthy()
-      expect(statusEl.textContent).toContain('Connection check command not registered in this build')
-    })
-  })
-
-  it('reconciles recovery status and truthfully displays interrupted attempt states', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    mockBackend.reconcileCloudRecovery.mockResolvedValueOnce({ decision: 'ambiguous_unknown' })
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
-    })
-
-    const checkRecoveryButton = screen.getByRole('button', { name: 'Check recovery' })
-    expect(checkRecoveryButton).toBeTruthy()
-
-    await fireEvent.click(checkRecoveryButton)
-
-    await waitFor(() => {
-      const recoveryBox = container.querySelector('.recovery-status-box')
-      expect(recoveryBox).toBeTruthy()
-      expect(recoveryBox.textContent).toContain('Interrupted attempt detected (status unknown). Automatic re-dispatch is forbidden.')
-    })
-
-    // Test cached result state
-    mockBackend.reconcileCloudRecovery.mockResolvedValueOnce({ decision: 'result_cached_ready' })
-    await fireEvent.click(checkRecoveryButton)
-
-    await waitFor(() => {
-      const recoveryBox = container.querySelector('.recovery-status-box')
-      expect(recoveryBox.textContent).toContain('Validated remote result cached and ready for local project review.')
-    })
-
-    // Test stale attachment state
-    mockBackend.reconcileCloudRecovery.mockResolvedValueOnce({ decision: 'stale_attachment' })
-    await fireEvent.click(checkRecoveryButton)
-
-    await waitFor(() => {
-      const recoveryBox = container.querySelector('.recovery-status-box')
-      expect(recoveryBox.textContent).toContain('Interrupted attempt result retained in cache; region was modified locally (stale attachment rejected).')
-    })
-  })
-
-  it('truthfully displays remote execution unavailable status in disclaimer box', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
-    })
-
-    const statusText = container.querySelector('.execution-status-text')
-    expect(statusText).toBeTruthy()
-    expect(statusText.textContent).toContain('Remote execution:')
-    expect(statusText.textContent).toContain('Unavailable (provider execution is not enabled in this build)')
-  })
-
-  it('disables delete buttons during profile editing and removal confirmation and prevents discarding draft or confirmation', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
-    })
-
-    // 1. Enter edit mode on Modal profile and make unsaved changes to draft
-    const editButtons = screen.getAllByRole('button', { name: /^Edit / })
-    await fireEvent.click(editButtons[0])
-
-    const nameInput = screen.getByPlaceholderText('e.g. Production GPU Worker')
-    await fireEvent.input(nameInput, { target: { value: 'Draft Name In Progress' } })
-
-    // Verify all Delete buttons are disabled while editingProfile is active
-    const deleteButtonsDuringEdit = screen.getAllByRole('button', { name: /^Delete / })
-    expect(deleteButtonsDuringEdit.length).toBe(2)
-    expect(deleteButtonsDuringEdit[0].disabled).toBe(true)
-    expect(deleteButtonsDuringEdit[1].disabled).toBe(true)
-
-    // Attempt to click Delete on both modal and beam profiles
-    await fireEvent.click(deleteButtonsDuringEdit[0])
-    await fireEvent.click(deleteButtonsDuringEdit[1])
-
-    // Verify draft is preserved, removal card did not appear, and no backend write occurred
-    expect(nameInput.value).toBe('Draft Name In Progress')
-    expect(container.querySelector('.profile-form-card')).toBeTruthy()
-    expect(container.querySelector('.removal-confirm-card')).toBeNull()
-    expect(mockBackend.writeInferenceConfig).not.toHaveBeenCalled()
-
-    // Cancel edit to return to idle state
-    const cancelEditButton = screen.getByRole('button', { name: 'Cancel' })
-    await fireEvent.click(cancelEditButton)
-    expect(container.querySelector('.profile-form-card')).toBeNull()
-
-    // 2. Start removal confirmation for Modal profile
-    const idleDeleteButtons = screen.getAllByRole('button', { name: /^Delete / })
-    expect(idleDeleteButtons[0].disabled).toBe(false)
-    expect(idleDeleteButtons[1].disabled).toBe(false)
-
-    await fireEvent.click(idleDeleteButtons[0])
-
-    const confirmCard = container.querySelector('.removal-confirm-card')
-    expect(confirmCard).toBeTruthy()
-    expect(confirmCard.textContent).toContain('Remove Modal Production (modal-prod)')
-
-    // Verify all Delete buttons are disabled while removingProfile is active
-    const deleteButtonsDuringRemoval = screen.getAllByRole('button', { name: /^Delete / })
-    expect(deleteButtonsDuringRemoval[0].disabled).toBe(true)
-    expect(deleteButtonsDuringRemoval[1].disabled).toBe(true)
-
-    // Attempt to click Beam delete button while Modal removal confirmation is active
-    await fireEvent.click(deleteButtonsDuringRemoval[1])
-
-    // Verify modal removal confirmation is still intact and not overwritten by beam, and no write occurred
-    expect(container.querySelector('.removal-confirm-card')?.textContent).toContain(
-      'Remove Modal Production (modal-prod)',
+    await fireEvent.click(within(row(MANUAL.name)).getByRole('button', { name: t('settings.inference.endpoints.test') }))
+    await waitFor(() =>
+      expect(within(row(MANUAL.name)).getByText(t('settings.inference.health.credentialMissing'))).toBeTruthy(),
     )
-    expect(container.querySelector('.removal-confirm-card')?.textContent).not.toContain('beam-prod')
-    expect(mockBackend.writeInferenceConfig).not.toHaveBeenCalled()
   })
 
-  it('moves focus to confirmation card control on open and returns focus to originating delete control on cancel', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
+  it('choosing another default saves it', async () => {
+    const backend = await seeded({ endpoints: [MADE, MANUAL], selected: { type: 'modal', profile_id: MADE.id } })
+    show(backend)
+    await statusSays(t('settings.inference.status.ready', { name: MADE.name }))
+    await screen.findByText(MANUAL.name, { selector: 'label' })
 
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
-    })
-
-    // Find the Modal profile Delete button
-    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
-    const modalDeleteBtn = deleteButtons[0]
-    expect(modalDeleteBtn.getAttribute('aria-label')).toBe('Delete Modal Production (modal-prod)')
-
-    // 1. Simulate keyboard focus arriving at Delete button and activating it
-    modalDeleteBtn.focus()
-    expect(document.activeElement).toBe(modalDeleteBtn)
-
-    await fireEvent.click(modalDeleteBtn)
-
-    // Confirm removal card is open and trigger is disabled
-    const confirmCard = container.querySelector('.removal-confirm-card')
-    expect(confirmCard).toBeTruthy()
-    expect(modalDeleteBtn.disabled).toBe(true)
-
-    // Verify focus has moved to a confirmation-card control (Cancel button)
-    const cancelButton = screen.getByRole('button', { name: 'Cancel' })
-    expect(confirmCard.contains(document.activeElement)).toBe(true)
-    expect(document.activeElement).toBe(cancelButton)
-    expect(document.activeElement.disabled).toBe(false)
-
-    // 2. Activate Cancel to dismiss confirmation card
-    await fireEvent.click(cancelButton)
-
-    // Verify confirmation card dismissed
-    expect(container.querySelector('.removal-confirm-card')).toBeNull()
-
-    // Verify originating Delete button is enabled again and has focus returned
-    expect(modalDeleteBtn.disabled).toBe(false)
-    expect(document.activeElement).toBe(modalDeleteBtn)
-    expect(document.activeElement.disabled).toBe(false)
+    await fireEvent.click(defaultRadio(MANUAL.name))
+    await statusSays(t('settings.inference.status.ready', { name: MANUAL.name }))
+    expect((await backend.readInferenceConfig()).selectedTarget).toEqual({ type: 'beam', profile_id: MANUAL.id })
+    expect(within(row(MANUAL.name)).getByText(t('settings.inference.endpoints.default'))).toBeTruthy()
+    expect(defaultRadio(MADE.name).checked).toBe(false)
   })
 
-  it('restores focus to originating Beam delete button when beam profile removal is cancelled', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
+  it('a default that cannot be saved stays where it was', async () => {
+    const backend = await seeded({ endpoints: [MADE, MANUAL], selected: { type: 'modal', profile_id: MADE.id } })
+    show(backend)
+    await statusSays(t('settings.inference.status.ready', { name: MADE.name }))
+    await screen.findByText(MANUAL.name, { selector: 'label' })
+    vi.spyOn(backend, 'writeInferenceConfig').mockRejectedValueOnce(new Error('disk full'))
 
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
-    })
+    await fireEvent.click(defaultRadio(MANUAL.name))
+    expect((await screen.findByRole('alert')).textContent).toBe(t('settings.inference.error.saveFailed'))
+    expect(defaultRadio(MADE.name).checked).toBe(true)
+    expect(defaultRadio(MANUAL.name).checked).toBe(false)
+    expect((await backend.readInferenceConfig()).selectedTarget).toEqual({ type: 'modal', profile_id: MADE.id })
+  })
+})
 
-    // Find the Beam profile Delete button (second delete button)
-    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
-    const beamDeleteBtn = deleteButtons[1]
-    expect(beamDeleteBtn.getAttribute('aria-label')).toBe('Delete Beam Production (beam-prod)')
+describe('Remove', () => {
+  it('takes an endpoint off this computer and leaves the account alone', async () => {
+    const backend = await seeded({ endpoints: [MADE, MANUAL], selected: { type: 'modal', profile_id: MADE.id } })
+    show(backend)
+    await screen.findByText(MANUAL.name, { selector: 'label' })
 
-    beamDeleteBtn.focus()
-    expect(document.activeElement).toBe(beamDeleteBtn)
+    await fireEvent.click(within(row(MANUAL.name)).getByRole('button', { name: t('settings.inference.endpoints.remove') }))
+    const confirm = /** @type {HTMLElement} */ (
+      screen.getByRole('group', { name: t('settings.inference.remove.confirm', { name: MANUAL.name }) })
+    )
+    await waitFor(() => expect(document.activeElement?.textContent?.trim()).toBe(
+      t('settings.inference.remove.confirm', { name: MANUAL.name }),
+    ))
+    expect(within(confirm).getByText(t('settings.inference.remove.keepNote', { providerKey: BEAM_KEY }))).toBeTruthy()
+    // Only what setup made can be found again in the account.
+    expect(within(confirm).queryByRole('checkbox')).toBeNull()
 
-    await fireEvent.click(beamDeleteBtn)
-
-    const confirmCard = container.querySelector('.removal-confirm-card')
-    expect(confirmCard).toBeTruthy()
-    expect(beamDeleteBtn.disabled).toBe(true)
-
-    const cancelButton = screen.getByRole('button', { name: 'Cancel' })
-    expect(confirmCard.contains(document.activeElement)).toBe(true)
-    expect(document.activeElement).toBe(cancelButton)
-
-    // Cancel removal
-    await fireEvent.click(cancelButton)
-
-    expect(container.querySelector('.removal-confirm-card')).toBeNull()
-    expect(beamDeleteBtn.disabled).toBe(false)
-    expect(document.activeElement).toBe(beamDeleteBtn)
+    await fireEvent.click(within(confirm).getByRole('button', { name: t('settings.inference.remove.confirmButton') }))
+    await waitFor(() => expect(screen.queryByText(MANUAL.name, { selector: 'label' })).toBeNull())
+    expect(
+      app.notices.some(
+        (notice) => notice.key === 'notice.cloud.endpointRemoved' && notice.params.name === MANUAL.name,
+      ),
+    ).toBe(true)
+    const config = await backend.readInferenceConfig()
+    expect(config.beamProfiles[MANUAL.id]).toBeUndefined()
+    expect(config.selectedTarget).toEqual({ type: 'modal', profile_id: MADE.id })
+    const token = await backend.getCloudSecretSummary({ provider: 'beam', profileId: MANUAL.id, role: 'runtime' })
+    expect(token.present).toBe(false)
   })
 
-  it('ensures no focus to unmounted nodes when profile removal is confirmed rather than cancelled', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
+  it('can also delete what setup created: it lists it, asks for the key, and removes the endpoint', async () => {
+    const backend = await seeded()
+    const credentials = { token_id: 'ak-old', token_secret: 'as-old' }
+    const planned = await backend.runCloudProvisioner({
+      op: 'plan',
+      provider: 'modal',
+      params: { credentials, installation_id: MADE.id },
     })
-
-    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
-    const modalDeleteBtn = deleteButtons[0]
-
-    modalDeleteBtn.focus()
-    await fireEvent.click(modalDeleteBtn)
-
-    const confirmButton = screen.getByRole('button', { name: 'Confirm removal' })
-    await fireEvent.click(confirmButton)
-
-    await waitFor(() => {
-      expect(container.querySelector('.removal-confirm-card')).toBeNull()
-      // Profile was removed, so original modal delete button is unmounted from the DOM
-      expect(document.contains(modalDeleteBtn)).toBe(false)
-      // Focus must not be on unmounted button
-      expect(document.activeElement).not.toBe(modalDeleteBtn)
+    await backend.runCloudProvisioner({
+      op: 'apply',
+      provider: 'modal',
+      params: { credentials, installation_id: MADE.id, approved_plan_hash: planned.data.plan_hash },
     })
+    show(backend)
+    await statusSays(t('settings.inference.status.ready', { name: MADE.name }))
+
+    await fireEvent.click(within(row(MADE.name)).getByRole('button', { name: t('settings.inference.endpoints.remove') }))
+    const confirm = /** @type {HTMLElement} */ (
+      screen.getByRole('group', { name: t('settings.inference.remove.confirm', { name: MADE.name }) })
+    )
+    await fireEvent.click(within(confirm).getByRole('checkbox', { name: t('settings.inference.remove.alsoDelete') }))
+    expect(within(confirm).getByText(t('settings.inference.remove.deleteNote', { providerKey: MODAL_KEY }))).toBeTruthy()
+    await fireEvent.click(within(confirm).getByRole('button', { name: t('settings.inference.remove.review') }))
+
+    const heading = await screen.findByRole('heading', { name: t('settings.cloud.setup.heading.cleanup') })
+    await waitFor(() => expect(document.activeElement).toBe(heading))
+    await screen.findByText(`mc-weights-${MADE.id}`)
+    await fill(t('settings.cloud.setup.connect.modalTokenId'), 'ak-old')
+    await fill(t('settings.cloud.setup.connect.modalTokenSecret'), 'as-old')
+    await fireEvent.click(screen.getByRole('checkbox', { name: t('settings.cloud.setup.cleanup.approve') }))
+    await fireEvent.click(button(t('settings.cloud.setup.cleanup.delete')))
+
+    await screen.findByRole('heading', { name: t('settings.cloud.setup.heading.cleaned') })
+    await waitFor(() => expect(screen.queryByText(MADE.name, { selector: 'label' })).toBeNull())
+    expect(screen.getByText(t('settings.inference.endpoints.empty'))).toBeTruthy()
+    await statusSays(t('settings.inference.status.attention', { reasonKey: 'settings.inference.reason.none' }))
+    expect((await backend.readInferenceConfig()).modalProfiles[MADE.id]).toBeUndefined()
+
+    // The Remove it was opened from went with the endpoint, so focus goes to
+    // the heading of the list it was in.
+    await fireEvent.click(button(t('shell.action.close')))
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole('heading', { name: t('settings.inference.endpoints.title') })),
+    )
   })
 
-  it('dismisses removal confirmation on Escape, restores focus, does not write backend, and stops propagation to window keydown listener', async () => {
-    mockBackend.readInferenceConfig.mockResolvedValueOnce(structuredClone(populatedMockConfig))
-    const { container } = render(InferenceSettings)
-
-    await waitFor(() => {
-      expect(container.querySelector('.profile-id')?.textContent).toBe('(modal-prod)')
+  it('puts focus back on Remove when the clean-up is left without deleting anything', async () => {
+    const backend = await seeded()
+    const credentials = { token_id: 'ak-old', token_secret: 'as-old' }
+    const planned = await backend.runCloudProvisioner({
+      op: 'plan',
+      provider: 'modal',
+      params: { credentials, installation_id: MADE.id },
     })
+    await backend.runCloudProvisioner({
+      op: 'apply',
+      provider: 'modal',
+      params: { credentials, installation_id: MADE.id, approved_plan_hash: planned.data.plan_hash },
+    })
+    show(backend)
+    await statusSays(t('settings.inference.status.ready', { name: MADE.name }))
 
-    const deleteButtons = screen.getAllByRole('button', { name: /^Delete / })
-    const modalDeleteBtn = deleteButtons[0]
+    await fireEvent.click(within(row(MADE.name)).getByRole('button', { name: t('settings.inference.endpoints.remove') }))
+    const confirm = /** @type {HTMLElement} */ (
+      screen.getByRole('group', { name: t('settings.inference.remove.confirm', { name: MADE.name }) })
+    )
+    await fireEvent.click(within(confirm).getByRole('checkbox', { name: t('settings.inference.remove.alsoDelete') }))
+    await fireEvent.click(within(confirm).getByRole('button', { name: t('settings.inference.remove.review') }))
+    await screen.findByRole('heading', { name: t('settings.cloud.setup.heading.cleanup') })
+    // Back waits for the plan of what would be deleted.
+    await screen.findByText(`mc-weights-${MADE.id}`)
 
-    // 1. Focus originating delete button and trigger removal
-    modalDeleteBtn.focus()
-    expect(document.activeElement).toBe(modalDeleteBtn)
+    await fireEvent.click(button(t('settings.cloud.setup.review.back')))
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        within(row(MADE.name)).getByRole('button', { name: t('settings.inference.endpoints.remove') }),
+      ),
+    )
+  })
+})
 
-    await fireEvent.click(modalDeleteBtn)
+describe('Connect an existing endpoint', () => {
+  async function openForm() {
+    await fireEvent.click(button(t('settings.inference.connect.title')))
+  }
 
-    const confirmCard = container.querySelector('.removal-confirm-card')
-    expect(confirmCard).toBeTruthy()
-    expect(modalDeleteBtn.disabled).toBe(true)
+  it('saves the endpoint with its token, makes it the default, and checks it', async () => {
+    const backend = await seeded()
+    show(backend)
+    await screen.findByText(t('settings.inference.endpoints.empty'))
+    await openForm()
+    await fill(t('settings.inference.connect.name'), 'My Modal')
+    await fill(t('settings.inference.connect.endpoint'), 'https://me--gateway.modal.run/mc/v1')
+    await fill(t('settings.inference.token.modalTokenId'), 'pt-id')
+    await fill(t('settings.inference.token.modalTokenSecret'), 'pt-secret')
+    await fireEvent.click(button(t('settings.inference.connect.connect')))
 
-    const focusedControl = document.activeElement
-    expect(confirmCard.contains(focusedControl)).toBe(true)
-    expect(focusedControl.disabled).toBe(false)
+    await screen.findByText(t('settings.inference.connect.connected', { name: 'My Modal' }))
+    const config = await backend.readInferenceConfig()
+    const [id] = Object.keys(config.modalProfiles)
+    expect(id).toMatch(/^ep_[a-z0-9]{6}$/)
+    expect(config.modalProfiles[id]).toMatchObject({ name: 'My Modal', endpointUrl: 'https://me--gateway.modal.run/mc/v1' })
+    expect(config.selectedTarget).toEqual({ type: 'modal', profile_id: id })
+    expect((await backend.getCloudSecretSummary({ provider: 'modal', profileId: id, role: 'runtime' })).present).toBe(true)
 
-    // Window keydown listener representing parent Modal.svelte listener
-    const windowKeydownListener = vi.fn()
-    window.addEventListener('keydown', windowKeydownListener)
-
-    try {
-      // Other keys are left untouched and bubble to window without dismissing
-      const arrowNotPrevented = await fireEvent.keyDown(focusedControl, { key: 'ArrowDown' })
-      expect(arrowNotPrevented).toBe(true)
-      expect(windowKeydownListener).toHaveBeenCalledTimes(1)
-      expect(container.querySelector('.removal-confirm-card')).toBeTruthy()
-
-      windowKeydownListener.mockClear()
-
-      // 2. Press Escape on focused card control
-      const notPrevented = await fireEvent.keyDown(focusedControl, { key: 'Escape' })
-      expect(notPrevented).toBe(false)
-
-      // 3. Verify card dismissed
-      expect(container.querySelector('.removal-confirm-card')).toBeNull()
-
-      // 4. Verify no backend write occurred
-      expect(mockBackend.writeInferenceConfig).not.toHaveBeenCalled()
-
-      // 5. Verify focus restored to originating delete control
-      expect(modalDeleteBtn.disabled).toBe(false)
-      expect(document.activeElement).toBe(modalDeleteBtn)
-
-      // 6. Verify window keydown listener did not receive the event
-      expect(windowKeydownListener).not.toHaveBeenCalled()
-    } finally {
-      window.removeEventListener('keydown', windowKeydownListener)
+    await waitFor(() => expect(within(row('My Modal')).getByText(t('settings.inference.token.saved'))).toBeTruthy())
+    expect(within(row('My Modal')).getByText(t('settings.inference.health.reachable'))).toBeTruthy()
+    await statusSays(t('settings.inference.status.ready', { name: 'My Modal' }))
+    // The token fields are wiped once the keychain has answered.
+    for (const label of [t('settings.inference.token.modalTokenId'), t('settings.inference.token.modalTokenSecret')]) {
+      expect(/** @type {HTMLInputElement} */ (screen.getByLabelText(label)).value).toBe('')
     }
+  })
+
+  it('takes the endpoint back out when its token cannot be saved', async () => {
+    const backend = await seeded()
+    vi.spyOn(backend, 'storeCloudSecret').mockRejectedValueOnce(new Error('keychain locked'))
+    show(backend)
+    await screen.findByText(t('settings.inference.endpoints.empty'))
+    await openForm()
+    await fireEvent.click(screen.getByRole('radio', { name: t('settings.inference.provider.beam') }))
+    await fill(t('settings.inference.connect.name'), 'My Beam')
+    await fill(t('settings.inference.connect.endpoint'), 'https://me.app.beam.cloud/mc/v1')
+    await fill(t('settings.inference.token.beamToken'), 'bk-secret')
+    await fireEvent.click(button(t('settings.inference.connect.connect')))
+
+    expect((await screen.findByRole('alert')).textContent).toBe(t('settings.inference.error.tokenSaveFailed'))
+    const config = await backend.readInferenceConfig()
+    expect(config.beamProfiles).toEqual({})
+    expect(config.selectedTarget).toEqual({ type: 'local' })
+    expect(/** @type {HTMLInputElement} */ (screen.getByLabelText(t('settings.inference.token.beamToken'))).value).toBe('')
+    expect(screen.queryByText('My Beam', { selector: 'label' })).toBeNull()
+  })
+
+  it('checks the address before saving anything', async () => {
+    const backend = await seeded()
+    const write = vi.spyOn(backend, 'writeInferenceConfig')
+    show(backend)
+    await screen.findByText(t('settings.inference.endpoints.empty'))
+    await openForm()
+    await fill(t('settings.inference.connect.name'), 'Plain HTTP')
+    await fill(t('settings.inference.connect.endpoint'), 'http://me.example.com/mc/v1')
+    await fill(t('settings.inference.token.modalTokenId'), 'pt-id')
+    await fill(t('settings.inference.token.modalTokenSecret'), 'pt-secret')
+    await fireEvent.click(button(t('settings.inference.connect.connect')))
+    expect((await screen.findByRole('alert')).textContent).toBe(t('settings.inference.error.invalidUrl'))
+    expect(write).not.toHaveBeenCalled()
+  })
+})
+
+describe('Needs attention', () => {
+  it('offers a setup that did not finish for Resume, or forgets it', async () => {
+    setup.unfinished = { provider: 'beam', installationId: 'mc-half01', options: {} }
+    const backend = await seeded()
+    show(backend)
+    const text = t('settings.inference.recovery.unfinished', { providerKey: BEAM_KEY, id: 'mc-half01' })
+    await screen.findByText(text)
+
+    await fireEvent.click(button(t('settings.inference.recovery.resume')))
+    const heading = await screen.findByRole('heading', { name: t('settings.cloud.setup.heading.resume') })
+    await waitFor(() => expect(document.activeElement).toBe(heading))
+    expect(screen.getByLabelText(t('settings.cloud.setup.connect.beamToken'))).toBeTruthy()
+    // One place for it at a time: the reminder waits while the provisioner has it.
+    expect(screen.queryByText(text)).toBeNull()
+
+    await fireEvent.click(button(t('shell.action.close')))
+    await screen.findByText(text)
+    // Back on the control it was opened from, which is drawn again with it.
+    await waitFor(() => expect(document.activeElement).toBe(button(t('settings.inference.recovery.resume'))))
+    await fireEvent.click(button(t('settings.inference.recovery.forget')))
+    await waitFor(() => expect(screen.queryByText(text)).toBeNull())
+    expect(setup.unfinished).toBeNull()
+    expect(attentionHeading()).toBeNull()
+  })
+
+  it('puts focus back on Get a new token when its provisioner is closed and the token is still missing', async () => {
+    const backend = await seeded({ endpoints: [{ ...MADE, token: false }], selected: { type: 'modal', profile_id: MADE.id } })
+    show(backend)
+    await statusSays(t('settings.inference.status.attention', { reasonKey: 'settings.inference.reason.noSecret' }))
+
+    await fireEvent.click(button(t('settings.inference.recovery.newToken')))
+    const heading = await screen.findByRole('heading', { name: t('settings.cloud.setup.heading.resume') })
+    await waitFor(() => expect(document.activeElement).toBe(heading))
+
+    await fireEvent.click(button(t('shell.action.close')))
+    await waitFor(() => expect(document.activeElement).toBe(button(t('settings.inference.recovery.newToken'))))
+  })
+
+  it('lists the renders the last session could not settle until they are dismissed', async () => {
+    const backend = await seeded()
+    show(backend)
+    await screen.findByText(t('settings.inference.endpoints.empty'))
+    const first = `att-${'0'.repeat(24)}`
+    cloud.recovery = {
+      attached: [],
+      stillRunning: [],
+      needsAttention: [
+        { attemptId: first, chapterId: 'chapter-1', pageIndex: 2, regionId: 'region-1', reason: 'ambiguous' },
+        { attemptId: `att-${'1'.repeat(24)}`, chapterId: null, pageIndex: null, regionId: null, reason: 'failed' },
+      ],
+    }
+    const ambiguous = t('settings.inference.recovery.attempt', {
+      page: 3,
+      reasonKey: 'settings.inference.recovery.reason.ambiguous',
+    })
+    const failed = t('settings.inference.recovery.attemptNoPage', { reasonKey: 'settings.inference.recovery.reason.failed' })
+    await screen.findByText(ambiguous)
+    expect(screen.getByText(failed)).toBeTruthy()
+
+    const dismiss = screen.getAllByRole('button', { name: t('settings.inference.recovery.dismiss') })
+    await fireEvent.click(dismiss[0])
+    await waitFor(() => expect(screen.queryByText(ambiguous)).toBeNull())
+    expect(screen.getByText(failed)).toBeTruthy()
+    expect(cloud.recovery?.needsAttention.map((entry) => entry.attemptId)).not.toContain(first)
+  })
+})
+
+describe('Set up with Modal or Beam', () => {
+  it('opens in place, and closing it puts focus back on the button', async () => {
+    const backend = await seeded()
+    show(backend)
+    await screen.findByText(t('settings.inference.endpoints.empty'))
+    await fireEvent.click(button(t('settings.inference.setup.action')))
+    const heading = await screen.findByRole('heading', { name: t('settings.cloud.setup.heading.connect') })
+    await waitFor(() => expect(document.activeElement).toBe(heading))
+
+    await fireEvent.click(button(t('shell.action.cancel')))
+    await waitFor(() => expect(document.activeElement).toBe(button(t('settings.inference.setup.action'))))
+  })
+
+  it('lists the new endpoint as the default once setup has saved it', async () => {
+    const backend = await seeded()
+    show(backend)
+    await screen.findByText(t('settings.inference.endpoints.empty'))
+    await fireEvent.click(button(t('settings.inference.setup.action')))
+    await fill(t('settings.cloud.setup.connect.modalTokenId'), 'ak-new')
+    await fill(t('settings.cloud.setup.connect.modalTokenSecret'), 'as-new')
+    await fireEvent.click(button(t('settings.cloud.setup.connect.continue')))
+    await screen.findByRole('heading', { name: t('settings.cloud.setup.heading.review') })
+    await fireEvent.click(
+      screen.getByRole('checkbox', { name: t('settings.cloud.setup.review.approve', { providerKey: MODAL_KEY }) }),
+    )
+    await fireEvent.click(button(t('settings.cloud.setup.review.start')))
+    await screen.findByRole('heading', { name: t('settings.cloud.setup.heading.done') })
+
+    const label = await screen.findByText(/^Modal \(mc-[a-z0-9]{6}\)$/, { selector: 'label' })
+    const name = label.textContent?.trim() ?? ''
+    expect(within(row(name)).getByText(t('settings.inference.endpoints.default'))).toBeTruthy()
+    await statusSays(t('settings.inference.status.ready', { name }))
+  })
+
+  it('turns the cloud on when a setup ends with a healthy endpoint', async () => {
+    const backend = await seeded({ allowed: false })
+    show(backend)
+    await screen.findByText(t('settings.inference.endpoints.empty'))
+    await fireEvent.click(button(t('settings.inference.setup.action')))
+    await fill(t('settings.cloud.setup.connect.modalTokenId'), 'ak-new')
+    await fill(t('settings.cloud.setup.connect.modalTokenSecret'), 'as-new')
+    await fireEvent.click(button(t('settings.cloud.setup.connect.continue')))
+    await screen.findByRole('heading', { name: t('settings.cloud.setup.heading.review') })
+    await fireEvent.click(
+      screen.getByRole('checkbox', { name: t('settings.cloud.setup.review.approve', { providerKey: MODAL_KEY }) }),
+    )
+    expect(session.cloudAllowed).toBe(false)
+    await fireEvent.click(button(t('settings.cloud.setup.review.start')))
+    await screen.findByRole('heading', { name: t('settings.cloud.setup.heading.done') })
+
+    await waitFor(() => expect(session.cloudAllowed).toBe(true))
+    expect((await backend.readSettings()).cloudEngines).toBe('allowed')
+    const label = await screen.findByText(/^Modal \(mc-[a-z0-9]{6}\)$/, { selector: 'label' })
+    await statusSays(t('settings.inference.status.ready', { name: label.textContent?.trim() ?? '' }))
+  })
+
+  it('picks the checklist back up when Settings opens while a setup runs', async () => {
+    const backend = await seeded()
+    setup.run = {
+      id: 9_001,
+      op: 'apply',
+      provider: 'modal',
+      installationId: 'mc-run001',
+      status: 'running',
+      errorCode: null,
+      steps: [{ id: 'image', state: 'running', startedAt: Date.now(), endedAt: null, pct: null }],
+      startedAt: Date.now(),
+      endedAt: null,
+      data: null,
+    }
+    show(backend)
+    await screen.findByRole('heading', { name: t('settings.cloud.setup.heading.running') })
+    const steps = screen.getByRole('list', { name: t('settings.cloud.setup.heading.running') })
+    expect(within(steps).getByText(t('settings.cloud.setup.step.image'))).toBeTruthy()
+    expect(button(t('settings.cloud.setup.running.stop'))).toBeTruthy()
   })
 })

@@ -1,21 +1,28 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  CLOUD_EVENTS,
   createTauriBackend,
+  EVENT_METHODS,
   implementedMethods,
-  isCloudExecutionReady as isTauriCloudExecutionReady,
   isCloudExecutionRegistered,
   isTauri,
   SEAM_METHODS,
   TAURI_PENDING_CLOUD_COMMANDS,
+  TAURI_PROVISIONER_COMMANDS,
   TAURI_REGISTERED_CLOUD_COMMANDS,
 } from './tauri.js'
 import {
   getBackend,
   isCloudExecutionReady,
   isCloudExecutionRegistered as isBackendCloudExecutionRegistered,
+  readCloudReadiness,
   setBackend,
 } from './backend.js'
+import { createMockBackend } from './mock.js'
+
+/** The seam methods that are commands, as opposed to event listeners. */
+const COMMAND_METHODS = SEAM_METHODS.filter((method) => !EVENT_METHODS.includes(method))
 
 /**
  * A fallback that records every call and answers with something identifiable,
@@ -61,16 +68,16 @@ describe('the Tauri adapter', () => {
     const invoke = vi.fn().mockResolvedValue({})
     const backend = createTauriBackend({ fallback, invoke })
 
-    for (const method of SEAM_METHODS) {
-      if (method === 'subscribe') backend.subscribe(() => {})
-      else await backend[method]({})
+    for (const method of COMMAND_METHODS) {
+      await backend[method]({})
     }
+    backend.subscribe(() => {})
 
     const delegated = new Set(fallback.calls.map((call) => call.method))
     // `readSettings` reaches the fallback too - for the defaults, not for the
     // value - so it is excluded from the delegation check by name rather than
     // by accident.
-    const served = SEAM_METHODS.filter((m) => !delegated.has(m) || m === 'readSettings')
+    const served = COMMAND_METHODS.filter((m) => !delegated.has(m) || m === 'readSettings')
     expect(served.sort()).toEqual(implementedMethods())
   })
 
@@ -215,16 +222,16 @@ describe('the Tauri adapter', () => {
     const fallback = recordingFallback()
     const backend = createTauriBackend({ fallback, invoke: vi.fn().mockResolvedValue({}) })
 
-    for (const method of SEAM_METHODS) {
-      if (method === 'subscribe') backend.subscribe(() => {})
-      else await backend[method]({})
+    for (const method of COMMAND_METHODS) {
+      await backend[method]({})
     }
+    backend.subscribe(() => {})
 
     expect([...new Set(fallback.calls.map((call) => call.method))].sort()).toEqual([
       'readSettings',
       'subscribe',
     ])
-    expect(implementedMethods()).toEqual(SEAM_METHODS.filter((m) => m !== 'subscribe').sort())
+    expect(implementedMethods()).toEqual([...COMMAND_METHODS].sort())
   })
 
   it('constructed outside a Tauri window, a command rejects rather than throwing', async () => {
@@ -651,52 +658,236 @@ describe('the Tauri adapter', () => {
         'cancel_cloud_attempt',
         'reconcile_cloud_recovery',
       ])
+    })
 
-      // Execution readiness: must remain false until an authoritative backend capability exists
-      // Asserts that caller-supplied attestation and forged truthy objects cannot bypass readiness
-      expect(isCloudExecutionReady()).toBe(false)
-      expect(isTauriCloudExecutionReady()).toBe(false)
-      expect(isCloudExecutionReady(null)).toBe(false)
-      expect(isCloudExecutionReady(undefined)).toBe(false)
-      expect(isCloudExecutionReady({})).toBe(false)
-      expect(isCloudExecutionReady(true)).toBe(false)
-      expect(isTauriCloudExecutionReady(true)).toBe(false)
-      expect(isCloudExecutionReady({ stagingAvailable: true })).toBe(false)
-      expect(isCloudExecutionReady({ runtimeAvailable: true })).toBe(false)
-      expect(isCloudExecutionReady({ integrationReady: true })).toBe(false)
-      expect(isCloudExecutionReady({ stagingAvailable: true, runtimeAvailable: true })).toBe(false)
-      expect(isCloudExecutionReady({ livePrerequisitesMet: true })).toBe(false)
-      expect(isTauriCloudExecutionReady({ livePrerequisitesMet: true })).toBe(false)
+    it('computes readiness from the permission, the default target and its runtime secret', async () => {
+      const mock = createMockBackend({ timing: { method: 0 } })
+      expect(await isCloudExecutionReady(mock)).toBe(false)
+      expect((await readCloudReadiness(mock)).reason).toBe('off')
+
+      await mock.writeSettings({ cloudEngines: 'allowed' })
+      expect((await readCloudReadiness(mock)).reason).toBe('noTarget')
+
+      await mock.writeInferenceConfig({
+        config: {
+          schemaVersion: 1,
+          selectedTarget: { type: 'modal', profile_id: 'm1' },
+          beamProfiles: {},
+          modalProfiles: {
+            m1: {
+              id: 'm1',
+              name: 'Modal Worker',
+              endpointUrl: 'https://worker.modal.run/mc/v1',
+              canonicalOrigin: 'https://worker.modal.run',
+              canonicalOriginFingerprint: 'fp-1',
+              createdAtMs: 1,
+              updatedAtMs: 1,
+            },
+          },
+        },
+      })
+      expect(await readCloudReadiness(mock)).toMatchObject({ reason: 'noSecret', configured: false })
+
+      await mock.storeCloudSecret({ provider: 'modal', profileId: 'm1', role: 'runtime', secret: 's', tokenId: 't' })
+      const verdict = await readCloudReadiness(mock)
+      expect(verdict).toMatchObject({
+        allowed: true,
+        configured: true,
+        ready: true,
+        reason: null,
+        target: { type: 'modal', profile_id: 'm1' },
+      })
+      expect(verdict.profile.name).toBe('Modal Worker')
+      expect(await isCloudExecutionReady(mock)).toBe(true)
+
+      await mock.writeSettings({ cloudEngines: 'blocked' })
+      const off = await readCloudReadiness(mock)
+      expect(off).toMatchObject({ allowed: false, configured: true, ready: false, reason: 'off' })
+      // The endpoint that would be used is still named while the switch is off,
+      // and so is the fact that switching cloud on is all that is left.
+      expect(off.target).toEqual({ type: 'modal', profile_id: 'm1' })
+    })
+
+    it('counts anything it cannot read as not ready, and cannot be talked into ready', async () => {
+      expect(await isCloudExecutionReady({})).toBe(false)
       expect(
-        isCloudExecutionReady({
-          stagingAvailable: true,
-          runtimeAvailable: true,
-          integrationReady: true,
-        }),
+        await isCloudExecutionReady({ readSettings: () => Promise.reject(new Error('store locked')) }),
       ).toBe(false)
-      expect(
-        isTauriCloudExecutionReady({
-          stagingAvailable: true,
-          runtimeAvailable: true,
-          integrationReady: true,
-        }),
-      ).toBe(false)
-      expect(
-        isCloudExecutionReady({
-          modalStaging: true,
-          beamStaging: true,
-          runtimeAvailable: true,
-          integrationReady: true,
-        }),
-      ).toBe(false)
-      expect(
-        isTauriCloudExecutionReady({
-          modalStaging: true,
-          beamStaging: true,
-          runtimeAvailable: true,
-          integrationReady: true,
-        }),
-      ).toBe(false)
+      const forged = {
+        readSettings: async () => ({ cloudEngines: 'allowed' }),
+        readInferenceConfig: async () => ({ selectedTarget: { type: 'local' }, modalProfiles: {}, beamProfiles: {} }),
+        getCloudSecretSummary: async () => ({ present: true }),
+        ready: true,
+        livePrerequisitesMet: true,
+      }
+      expect(await readCloudReadiness(forged)).toMatchObject({ ready: false, reason: 'noTarget' })
+    })
+  })
+
+  describe('cloud events and cancel', () => {
+    it('listens to the two cloud events and answers with their unlisten', async () => {
+      const unlisten = vi.fn()
+      const listen = vi.fn(() => Promise.resolve(unlisten))
+      const backend = createTauriBackend({ fallback: recordingFallback(), invoke: vi.fn(), listen })
+      const onProgress = () => {}
+      const onAttempt = () => {}
+
+      expect(await backend.onProvisionProgress(onProgress)).toBe(unlisten)
+      expect(await backend.onCloudAttempt(onAttempt)).toBe(unlisten)
+      expect(listen).toHaveBeenNthCalledWith(1, CLOUD_EVENTS.provisionProgress, onProgress)
+      expect(listen).toHaveBeenNthCalledWith(2, CLOUD_EVENTS.cloudAttempt, onAttempt)
+      expect(CLOUD_EVENTS).toEqual({
+        provisionProgress: 'provision://progress',
+        cloudAttempt: 'cloud://attempt',
+      })
+    })
+
+    it('hands the handler only the payload of a Tauri event', async () => {
+      const listeners = new Map()
+      globalThis.__TAURI__ = {
+        event: {
+          listen: (event, callback) => {
+            listeners.set(event, callback)
+            return Promise.resolve(() => listeners.delete(event))
+          },
+        },
+      }
+      try {
+        const backend = createTauriBackend({ fallback: recordingFallback(), invoke: vi.fn() })
+        const seen = []
+        const unlisten = await backend.onCloudAttempt((payload) => seen.push(payload))
+        listeners.get('cloud://attempt')({ event: 'cloud://attempt', id: 7, payload: { phase: 'queued' } })
+        expect(seen).toEqual([{ phase: 'queued' }])
+        unlisten()
+        expect(listeners.has('cloud://attempt')).toBe(false)
+      } finally {
+        delete globalThis.__TAURI__
+      }
+    })
+
+    it('outside a window, a listener resolves to an unlisten that does nothing', async () => {
+      const backend = createTauriBackend({ fallback: recordingFallback(), invoke: vi.fn() })
+      const unlisten = await backend.onProvisionProgress(() => {})
+      expect(typeof unlisten).toBe('function')
+      expect(() => unlisten()).not.toThrow()
+    })
+
+    it('stops a running helper with cancel_cloud_provisioner', async () => {
+      const invoke = vi.fn().mockResolvedValue({ cancelled: true })
+      const backend = createTauriBackend({ fallback: recordingFallback(), invoke })
+      await backend.cancelCloudProvisioner()
+      expect(invoke).toHaveBeenCalledWith('cancel_cloud_provisioner')
+    })
+
+    it('passes the cloud grant to rerun_mask and clean_anyway inside params', async () => {
+      const invoke = vi.fn().mockResolvedValue({})
+      const backend = createTauriBackend({ fallback: recordingFallback(), invoke })
+      const params = {
+        grantNonce: 'grant-1',
+        executionTarget: { type: 'modal', profile_id: 'm1' },
+        recipe: { recipe_id: 'mc-flux2-klein-edit-v1' },
+        intent: { action: 'cleanAnyway' },
+      }
+      await backend.rerunMask({ maskId: 'r1-m2', kind: 'fill', engine: 'cloud', params })
+      await backend.cleanAnyway({ regionId: 'r1', engine: 'cloud', params })
+      await backend.cleanAnyway({ regionId: 'r2', engine: 'lama' })
+      expect(invoke).toHaveBeenCalledWith('rerun_mask', { maskId: 'r1-m2', kind: 'fill', engine: 'cloud', params })
+      expect(invoke).toHaveBeenCalledWith('clean_anyway', { regionId: 'r1', engine: 'cloud', params })
+      expect(invoke).toHaveBeenCalledWith('clean_anyway', { regionId: 'r2', engine: 'lama' })
+    })
+
+    it('asks for recovery with apply, as the start-up pass does', async () => {
+      const invoke = vi.fn().mockResolvedValue({ attached: [], stillRunning: [], needsAttention: [] })
+      const backend = createTauriBackend({ fallback: recordingFallback(), invoke })
+      await backend.reconcileCloudRecovery({ apply: true })
+      expect(invoke).toHaveBeenCalledWith('reconcile_cloud_recovery', { apply: true })
+    })
+  })
+
+  describe('cloud provisioner helper desktop bridge', () => {
+    it('maps runCloudProvisioner to run_cloud_provisioner command with exact parameters', async () => {
+      const responseEnvelope = {
+        protocol_version: '1.0.0',
+        request_id: 'req-prov-1',
+        success: true,
+        data: { op: 'inspect', provider: 'modal', status: 'ready' },
+        error: null,
+      }
+      const invoke = vi.fn().mockResolvedValue(responseEnvelope)
+      const fallback = recordingFallback()
+      const backend = createTauriBackend({ fallback, invoke })
+
+      const spec = {
+        op: 'inspect',
+        provider: 'modal',
+        params: {
+          credentials: { token_id: 'test-id', token_secret: 'test-secret' },
+        },
+      }
+      const result = await backend.runCloudProvisioner(spec)
+      expect(invoke).toHaveBeenCalledTimes(1)
+      expect(invoke).toHaveBeenCalledWith('run_cloud_provisioner', spec)
+      expect(result).toEqual(responseEnvelope)
+      expect(fallback.calls.some((c) => c.method === 'runCloudProvisioner')).toBe(false)
+    })
+
+    it('propagates missing-helper and execution errors from runCloudProvisioner without fallback', async () => {
+      const errorEnvelope = {
+        protocol_version: '1.0.0',
+        request_id: 'req-missing-1',
+        success: false,
+        data: null,
+        error: {
+          code: 'ERR_PROVIDER_UNAVAILABLE',
+          message: 'Cloud provisioner helper binary not found',
+          actionable_guidance: 'Install provisioner helper',
+          remedy_steps: ['Set MANGA_CLEANER_PROVISIONER_BIN'],
+        },
+      }
+      const invoke = vi.fn().mockResolvedValue(errorEnvelope)
+      const fallback = recordingFallback()
+      const backend = createTauriBackend({ fallback, invoke })
+
+      const result = await backend.runCloudProvisioner({ op: 'probe_compatibility', provider: 'modal' })
+      expect(result.success).toBe(false)
+      expect(result.error.code).toBe('ERR_PROVIDER_UNAVAILABLE')
+      expect(fallback.calls.some((c) => c.method === 'runCloudProvisioner')).toBe(false)
+    })
+
+    it('exports all 8 allowlisted provisioner IPC commands in TAURI_PROVISIONER_COMMANDS', () => {
+      expect(TAURI_PROVISIONER_COMMANDS).toEqual([
+        'run_cloud_provisioner',
+        'cancel_cloud_provisioner',
+        'provision_inspect',
+        'provision_plan',
+        'provision_apply',
+        'provision_resume',
+        'provision_cleanup',
+        'provision_probe',
+      ])
+    })
+
+    it('supports runCloudProvisioner in mock backend with simulated missing helper', async () => {
+      const mock = createMockBackend({ timing: { method: 0 } })
+      const successRes = await mock.runCloudProvisioner({
+        op: 'inspect',
+        provider: 'beam',
+        params: { credentials: { beam_token: 'fake-token' } },
+      })
+      expect(successRes.success).toBe(true)
+      expect(successRes.protocol_version).toBe('1.0.0')
+
+      const noKey = await mock.runCloudProvisioner({ op: 'inspect', provider: 'beam' })
+      expect(noKey.success).toBe(false)
+      expect(noKey.error.code).toBe('ERR_VALIDATION_ERROR')
+
+      const missingRes = await mock.runCloudProvisioner({
+        op: 'inspect',
+        provider: 'beam',
+        params: { simulateMissingHelper: true },
+      })
+      expect(missingRes.success).toBe(false)
+      expect(missingRes.error.code).toBe('ERR_PROVIDER_UNAVAILABLE')
     })
   })
 })

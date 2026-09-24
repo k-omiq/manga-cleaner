@@ -764,3 +764,51 @@ Windows or Linux, and a one-machine number is never written as though it were ge
 - **The disagreement between two harnesses on one machine,** 1.7× to 2.1× on the same models.
   The in-process rung peaks came off the same tool that produced the wrong sidecar figure and
   may be the same wrong line of its output.
+- **Nothing in the cloud path has run against a real Modal or Beam account.** Every test of it uses
+  fakes: stand-ins for the two provider SDKs, checked against the SDKs' own source, loopback
+  gateways, and the gateway app driven in process. The first real setup is therefore the first live
+  test of each of these. On Modal: that the edge proxy's auth holds with the headers the app sends,
+  that the access token can be allowed on both RBAC and non-RBAC workspaces, how long results are
+  retained, the Dict size limits, and the length limit on the web URL's label. On Beam: how an HTTP
+  enqueue body maps to task arguments, the shape of the task id answer, reading a Map from inside a
+  container, the invoke URL's format, the name and id filters, what `authorized` actually checks,
+  and whether RTX5090 runs the CUDA 12.9 wheels. Image build time, GPU memory at 24 GB, cold start
+  and the cost of one render are all unmeasured, and the consent dialog shows no estimate because no
+  gateway reports one.
+- **The request limits the cloud runs under are the drafted ones.** The wire contract's size and
+  pixel limits were written before any measurement, and cloud execution now runs with them as host
+  safety ceilings. None has been checked against what a provider accepts or what the GPU renders
+  inside the job timeout.
+- **The cloud setup on Windows is an argument, not a run.** The frozen Windows helper has not been
+  built, and `cargo check --target x86_64-pc-windows-msvc` cannot run on the Mac this was written on
+  (`ring` needs the Windows C headers), so no machine has compiled the `cfg(windows)` code. Stopping
+  a setup there kills the helper process alone: a PyInstaller one-file helper runs as a child of its
+  own bootloader, and that child may outlive the stop. On Beam, the path separators in the upload
+  ignore file are untested there. The release workflow's helper build step has not run either; a
+  build without the helper refuses setup with a typed error rather than looking for a Python on the
+  machine.
+- **A few narrow windows where the account and the app can disagree.** Modal's access token is
+  created before the setup journal records it, so a helper killed between the two leaves a token in
+  the account that cleanup does not know about. A render past its 15-minute interactive bound stays
+  accepted until the next start resumes waiting on it. Two settings writes at the same moment can
+  still race, and the later one wins whole. The gateway reads its own job records through the Modal
+  SDK, which unpickles them; the records are written by the app's own worker inside the user's
+  account, so the trust boundary is the account, and nothing narrower has been added.
+- **Beam cleanup empties the job map but cannot delete it.** beta9 0.1.268 has no call that removes
+  a Map, so cleanup deletes every key, lists again, and fails if any key is left. An empty map
+  object stays in the account. Cleanup also assumes that listing an empty map answers with no keys
+  rather than a refusal, and that Beam's task list answers an unknown task id with an empty result;
+  neither has been seen live. A seed download the provider cannot report on is judged gone after 180
+  s with no status, or 60 s with no new heartbeat; those bounds are guesses, not measurements of a
+  slow cold start.
+- **The Modal sign-in inside the helper is bounded at 40 s,** below the app's 60 s limit on inspect
+  and plan, so that a slow sign-in fails as a typed error rather than as a killed helper. The SDK
+  itself retries for about a minute. A very slow network can hit the bound, and no measured network
+  has.
+- **The cloud interface has not run in the shipped webview.** It is tested in jsdom and was walked
+  through in a Chromium mock. The app ships WKWebView on macOS, where focus and event timing differ,
+  and no `cloud://attempt` or `provision://progress` event has yet crossed a real Tauri bridge.
+- **The old cloud review causes are still read.** The native library index (`library.rs`) and the
+  frontend review model still map the review states of the earlier cloud design (a rejected request,
+  an accepted one). Nothing writes them any more and no released build ever did, but removing them
+  is a change to how saved projects are read, and it was left for later.

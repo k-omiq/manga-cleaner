@@ -61,6 +61,8 @@ const IMPLEMENTED = Object.freeze({
   getCloudAttemptResult: 'get_cloud_attempt_result',
   cancelCloudAttempt: 'cancel_cloud_attempt',
   reconcileCloudRecovery: 'reconcile_cloud_recovery',
+  runCloudProvisioner: 'run_cloud_provisioner',
+  cancelCloudProvisioner: 'cancel_cloud_provisioner',
   listProjects: 'list_projects',
   createProject: 'create_project',
   createChapter: 'create_chapter',
@@ -139,6 +141,10 @@ export const SEAM_METHODS = Object.freeze([
   'getCloudAttemptResult',
   'cancelCloudAttempt',
   'reconcileCloudRecovery',
+  'runCloudProvisioner',
+  'cancelCloudProvisioner',
+  'onProvisionProgress',
+  'onCloudAttempt',
   'about',
   'listLoadedModels',
   'unloadModel',
@@ -152,6 +158,23 @@ export const SEAM_METHODS = Object.freeze([
   'downloadRuntime',
   'deleteRuntime',
 ])
+
+/**
+ * The seam methods that are listeners rather than calls.
+ *
+ * `subscribe` is the run stream, merged with the fallback's. The other two are
+ * Tauri events the core emits while a helper or a render is running
+ * (`provision://progress`, `cloud://attempt`), and each answers with a promise
+ * of its unlisten function, the shape Tauri's own `listen` has. None of the
+ * three is a command, so none is in `IMPLEMENTED`.
+ */
+export const EVENT_METHODS = Object.freeze(['subscribe', 'onProvisionProgress', 'onCloudAttempt'])
+
+/** The event names the two cloud listeners attach to. */
+export const CLOUD_EVENTS = Object.freeze({
+  provisionProgress: 'provision://progress',
+  cloudAttempt: 'cloud://attempt',
+})
 
 /** Whether this page is running inside a Tauri window. */
 export function isTauri() {
@@ -172,16 +195,34 @@ function globalInvoke() {
 }
 
 /**
+ * `listen`, from wherever Tauri put it, answering with the event's payload
+ * only. Outside a window there is nothing to listen to, and the answer is an
+ * unlisten that does nothing rather than a rejection: a listener is attached
+ * at startup, and a browser tab has no events to miss.
+ *
+ * @param {string} event
+ * @param {(payload: any) => void} handler
+ * @returns {Promise<() => void>}
+ */
+function globalListen(event, handler) {
+  const listen = globalThis.__TAURI__?.event?.listen
+  if (typeof listen !== 'function') return Promise.resolve(() => {})
+  return Promise.resolve(listen(event, (message) => handler(message?.payload)))
+}
+
+/**
  * @param {Object} options
  * @param {import('./backend.js').Backend} options.fallback - serves every method not yet implemented
  * @param {(command: string, args?: Object) => Promise<any>} [options.invoke] - injected for tests
+ * @param {(event: string, handler: (payload: any) => void) => Promise<() => void>} [options.listen] - injected for tests
  * @returns {import('./backend.js').Backend}
  */
-export function createTauriBackend({ fallback, invoke }) {
+export function createTauriBackend({ fallback, invoke, listen }) {
   // `async` so that being constructed outside Tauri surfaces as a rejected
   // promise like any other backend failure, rather than as a synchronous throw
   // from a method the seam declares async.
   const call = invoke ?? (async (command, args) => globalInvoke()(command, args))
+  const on = listen ?? globalListen
 
   /**
    * Settings are stored by the core and *defaulted* by the interface.
@@ -226,6 +267,13 @@ export function createTauriBackend({ fallback, invoke }) {
     getCloudAttemptResult: (spec) => call(IMPLEMENTED.getCloudAttemptResult, spec),
     cancelCloudAttempt: (spec) => call(IMPLEMENTED.cancelCloudAttempt, spec),
     reconcileCloudRecovery: (spec = {}) => call(IMPLEMENTED.reconcileCloudRecovery, spec),
+    runCloudProvisioner: (spec = {}) => {
+      const { op = 'inspect', provider = 'modal', params = {} } = spec ?? {}
+      return call(IMPLEMENTED.runCloudProvisioner, { op, provider, params })
+    },
+    // Kills the running helper. Its journal is what makes a later `resume`
+    // safe, so stopping is never a loss of what was already created.
+    cancelCloudProvisioner: () => call(IMPLEMENTED.cancelCloudProvisioner),
 
     // Straight passthrough. The commands answer in the seam's own shapes - the
     // conversions that used to justify a mapping layer happen in Rust, where
@@ -282,10 +330,23 @@ export function createTauriBackend({ fallback, invoke }) {
         tool,
         params: params ?? null,
       }),
-    rerunMask: ({ maskId, kind, engine }) =>
-      call(IMPLEMENTED.rerunMask, { maskId, kind, engine: engine ?? null }),
-    cleanAnyway: ({ regionId, engine }) =>
-      call(IMPLEMENTED.cleanAnyway, { regionId, engine: engine ?? null }),
+    // `params` carries a cloud run's grant - `grantNonce`, `executionTarget`,
+    // `recipe`, `intent`, the four `applyTool` already sends - and is left off
+    // entirely for a local rung, so the command sees exactly what it saw
+    // before the cloud could reach it.
+    rerunMask: ({ maskId, kind, engine, params }) =>
+      call(IMPLEMENTED.rerunMask, {
+        maskId,
+        kind,
+        engine: engine ?? null,
+        ...(params ? { params } : {}),
+      }),
+    cleanAnyway: ({ regionId, engine, params }) =>
+      call(IMPLEMENTED.cleanAnyway, {
+        regionId,
+        engine: engine ?? null,
+        ...(params ? { params } : {}),
+      }),
     sidecarAvailable: () => call(IMPLEMENTED.sidecarAvailable),
     listSidecarModels: () => call(IMPLEMENTED.listSidecarModels),
 
@@ -347,6 +408,7 @@ export function createTauriBackend({ fallback, invoke }) {
 
   const backend = {}
   for (const method of SEAM_METHODS) {
+    if (EVENT_METHODS.includes(method)) continue
     backend[method] = Object.hasOwn(implementations, method)
       ? implementations[method]
       : (...args) => /** @type {any} */ (fallback)[method](...args)
@@ -363,6 +425,12 @@ export function createTauriBackend({ fallback, invoke }) {
    * because a run belongs entirely to one implementation.
    */
   backend.subscribe = createEventStream({ call, fallback })
+
+  // Only the core emits these: every command that could produce one - the
+  // helper, `applyTool`, `rerunMask`, `cleanAnyway` - is served here, never by
+  // the fallback, so there is no second stream to merge.
+  backend.onProvisionProgress = (handler) => on(CLOUD_EVENTS.provisionProgress, handler)
+  backend.onCloudAttempt = (handler) => on(CLOUD_EVENTS.cloudAttempt, handler)
 
   return /** @type {import('./backend.js').Backend} */ (backend)
 }
@@ -400,6 +468,20 @@ export const TAURI_REGISTERED_CLOUD_COMMANDS = Object.freeze([
 export const TAURI_PENDING_CLOUD_COMMANDS = Object.freeze([])
 
 /**
+ * The cloud provisioner helper IPC commands registered in `src-tauri/src/lib.rs`.
+ */
+export const TAURI_PROVISIONER_COMMANDS = Object.freeze([
+  'run_cloud_provisioner',
+  'cancel_cloud_provisioner',
+  'provision_inspect',
+  'provision_plan',
+  'provision_apply',
+  'provision_resume',
+  'provision_cleanup',
+  'provision_probe',
+])
+
+/**
  * Truthfully reports whether all required remote execution lifecycle commands are registered in Tauri.
  * Registration indicates that genuine backend handlers exist in `src-tauri/src/lib.rs` and are mapped in the adapter.
  *
@@ -407,17 +489,4 @@ export const TAURI_PENDING_CLOUD_COMMANDS = Object.freeze([])
  */
 export function isCloudExecutionRegistered() {
   return TAURI_PENDING_CLOUD_COMMANDS.length === 0 && TAURI_REGISTERED_CLOUD_COMMANDS.length > 0
-}
-
-/**
- * Reports whether remote cloud execution is ready for live operations.
- *
- * Semantic split: while Tauri IPC command registration truth is true (`isCloudExecutionRegistered() === true`),
- * execution readiness must remain false until an authoritative backend capability exists.
- * Caller-supplied attestation is rejected to prevent untrusted premature readiness bypass.
- *
- * @returns {boolean}
- */
-export function isCloudExecutionReady() {
-  return false
 }

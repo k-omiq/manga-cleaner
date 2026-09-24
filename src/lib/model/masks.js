@@ -58,13 +58,18 @@ export function orderMasks(masks) {
  * request id. Not the full `Provenance` record: hashes
  * and execution provider are reproducibility data, not review copy.
  *
+ * A mask the cloud rendered names Cloud as its engine, as its row does
+ * (`maskEngine`), and the model its own record names. The version beside it
+ * is not that model's: the native side keeps the one the patch it replaced
+ * carried.
+ *
  * @param {import('./types.js').Mask} mask
  * @returns {ProvenanceFact[]}
  */
 export function provenanceFacts(mask) {
   const facts = [
-    { key: 'masks.provenance.engine', value: mask.provenance.engine },
-    { key: 'masks.provenance.modelVersion', value: mask.provenance.engine_version },
+    { key: 'masks.provenance.engine', value: maskEngine(mask) },
+    { key: 'masks.provenance.modelVersion', value: mask.provenance.cloud?.model || mask.provenance.engine_version },
     { key: 'masks.provenance.fillMode', value: mask.fillMode },
     { key: 'masks.provenance.elapsed', value: mask.elapsedMs },
   ]
@@ -84,24 +89,29 @@ export function provenanceFacts(mask) {
  */
 
 /**
- * The engines a row may be switched to, weakest first.
+ * The local engines a row may be switched to, weakest first.
  *
- * The local rungs only. `cloud` is deliberately absent: it spends money, and
- * the one flow that may spend it is Content-aware fill's, which carries the
- * transmission statement and the cost confirmation. A dropdown on a list row has room for neither, and a row control that
- * silently bills is the defect those two steps exist to prevent - the same
- * reasoning that pins an automatic run at `LOCAL_CEILING`.
+ * Local only, because this list is also where Auto clean's two engine rows and
+ * the AI mask brush get their rungs (`editor/tools.js`), and an automatic run
+ * never reaches the cloud. The cloud is offered beside these, by the row and
+ * the region menu themselves, when a cloud endpoint is ready: see `rowEngines`
+ * and `CLOUD_ENGINE`. Choosing it asks for consent before anything is sent.
  *
- * `flux` is rung 3a and is **local**, so the argument
- * above does not exclude it - what does exclude it from an automatic run is
+ * `flux` is rung 3a and is **local**. What keeps it out of an automatic run is
  * that it costs ten to sixty seconds and several gigabytes a region, which is
- * a spend of a different kind and one a person has to choose per region. It is
- * in this list and is offered only where the sidecar is actually installed;
- * see `rowEngines`.
+ * a spend a person has to choose per region. It is in this list and is
+ * offered only where the sidecar is actually installed; see `rowEngines`.
  *
  * @type {ReadonlyArray<string>}
  */
 export const ROW_ENGINES = Object.freeze(['fill', 'denoise', 'lama', 'flux'])
+
+/**
+ * The engine a row or the region menu offers for rendering on the user's own
+ * cloud GPU. Not a rung: it runs whatever model the endpoint serves, and only
+ * after one consent per request (`editor/cloudflow.svelte.js`).
+ */
+export const CLOUD_ENGINE = 'cloud'
 
 /**
  * The engines this machine may actually be asked for.
@@ -115,6 +125,12 @@ export const ROW_ENGINES = Object.freeze(['fill', 'denoise', 'lama', 'flux'])
  * for a missing weight because the remedy is one press in Settings › Models
  * and the tool window is not where that sentence belongs.
  *
+ * The cloud follows the same rule. It comes last, after the strongest local
+ * rung, and only when `options.cloud` is true: the permission is on and the
+ * default endpoint has an access token (`state/cloud.svelte.js#cloudUsable`,
+ * the same verdict as `api/backend.js#isCloudExecutionReady`). Otherwise it
+ * is left out, not greyed.
+ *
  * `available` is `state/capabilities.svelte.js`'s `engines` map, derived from
  * the catalogue's own `requiredBy` rather than from a list written twice. A
  * rung the map says nothing about is offered - the map is a record of what is
@@ -124,11 +140,13 @@ export const ROW_ENGINES = Object.freeze(['fill', 'denoise', 'lama', 'flux'])
  * application, and not rung 3a, which never does.
  *
  * @param {Record<string, boolean>} [available] - which rungs have what they need
+ * @param {{cloud?: boolean}} [options] - `cloud`: whether a cloud endpoint is ready
  * @returns {ReadonlyArray<string>}
  */
-export function rowEngines(available) {
+export function rowEngines(available, options = {}) {
   const known = available ?? UNANSWERED
-  return ROW_ENGINES.filter((rung) => (known[rung] ?? true) !== false)
+  const local = ROW_ENGINES.filter((rung) => (known[rung] ?? true) !== false)
+  return options.cloud === true ? [...local, CLOUD_ENGINE] : local
 }
 
 /**
@@ -143,21 +161,45 @@ export function rowEngines(available) {
 const UNANSWERED = Object.freeze({ flux: false })
 
 /**
- * Whether a mask's engine may be re-run or swapped from a Layers row.
+ * Whether a mask was rendered in the cloud: a legacy `cloud` engine, or a
+ * patch whose provenance carries a cloud record (the native side records a
+ * cloud render as FLUX, run on the endpoint, with that record beside it).
  *
- * False for a cloud mask (legacy `cloud` engine or remote mask with cloud provenance),
- * for the reason `ROW_ENGINES` gives: re-running one is another billable request,
- * and the row cannot ask for the confirmation that would make it legitimate.
+ * @param {import('./types.js').Mask|null} mask
+ * @returns {boolean}
+ */
+export function isCloudMask(mask) {
+  return Boolean(mask?.provenance) && (mask.provenance.engine === CLOUD_ENGINE || Boolean(mask.provenance.cloud))
+}
+
+/**
+ * The engine a mask ran on, as a picker names it: `cloud` for a cloud render,
+ * whichever model the endpoint ran, and the rung otherwise.
+ *
+ * @param {import('./types.js').Mask|null} mask
+ * @returns {string|null}
+ */
+export function maskEngine(mask) {
+  if (!mask?.provenance) return null
+  return isCloudMask(mask) ? CLOUD_ENGINE : mask.provenance.engine
+}
+
+/**
+ * Whether a mask may be re-run or swapped from a Layers row or the region
+ * menu. Every mask with a provenance record may.
+ *
+ * A cloud mask included. Re-running one is another request to the user's
+ * cloud GPU, and it is asked for like every other: Try again on a cloud mask
+ * goes back to the cloud, and the consent dialog comes first
+ * (`editor/maskactions.svelte.js#rerunMask`). With the cloud off or not set
+ * up, that request is refused with a notice saying why, and nothing is sent;
+ * the picker still offers the local engines, which re-clean it here.
  *
  * @param {import('./types.js').Mask|null} mask
  * @returns {boolean}
  */
 export function reRunnable(mask) {
-  if (!mask || !mask.provenance) return false
-  if (mask.provenance.engine === 'cloud' || Boolean(mask.provenance.cloud)) {
-    return false
-  }
-  return true
+  return Boolean(mask?.provenance)
 }
 
 /**
@@ -196,22 +238,26 @@ export function engineChoiceLabel(rung) {
  * The three, in order: **Try again**, **Clean with** (the engines, with the
  * one in use checked), **Delete**.
  *
- * Nothing is offered as a disabled entry. Both suppressions have the same
- * shape - there is no engine to re-run - and a greyed row saying so would be
- * an explanation nobody asked for on a menu the pointer opened by accident as
- * often as on purpose:
+ * Nothing is offered as a disabled entry. A region with no mask has never
+ * been cleaned, so *again* is meaningless and it gets Delete alone; a greyed
+ * row saying so would be an explanation nobody asked for on a menu the
+ * pointer opened by accident as often as on purpose.
  *
- *   - a region with no mask has never been cleaned, so *again* is meaningless;
- *   - a cloud mask is `reRunnable === false`, because re-running one is
- *     another billable request and a menu cannot ask for the confirmation
- *     that would make it legitimate (see `ROW_ENGINES`).
+ * **Clean with** lists the local rungs this machine can run and, when
+ * `options.cloud` is true, Cloud after them (`rowEngines`). The engine in use
+ * leads the list when it is not otherwise offered, so a cloud mask still
+ * reads as Cloud with the cloud off, and a mask whose rung has lost its
+ * weights still names that rung. Cloud, and Try again on a cloud mask, both
+ * ask for consent before anything is sent.
  *
- * Delete survives both: every row can be removed, and for a region with no
- * mask it is the region itself that goes - which is how a warning the user has
- * read and decided about leaves the list.
+ * Delete is on every menu: for a region with no mask it is the region itself
+ * that goes - which is how a warning the user has read and decided about
+ * leaves the list.
  *
  * @param {import('./types.js').Region} region
- * @param {{engines?: Record<string, boolean>}} [options] - `capabilities.engines`; absent offers every rung
+ * @param {{engines?: Record<string, boolean>, cloud?: boolean}} [options] -
+ *   `capabilities.engines` (absent offers every shipped rung) and whether a
+ *   cloud endpoint is ready
  * @returns {RegionMenuSection[]}
  */
 export function regionMenuSections(region, options = {}) {
@@ -225,11 +271,11 @@ export function regionMenuSections(region, options = {}) {
       labelKey: null,
       items: [{ id: 'retry', labelKey: 'masks.action.retry', icon: 'refresh' }],
     })
-    // The rung the mask actually used leads the list even when the picker does
-    // not offer it, exactly as the row's `<select>` does it: a menu showing
-    // nothing checked would be a menu claiming the region has no engine.
-    const current = mask.provenance.engine
-    const offered = rowEngines(options.engines)
+    // The engine the mask actually used leads the list even when the picker
+    // does not offer it, exactly as the row's `<select>` does it: a menu
+    // showing nothing checked would be a menu claiming the region has no engine.
+    const current = /** @type {string} */ (maskEngine(mask))
+    const offered = rowEngines(options.engines, { cloud: options.cloud })
     const rungs = offered.includes(current) ? offered : [current, ...offered]
     sections.push({
       id: 'engine',

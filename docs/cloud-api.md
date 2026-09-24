@@ -1,7 +1,7 @@
 # Manga Cleaner Cloud Wire API Specification (`/mc/v1`)
 
 **Protocol Version:** `1.0.0` (offline contract)
-**Status:** P0 architecture notes, superseded for exact schemas by [cloud-contract.md](cloud-contract.md). No deployed gateway or paid execution is available.
+**Status:** P0 architecture notes, superseded for exact schemas by [cloud-contract.md](cloud-contract.md). Gateways exist in `deploy/cloud/` and have not yet run live.
 
 ---
 
@@ -40,7 +40,7 @@ Returns authenticated runtime metadata: supported protocol version, pinned symbo
 - **Provisional Limits (Unmeasured):**
   - Max dimensions: 2048×2048 px; Max megapixels: 4.19 MP.
   - Fixture max PNG: 16 MiB; fixture max multipart: 32 MiB; Default worker deadline: 120s.
-  *(These schema-only draft limits are provisional and unmeasured; they must NOT enable cloud execution until measured in P1/P5 benchmarking. Shared offline wire fixtures exist; production limits remain unmeasured).*
+  *(These limits are still provisional and unmeasured. Cloud execution now runs with them as safety ceilings.)*
 
 ### `POST /mc/v1/jobs`
 Accepts `multipart/form-data` containing:

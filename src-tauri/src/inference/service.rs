@@ -22,21 +22,36 @@
 //! 7. **Crash Discovery & Offline Recovery:** Cached outputs recover without resubmission.
 //! 8. **Stale Revision Attachment Rejection:** Drifts in source pixels, region geometry, or mask
 //!    hashes reject project attachment (`StaleAttachment`) while preserving cached results for inspection.
+//!
+//! ## Progress and cancellation
+//!
+//! A render reports its phases to an optional [`ProgressSink`] (the Tauri layer turns them into
+//! `cloud://attempt` events) and ends with exactly one of `committed`, `failed`, `cancelled` or
+//! `unknown`, the last three carrying [`InferenceServiceError::code`]. A render in progress is
+//! registered by attempt id, so [`request_render_cancel`] reaches it before the journal has a
+//! remote handle to cancel; once it has one, a `CancelRequested` written by another command
+//! stops the wait as well.
 
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cleaner_core::cloud_decode::{decode_result_crop, DecodedResultCrop, ResultDecodeError};
+use cleaner_core::cloud_decode::{DecodedResultCrop, ResultDecodeError};
 use cleaner_core::cloud_wire::{
-    compute_request_digest, JobExecutionStatus, JobRequestMetadata, ResultMetadata, ServiceLimits,
-    TypedError, WireRenderRecipe, WireValidationError, PROTOCOL_VERSION,
+    compute_request_digest, JobExecutionStatus, JobRequestMetadata, JobStatusResponse,
+    ResultMetadata, ServiceLimits, TypedError, WireRenderRecipe, WireValidationError,
+    PROTOCOL_VERSION,
 };
+use cleaner_core::engines::flux::wire_sampling;
 use cleaner_core::engines::render::{CloudProvider, ExecutionTarget, PreparedRender, RenderRecipe};
 use cleaner_core::fit::{self, EdgeMap};
 use cleaner_core::ingest::sha256_hex;
 use cleaner_core::patch::{CloudRecord, Engine};
 use cleaner_core::project::Job;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::inference::config::{compute_canonical_endpoint_fingerprint, InferenceConfig};
@@ -50,8 +65,8 @@ use crate::inference::http::{
     RuntimeCredential,
 };
 use crate::inference::journal::{
-    AttemptJournal, AttemptPhase, CreateAttemptIntent, JournalError, ProjectRegionSnapshot,
-    RecoveryDecision,
+    AttemptJournal, AttemptLockGuard, AttemptPhase, AttemptRecord, CreateAttemptIntent,
+    JournalError, ProjectRegionSnapshot, RecoveryDecision,
 };
 use crate::inference::policy::{Grant, GrantError, GrantScope, GrantService};
 use crate::inference::secrets::{
@@ -89,6 +104,11 @@ pub enum InferenceServiceError {
     #[error("HTTP transport error: {0}")]
     Http(#[from] HttpTransportError),
 
+    /// The submit request failed after the attempt was marked dispatching, so
+    /// the gateway may or may not hold the job. The journal says `Unknown`.
+    #[error("job submission outcome unknown: {0}")]
+    AmbiguousSubmission(HttpTransportError),
+
     #[error("wire contract validation error: {0}")]
     Wire(#[from] WireValidationError),
 
@@ -101,6 +121,10 @@ pub enum InferenceServiceError {
     #[error("remote job was cancelled (handle '{0}')")]
     RemoteJobCancelled(String),
 
+    /// The user cancelled the render and it stopped waiting.
+    #[error("cloud render was cancelled")]
+    Cancelled,
+
     #[error("polling timeout exceeded for job handle '{0}'")]
     PollingTimeout(String),
 
@@ -112,6 +136,110 @@ pub enum InferenceServiceError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl InferenceServiceError {
+    /// The stable snake_case code the interface maps to a sentence.
+    ///
+    /// The error's own text never crosses to the webview: it can carry a
+    /// path, a remote handle or words a gateway chose.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::CloudDisabled => "cloud_disabled",
+            Self::LocalTargetNotAllowed => "target_invalid",
+            Self::ProfileNotFound(..) => "profile_missing",
+            Self::CredentialMissing(_) => "credential_missing",
+            Self::Grant(_) => "consent_invalid",
+            Self::Consent(err) => consent_code(err),
+            Self::Journal(err) => journal_code(err),
+            Self::Http(err) => http_code(err),
+            // A gateway that answered with a status said why; one that never
+            // answered leaves only the fact that nobody knows.
+            Self::AmbiguousSubmission(
+                HttpTransportError::ConnectionError | HttpTransportError::Timeout,
+            ) => "submission_unknown",
+            Self::AmbiguousSubmission(err) => http_code(err),
+            Self::Wire(_) => "gateway_protocol",
+            Self::Decode(_) => "result_invalid",
+            Self::RemoteJobFailed { .. } => "remote_failed",
+            Self::RemoteJobCancelled(_) => "remote_cancelled",
+            Self::Cancelled => "cancelled",
+            Self::PollingTimeout(_) => "poll_timeout",
+            Self::StaleAttachment(_) => "region_changed",
+            Self::JobManifest(_) | Self::Io(_) => "project_error",
+        }
+    }
+
+    /// The phase a render that failed with this error ends in.
+    pub fn phase(&self) -> RenderPhase {
+        match self {
+            Self::Cancelled | Self::RemoteJobCancelled(_) => RenderPhase::Cancelled,
+            Self::AmbiguousSubmission(_) => RenderPhase::Unknown,
+            _ => RenderPhase::Failed,
+        }
+    }
+}
+
+fn consent_code(err: &ConsentError) -> &'static str {
+    match err {
+        ConsentError::CloudDisabled => "cloud_disabled",
+        ConsentError::LocalTargetNotAllowed => "target_invalid",
+        ConsentError::ProfileNotFound(..) => "profile_missing",
+        ConsentError::InvalidEndpoint(_) => "endpoint_invalid",
+        ConsentError::RegionNotFound(_) | ConsentError::PageNotFound(..) | ConsentError::PageMismatch => {
+            "region_not_found"
+        }
+        ConsentError::SourceImageError
+        | ConsentError::RenderPrepareFailed(_)
+        | ConsentError::UnsupportedNewRegion(_) => "region_unsupported",
+        ConsentError::RevisionMismatch
+        | ConsentError::SourceMismatch
+        | ConsentError::MaskMismatch
+        | ConsentError::CropDigestMismatch => "region_changed",
+        // The profile or the endpoint moved on between consent and dispatch.
+        ConsentError::ConfigMismatch | ConsentError::ProfileMutated => "target_changed",
+        _ => "consent_invalid",
+    }
+}
+
+fn journal_code(err: &JournalError) -> &'static str {
+    match err {
+        JournalError::AttemptLocked { .. } => "attempt_busy",
+        JournalError::AttemptAlreadyExists { .. } | JournalError::DuplicateCommit { .. } => {
+            "attempt_exists"
+        }
+        JournalError::StaleAttachment { .. } => "region_changed",
+        JournalError::Wire(_)
+        | JournalError::Decode(_)
+        | JournalError::ResultDigestMismatch { .. }
+        | JournalError::LimitExceeded { .. } => "result_invalid",
+        _ => "journal_error",
+    }
+}
+
+fn http_code(err: &HttpTransportError) -> &'static str {
+    match err {
+        HttpTransportError::UnexpectedStatus { status: 401 | 403 } => "gateway_unauthorized",
+        HttpTransportError::UnexpectedStatus { .. } => "gateway_error",
+        HttpTransportError::ConnectionError
+        | HttpTransportError::Timeout
+        | HttpTransportError::DnsResolutionFailed
+        | HttpTransportError::DnsResolverBusy => "gateway_unreachable",
+        HttpTransportError::InvalidCredential | HttpTransportError::CredentialProviderMismatch => {
+            "credential_missing"
+        }
+        HttpTransportError::InvalidTarget
+        | HttpTransportError::InvalidProfileId
+        | HttpTransportError::EndpointValidationFailed
+        | HttpTransportError::NonPublicIpRejected
+        | HttpTransportError::RedirectForbidden => "endpoint_invalid",
+        HttpTransportError::ContentTypeMismatch
+        | HttpTransportError::BodySizeLimitExceeded
+        | HttpTransportError::WireValidation
+        | HttpTransportError::JsonDeserialization
+        | HttpTransportError::ProviderMismatch
+        | HttpTransportError::InvalidHandle => "gateway_protocol",
+    }
 }
 
 /// Polling configuration for status retrieval.
@@ -132,11 +260,224 @@ impl Default for PollOptions {
     }
 }
 
+impl PollOptions {
+    /// A render the user is watching: one status request a second for up to
+    /// fifteen minutes. A cold start pays for a container, an image pull and a
+    /// 5.5 GB weight load before the first step runs, so the bound is sized to
+    /// that and not to the seconds a warm render takes.
+    pub fn interactive() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(1),
+            timeout: Duration::from_secs(15 * 60),
+            max_polls: 15 * 60,
+        }
+    }
+}
+
+/// One phase of a cloud render, as the `cloud://attempt` event names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderPhase {
+    Preparing,
+    Submitting,
+    Queued,
+    Running,
+    Downloading,
+    Compositing,
+    Committed,
+    Failed,
+    Cancelled,
+    Unknown,
+}
+
+/// The `cloud://attempt` payload. `errorCode` is null until a render ends
+/// anywhere but `committed`, and is then one of [`InferenceServiceError::code`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudAttemptProgress {
+    pub attempt_id: String,
+    pub region_id: String,
+    pub chapter_id: String,
+    pub page_index: u32,
+    pub phase: RenderPhase,
+    pub elapsed_ms: u64,
+    pub error_code: Option<&'static str>,
+}
+
+/// Where a render's phases go: the Tauri layer emits them as events, tests
+/// collect them.
+pub type ProgressSink = Arc<dyn Fn(&CloudAttemptProgress) + Send + Sync>;
+
+/// How often a waiting render looks at its cancel flag between polls.
+const CANCEL_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+/// The gateway's window to confirm a cancel before the render stops waiting
+/// for it. An unconfirmed cancel stays `CancelRequested` for recovery.
+const CANCEL_CONFIRM_POLLS: u32 = 10;
+const CANCEL_CONFIRM_INTERVAL: Duration = Duration::from_millis(200);
+/// How long a journal write waits out a lock that another command holds for
+/// the length of one write of its own.
+const LOCK_RETRIES: u32 = 50;
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
 fn current_epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// The attempt a grant nonce names: `att-` and the first 24 hex digits of its
+/// SHA-256. Derived rather than minted so the interface can name the attempt
+/// it just consented to without the nonce being stored anywhere.
+pub fn attempt_id_for_nonce(grant_nonce: &str) -> String {
+    format!("att-{}", &sha256_hex(grant_nonce.as_bytes())[0..24])
+}
+
+/// The chapter a job is. A library job lives at `<project>/<chapter>.mtclean`
+/// ([`crate::library::Library::job_path`]), so the id is the file's stem and
+/// not its folder's name, which is the project's.
+fn chapter_id_of(job_path: &Path) -> String {
+    job_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Renders and resumed waits running in this process, by attempt id, each
+/// with the flag its poll loop watches.
+fn live_renders() -> MutexGuard<'static, HashMap<String, Arc<AtomicBool>>> {
+    static LIVE: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+    LIVE.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Ask a render running in this process to stop. Answers whether one was.
+///
+/// Until the gateway has accepted the job there is no handle for the journal
+/// to cancel, so this flag is the only way to reach the render then; it acts
+/// on it at its next safe point, and never after the result is downloaded.
+pub fn request_render_cancel(attempt_id: &str) -> bool {
+    match live_renders().get(attempt_id) {
+        Some(flag) => {
+            flag.store(true, Ordering::SeqCst);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Whether a render or a resumed wait on this attempt is running in this
+/// process. Recovery leaves such an attempt alone: its `Dispatching` is a
+/// request in flight, not an interrupted one.
+pub fn is_render_live(attempt_id: &str) -> bool {
+    live_renders().contains_key(attempt_id)
+}
+
+/// This process's claim on one attempt for the length of a render. Dropping
+/// it takes the attempt out of reach of [`request_render_cancel`].
+struct LiveRender {
+    attempt_id: String,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl LiveRender {
+    /// `None` when the attempt is already being rendered or waited on here: a
+    /// second loop over one handle would only race the first to the journal.
+    fn register(attempt_id: &str) -> Option<Self> {
+        let mut live = live_renders();
+        if live.contains_key(attempt_id) {
+            return None;
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        live.insert(attempt_id.to_string(), Arc::clone(&cancelled));
+        Some(Self {
+            attempt_id: attempt_id.to_string(),
+            cancelled,
+        })
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Sleep for `total`, waking early once a cancel arrives.
+    fn wait(&self, total: Duration) {
+        let deadline = Instant::now() + total;
+        while !self.cancelled() {
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            std::thread::sleep((deadline - now).min(CANCEL_CHECK_INTERVAL));
+        }
+    }
+}
+
+impl Drop for LiveRender {
+    fn drop(&mut self) {
+        live_renders().remove(&self.attempt_id);
+    }
+}
+
+/// Reports one render's phases to the sink, each change once.
+struct PhaseReporter<'a> {
+    sink: Option<&'a ProgressSink>,
+    template: CloudAttemptProgress,
+    started: Instant,
+    last: Cell<Option<RenderPhase>>,
+}
+
+impl<'a> PhaseReporter<'a> {
+    fn new(
+        sink: Option<&'a ProgressSink>,
+        attempt_id: &str,
+        region_id: &str,
+        chapter_id: &str,
+        page_index: u32,
+    ) -> Self {
+        Self {
+            sink,
+            template: CloudAttemptProgress {
+                attempt_id: attempt_id.to_string(),
+                region_id: region_id.to_string(),
+                chapter_id: chapter_id.to_string(),
+                page_index,
+                phase: RenderPhase::Preparing,
+                elapsed_ms: 0,
+                error_code: None,
+            },
+            started: Instant::now(),
+            last: Cell::new(None),
+        }
+    }
+
+    fn enter(&self, phase: RenderPhase) {
+        self.report(phase, None);
+    }
+
+    /// The render's last event: `committed`, or where it stopped and why.
+    fn settle<T>(&self, outcome: &Result<T, InferenceServiceError>) {
+        match outcome {
+            Ok(_) => self.report(RenderPhase::Committed, None),
+            Err(err) => self.report(err.phase(), Some(err.code())),
+        }
+    }
+
+    fn report(&self, phase: RenderPhase, error_code: Option<&'static str>) {
+        if self.last.replace(Some(phase)) == Some(phase) {
+            return;
+        }
+        if let Some(sink) = self.sink {
+            sink(&CloudAttemptProgress {
+                phase,
+                elapsed_ms: self.started.elapsed().as_millis() as u64,
+                error_code,
+                ..self.template.clone()
+            });
+        }
+    }
 }
 
 /// Coherent service managing the lifecycle of cloud inference requests.
@@ -146,6 +487,7 @@ pub struct InferenceService {
     grants: Option<Arc<GrantService>>,
     secrets: Option<Arc<SecretManager>>,
     custom_client: Option<CloudHttpClient>,
+    progress: Option<ProgressSink>,
 }
 
 impl InferenceService {
@@ -157,6 +499,7 @@ impl InferenceService {
             grants: None,
             secrets: None,
             custom_client: None,
+            progress: None,
         }
     }
 
@@ -174,12 +517,19 @@ impl InferenceService {
             grants: Some(grants),
             secrets: Some(secrets),
             custom_client: None,
+            progress: None,
         }
     }
 
     /// Attach a custom/mock HTTP transport client for unit testing.
     pub fn with_custom_client(mut self, client: CloudHttpClient) -> Self {
         self.custom_client = Some(client);
+        self
+    }
+
+    /// Report every render's phases to `sink`.
+    pub fn with_progress(mut self, sink: ProgressSink) -> Self {
+        self.progress = Some(sink);
         self
     }
 
@@ -205,6 +555,26 @@ impl InferenceService {
         match &self.secrets {
             Some(s) => s.as_ref(),
             None => SecretManager::global(),
+        }
+    }
+
+    /// The attempt lock, waited for briefly.
+    ///
+    /// `acquire_lock` never blocks, and what a render can meet here (a cancel
+    /// or status command) holds the lock for one journal write, so a short
+    /// wait turns a spurious `AttemptLocked` into the write the render needed.
+    /// A render that gave up instead could leave an accepted job recorded as
+    /// dispatching, which recovery would then have to call unknown.
+    fn lock_attempt(&self, attempt_id: &str) -> Result<AttemptLockGuard, JournalError> {
+        let mut tries = 0;
+        loop {
+            match self.journal.acquire_lock(attempt_id) {
+                Err(JournalError::AttemptLocked { .. }) if tries < LOCK_RETRIES => {
+                    tries += 1;
+                    std::thread::sleep(LOCK_RETRY_INTERVAL);
+                }
+                other => return other,
+            }
         }
     }
 
@@ -285,9 +655,67 @@ impl InferenceService {
     }
 
     /// Execute a fully authenticated, durable remote cloud inference operation.
+    ///
+    /// Reports `preparing` first and then every phase change to the progress
+    /// sink, and stops on [`request_render_cancel`] or a `CancelRequested`
+    /// recorded in the journal while it waits. The attempt id is
+    /// [`attempt_id_for_nonce`] of `grant_nonce`.
     #[allow(clippy::too_many_arguments)]
     pub fn execute_cloud_render(
         &self,
+        grant_nonce: &str,
+        job_path: &Path,
+        page_index: u32,
+        region_id: &str,
+        target: &ExecutionTarget,
+        recipe: &RenderRecipe,
+        intent: &OperationIntent,
+        config: &InferenceConfig,
+        cloud_allowed: bool,
+        poll_opts: &PollOptions,
+    ) -> Result<ApiRegion, InferenceServiceError> {
+        let attempt_id = attempt_id_for_nonce(grant_nonce);
+        // Checked before a single event goes out: the render already running
+        // under this id is the one the interface is watching, and a `failed`
+        // from here would be read as its end.
+        let Some(live) = LiveRender::register(&attempt_id) else {
+            return Err(InferenceServiceError::Journal(JournalError::AttemptLocked {
+                attempt_id,
+            }));
+        };
+        let reporter = PhaseReporter::new(
+            self.progress.as_ref(),
+            &attempt_id,
+            region_id,
+            &chapter_id_of(job_path),
+            page_index,
+        );
+        reporter.enter(RenderPhase::Preparing);
+        let outcome = self.dispatch_and_attach(
+            &live,
+            &reporter,
+            &attempt_id,
+            grant_nonce,
+            job_path,
+            page_index,
+            region_id,
+            target,
+            recipe,
+            intent,
+            config,
+            cloud_allowed,
+            poll_opts,
+        );
+        reporter.settle(&outcome);
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_and_attach(
+        &self,
+        live: &LiveRender,
+        reporter: &PhaseReporter<'_>,
+        attempt_id: &str,
         grant_nonce: &str,
         job_path: &Path,
         page_index: u32,
@@ -332,8 +760,6 @@ impl InferenceService {
             mask_hash,
             revision,
             source_idx,
-            page_w,
-            page_h,
         ) = {
             let _lock = run::lock_job(job_path);
             let job = Job::open(job_path)
@@ -413,8 +839,6 @@ impl InferenceService {
                 mask_hash,
                 revision,
                 source_idx,
-                page.width,
-                page.height,
             )
         };
 
@@ -440,24 +864,24 @@ impl InferenceService {
         };
 
         // 4. Create Intent & Acquire Journal Lock
-        let attempt_id = format!("att-{}", &sha256_hex(grant_nonce.as_bytes())[0..24]);
         let job_id = format!(
             "job-{}",
             &sha256_hex(format!("{region_id}:{page_index}").as_bytes())[0..24]
         );
 
         let wire_recipe: WireRenderRecipe = recipe.clone().into();
+        let sampling = wire_sampling();
 
         let req_meta = JobRequestMetadata {
             protocol_version: PROTOCOL_VERSION.to_string(),
             job_id: job_id.clone(),
-            attempt_id: attempt_id.clone(),
+            attempt_id: attempt_id.to_string(),
             recipe: wire_recipe,
             width: crop_bounds.w,
             height: crop_bounds.h,
-            seed: 42,
-            steps: 4,
-            guidance_scaled: 350,
+            seed: sampling.seed,
+            steps: sampling.steps,
+            guidance_scaled: sampling.guidance_scaled,
             image_sha256: crop_sha256.clone(),
             hint_sha256: hint_sha256.clone(),
             request_digest: String::new(),
@@ -468,7 +892,7 @@ impl InferenceService {
         req_meta.request_digest = request_digest.clone();
 
         let create_intent = CreateAttemptIntent {
-            attempt_id: attempt_id.clone(),
+            attempt_id: attempt_id.to_string(),
             job_id: job_id.clone(),
             provider,
             profile_id: profile_id.to_string(),
@@ -480,20 +904,35 @@ impl InferenceService {
             native_mask_conditioning: recipe.native_mask_conditioning,
             width: crop_bounds.w,
             height: crop_bounds.h,
-            seed: 42,
-            steps: 4,
-            guidance_scaled: 350,
+            seed: sampling.seed,
+            steps: sampling.steps,
+            guidance_scaled: sampling.guidance_scaled,
             source_image_hash: source_hash.clone(),
             region_id: region_id.to_string(),
             region_revision: revision,
             crop_sha256: crop_sha256.clone(),
             hint_sha256: hint_sha256.clone(),
             request_digest,
-            chapter_id: None,
+            // Recovery finds the job again from these, so they are the
+            // library's own ids and not whatever the caller called the page.
+            chapter_id: Some(chapter_id_of(job_path)),
             page_index: Some(page_index),
         };
 
+        // Nothing durable exists yet, so a cancel that arrived while the crop
+        // was prepared ends the render here: no intent, no grant spent.
+        if live.cancelled() {
+            return Err(InferenceServiceError::Cancelled);
+        }
+
         let (_record, guard) = self.journal.create_intent(create_intent)?;
+
+        // The last point where a cancel costs nothing: the grant is unspent and
+        // no request has been made, so the intent closes as never dispatched.
+        if live.cancelled() {
+            let _ = self.journal.abort_intent_no_dispatch(&guard);
+            return Err(InferenceServiceError::Cancelled);
+        }
 
         // 5. Consume grant at the last safe point before marking Dispatching and network dispatch
         if let Err(e) = self.resolve_grants().validate_and_consume(grant_nonce, &scope) {
@@ -513,46 +952,90 @@ impl InferenceService {
         drop(guard);
 
         // 7. Submit job over HTTP POST (executed without holding attempt lock - Property 6)
+        reporter.enter(RenderPhase::Submitting);
         let accepted =
             match client.submit_job(&req_meta, &crop_png, &hint_png, self.journal.limits()) {
                 Ok(acc) => {
-                    let guard = self.journal.acquire_lock(&attempt_id)?;
+                    let guard = self.lock_attempt(attempt_id)?;
                     self.journal.record_accepted_handle(&guard, &acc.handle)?;
-                    drop(guard);
                     acc
                 }
                 Err(e) => {
                     // Interrupted or network error during submit -> must record transport error
                     // so attempt transitions to Unknown and is NEVER auto-retried.
-                    if let Ok(guard) = self.journal.acquire_lock(&attempt_id) {
+                    if let Ok(guard) = self.lock_attempt(attempt_id) {
                         let _ = self.journal.record_dispatch_transport_error(&guard);
                     }
-                    return Err(InferenceServiceError::Http(e));
+                    return Err(InferenceServiceError::AmbiguousSubmission(e));
                 }
             };
 
-        // 6. Poll status until completion (executed without holding attempt lock - Property 6)
-        let handle = accepted.handle;
+        // 8. Poll status until completion (executed without holding attempt lock - Property 6)
+        reporter.enter(RenderPhase::Queued);
+        let status = self.poll_to_completion(
+            live,
+            reporter,
+            &client,
+            attempt_id,
+            &accepted.handle,
+            &req_meta,
+            poll_opts,
+            true,
+        )?;
+
+        // 9. Download, cache and attach
+        self.download_and_attach(
+            reporter,
+            &client,
+            attempt_id,
+            &accepted.handle,
+            &req_meta,
+            &status,
+            job_path,
+            Some(source_idx),
+        )
+    }
+
+    /// Wait for a remote job to finish, one status request per interval.
+    ///
+    /// A status fault is retried on the same handle, never by resubmitting. A
+    /// cancel stops the wait: the flag at once, and a `CancelRequested` in the
+    /// journal at the next poll when `watch_journal` says one there is news
+    /// (it is not for an attempt whose cancel was recorded before the wait).
+    #[allow(clippy::too_many_arguments)]
+    fn poll_to_completion(
+        &self,
+        live: &LiveRender,
+        reporter: &PhaseReporter<'_>,
+        client: &CloudHttpClient,
+        attempt_id: &str,
+        handle: &str,
+        req_meta: &JobRequestMetadata,
+        poll_opts: &PollOptions,
+        watch_journal: bool,
+    ) -> Result<JobStatusResponse, InferenceServiceError> {
         let start = Instant::now();
         let mut polls = 0;
-        let mut final_status = None;
-
-        while polls < poll_opts.max_polls && start.elapsed() < poll_opts.timeout {
+        loop {
+            if live.cancelled() || (watch_journal && self.cancel_recorded(attempt_id)) {
+                return Err(self.stop_after_cancel(client, attempt_id, handle, req_meta));
+            }
+            if polls >= poll_opts.max_polls || start.elapsed() >= poll_opts.timeout {
+                return Err(InferenceServiceError::PollingTimeout(handle.to_string()));
+            }
             polls += 1;
-            match client.get_job_status(&handle, &req_meta) {
-                Ok(status_resp) => match status_resp.status {
-                    JobExecutionStatus::Pending | JobExecutionStatus::Running => {
-                        std::thread::sleep(poll_opts.poll_interval);
-                    }
-                    JobExecutionStatus::Completed => {
-                        final_status = Some(status_resp);
-                        break;
-                    }
+            // A polling fault leaves the durable handle in place: the next
+            // poll asks again and nothing is resubmitted.
+            if let Ok(status) = client.get_job_status(handle, req_meta) {
+                match status.status {
+                    JobExecutionStatus::Pending => reporter.enter(RenderPhase::Queued),
+                    JobExecutionStatus::Running => reporter.enter(RenderPhase::Running),
+                    JobExecutionStatus::Completed => return Ok(status),
                     JobExecutionStatus::Failed => {
-                        if let Ok(guard) = self.journal.acquire_lock(&attempt_id) {
+                        if let Ok(guard) = self.lock_attempt(attempt_id) {
                             let _ = self.journal.record_failed(&guard);
                         }
-                        let err = status_resp.error.unwrap_or(TypedError {
+                        let err = status.error.unwrap_or(TypedError {
                             error_code: "remote_failure".into(),
                             message: "remote job failed".into(),
                         });
@@ -562,25 +1045,85 @@ impl InferenceService {
                         });
                     }
                     JobExecutionStatus::Cancelled => {
-                        if let Ok(guard) = self.journal.acquire_lock(&attempt_id) {
+                        if let Ok(guard) = self.lock_attempt(attempt_id) {
                             let _ = self.journal.record_cancelled(&guard);
                         }
-                        return Err(InferenceServiceError::RemoteJobCancelled(handle));
+                        return Err(InferenceServiceError::RemoteJobCancelled(handle.to_string()));
                     }
-                },
-                Err(_) => {
-                    // Polling fault: preserve known handle and retry polling
-                    std::thread::sleep(poll_opts.poll_interval);
                 }
             }
+            live.wait(poll_opts.poll_interval);
         }
+    }
 
-        let status_resp =
-            final_status.ok_or_else(|| InferenceServiceError::PollingTimeout(handle.clone()))?;
+    /// Whether another command has recorded a cancel for this attempt.
+    fn cancel_recorded(&self, attempt_id: &str) -> bool {
+        matches!(
+            self.journal.get_record(attempt_id).map(|record| record.phase),
+            Ok(AttemptPhase::CancelRequested { .. })
+        )
+    }
 
-        // 7. Download result bytes (executed without holding attempt lock - Property 6)
+    /// Stop a render whose accepted job the user cancelled.
+    ///
+    /// The journal says `CancelRequested` before the request goes out, as
+    /// [`Self::cancel_cloud_render`] does, so a crash from here recovers as a
+    /// cancel still to be confirmed. The request is sent even when a cancel
+    /// command recorded it first: the gateway treats a repeat as a no-op, and
+    /// that command's own request may not have arrived. The gateway then gets
+    /// a short window to confirm; a job it has not confirmed stays
+    /// `CancelRequested`, which is non-terminal and settled by recovery.
+    fn stop_after_cancel(
+        &self,
+        client: &CloudHttpClient,
+        attempt_id: &str,
+        handle: &str,
+        req_meta: &JobRequestMetadata,
+    ) -> InferenceServiceError {
+        if let Ok(guard) = self.lock_attempt(attempt_id) {
+            let _ = self.journal.record_cancel_requested(&guard);
+        }
+        let _ = client.cancel_job(handle, req_meta);
+        for _ in 0..CANCEL_CONFIRM_POLLS {
+            match client.get_job_status(handle, req_meta).map(|status| status.status) {
+                Ok(JobExecutionStatus::Cancelled) => {
+                    if let Ok(guard) = self.lock_attempt(attempt_id) {
+                        let _ = self.journal.record_cancelled(&guard);
+                    }
+                    break;
+                }
+                Ok(JobExecutionStatus::Failed) => {
+                    if let Ok(guard) = self.lock_attempt(attempt_id) {
+                        let _ = self.journal.record_failed(&guard);
+                    }
+                    break;
+                }
+                // Finished before the cancel landed: the result stays with the
+                // gateway and recovery attaches it, which is the journal's
+                // `CancelRequested` to `ResultCached` edge.
+                Ok(JobExecutionStatus::Completed) => break,
+                _ => std::thread::sleep(CANCEL_CONFIRM_INTERVAL),
+            }
+        }
+        InferenceServiceError::Cancelled
+    }
+
+    /// Download a finished job's result, cache it, and attach it.
+    #[allow(clippy::too_many_arguments)]
+    fn download_and_attach(
+        &self,
+        reporter: &PhaseReporter<'_>,
+        client: &CloudHttpClient,
+        attempt_id: &str,
+        handle: &str,
+        req_meta: &JobRequestMetadata,
+        status: &JobStatusResponse,
+        job_path: &Path,
+        source_idx: Option<usize>,
+    ) -> Result<ApiRegion, InferenceServiceError> {
+        reporter.enter(RenderPhase::Downloading);
         let result_meta = ResultMetadata {
-            handle: handle.clone(),
+            handle: handle.to_string(),
             job_id: req_meta.job_id.clone(),
             attempt_id: req_meta.attempt_id.clone(),
             request_digest: req_meta.request_digest.clone(),
@@ -589,56 +1132,174 @@ impl InferenceService {
             model_id: req_meta.recipe.model_id.clone(),
             model_revision: req_meta.recipe.model_revision.clone(),
             native_mask_conditioning: req_meta.recipe.native_mask_conditioning,
-            result_digest: status_resp.result_digest.clone().unwrap_or_default(),
-            reported_cost_usd: status_resp.reported_cost_usd,
+            result_digest: status.result_digest.clone().unwrap_or_default(),
+            reported_cost_usd: status.reported_cost_usd,
             width: req_meta.width,
             height: req_meta.height,
-            byte_length: status_resp.result_bytes.unwrap_or(0),
+            byte_length: status.result_bytes.unwrap_or(0),
         };
 
         let result_bytes =
-            client.fetch_result_bytes(&handle, &result_meta, &req_meta, self.journal.limits())?;
+            client.fetch_result_bytes(handle, &result_meta, req_meta, self.journal.limits())?;
 
-        let guard = self.journal.acquire_lock(&attempt_id)?;
-        let decoded_crop = self
+        let guard = self.lock_attempt(attempt_id)?;
+        let decoded = self
             .journal
             .cache_result(&guard, &result_bytes, &result_meta)?;
 
-        // 8. Two-phase project attachment
-        let patch_id = format!("{}-p{:03}-{}", region_id, page_index, current_epoch_ms());
-        let snapshot = ProjectRegionSnapshot {
-            source_image_hash: source_hash.clone(),
-            region_id: region_id.to_string(),
-            region_revision: revision,
-            crop_sha256: crop_sha256.clone(),
-            hint_sha256: hint_sha256.clone(),
+        reporter.enter(RenderPhase::Compositing);
+        let (_patch_id, region) = self.attach_cached(&guard, job_path, source_idx, &decoded)?;
+        Ok(region)
+    }
+
+    /// Attach a validated cached result to the project, two-phase, and answer
+    /// with the committed patch id and the region.
+    ///
+    /// A retry of an attempt that already reached `AttachmentPending` reuses
+    /// that patch id, so it commits the same patch instead of tripping
+    /// `DuplicateCommit`. If the patch is already in the project (the crash
+    /// fell between the manifest write and the confirmation), the attempt is
+    /// confirmed without compositing again: the region's revision changed with
+    /// that write, so a second attach would only be refused as stale.
+    fn attach_cached(
+        &self,
+        guard: &AttemptLockGuard,
+        job_path: &Path,
+        source_idx: Option<usize>,
+        decoded: &DecodedResultCrop,
+    ) -> Result<(String, ApiRegion), InferenceServiceError> {
+        let record = self.journal.read_record_locked(guard)?;
+        let (handle, patch_id, result_digest, reported_cost_usd) = match &record.phase {
+            AttemptPhase::ResultCached {
+                handle,
+                result_digest,
+                reported_cost_usd,
+                ..
+            } => (
+                handle.clone(),
+                format!(
+                    "{}-p{:03}-{}",
+                    record.region_id,
+                    record.page_index.unwrap_or(0),
+                    current_epoch_ms()
+                ),
+                result_digest.clone(),
+                *reported_cost_usd,
+            ),
+            AttemptPhase::AttachmentPending {
+                handle,
+                patch_id,
+                result_digest,
+                reported_cost_usd,
+                ..
+            } => (
+                handle.clone(),
+                patch_id.clone(),
+                result_digest.clone(),
+                *reported_cost_usd,
+            ),
+            other => {
+                return Err(InferenceServiceError::Journal(JournalError::InvalidTransition {
+                    current: format!("{other:?}"),
+                    attempted: "attach_cached".into(),
+                }))
+            }
         };
 
-        self.journal
-            .prepare_attachment(&guard, &snapshot, &patch_id)?;
+        let (source_idx, attached) = self.attachment_site(job_path, &record, source_idx)?;
 
-        let api_region = self.attach_patch_to_project(
+        // Taken from the record, which is what the grant and the crop were
+        // bound to: the attach re-reads the project and refuses any drift.
+        let snapshot = ProjectRegionSnapshot {
+            source_image_hash: record.source_image_hash.clone(),
+            region_id: record.region_id.clone(),
+            region_revision: record.region_revision,
+            crop_sha256: record.crop_sha256.clone(),
+            hint_sha256: record.hint_sha256.clone(),
+        };
+        // A no-op for an attempt already pending under this patch id.
+        self.journal.prepare_attachment(guard, &snapshot, &patch_id)?;
+        if let Some(region) = attached {
+            self.journal.confirm_committed(guard, &patch_id)?;
+            return Ok((patch_id, region));
+        }
+
+        let region = self.attach_patch_to_project(
             job_path,
             source_idx,
-            region_id,
+            &record.region_id,
             &snapshot,
-            &decoded_crop,
-            &recipe.clone(),
-            provider,
-            profile_id,
+            decoded,
+            &RenderRecipe::new(
+                &record.recipe_id,
+                &record.preprocessing_version,
+                &record.model_id,
+                &record.model_revision,
+                record.native_mask_conditioning,
+            ),
+            record.provider,
+            &record.profile_id,
             &handle,
-            &req_meta.job_id,
-            &req_meta.attempt_id,
-            &req_meta.request_digest,
-            &result_meta.result_digest,
-            status_resp.reported_cost_usd,
-            page_w,
-            page_h,
+            &record.job_id,
+            &record.attempt_id,
+            &record.request_digest,
+            &result_digest,
+            reported_cost_usd,
+            record.width,
+            record.height,
         )?;
 
-        self.journal.confirm_committed(&guard, &patch_id)?;
-        drop(guard);
-        Ok(api_region)
+        self.journal.confirm_committed(guard, &patch_id)?;
+        Ok((patch_id, region))
+    }
+
+    /// Where an attempt's result goes, and the region as it stands when the
+    /// project already holds this attempt's patch.
+    ///
+    /// A page or region that is gone is a stale attachment like any other
+    /// drift: the result stays cached and nothing is written.
+    fn attachment_site(
+        &self,
+        job_path: &Path,
+        record: &AttemptRecord,
+        source_idx: Option<usize>,
+    ) -> Result<(usize, Option<ApiRegion>), InferenceServiceError> {
+        let _lock = run::lock_job(job_path);
+        let job =
+            Job::open(job_path).map_err(|e| InferenceServiceError::JobManifest(e.to_string()))?;
+        let patch = job
+            .project
+            .patches
+            .iter()
+            .find(|patch| patch.id == record.region_id)
+            .ok_or_else(|| {
+                InferenceServiceError::StaleAttachment("region no longer in chapter".into())
+            })?;
+        let source_idx = match (source_idx, record.page_index) {
+            (Some(idx), _) => idx,
+            (None, Some(page)) => Library::resolve_page(&job.project, page as usize)
+                .ok_or_else(|| {
+                    InferenceServiceError::StaleAttachment("page no longer in chapter".into())
+                })?,
+            (None, None) => patch.source_idx,
+        };
+        let carries_attempt = patch
+            .provenance
+            .cloud
+            .as_ref()
+            .and_then(|cloud| cloud.attempt_id.as_deref())
+            == Some(record.attempt_id.as_str());
+        if !carries_attempt {
+            return Ok((source_idx, None));
+        }
+        let region = crate::library::region_and_status(
+            &chapter_id_of(job_path),
+            &job.project,
+            source_idx,
+            &record.region_id,
+        )
+        .map(|(region, _)| region);
+        Ok((source_idx, region))
     }
 
     /// Internal helper to commit a composited patch into the project manifest.
@@ -751,19 +1412,15 @@ impl InferenceService {
             .map_err(|e| InferenceServiceError::JobManifest(e.to_string()))?;
         crate::library::invalidate_manifest_cache(job_path);
 
-        let chapter_id = job_path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("chapter");
-
-        let (api_region, _) =
-            crate::library::region_and_status(chapter_id, &job.project, source_idx, region_id)
-                .ok_or_else(|| {
-                    InferenceServiceError::JobManifest(
-                        "failed to resolve region in manifest".to_string(),
-                    )
-                })?;
+        let (api_region, _) = crate::library::region_and_status(
+            &chapter_id_of(job_path),
+            &job.project,
+            source_idx,
+            region_id,
+        )
+        .ok_or_else(|| {
+            InferenceServiceError::JobManifest("failed to resolve region in manifest".to_string())
+        })?;
 
         Ok(api_region)
     }
@@ -830,7 +1487,122 @@ impl InferenceService {
         Ok(RecoveryDecision::ResumeCancelPolling { handle })
     }
 
+    /// Settle what can be settled about an attempt without the network.
+    ///
+    /// An interrupted submission becomes `AmbiguousUnknown` and is never
+    /// resubmitted; a cached result is attached (`AlreadyCommitted`), or
+    /// refused as [`InferenceServiceError::StaleAttachment`] and kept cached
+    /// when its region has moved on or `job_path` is unknown; an accepted job
+    /// comes back as `ResumePolling` or `ResumeCancelPolling` for
+    /// [`Self::resume_cloud_render`]. Everything else is the journal's own
+    /// decision, unchanged.
+    pub fn recover_attempt_locally(
+        &self,
+        attempt_id: &str,
+        job_path: Option<&Path>,
+    ) -> Result<RecoveryDecision, InferenceServiceError> {
+        let guard = self.lock_attempt(attempt_id)?;
+        match self.journal.recover_attempt(&guard)? {
+            RecoveryDecision::ResultCachedReadyForAttach { .. }
+            | RecoveryDecision::AttachmentPendingVerification { .. } => {
+                let job_path = job_path.ok_or_else(|| {
+                    InferenceServiceError::StaleAttachment("chapter no longer in library".into())
+                })?;
+                let decoded = self.journal.read_cached_crop(&guard)?;
+                let (patch_id, _) = self.attach_cached(&guard, job_path, None, &decoded)?;
+                Ok(RecoveryDecision::AlreadyCommitted { patch_id })
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Wait on an attempt the journal holds as accepted, then attach its
+    /// result: the recovery path for a job that outlived the app.
+    ///
+    /// Never submits. Reports the same phases as [`Self::execute_cloud_render`]
+    /// from `queued` on and stops on the same cancel. An attempt whose cancel
+    /// was recorded before this wait is waited on until the gateway settles
+    /// it, and attached if the job finished anyway.
+    pub fn resume_cloud_render(
+        &self,
+        attempt_id: &str,
+        job_path: &Path,
+        config: &InferenceConfig,
+        poll_opts: &PollOptions,
+    ) -> Result<ApiRegion, InferenceServiceError> {
+        let Some(live) = LiveRender::register(attempt_id) else {
+            return Err(InferenceServiceError::Journal(JournalError::AttemptLocked {
+                attempt_id: attempt_id.to_string(),
+            }));
+        };
+        let record = self.journal.get_record(attempt_id)?;
+        let chapter_id = record
+            .chapter_id
+            .clone()
+            .unwrap_or_else(|| chapter_id_of(job_path));
+        let reporter = PhaseReporter::new(
+            self.progress.as_ref(),
+            attempt_id,
+            &record.region_id,
+            &chapter_id,
+            record.page_index.unwrap_or(0),
+        );
+        let outcome = self.wait_and_attach(&live, &reporter, &record, job_path, config, poll_opts);
+        reporter.settle(&outcome);
+        outcome
+    }
+
+    fn wait_and_attach(
+        &self,
+        live: &LiveRender,
+        reporter: &PhaseReporter<'_>,
+        record: &AttemptRecord,
+        job_path: &Path,
+        config: &InferenceConfig,
+        poll_opts: &PollOptions,
+    ) -> Result<ApiRegion, InferenceServiceError> {
+        let (handle, cancel_is_news) = match &record.phase {
+            AttemptPhase::Accepted { handle } => (handle.clone(), true),
+            AttemptPhase::CancelRequested { handle } => (handle.clone(), false),
+            other => {
+                return Err(InferenceServiceError::Journal(JournalError::InvalidTransition {
+                    current: format!("{other:?}"),
+                    attempted: "resume_cloud_render".into(),
+                }))
+            }
+        };
+        reporter.enter(RenderPhase::Queued);
+        let client = self.build_http_client(record.provider, &record.profile_id, config)?;
+        let req_meta = record.to_request_metadata();
+        let status = self.poll_to_completion(
+            live,
+            reporter,
+            &client,
+            &record.attempt_id,
+            &handle,
+            &req_meta,
+            poll_opts,
+            cancel_is_news,
+        )?;
+        self.download_and_attach(
+            reporter,
+            &client,
+            &record.attempt_id,
+            &handle,
+            &req_meta,
+            &status,
+            job_path,
+            None,
+        )
+    }
+
     /// Recover an attempt upon application restart or following a crash.
+    ///
+    /// [`Self::recover_attempt_locally`], and then for an accepted job a wait
+    /// bounded by `poll_opts`: a result that arrives is attached
+    /// (`AlreadyCommitted`), a job still running stays `ResumePolling` (or
+    /// `ResumeCancelPolling`), and one the gateway failed or cancelled is
+    /// `Terminal`. Nothing is ever resubmitted.
     pub fn recover_cloud_attempt(
         &self,
         attempt_id: &str,
@@ -838,160 +1610,29 @@ impl InferenceService {
         config: &InferenceConfig,
         poll_opts: &PollOptions,
     ) -> Result<RecoveryDecision, InferenceServiceError> {
-        let guard = self.journal.acquire_lock(attempt_id)?;
-        let decision = self.journal.recover_attempt(&guard)?;
-
-        match decision {
-            RecoveryDecision::AmbiguousUnknown { reason } => {
-                // Ambiguous submission is NEVER auto-retried
-                Ok(RecoveryDecision::AmbiguousUnknown { reason })
-            }
-            RecoveryDecision::ResumePolling { handle } => {
-                let record = self.journal.read_record_locked(&guard)?;
-                // Release lock before network polling and result download (Property 6)
-                drop(guard);
-
-                let client = self.build_http_client(record.provider, &record.profile_id, config)?;
-                let req_meta = record.to_request_metadata();
-
-                let mut final_status = None;
-                for _ in 0..poll_opts.max_polls {
-                    if let Ok(st) = client.get_job_status(&handle, &req_meta) {
-                        if st.status == JobExecutionStatus::Completed {
-                            final_status = Some(st);
-                            break;
-                        }
-                    }
-                    std::thread::sleep(poll_opts.poll_interval);
+        let waiting = match self.recover_attempt_locally(attempt_id, Some(job_path))? {
+            decision @ (RecoveryDecision::ResumePolling { .. }
+            | RecoveryDecision::ResumeCancelPolling { .. }) => decision,
+            settled => return Ok(settled),
+        };
+        match self.resume_cloud_render(attempt_id, job_path, config, poll_opts) {
+            Ok(_) => match self.journal.get_record(attempt_id)?.phase {
+                AttemptPhase::Committed { patch_id, .. } => {
+                    Ok(RecoveryDecision::AlreadyCommitted { patch_id })
                 }
-
-                if let Some(status_resp) = final_status {
-                    let result_meta = ResultMetadata {
-                        handle: handle.clone(),
-                        job_id: req_meta.job_id.clone(),
-                        attempt_id: req_meta.attempt_id.clone(),
-                        request_digest: req_meta.request_digest.clone(),
-                        recipe_id: req_meta.recipe.recipe_id.clone(),
-                        preprocessing_version: req_meta.recipe.preprocessing_version.clone(),
-                        model_id: req_meta.recipe.model_id.clone(),
-                        model_revision: req_meta.recipe.model_revision.clone(),
-                        native_mask_conditioning: req_meta.recipe.native_mask_conditioning,
-                        result_digest: status_resp.result_digest.clone().unwrap_or_default(),
-                        reported_cost_usd: status_resp.reported_cost_usd,
-                        width: req_meta.width,
-                        height: req_meta.height,
-                        byte_length: status_resp.result_bytes.unwrap_or(0),
-                    };
-
-                    let result_bytes = client.fetch_result_bytes(
-                        &handle,
-                        &result_meta,
-                        &req_meta,
-                        self.journal.limits(),
-                    )?;
-
-                    let guard = self.journal.acquire_lock(attempt_id)?;
-                    self.journal
-                        .cache_result(&guard, &result_bytes, &result_meta)?;
-                    drop(guard);
-                    return Ok(RecoveryDecision::ResultCachedReadyForAttach {
-                        handle,
-                        result_digest: result_meta.result_digest,
-                    });
-                }
-
-                Ok(RecoveryDecision::ResumePolling { handle })
-            }
-            RecoveryDecision::ResultCachedReadyForAttach { result_digest, .. }
-            | RecoveryDecision::AttachmentPendingVerification { result_digest, .. } => {
-                let record = self.journal.read_record_locked(&guard)?;
-                let handle = match &record.phase {
-                    AttemptPhase::Accepted { handle }
-                    | AttemptPhase::CancelRequested { handle }
-                    | AttemptPhase::ResultCached { handle, .. }
-                    | AttemptPhase::AttachmentPending { handle, .. }
-                    | AttemptPhase::Committed { handle, .. } => handle.clone(),
-                    _ => "recovered-handle".to_string(),
-                };
-
-                let snapshot = ProjectRegionSnapshot {
-                    source_image_hash: record.source_image_hash.clone(),
-                    region_id: record.region_id.clone(),
-                    region_revision: record.region_revision,
-                    crop_sha256: record.crop_sha256.clone(),
-                    hint_sha256: record.hint_sha256.clone(),
-                };
-
-                let png_bytes = self.journal.read_cached_png(&guard)?;
-                let result_meta = ResultMetadata {
-                    handle: handle.clone(),
-                    job_id: record.job_id.clone(),
-                    attempt_id: record.attempt_id.clone(),
-                    request_digest: record.request_digest.clone(),
-                    recipe_id: record.recipe_id.clone(),
-                    preprocessing_version: record.preprocessing_version.clone(),
-                    model_id: record.model_id.clone(),
-                    model_revision: record.model_revision.clone(),
-                    native_mask_conditioning: record.native_mask_conditioning,
-                    result_digest: result_digest.clone(),
-                    reported_cost_usd: None,
-                    width: record.width,
-                    height: record.height,
-                    byte_length: png_bytes.len() as u64,
-                };
-
-                let decoded = decode_result_crop(
-                    &png_bytes,
-                    &result_meta,
-                    &record.to_request_metadata(),
-                    self.journal.limits(),
-                    &handle,
-                )?;
-
-                let patch_id = format!("{}-recovered", record.region_id);
-                self.journal
-                    .prepare_attachment(&guard, &snapshot, &patch_id)?;
-
-                let source_idx = {
-                    let job = Job::open(job_path)
-                        .map_err(|e| InferenceServiceError::JobManifest(e.to_string()))?;
-                    job.project
-                        .patches
-                        .iter()
-                        .find(|r| r.id == record.region_id)
-                        .map(|r| r.source_idx)
-                        .unwrap_or(0)
-                };
-
-                let _api_region = self.attach_patch_to_project(
-                    job_path,
-                    source_idx,
-                    &record.region_id,
-                    &snapshot,
-                    &decoded,
-                    &RenderRecipe::new(
-                        &record.recipe_id,
-                        &record.preprocessing_version,
-                        &record.model_id,
-                        &record.model_revision,
-                        record.native_mask_conditioning,
-                    ),
-                    record.provider,
-                    &record.profile_id,
-                    &handle,
-                    &record.job_id,
-                    &record.attempt_id,
-                    &record.request_digest,
-                    &result_digest,
-                    None,
-                    record.width,
-                    record.height,
-                )?;
-
-                self.journal.confirm_committed(&guard, &patch_id)?;
-                Ok(RecoveryDecision::AlreadyCommitted { patch_id })
-            }
-            other => Ok(other),
+                other => Err(InferenceServiceError::Journal(JournalError::InvalidTransition {
+                    current: format!("{other:?}"),
+                    attempted: "recover_cloud_attempt".into(),
+                })),
+            },
+            Err(InferenceServiceError::PollingTimeout(_)) => Ok(waiting),
+            Err(
+                err @ (InferenceServiceError::RemoteJobFailed { .. }
+                | InferenceServiceError::RemoteJobCancelled(_)),
+            ) => Ok(RecoveryDecision::Terminal {
+                message: err.to_string(),
+            }),
+            Err(err) => Err(err),
         }
     }
 }
@@ -999,6 +1640,7 @@ impl InferenceService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cleaner_core::cloud_decode::decode_result_crop;
     use crate::inference::config::validate_https_endpoint;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -2751,5 +3393,614 @@ mod tests {
         let grant_state = grant_service.get_grant(&grant.nonce).unwrap();
         assert_eq!(grant_state.attempts_used, 0);
         assert!(service.journal().list_attempt_ids().unwrap().is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Interactive render end to end, against a loopback gateway that parses
+    // each request properly (headers, then exactly Content-Length bytes).
+    // ------------------------------------------------------------------
+
+    const FAKE_HANDLE: &str = "h-fake-1";
+
+    /// How the fake gateway's one job behaves once accepted.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum JobScript {
+        /// `pending`, `running`, then `completed`.
+        Completes,
+        /// `running` until a cancel arrives, then `cancelled`.
+        RunsUntilCancelled,
+        /// `running` until [`FakeGateway::finish`], then `completed`.
+        RunsUntilFinished,
+        /// The submission's connection closes before any answer.
+        DropsSubmission,
+    }
+
+    /// One parsed HTTP/1.1 request.
+    struct FakeRequest {
+        method: String,
+        path: String,
+        body: Vec<u8>,
+    }
+
+    fn read_fake_request(stream: &mut std::net::TcpStream) -> Option<FakeRequest> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let header_end = loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let n = stream.read(&mut chunk).ok().filter(|n| *n > 0)?;
+            buf.extend_from_slice(&chunk[..n]);
+        };
+        let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+        let mut lines = head.split("\r\n");
+        let mut request_line = lines.next()?.split(' ');
+        let method = request_line.next()?.to_string();
+        let path = request_line.next()?.to_string();
+        let length = lines
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = buf[header_end..].to_vec();
+        while body.len() < length {
+            let n = stream.read(&mut chunk).ok().filter(|n| *n > 0)?;
+            body.extend_from_slice(&chunk[..n]);
+        }
+        body.truncate(length);
+        Some(FakeRequest { method, path, body })
+    }
+
+    fn fake_respond(stream: &mut std::net::TcpStream, status: &str, content_type: &str, body: &[u8]) {
+        let head = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(body);
+    }
+
+    /// The JSON metadata part of a multipart submission.
+    fn submission_metadata(body: &[u8]) -> serde_json::Value {
+        let needle = b"{\"protocol_version\"";
+        let start = body
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("metadata part in the submission");
+        serde_json::Deserializer::from_slice(&body[start..])
+            .into_iter::<serde_json::Value>()
+            .next()
+            .expect("one JSON object")
+            .expect("valid metadata JSON")
+    }
+
+    /// A result the size the request asked for.
+    fn fake_result_png(meta: &serde_json::Value) -> Vec<u8> {
+        let width = meta["width"].as_u64().unwrap() as u32;
+        let height = meta["height"].as_u64().unwrap() as u32;
+        let raster = cleaner_core::image::Raster {
+            width,
+            height,
+            mode: cleaner_core::image::ColorMode::Rgb,
+            depth: cleaner_core::image::BitDepth::Eight,
+            icc: None,
+            palette: None,
+            trns: None,
+            srgb_intent: None,
+            data: vec![220; (width * height * 3) as usize],
+        };
+        cleaner_core::image::encode(&raster, Format::Png).unwrap()
+    }
+
+    /// The identity every job answer repeats back from the request.
+    fn fake_job_identity(meta: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "handle": FAKE_HANDLE,
+            "job_id": meta["job_id"],
+            "attempt_id": meta["attempt_id"],
+            "request_digest": meta["request_digest"],
+            "recipe_id": meta["recipe"]["recipe_id"],
+            "preprocessing_version": meta["recipe"]["preprocessing_version"],
+            "model_id": meta["recipe"]["model_id"],
+            "model_revision": meta["recipe"]["model_revision"],
+            "native_mask_conditioning": false,
+        })
+    }
+
+    #[derive(Clone, Default)]
+    struct GatewayCounters {
+        submits: Arc<AtomicUsize>,
+        polls: Arc<AtomicUsize>,
+        cancels: Arc<AtomicUsize>,
+        results: Arc<AtomicUsize>,
+        metadata: Arc<Mutex<Option<serde_json::Value>>>,
+        finished: Arc<AtomicBool>,
+    }
+
+    struct FakeGateway {
+        endpoint: String,
+        seen: GatewayCounters,
+    }
+
+    impl FakeGateway {
+        fn start(script: JobScript) -> FakeGateway {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let seen = GatewayCounters::default();
+            let shared = seen.clone();
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    let seen = shared.clone();
+                    thread::spawn(move || seen.serve(script, &mut stream));
+                }
+            });
+            FakeGateway {
+                endpoint: format!("http://127.0.0.1:{port}/mc/v1"),
+                seen,
+            }
+        }
+
+        /// A `RunsUntilFinished` job completes from the next poll on.
+        fn finish(&self) {
+            self.seen.finished.store(true, Ordering::SeqCst);
+        }
+
+        fn client(&self) -> CloudHttpClient {
+            let target =
+                CloudEndpointTarget::new_test_target(CloudProvider::Modal, "modal-prof-1", &self.endpoint)
+                    .unwrap();
+            let credential = BoundRuntimeCredential::new(
+                &target,
+                RuntimeCredential::ModalProxy {
+                    token_id: "tid".into(),
+                    token_secret: SecretValue::new("tsec"),
+                },
+            )
+            .unwrap();
+            CloudHttpClient::new_test_client(target, credential, reqwest::blocking::Client::new())
+        }
+
+        fn count(counter: &AtomicUsize) -> usize {
+            counter.load(Ordering::SeqCst)
+        }
+    }
+
+    impl GatewayCounters {
+        fn serve(&self, script: JobScript, stream: &mut std::net::TcpStream) {
+            let Some(request) = read_fake_request(stream) else {
+                return;
+            };
+            let job = format!("/mc/v1/jobs/{FAKE_HANDLE}");
+            let meta = || self.metadata.lock().unwrap().clone().expect("a submission first");
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/mc/v1/jobs") => {
+                    self.submits.fetch_add(1, Ordering::SeqCst);
+                    if script == JobScript::DropsSubmission {
+                        return;
+                    }
+                    let submitted = submission_metadata(&request.body);
+                    let mut accepted = fake_job_identity(&submitted);
+                    accepted["status"] = "pending".into();
+                    *self.metadata.lock().unwrap() = Some(submitted);
+                    fake_respond(stream, "202 Accepted", "application/json", accepted.to_string().as_bytes());
+                }
+                ("POST", path) if path == format!("{job}/cancel") => {
+                    self.cancels.fetch_add(1, Ordering::SeqCst);
+                    let meta = meta();
+                    let body = serde_json::json!({
+                        "handle": FAKE_HANDLE,
+                        "job_id": meta["job_id"],
+                        "attempt_id": meta["attempt_id"],
+                        "request_digest": meta["request_digest"],
+                        "status": "cancel_requested",
+                        "acknowledged": true,
+                    });
+                    fake_respond(stream, "200 OK", "application/json", body.to_string().as_bytes());
+                }
+                ("GET", path) if path == format!("{job}/result") => {
+                    self.results.fetch_add(1, Ordering::SeqCst);
+                    fake_respond(stream, "200 OK", "image/png", &fake_result_png(&meta()));
+                }
+                ("GET", path) if path == job => {
+                    let poll = self.polls.fetch_add(1, Ordering::SeqCst);
+                    let cancelled = self.cancels.load(Ordering::SeqCst) > 0;
+                    let status = match script {
+                        JobScript::Completes => ["pending", "running", "completed"][poll.min(2)],
+                        JobScript::RunsUntilCancelled if cancelled => "cancelled",
+                        JobScript::RunsUntilFinished if self.finished.load(Ordering::SeqCst) => {
+                            "completed"
+                        }
+                        _ => "running",
+                    };
+                    let meta = meta();
+                    let mut body = fake_job_identity(&meta);
+                    body["status"] = status.into();
+                    if status == "completed" {
+                        let png = fake_result_png(&meta);
+                        body["result_digest"] = sha256_hex(&png).into();
+                        body["result_bytes"] = png.len().into();
+                    }
+                    fake_respond(stream, "200 OK", "application/json", body.to_string().as_bytes());
+                }
+                _ => fake_respond(stream, "404 Not Found", "application/json", b"{}"),
+            }
+        }
+    }
+
+    /// A chapter with region `reg-1`, a grant to clean it in the cloud, and
+    /// every `cloud://attempt` event the renders below report.
+    struct RenderFixture {
+        journal_dir: PathBuf,
+        manifest: PathBuf,
+        config: InferenceConfig,
+        target: ExecutionTarget,
+        recipe: RenderRecipe,
+        intent: OperationIntent,
+        nonce: String,
+        consent: Arc<ConsentService>,
+        grants: Arc<GrantService>,
+        events: Arc<Mutex<Vec<CloudAttemptProgress>>>,
+    }
+
+    impl RenderFixture {
+        fn new(name: &str) -> RenderFixture {
+            let scratch = test_scratch(name);
+            let (manifest, _bounds) = setup_test_job(&scratch, "reg-1");
+            let config = test_config();
+            let grants = Arc::new(GrantService::new());
+            let consent = Arc::new(ConsentService::new_isolated(Arc::clone(&grants)));
+            let target = ExecutionTarget::Modal {
+                profile_id: "modal-prof-1".into(),
+            };
+            let recipe = RenderRecipe::new(
+                "sdnq-v1",
+                "1.0.0",
+                "flux-schnell",
+                "0123456789abcdef0123456789abcdef01234567",
+                false,
+            );
+            let intent = OperationIntent::CleanAnyway;
+            let proposal = consent
+                .prepare_proposal(
+                    PrepareProposalRequest {
+                        chapter_id: "chapter".into(),
+                        page_index: 0,
+                        region_id: Some("reg-1".into()),
+                        target: target.clone(),
+                        recipe: recipe.clone(),
+                        intent: intent.clone(),
+                    },
+                    &config,
+                    true,
+                    &manifest,
+                )
+                .unwrap();
+            let grant = consent
+                .confirm_proposal(ConfirmProposalOptions {
+                    proposal_id: &proposal.proposal_id,
+                    intent: &intent,
+                    config: &config,
+                    cloud_allowed: true,
+                    job_path: &manifest,
+                    grant_ttl: Duration::from_secs(120),
+                    max_attempts: 1,
+                })
+                .unwrap();
+            RenderFixture {
+                journal_dir: scratch.join("journal"),
+                manifest,
+                config,
+                target,
+                recipe,
+                intent,
+                nonce: grant.nonce,
+                consent,
+                grants,
+                events: Arc::default(),
+            }
+        }
+
+        /// A service on this fixture's journal, as a fresh process would build it.
+        fn service(&self, gateway: &FakeGateway) -> InferenceService {
+            let events = Arc::clone(&self.events);
+            InferenceService::new_isolated(
+                &self.journal_dir,
+                cleaner_core::cloud_wire::provisional_fixture_limits(),
+                Arc::clone(&self.consent),
+                Arc::clone(&self.grants),
+                Arc::new(SecretManager::new_in_memory()),
+            )
+            .with_custom_client(gateway.client())
+            .with_progress(Arc::new(move |progress: &CloudAttemptProgress| {
+                events.lock().unwrap().push(progress.clone())
+            }))
+        }
+
+        fn render(
+            &self,
+            service: &InferenceService,
+            poll: &PollOptions,
+        ) -> Result<ApiRegion, InferenceServiceError> {
+            service.execute_cloud_render(
+                &self.nonce,
+                &self.manifest,
+                0,
+                "reg-1",
+                &self.target,
+                &self.recipe,
+                &self.intent,
+                &self.config,
+                true,
+                poll,
+            )
+        }
+
+        fn attempt_id(&self) -> String {
+            attempt_id_for_nonce(&self.nonce)
+        }
+
+        /// The phases reported so far, then forget them.
+        fn take_phases(&self) -> Vec<RenderPhase> {
+            std::mem::take(&mut *self.events.lock().unwrap())
+                .into_iter()
+                .map(|event| event.phase)
+                .collect()
+        }
+
+        fn last_event(&self) -> CloudAttemptProgress {
+            self.events.lock().unwrap().last().cloned().expect("an event")
+        }
+
+        fn phase_on_disk(&self, service: &InferenceService) -> AttemptPhase {
+            service.journal().get_record(&self.attempt_id()).unwrap().phase
+        }
+
+        fn committed_patch(&self) -> Patch {
+            let job = Job::open(&self.manifest).unwrap();
+            let record = job.project.patches.iter().find(|r| r.id == "reg-1").unwrap();
+            job.load_patch(record).unwrap()
+        }
+    }
+
+    fn fast_polls() -> PollOptions {
+        PollOptions {
+            poll_interval: Duration::from_millis(20),
+            timeout: Duration::from_secs(20),
+            max_polls: 1000,
+        }
+    }
+
+    /// Wait (bounded) until `counter` reaches `at_least`.
+    fn wait_for(counter: &AtomicUsize, at_least: usize) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while counter.load(Ordering::SeqCst) < at_least {
+            assert!(Instant::now() < deadline, "the gateway never saw the request");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_cloud_render_runs_end_to_end_and_reports_every_phase() {
+        let fixture = RenderFixture::new("e2e-happy");
+        let gateway = FakeGateway::start(JobScript::Completes);
+        let service = fixture.service(&gateway);
+
+        let region = fixture.render(&service, &fast_polls()).unwrap();
+
+        assert_eq!(region.outcome, "cleaned");
+        assert_eq!(
+            fixture.take_phases(),
+            [
+                RenderPhase::Preparing,
+                RenderPhase::Submitting,
+                RenderPhase::Queued,
+                RenderPhase::Running,
+                RenderPhase::Downloading,
+                RenderPhase::Compositing,
+                RenderPhase::Committed,
+            ]
+        );
+        assert_eq!(FakeGateway::count(&gateway.seen.submits), 1);
+        assert_eq!(FakeGateway::count(&gateway.seen.results), 1);
+
+        // Every event names the attempt, region, chapter and page (IC-3).
+        let attempt_id = fixture.attempt_id();
+        assert!(attempt_id.starts_with("att-") && attempt_id.len() == 28);
+
+        // The wire carried the local recipe's sampling (IC-6).
+        let submitted = gateway.seen.metadata.lock().unwrap().clone().unwrap();
+        let sampling = wire_sampling();
+        assert_eq!(submitted["seed"], sampling.seed);
+        assert_eq!(submitted["steps"], sampling.steps);
+        assert_eq!(submitted["guidance_scaled"], sampling.guidance_scaled);
+        assert_eq!(submitted["attempt_id"], attempt_id.as_str());
+
+        // Provenance of the committed patch.
+        let patch = fixture.committed_patch();
+        assert_eq!(patch.provenance.engine, Engine::Flux);
+        let cloud = patch.provenance.cloud.expect("cloud record");
+        assert_eq!(cloud.provider, "modal");
+        assert_eq!(cloud.profile_id.as_deref(), Some("modal-prof-1"));
+        assert_eq!(cloud.job_id.as_deref(), submitted["job_id"].as_str());
+        assert_eq!(cloud.attempt_id.as_deref(), Some(attempt_id.as_str()));
+        assert_eq!(cloud.recipe_id.as_deref(), Some("sdnq-v1"));
+        assert_eq!(
+            cloud.model_revision.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(cloud.cost, None);
+        assert!(matches!(fixture.phase_on_disk(&service), AttemptPhase::Committed { .. }));
+    }
+
+    #[test]
+    fn every_event_of_a_render_carries_its_identity() {
+        let fixture = RenderFixture::new("e2e-identity");
+        let gateway = FakeGateway::start(JobScript::Completes);
+        let service = fixture.service(&gateway);
+
+        fixture.render(&service, &fast_polls()).unwrap();
+
+        let events = fixture.events.lock().unwrap().clone();
+        assert!(!events.is_empty());
+        for event in &events {
+            assert_eq!(event.attempt_id, fixture.attempt_id());
+            assert_eq!(event.region_id, "reg-1");
+            assert_eq!(event.chapter_id, "chapter");
+            assert_eq!(event.page_index, 0);
+            assert_eq!(event.error_code, None);
+        }
+        assert!(events.windows(2).all(|pair| pair[0].elapsed_ms <= pair[1].elapsed_ms));
+    }
+
+    #[test]
+    fn a_render_cancelled_mid_poll_stops_and_ends_cancelled() {
+        let fixture = RenderFixture::new("e2e-cancel-flag");
+        let gateway = FakeGateway::start(JobScript::RunsUntilCancelled);
+        let service = fixture.service(&gateway);
+        let attempt_id = fixture.attempt_id();
+
+        let started = Instant::now();
+        let outcome = thread::scope(|scope| {
+            scope.spawn(|| {
+                wait_for(&gateway.seen.polls, 2);
+                assert!(request_render_cancel(&attempt_id), "the render was not live");
+            });
+            fixture.render(&service, &fast_polls())
+        });
+
+        assert!(matches!(outcome, Err(InferenceServiceError::Cancelled)), "{outcome:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let last = fixture.last_event();
+        assert_eq!(last.phase, RenderPhase::Cancelled);
+        assert_eq!(last.error_code, Some("cancelled"));
+        assert_eq!(FakeGateway::count(&gateway.seen.submits), 1);
+        assert_eq!(FakeGateway::count(&gateway.seen.cancels), 1);
+        assert!(matches!(fixture.phase_on_disk(&service), AttemptPhase::Cancelled { .. }));
+        assert!(!is_render_live(&attempt_id));
+    }
+
+    #[test]
+    fn a_cancel_recorded_by_another_command_stops_the_render() {
+        let fixture = RenderFixture::new("e2e-cancel-journal");
+        let gateway = FakeGateway::start(JobScript::RunsUntilCancelled);
+        let service = fixture.service(&gateway);
+        let attempt_id = fixture.attempt_id();
+
+        let outcome = thread::scope(|scope| {
+            scope.spawn(|| {
+                wait_for(&gateway.seen.polls, 2);
+                // What `cancel_cloud_attempt` writes before its own request.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let guard = loop {
+                    match service.journal().acquire_lock(&attempt_id) {
+                        Ok(guard) => break guard,
+                        Err(JournalError::AttemptLocked { .. }) if Instant::now() < deadline => {
+                            thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(err) => panic!("attempt lock never came free: {err:?}"),
+                    }
+                };
+                service.journal().record_cancel_requested(&guard).unwrap();
+            });
+            fixture.render(&service, &fast_polls())
+        });
+
+        assert!(matches!(outcome, Err(InferenceServiceError::Cancelled)), "{outcome:?}");
+        assert_eq!(fixture.last_event().phase, RenderPhase::Cancelled);
+        assert_eq!(FakeGateway::count(&gateway.seen.cancels), 1);
+        assert!(matches!(fixture.phase_on_disk(&service), AttemptPhase::Cancelled { .. }));
+    }
+
+    #[test]
+    fn a_submission_lost_in_transport_ends_unknown_and_is_never_resent() {
+        let fixture = RenderFixture::new("e2e-submit-lost");
+        let gateway = FakeGateway::start(JobScript::DropsSubmission);
+        let service = fixture.service(&gateway);
+
+        let outcome = fixture.render(&service, &fast_polls());
+
+        assert!(matches!(outcome, Err(InferenceServiceError::AmbiguousSubmission(_))), "{outcome:?}");
+        let last = fixture.last_event();
+        assert_eq!(last.phase, RenderPhase::Unknown);
+        assert_eq!(last.error_code, Some("submission_unknown"));
+        assert_eq!(
+            fixture.take_phases(),
+            [RenderPhase::Preparing, RenderPhase::Submitting, RenderPhase::Unknown]
+        );
+        assert!(matches!(fixture.phase_on_disk(&service), AttemptPhase::Unknown { .. }));
+
+        // Neither recovery nor a second try with the same grant sends it again.
+        let decision = service
+            .recover_cloud_attempt(&fixture.attempt_id(), &fixture.manifest, &fixture.config, &fast_polls())
+            .unwrap();
+        assert!(matches!(decision, RecoveryDecision::AmbiguousUnknown { .. }), "{decision:?}");
+        assert!(fixture.render(&service, &fast_polls()).is_err());
+        assert_eq!(FakeGateway::count(&gateway.seen.submits), 1);
+    }
+
+    #[test]
+    fn a_job_that_outlives_the_app_is_attached_after_a_restart() {
+        let fixture = RenderFixture::new("e2e-restart");
+        let gateway = FakeGateway::start(JobScript::RunsUntilFinished);
+
+        // First run: the wait runs out while the job still runs remotely.
+        {
+            let service = fixture.service(&gateway);
+            let short = PollOptions {
+                poll_interval: Duration::from_millis(20),
+                timeout: Duration::from_millis(300),
+                max_polls: 1000,
+            };
+            let outcome = fixture.render(&service, &short);
+            assert!(matches!(outcome, Err(InferenceServiceError::PollingTimeout(_))), "{outcome:?}");
+            assert_eq!(fixture.last_event().error_code, Some("poll_timeout"));
+            assert!(matches!(fixture.phase_on_disk(&service), AttemptPhase::Accepted { .. }));
+        }
+        fixture.take_phases();
+        gateway.finish();
+
+        // Restart: a new service on the same journal finds the job accepted.
+        let service = fixture.service(&gateway);
+        let manifest = fixture.manifest.clone();
+        let chapter_path = move |chapter_id: &str| (chapter_id == "chapter").then(|| manifest.clone());
+        let (report, waits) =
+            crate::inference::commands::recover_all_attempts(&service, &chapter_path);
+        assert!(report.attached.is_empty() && report.needs_attention.is_empty());
+        assert_eq!(report.still_running.len(), 1);
+        let entry = &report.still_running[0];
+        assert_eq!(entry.attempt_id, fixture.attempt_id());
+        assert_eq!(entry.chapter_id.as_deref(), Some("chapter"));
+        assert_eq!(entry.page_index, Some(0));
+        assert_eq!(entry.region_id, "reg-1");
+        assert_eq!(waits, [(fixture.attempt_id(), fixture.manifest.clone())]);
+
+        // The wait `reconcileCloudRecovery({apply: true})` starts for it.
+        let decision = service
+            .recover_cloud_attempt(&fixture.attempt_id(), &fixture.manifest, &fixture.config, &fast_polls())
+            .unwrap();
+        assert!(matches!(decision, RecoveryDecision::AlreadyCommitted { .. }), "{decision:?}");
+        assert_eq!(
+            fixture.take_phases(),
+            [
+                RenderPhase::Queued,
+                RenderPhase::Downloading,
+                RenderPhase::Compositing,
+                RenderPhase::Committed,
+            ]
+        );
+        let patch = fixture.committed_patch();
+        assert_eq!(patch.provenance.engine, Engine::Flux);
+        assert_eq!(
+            patch.provenance.cloud.and_then(|cloud| cloud.attempt_id),
+            Some(fixture.attempt_id())
+        );
+        assert_eq!(FakeGateway::count(&gateway.seen.submits), 1);
+
+        // Settled: the next recovery has nothing to report.
+        let (report, waits) =
+            crate::inference::commands::recover_all_attempts(&service, &chapter_path);
+        assert!(report.attached.is_empty() && report.still_running.is_empty());
+        assert!(report.needs_attention.is_empty() && waits.is_empty());
     }
 }

@@ -318,33 +318,20 @@ describe('P3c1 cloud inference and secrets frontend API mapping', () => {
       expect(JSON.stringify(clean)).not.toContain('leaked')
     })
 
-    it('explicitly refuses / rejects all secret operations in browser mock without timer dependencies', async () => {
-      const mock = createMockBackend()
+    it('keeps a session-only secret store that answers presence and never the value', async () => {
+      const mock = createMockBackend({ timing: { method: 0 } })
+      const key = { provider: 'beam', profileId: 'beam-1', role: 'runtime' }
 
-      await expect(
-        mock.storeCloudSecret({
-          provider: 'beam',
-          profileId: 'beam-1',
-          role: 'runtime',
-          secret: 'token-abc',
-        }),
-      ).rejects.toThrow(/unavailable in browser mock/)
+      expect(await mock.getCloudSecretSummary(key)).toEqual({ ...key, present: false, backend: 'session' })
+      const stored = await mock.storeCloudSecret({ ...key, secret: 'token-abc' })
+      expect(stored).toEqual({ ...key, present: true, backend: 'session' })
+      expect(JSON.stringify(stored)).not.toContain('token-abc')
+      expect(await mock.getCloudSecretSummary(key)).toMatchObject({ present: true })
+      expect(await mock.deleteCloudSecret(key)).toMatchObject({ present: false })
 
-      await expect(
-        mock.deleteCloudSecret({
-          provider: 'beam',
-          profileId: 'beam-1',
-          role: 'runtime',
-        }),
-      ).rejects.toThrow(/unavailable in browser mock/)
-
-      await expect(
-        mock.getCloudSecretSummary({
-          provider: 'beam',
-          profileId: 'beam-1',
-          role: 'runtime',
-        }),
-      ).rejects.toThrow(/unavailable in browser mock/)
+      await expect(mock.storeCloudSecret({ ...key, secret: '   ' })).rejects.toThrow(/must not be empty/)
+      await expect(mock.getCloudSecretSummary({ ...key, role: 'owner' })).rejects.toThrow(/unknown secret role/)
+      await expect(mock.getCloudSecretSummary({ ...key, provider: 'google' })).rejects.toThrow(/unknown cloud provider/)
     })
 
     describe('P3/P4 deterministic mock cloud authorization and attempt lifecycle', () => {
@@ -404,6 +391,13 @@ describe('P3c1 cloud inference and secrets frontend API mapping', () => {
       it('checks connection reachability without triggering GPU work or model download', async () => {
         const mock = await setupMockWithProfiles()
 
+        // No runtime token yet: the check does not reach out at all.
+        const tokenless = await mock.checkCloudConnection({ provider: 'modal', profileId: 'modal-prod' })
+        expect(tokenless).toEqual({ ok: false, status: 'credential_missing', provider: 'modal', profileId: 'modal-prod' })
+
+        for (const profileId of ['modal-prod', 'modal-offline']) {
+          await mock.storeCloudSecret({ provider: 'modal', profileId, role: 'runtime', secret: 'runtime-secret', tokenId: 'wk-1' })
+        }
         const reachable = await mock.checkCloudConnection({ provider: 'modal', profileId: 'modal-prod' })
         expect(reachable).toEqual({
           ok: true,
@@ -429,7 +423,10 @@ describe('P3c1 cloud inference and secrets frontend API mapping', () => {
         const info = await mock.getCloudModelInfo({ provider: 'beam', profileId: 'beam-prod' })
 
         expect(info.supportedProtocolVersion).toBe('1.0.0')
-        expect(info.pinnedModelId).toBe('flux-schnell')
+        expect(info.pinnedModelId).toBe('Disty0/FLUX.2-klein-4B-SDNQ-4bit-dynamic')
+        expect(info.pinnedRecipeId).toBe('mc-flux2-klein-edit-v1')
+        expect(info.preprocessingVersion).toBe('1.0.0')
+        expect(info.nativeMaskConditioning).toBe(false)
         expect(info.limits.maxDimensions).toEqual([2048, 2048])
         expect(info.limits.maxMegapixels).toBe(4.19)
         expect(info.limits.defaultWorkerDeadlineSec).toBe(120)
@@ -666,7 +663,7 @@ describe('P3c1 cloud inference and secrets frontend API mapping', () => {
       it('uses the immutable pinned revision in getCloudModelInfo and default consent recipe (never mutable main)', async () => {
         const mock = await setupMockWithProfiles()
         const info = await mock.getCloudModelInfo({ provider: 'beam', profileId: 'beam-prod' })
-        expect(info.pinnedModelRevision).toBe('0123456789abcdef0123456789abcdef01234567')
+        expect(info.pinnedModelRevision).toBe('45e9cc76cb70f84473ce5c6c2e2282d0ef3c6ecd')
         expect(info.pinnedModelRevision).not.toBe('main')
 
         await mock.writeSettings({ cloudEngines: 'allowed' })
@@ -674,14 +671,14 @@ describe('P3c1 cloud inference and secrets frontend API mapping', () => {
           target: { type: 'modal', profile_id: 'modal-prod' },
           intent: { action: 'applyTool', tool: 'contentAwareFill' },
         })
-        expect(proposal.recipe.model_revision).toBe('0123456789abcdef0123456789abcdef01234567')
+        expect(proposal.recipe.model_revision).toBe('45e9cc76cb70f84473ce5c6c2e2282d0ef3c6ecd')
         expect(proposal.recipe.model_revision).not.toBe('main')
 
         const grant = await mock.confirmCloudConsent({
           proposalId: proposal.proposalId,
           intent: { action: 'applyTool', tool: 'contentAwareFill' },
         })
-        expect(grant.scope.recipe.model_revision).toBe('0123456789abcdef0123456789abcdef01234567')
+        expect(grant.scope.recipe.model_revision).toBe('45e9cc76cb70f84473ce5c6c2e2282d0ef3c6ecd')
       })
 
       it('fails closed when grantNonce is missing, empty, or unknown', async () => {

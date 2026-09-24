@@ -3,7 +3,7 @@
    * The application shell.
    *
    * Five responsibilities, and no more - screens, panels and dialogs are
-   * Tasks 6–11:
+   * Tasks 6 to 11:
    *
    *  1. Route: library / chapters (both Home) and editor.
    *  2. Theme: apply the resolved theme to `<html data-theme>` and follow the
@@ -18,6 +18,8 @@
   import { getBackend } from './lib/api/backend.js'
   import { session, installThemeSync, applyTheme, reconcileSettings } from './lib/state/session.svelte.js'
   import { loadCapabilities } from './lib/state/capabilities.svelte.js'
+  import { startCloud } from './lib/state/cloud.svelte.js'
+  import CloudJobStatus from './lib/editor/CloudJobStatus.svelte'
   import {
     loadedModels,
     pollLoadedModels,
@@ -58,7 +60,10 @@
         if (live) return backend.writeSettings(reconcileSettings(settings))
       })
       .then(() => {
-        if (live) loadCapabilities(backend)
+        if (!live) return
+        loadCapabilities(backend)
+        // Cloud readiness and start-up recovery read the reconciled permission.
+        startCloud(backend)
       })
     return () => {
       live = false
@@ -179,6 +184,7 @@
      14px anchor and the notice stack rises above it. Both are `z-index: 10`,
      below the floating windows at `20 + rank`. -->
 <div class="corner" bind:clientHeight={panelHeight}>
+  <CloudJobStatus />
   <LoadedModels
     models={loaded}
     title={t('models.title')}
@@ -226,5 +232,8 @@
     bottom: 14px;
     left: 14px;
     z-index: 10;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
   }
 </style>

@@ -24,7 +24,8 @@ import {
   replaceRegion,
   select,
 } from '../state/editor.svelte.js'
-import { applyWithConfirmations, cloudRefused } from './cloudflow.svelte.js'
+import { cloudRefused, requestCloudConsent, runCloudJob } from './cloudflow.svelte.js'
+import { toolSpendsCloud } from './tools.js'
 // The reporter lives beside the actions it was written for, and this module
 // already follows that one for everything else it does; a second copy of the
 // same three lines is a second sentence a failed edit could start saying.
@@ -67,8 +68,9 @@ export async function applyActiveToolToRegion(regionId, extraParams) {
   // and asking the adapter first would let it mutate its own state for an edit
   // this side can neither swap in nor reverse. Unreachable while every id
   // comes from a rendered region; the ordering is what keeps it unreachable.
-  const region = findRegion(regionId)
-  if (!region) return false
+  const located = locateRegion(regionId)
+  if (!located) return false
+  const { region, pageIndex } = located
 
   const tool = editor.tool
   const mergedParams = { ...$state.snapshot(editor.toolParams[tool] ?? {}), ...(extraParams ?? {}) }
@@ -86,6 +88,10 @@ export async function applyActiveToolToRegion(regionId, extraParams) {
   const before = snapshot(region)
   select(regionId)
 
+  if (toolSpendsCloud(tool, params)) {
+    return applyInCloud({ chapterId: chapter.id, pageIndex, regionId, tool, params, before })
+  }
+
   // Every caller of this function fires it and walks away - a region click does
   // not await it, and neither does the gesture that lands on an existing
   // region - so a rejection here reached nothing at all: no handler, no notice,
@@ -97,29 +103,110 @@ export async function applyActiveToolToRegion(regionId, extraParams) {
   /** @type {any} */
   let result
   try {
-    result = await applyWithConfirmations(
-      (next) =>
-        getBackend().applyTool({
-          tool,
-          params: next,
-          chapterId: chapter.id,
-          pageIndex: editor.pageIndex,
-          regionId,
-        }),
+    result = await getBackend().applyTool({
+      tool,
       params,
-    )
+      chapterId: chapter.id,
+      pageIndex,
+      regionId,
+    })
   } catch (error) {
     return reportRegionEditFailure(error)
   }
+  return landApplied(result, regionId, before)
+}
 
-  switch (result.status) {
+/**
+ * Render in the cloud a region the open chapter already holds, after one
+ * consent: the second half of a drawn region pointed at the cloud, which
+ * `createRegion` made locally first.
+ *
+ * @param {string} regionId
+ * @param {string} tool
+ * @param {Record<string, unknown>} params - the tool's own, cloud choice included
+ * @returns {Promise<boolean>} whether anything changed
+ */
+export async function renderRegionInCloud(regionId, tool, params) {
+  const chapter = editor.chapter
+  const located = locateRegion(regionId)
+  if (!chapter || !located) return false
+  return applyInCloud({
+    chapterId: chapter.id,
+    pageIndex: located.pageIndex,
+    regionId,
+    tool,
+    params,
+    before: snapshot(located.region),
+  })
+}
+
+/**
+ * The cloud half of a click: one consent, then the render, watched.
+ *
+ * The chapter can change while the dialog is up or the render runs. A result
+ * for a chapter that is no longer open is not swapped into the one that is,
+ * and not recorded for its undo: the native side has already stored it on the
+ * page it belongs to, where the chapter shows it when it opens again.
+ *
+ * @param {{chapterId: string, pageIndex: number, regionId: string, tool: string, params: Record<string, unknown>, before: RegionState}} spec
+ * @returns {Promise<boolean>}
+ */
+async function applyInCloud({ chapterId, pageIndex, regionId, tool, params, before }) {
+  const where = { chapterId, pageIndex, regionId }
+  const intent = { action: 'applyTool', tool, params }
+  const grant = await requestCloudConsent({ ...where, intent })
+  if (!grant) return false
+
+  const result = await runCloudJob(
+    grant,
+    where,
+    (cloudParams) => getBackend().applyTool({ tool, params: { ...params, ...cloudParams }, ...where }),
+    cloudOutcomeOf,
+  )
+  if (!result || editor.chapter?.id !== chapterId) return false
+  return landApplied(result, regionId, before)
+}
+
+/**
+ * How an `applyTool` answer to a cloud render ended, for the status element.
+ *
+ * @param {any} result
+ * @returns {import('../state/cloud.svelte.js').CloudOutcome|null}
+ */
+function cloudOutcomeOf(result) {
+  switch (result?.status) {
+    case 'applied':
+      return { phase: 'committed' }
+    case 'failed':
+    case 'cancelled':
+    case 'unknown':
+      return { phase: result.status, errorCode: result.errorCode ?? null }
+    // The backend refused because cloud went off, and said so itself.
+    case 'blocked':
+      return { phase: 'failed', errorCode: 'cloud_disabled', quiet: true }
+    case 'not-found':
+      return { phase: 'failed', errorCode: 'region_not_found' }
+    default:
+      return null
+  }
+}
+
+/**
+ * Swap in what `applyTool` answered and record it for undo.
+ *
+ * @param {any} result
+ * @param {string} regionId
+ * @param {RegionState} before
+ * @returns {boolean} whether anything changed
+ */
+function landApplied(result, regionId, before) {
+  switch (result?.status) {
     case 'applied': {
       if (!result.region) return false
       // The page's status comes back with the region, as it does from every
       // other region-level edit: `api/tools.js#applyToolToRegion` moves an
       // unclean page to cleaned, and a region put back without its page's
-      // status is how a full track ends up under a "not cleaned" mark. This
-      // was a recorded gap in `ApplyResult`; closing it is one optional field.
+      // status is how a full track ends up under a "not cleaned" mark.
       replaceRegion(result.region, result.pageStatus)
       recordApply(regionId, before, {
         region: result.region,
@@ -132,10 +219,9 @@ export async function applyActiveToolToRegion(regionId, extraParams) {
     // result arrives on the event channel, never from this promise.
     case 'run-started':
       return adoptRun(result, 'page') !== null
-    // `'blocked'` can only be reached now by a path the gate above did not
-    // recognise, and the adapter has already said so on the notice channel.
-    // `'cancelled'` is the user abandoning a confirmation dialog: nothing was
-    // sent and nothing changed.
+    // `'blocked'` is a path the gate above did not recognise, and the adapter
+    // has already said so on the notice channel. A cloud render that stopped
+    // has had its notice from the status element.
     default:
       return false
   }
@@ -155,9 +241,19 @@ function recordApply(regionId, before, after) {
  * @returns {import('../api/backend.js').ApiRegion|null}
  */
 export function findRegion(regionId) {
+  return locateRegion(regionId)?.region ?? null
+}
+
+/**
+ * A region of the open chapter and the index of the page that holds it.
+ *
+ * @param {string} regionId
+ * @returns {{region: import('../api/backend.js').ApiRegion, pageIndex: number}|null}
+ */
+export function locateRegion(regionId) {
   for (const page of editor.chapter?.pages ?? []) {
     const region = page.regions.find((candidate) => candidate.id === regionId)
-    if (region) return region
+    if (region) return { region, pageIndex: page.index }
   }
   return null
 }

@@ -1,6 +1,7 @@
 <script>
   import { regionMenuSections } from '../model/masks.js'
   import { capabilities } from '../state/capabilities.svelte.js'
+  import { cloudUsable } from '../state/cloud.svelte.js'
   import { runRegionMenuItem } from './maskactions.svelte.js'
   import { ContextMenu } from '../ui/index.js'
   import { t } from '../i18n/index.js'
@@ -18,6 +19,10 @@
    * `maskactions.svelte.js#runRegionMenuItem`, which is the row's own controls
    * and no second implementation of them.
    *
+   * Cloud is among the engines while a cloud endpoint is ready
+   * (`state/cloud.svelte.js#cloudUsable`), and left out otherwise. Picking it,
+   * or Try again on a cloud mask, asks for consent before anything is sent.
+   *
    * Controlled: the host owns `at` - `{x, y, region}` in client pixels, or
    * `null` - and closes the menu by clearing it.
    *
@@ -30,7 +35,7 @@
 
   const sections = $derived(
     at
-      ? regionMenuSections(at.region, { engines: capabilities.engines }).map((section) => ({
+      ? regionMenuSections(at.region, { engines: capabilities.engines, cloud: cloudUsable() }).map((section) => ({
           id: section.id,
           label: section.labelKey ? t(section.labelKey) : null,
           items: section.items.map((item) => ({

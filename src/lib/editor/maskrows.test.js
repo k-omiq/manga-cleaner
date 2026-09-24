@@ -93,7 +93,7 @@ describe('maskRows - unfiltered', () => {
     expect(row.engine).toBe('fill')
   })
 
-  it('withholds Try again and the engine picker from a cloud mask', () => {
+  it('offers Try again and the engine picker on a cloud mask', () => {
     const cloud = mask({
       provenance: {
         ...mask().provenance,
@@ -103,13 +103,13 @@ describe('maskRows - unfiltered', () => {
     })
     const [row] = maskRows([region({ mask: cloud })])
     expect(row.engine).toBe('cloud')
-    // Re-running one is another billable request, and a list row cannot ask
-    // for the confirmation that would make spending legitimate.
-    expect(row.reRunnable).toBe(false)
+    // Re-running one is another request to the cloud GPU, and the consent
+    // dialog asks for it first (`maskactions.svelte.js#rerunMask`).
+    expect(row.reRunnable).toBe(true)
     expect(row.deletable).toBe(true)
   })
 
-  it('withholds reRunnable from a remote FLUX mask with cloud provenance', () => {
+  it('names a patch the cloud rendered Cloud, as the native side records it: FLUX with a cloud record', () => {
     const remoteFlux = mask({
       provenance: {
         ...mask().provenance,
@@ -118,11 +118,21 @@ describe('maskRows - unfiltered', () => {
       },
     })
     const [row] = maskRows([region({ mask: remoteFlux })])
-    expect(row.engine).toBe('flux')
-    expect(row.reRunnable).toBe(false)
+    expect(row.engine).toBe('cloud')
+    expect(row.titleKey).toBe('ladder.rung.cloud')
+    expect(row.facts[0]).toEqual({ key: 'masks.provenance.engine', valueKey: 'ladder.rung.cloud' })
+    // The model its own record names, not the version the replaced patch carried.
+    expect(row.facts[1]).toEqual({ key: 'masks.provenance.modelVersion', value: 'flux-schnell' })
+    expect(row.reRunnable).toBe(true)
     expect(row.deletable).toBe(true)
     // subline does not contain fake zero cost
     expect(row.sub.map((s) => s.key)).not.toContain('masks.value.cloudCost')
+  })
+
+  it('keeps naming a local FLUX patch FLUX', () => {
+    const [row] = maskRows([region({ mask: mask({ provenance: { ...mask().provenance, engine: 'flux' } }) })])
+    expect(row.engine).toBe('flux')
+    expect(row.titleKey).toBe('ladder.rung.flux')
   })
 })
 
@@ -211,7 +221,7 @@ describe('maskRow facts', () => {
     )
   })
 
-  it('renders explicit dash for cloudCost when cost is null', () => {
+  it('says the cost was not reported when a cloud render came back without one', () => {
     const cloudMaskNullCost = mask({
       provenance: {
         ...mask().provenance,
@@ -222,7 +232,7 @@ describe('maskRow facts', () => {
     const row = maskRow(region({ mask: cloudMaskNullCost }), false)
     expect(row.facts.find((fact) => fact.key === 'masks.provenance.cloudCost')).toEqual({
       key: 'masks.provenance.cloudCost',
-      value: '—',
+      valueKey: 'masks.value.cloudCostUnknown',
     })
   })
 

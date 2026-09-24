@@ -12,6 +12,7 @@
 
 import {
   fillModeLabel,
+  maskEngine,
   orderMasks,
   provenanceFacts,
   reRunnable,
@@ -39,7 +40,7 @@ import { rungLabel } from '../model/ladder.js'
  * @property {Array<{key: string, params?: Object}>} sub - the sub-line, in parts
  * @property {string|null} reasonKey - why it needs review, if it does
  * @property {boolean} deletable - always; every row can be removed, warnings included
- * @property {string|null} engine - the rung that produced the mask, for the row's engine picker
+ * @property {string|null} engine - what produced the mask, for the row's engine picker: a rung, or `cloud` for a mask the cloud rendered
  * @property {boolean} reRunnable - whether the row may offer Try again and an engine picker
  * @property {Fact[]} facts
  * @property {import('../model/masks.js').MaskAction[]} actions
@@ -117,7 +118,9 @@ export function maskRow(region, filtered) {
     // leave alone has to be dismissable, and dismissing it is the same act as
     // deleting a mask - the region goes, and undo brings it back.
     deletable: true,
-    engine: mask ? mask.provenance.engine : null,
+    // `cloud` for a patch the cloud rendered, which the native side records
+    // as the FLUX rung with a cloud record: the row says where it ran.
+    engine: maskEngine(mask),
     reRunnable: reRunnable(mask),
     facts: factsFor(region, mask, reasonKey),
     // Only the two an unmasked review entry offers. A mask's own four -
@@ -129,16 +132,16 @@ export function maskRow(region, filtered) {
 }
 
 /**
- * A mask is named by the engine that produced it; a region with no mask is
- * named by what happened to it instead, since "nothing" is exactly the case
- * the user cannot see on the page.
+ * A mask is named by the engine that produced it, Cloud for one the cloud
+ * rendered; a region with no mask is named by what happened to it instead,
+ * since "nothing" is exactly the case the user cannot see on the page.
  *
  * @param {import('../api/backend.js').ApiRegion} region
  * @param {import('../model/types.js').Mask|null} mask
  * @returns {string}
  */
 function titleKeyFor(region, mask) {
-  if (mask) return rungLabel(mask.provenance.engine)
+  if (mask) return rungLabel(maskEngine(mask) ?? '')
   if (region.outcome === 'declined') return 'masks.title.declined'
   if (region.outcome === 'gate-skipped') return 'masks.title.gateSkipped'
   return 'masks.title.noMask'
@@ -216,7 +219,8 @@ function displayFact(fact) {
       if (typeof fact.value === 'number' && Number.isFinite(fact.value)) {
         return { key: fact.key, valueKey: 'masks.value.cloudCost', params: { cost: fact.value } }
       }
-      return { key: fact.key, value: '—' }
+      // No cost came back with the render. Saying so beats a guessed one.
+      return { key: fact.key, valueKey: 'masks.value.cloudCostUnknown' }
     default:
       // A model version and a cloud request id are proper nouns; translating
       // them would be translating an identifier.

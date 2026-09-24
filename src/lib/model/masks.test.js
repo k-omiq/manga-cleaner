@@ -7,8 +7,11 @@
 
 import { describe, expect, it } from 'vitest'
 import {
+  CLOUD_ENGINE,
   FILL_MODES,
   ROW_ENGINES,
+  isCloudMask,
+  maskEngine,
   nextFillMode,
   provenanceFacts,
   reRunnable,
@@ -66,8 +69,55 @@ describe('rowEngines', () => {
     expect(rowEngines()).toEqual(['fill', 'denoise', 'lama'])
   })
 
-  it('never offers the cloud, whatever the machine has', () => {
-    expect(rowEngines({ flux: true })).not.toContain('cloud')
+  it('offers the cloud last, and only when an endpoint is ready', () => {
+    expect(rowEngines({ flux: true })).not.toContain(CLOUD_ENGINE)
+    expect(rowEngines({ flux: true }, { cloud: false })).not.toContain(CLOUD_ENGINE)
+    expect(rowEngines({ flux: true }, { cloud: true })).toEqual([...ROW_ENGINES, CLOUD_ENGINE])
+    expect(rowEngines(undefined, { cloud: true })).toEqual(['fill', 'denoise', 'lama', CLOUD_ENGINE])
+  })
+
+  it('keeps the cloud out of the shared rung list, which automatic runs read', () => {
+    // `editor/tools.js` builds Auto clean's engine rows and the AI mask
+    // brush's from ROW_ENGINES; an automatic run never reaches the cloud.
+    expect(ROW_ENGINES).not.toContain(CLOUD_ENGINE)
+  })
+})
+
+describe('cloud masks', () => {
+  const remote = {
+    id: 'c1-p001-r0',
+    mask: {
+      id: 'c1-p001-r0-m1',
+      fillMode: 'reconstruct',
+      provenance: { engine: 'flux', cloud: { provider: 'modal', request_id: 'req-123', cost: null } },
+    },
+  }
+
+  it('are the legacy cloud engine, or a patch with a cloud record, and read as Cloud', () => {
+    expect(isCloudMask(masked('cloud').mask)).toBe(true)
+    expect(isCloudMask(remote.mask)).toBe(true)
+    expect(maskEngine(remote.mask)).toBe(CLOUD_ENGINE)
+    expect(isCloudMask(masked('flux').mask)).toBe(false)
+    expect(maskEngine(masked('flux').mask)).toBe('flux')
+    expect(maskEngine(null)).toBe(null)
+  })
+
+  it('may be tried again, which asks for consent again', () => {
+    expect(reRunnable(remote.mask)).toBe(true)
+    expect(reRunnable(masked('cloud').mask)).toBe(true)
+    expect(reRunnable(null)).toBe(false)
+  })
+
+  it('keep Cloud checked in the menu, leading the list while the cloud is not ready', () => {
+    const sections = regionMenuSections(remote, { engines: { flux: false } })
+    expect(ids(sections)).toEqual(['retry', 'engine:cloud', 'engine:fill', 'engine:denoise', 'engine:lama', 'delete'])
+    const engines = sections.find((section) => section.id === 'engine')
+    expect(engines.items.filter((item) => item.selected).map((item) => item.id)).toEqual(['engine:cloud'])
+  })
+
+  it('take Cloud in its own place once the cloud is ready', () => {
+    const sections = regionMenuSections(remote, { engines: { flux: false }, cloud: true })
+    expect(ids(sections)).toEqual(['retry', 'engine:fill', 'engine:denoise', 'engine:lama', 'engine:cloud', 'delete'])
   })
 })
 
@@ -125,8 +175,7 @@ describe('regionMenuSections', () => {
   })
 
   it('leads with the rung in use even when the picker does not offer it', () => {
-    // Not reachable for `cloud` - that mask is not re-runnable at all - but a
-    // build that retires a rung must still name what a mask already ran on.
+    // A build that retires a rung must still name what a mask already ran on.
     const sections = regionMenuSections(masked('retired'), { engines: { flux: false } })
     const engines = sections.find((section) => section.id === 'engine')
     expect(engines.items[0]).toMatchObject({ id: 'engine:retired', selected: true })
@@ -138,28 +187,23 @@ describe('regionMenuSections', () => {
     expect(sections[0].items[0].labelKey).toBe('masks.action.deleteRegion')
   })
 
-  it('offers Delete alone for a cloud mask - a re-run is another billable request', () => {
-    expect(reRunnable(masked('cloud').mask)).toBe(false)
-    const sections = regionMenuSections(masked('cloud'))
-    expect(ids(sections)).toEqual(['delete'])
-    expect(sections[0].items[0].labelKey).toBe('masks.action.delete')
-  })
-
-  it('disables reRunnable for remote cloud FLUX masks to prevent unconfirmed paid execution', () => {
-    const remoteFlux = {
-      id: 'c1-p001-r0',
-      mask: {
-        id: 'c1-p001-r0-m1',
-        fillMode: 'reconstruct',
-        provenance: {
-          engine: 'flux',
-          cloud: { provider: 'modal', request_id: 'req-123', cost: null },
-        },
-      },
-    }
-    expect(reRunnable(remoteFlux.mask)).toBe(false)
-    const sections = regionMenuSections(remoteFlux)
-    expect(ids(sections)).toEqual(['delete'])
+  it('offers Cloud last for a local mask when the cloud is ready, and not otherwise', () => {
+    expect(ids(regionMenuSections(masked('lama'), { engines: { flux: false }, cloud: true }))).toEqual([
+      'retry',
+      'engine:fill',
+      'engine:denoise',
+      'engine:lama',
+      'engine:cloud',
+      'delete',
+    ])
+    expect(ids(regionMenuSections(masked('lama'), { engines: { flux: false }, cloud: false }))).not.toContain(
+      'engine:cloud',
+    )
+    const engines = regionMenuSections(masked('lama'), { cloud: true }).find((section) => section.id === 'engine')
+    expect(engines.items.find((item) => item.id === 'engine:cloud')).toMatchObject({
+      labelKey: 'masks.engineChoice.cloud',
+      selected: false,
+    })
   })
 
   it('allows reRunnable for local FLUX masks without cloud provenance', () => {

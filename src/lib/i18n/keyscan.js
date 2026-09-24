@@ -43,6 +43,7 @@ export const NAMESPACES = Object.freeze([
   'modal',
   'models',
   'notice',
+  'onboarding',
   'pages',
   'paging',
   'progress',

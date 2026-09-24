@@ -14,15 +14,64 @@ mod history;
 pub mod inference;
 mod library;
 mod models;
+pub mod provision;
 mod region;
 pub mod run;
 mod settings;
 mod tile;
 mod weights;
 
+/// The tray icon's id, so close-to-tray can check the icon exists.
+const TRAY_ID: &str = "main";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    use tauri::Manager;
     tauri::Builder::default()
+        .setup(|app| {
+            use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
+            let show = MenuItem::with_id(app, "show", "Show Manga Cleaner", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Quit Manga Cleaner", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &quit])?;
+            let mut tray = TrayIconBuilder::with_id(TRAY_ID)
+                .menu(&menu)
+                .show_menu_on_left_click(true)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "quit" => app.exit(0),
+                    _ => {}
+                });
+            if let Some(icon) = app.default_window_icon() {
+                tray = tray.icon(icon.clone());
+            }
+            // Not fatal: a Linux desktop without an AppIndicator host has no
+            // tray, and the editor works without one. Close-to-tray checks
+            // that the icon exists before it hides the window.
+            if let Err(error) = tray.build(app) {
+                eprintln!("tray icon unavailable: {error}");
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // Hiding the only window with no tray icon to bring it back
+                // would leave the app running with no way to reach it.
+                let keep_running = window.app_handle().tray_by_id(TRAY_ID).is_some()
+                    && settings::read(window.app_handle())
+                        .ok()
+                        .and_then(|value| value.get("closeToTray").and_then(|v| v.as_bool()))
+                        .unwrap_or(false);
+                if keep_running {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         // The one capability the window has beyond `core:default`: a folder
         // chooser. Import cannot be real without it - a project and a chapter
         // each need a source folder, and until this plugin was registered the
@@ -53,6 +102,14 @@ pub fn run() {
             inference::commands::get_cloud_attempt_result,
             inference::commands::cancel_cloud_attempt,
             inference::commands::reconcile_cloud_recovery,
+            provision::run_cloud_provisioner,
+            provision::provision_inspect,
+            provision::provision_plan,
+            provision::provision_apply,
+            provision::provision_resume,
+            provision::provision_cleanup,
+            provision::provision_probe,
+            provision::cancel_cloud_provisioner,
             library::list_projects,
             library::create_project,
             library::create_chapter,
@@ -99,6 +156,15 @@ pub fn run() {
                 library::resolve_chapter(app, chapter_id).map_err(|error| error.to_string())
             }),
         )
-        .run(tauri::generate_context!())
-        .expect("error while running the application");
+        .build(tauri::generate_context!())
+        .expect("error while building the application")
+        .run(|_app, event| {
+            // The provisioner helper leads its own process group, so nothing
+            // ends it when this process ends. A quit during cloud setup stops
+            // it here rather than leaving it deploying with no one to read the
+            // result; its journal makes a later resume safe.
+            if let tauri::RunEvent::Exit = event {
+                provision::stop_helpers_for_exit();
+            }
+        });
 }

@@ -15,7 +15,7 @@ Remove Japanese text from manga and webtoon pages, locally.
 [![Rust](https://img.shields.io/badge/Rust-core-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![ONNX Runtime](https://img.shields.io/badge/ONNX%20Runtime-1.28-005ce6?style=flat-square&logo=onnx&logoColor=white)](https://onnxruntime.ai/)
 
-Manga Cleaner is a standalone desktop app that detects speech bubbles and free text, keeps only the Japanese ones, fits masks at native resolution, and cleans each region with the lightest engine that can do the job. Everything runs on your machine: no account, no upload, no Python. Pixels outside an edited region stay bit-identical to the source, and colour mode, bit depth, embedded ICC profile, and metadata are carried through to export.
+Manga Cleaner is a standalone desktop app that detects speech bubbles and free text, keeps only the Japanese ones, fits masks at native resolution, and cleans each region with the lightest engine that can do the job. Everything runs on your machine by default: no account, no upload, no Python. An optional cloud GPU on your own Modal or Beam account stays off until you set it up. Pixels outside an edited region stay bit-identical to the source, and colour mode, bit depth, embedded ICC profile, and metadata are carried through to export.
 
 ## Demo: pick the right engine
 
@@ -31,7 +31,7 @@ Download the installer from [cleaner.komiq.cc](https://cleaner.komiq.cc): a `.dm
 
 Windows needs 10 version 1803 x64 or later, which is what WebView2, the Visual C++ 2015-2022 runtime and ONNX Runtime 1.28 each require on their own. The Visual C++ runtime is not something to install: the four libraries the ONNX Runtime imports outright ship beside the executable, where the loader finds them first.
 
-Model weights and the runtime are not bundled, which keeps the installer small and respects weight provenance. On first launch the app offers to download the ONNX Runtime (about 32 MB on macOS, about 200 MB on Windows) plus the five required model weights (about 317 MB in total). Anything declined or missed can be fetched later from **Settings › Models**. An optional Japanese text reader (about 460 MB, three files) can be added from the same panel: it recovers roughly 5% of speech balloons that the script gate cannot read and would otherwise go to review uncleaned, and nothing else depends on it. For offline setups, place the verified files in the application's `models/` directory instead.
+Model weights and the runtime are not bundled, which keeps the installer small and respects weight provenance. The first-launch setup walks through the downloads (the ONNX Runtime, about 32 MB on macOS, about 200 MB on Windows, plus the five required model weights, about 317 MB in total), the defaults, an optional cloud GPU and app behavior. Anything declined or missed can be fetched later from **Settings › Models**. An optional Japanese text reader (about 460 MB, three files) can be added from the same panel: it recovers roughly 5% of speech balloons that the script gate cannot read and would otherwise go to review uncleaned, and nothing else depends on it. For offline setups, place the verified files in the application's `models/` directory instead.
 
 Intel Macs (`x86_64`) are unsupported: ONNX Runtime 1.28.0 publishes no `osx-x86_64` archive. Linux `x86_64` has a GPU path (the WebGPU plugin, with CUDA flavours for NVIDIA) that has not been executed on real hardware; Linux `aarch64` is best effort and CPU only. Neither is part of the release workflow.
 
@@ -47,10 +47,12 @@ Intel Macs (`x86_64`) are unsupported: ONNX Runtime 1.28.0 publishes no `osx-x86
 - Hardware acceleration chosen per model, overridable in **Settings › Acceleration**.
 - Optional Japanese text reader (manga-ocr) that rescues balloons the script gate cannot classify.
 - Keyboard shortcuts for every tool and panel, rebindable in Settings.
+- Optional cloud GPU on your own Modal or Beam account: paste a token and the app sets up the GPU endpoint for you. Off by default, every render is confirmed, and only a crop around the region is sent.
+- Skippable first-launch setup that walks through model downloads, defaults, an optional cloud GPU and app behavior.
 
 ## Built with
 
-[Tauri 2](https://v2.tauri.app/) for the shell, [Svelte 5](https://svelte.dev/) for the interface, a pure [Rust](https://www.rust-lang.org/) core for the pipeline, [ONNX Runtime](https://onnxruntime.ai/) for inference, and pure-Rust image I/O throughout. No Python is bundled or required.
+[Tauri 2](https://v2.tauri.app/) for the shell, [Svelte 5](https://svelte.dev/) for the interface, a pure [Rust](https://www.rust-lang.org/) core for the pipeline, [ONNX Runtime](https://onnxruntime.ai/) for inference, and pure-Rust image I/O throughout. The pipeline needs no Python. The one Python program the installer ships, the cloud setup helper, is frozen into its own executable and runs only while you set up, resume or remove a cloud GPU.
 
 Weights live outside this repository and are fetched at setup under their own licences:
 
@@ -112,7 +114,7 @@ npx tauri build
 
 ## Status
 
-The frontend is complete and tested (904 frontend tests, 822 Rust tests), and the Rust backend runs a page end to end: detection, bubble classification, script gating, mask fitting, fill, denoise, and LaMa inpainting, compositing, and export with asserted colour fidelity. Virtual stitching and streaming memory boundaries for long-strip webtoons are implemented, though cross-join detection overlap and real-world memory bounds are not yet measured against a large corpus. Windows and Linux runtime and GPU figures remain unmeasured on physical hardware. Known issues in the ladder: manga-LaMa can leave phantom text marks inside bubbles, quality metrics need tuning for outline-dominated regions, and the escalation path wants testing on more screentone fixtures. The optional FLUX.2 Klein sidecar runs over loopback HTTP and is measured on Apple Silicon, but is not yet validated across general manga styles.
+The frontend is complete and tested (1,094 frontend tests, 1,037 Rust tests, and 314 Python tests for the cloud setup helper and gateways), and the Rust backend runs a page end to end: detection, bubble classification, script gating, mask fitting, fill, denoise, and LaMa inpainting, compositing, and export with asserted colour fidelity. Virtual stitching and streaming memory boundaries for long-strip webtoons are implemented, though cross-join detection overlap and real-world memory bounds are not yet measured against a large corpus. Windows and Linux runtime and GPU figures remain unmeasured on physical hardware. Known issues in the ladder: manga-LaMa can leave phantom text marks inside bubbles, quality metrics need tuning for outline-dominated regions, and the escalation path wants testing on more screentone fixtures. The optional FLUX.2 Klein sidecar runs over loopback HTTP and is measured on Apple Silicon, but is not yet validated across general manga styles. The optional cloud GPU path (automatic Modal or Beam setup, a confirmation per render, cancel and recovery) is built and tested offline against fakes, and has not yet run against a real Modal or Beam account.
 
 ## Licence
 

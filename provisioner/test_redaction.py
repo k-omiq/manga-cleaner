@@ -46,6 +46,13 @@ class TestCredentialRedaction(unittest.TestCase):
         self.assertNotIn("super_secret_jwt_token_123456", redacted)
         self.assertIn("Bearer [REDACTED]", redacted)
 
+    def test_quoted_json_key_value_redaction(self):
+        self.assertEqual(redact_string('{"secret": "hunter2hunter2"}'), '{"secret": "[REDACTED]"}')
+        self.assertEqual(redact_string("{'api_key':'abcdef123456'}"), "{'api_key':'[REDACTED]'}")
+        self.assertEqual(redact_string("password = hunter2hunter2"), "password = [REDACTED]")
+        # Names that only start with a secret word stay readable.
+        self.assertEqual(redact_string('{"secret_name": "MC_MC_AB12CD_TOKEN"}'), '{"secret_name": "MC_MC_AB12CD_TOKEN"}')
+
     def test_query_param_token_redaction(self):
         url = "https://gateway.beam.cloud/v1/jobs/123/result?token=secret_query_val_999&format=png"
         redacted = redact_string(url)
@@ -162,6 +169,35 @@ class TestCredentialRedaction(unittest.TestCase):
         self.assertNotIn("b9_my_secret_token_000", serialized)
         self.assertNotIn("as-modal-secret-111", serialized)
         self.assertNotIn("b9_another_secret", serialized)
+
+
+    def test_modal_proxy_secret_redacted_but_token_id_kept(self):
+        """ws- secrets are redacted in text; the wk- id stays, the journal needs it for cleanup."""
+        text = "proxy token wk-AbC123def456 secret ws-XyZ789ghi012"
+        redacted = redact_string(text)
+        self.assertNotIn("ws-XyZ789ghi012", redacted)
+        self.assertIn("ws-[REDACTED]", redacted)
+        self.assertIn("wk-AbC123def456", redacted)
+
+    def test_names_ending_in_a_token_prefix_are_not_tokens(self):
+        """A Modal host for the workspace "studio-ws" is a name, not a ws- secret."""
+        url = "https://studio-ws--mc-ab12cd-gateway.modal.run/mc/v1"
+        self.assertEqual(redact_string(url), url)
+        self.assertEqual(redact_string("team-as-staging-2024.example"), "team-as-staging-2024.example")
+        self.assertEqual(redact_string("secret=ws-XyZ789ghi012"), "secret=ws-[REDACTED]")
+        self.assertEqual(redact_string("(ws-XyZ789ghi012)"), "(ws-[REDACTED])")
+
+    def test_patterns_off_keeps_names_and_still_redacts_known_secrets(self):
+        GLOBAL_REGISTRY.register("as-registered-secret-1")
+        try:
+            record = {"environment_name": "ws-staging-env1", "note": "as-registered-secret-1", "token": "x-1234"}
+            self.assertEqual(
+                redact_data(record, patterns=False),
+                {"environment_name": "ws-staging-env1", "note": "[REDACTED_CREDENTIAL]", "token": "[REDACTED_CREDENTIAL]"},
+            )
+            self.assertEqual(redact_data(record)["environment_name"], "ws-[REDACTED]")
+        finally:
+            GLOBAL_REGISTRY.unregister("as-registered-secret-1")
 
 
 if __name__ == "__main__":

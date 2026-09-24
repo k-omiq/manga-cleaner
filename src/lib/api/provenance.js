@@ -54,8 +54,14 @@ export const ENGINE_INFO = Object.freeze({
     elapsed: [10000, 60000],
     fillMode: 'reconstruct',
   },
+  // FLUX.2 Klein on the user's own Modal or Beam endpoint: rung 3a's recipe
+  // (IC-6), run on a GPU in their account, one consent per request. A render
+  // committed today is recorded as `flux` with a `provenance.cloud` record
+  // that names the provider, the endpoint and the model
+  // (`mock.js#cloudRecordFor`), the way the native side records it; this
+  // entry describes a mask whose engine is `cloud` itself.
   cloud: {
-    version: 'gemini-3.1-flash-image',
+    version: 'flux2-klein-4b sdnq-4bit',
     modelSha: null,
     provider: 'cloud',
     elapsed: [3000, 15000],
@@ -76,20 +82,6 @@ export const ENGINE_INFO = Object.freeze({
     fillMode: 'match-surround',
   },
 })
-
-/** The five cloud rejection causes, in doc order. */
-export const CLOUD_REJECTION_CAUSES = Object.freeze([
-  'safety-filter',
-  'transport-error',
-  'parameter-test',
-  'residual-test',
-  'structural',
-])
-
-/** Cloud tier and price (NB2 @1K). */
-export const CLOUD_TIER = '1K'
-export const CLOUD_COST = 0.067
-export const CLOUD_PROVIDER = 'google'
 
 /** Constants the pipeline actually ran with. */
 const PARAMS_SNAPSHOT = Object.freeze({
@@ -158,8 +150,6 @@ export function capRung(requested, ceiling) {
  * @property {'match-surround'|'reconstruct'|'solid'} [fillMode]
  * @property {number} [elapsedMs] - overrides the engine's simulated range
  * @property {boolean} [fittingReconstructed]
- * @property {import('../model/types.js').CloudOutcome|null} [cloudOutcome]
- * @property {boolean} [cloudBilled] - record a `Provenance.cloud` block (an accepted request)
  */
 
 /**
@@ -188,7 +178,10 @@ export function buildMask(spec) {
     fillMode: spec.fillMode ?? info.fillMode,
     elapsedMs,
     fittingReconstructed: spec.fittingReconstructed ?? false,
-    cloudOutcome: spec.cloudOutcome ?? null,
+    // Always null, as on every mask the native side makes today: it carries
+    // an outcome only for a job saved with a legacy cloud review state
+    // (`src-tauri/src/library.rs#review_flags`).
+    cloudOutcome: null,
     provenance: {
       engine: spec.engine,
       engine_version: info.version,
@@ -197,15 +190,8 @@ export function buildMask(spec) {
       params_snapshot,
       mask_sha256: spec.rng.sha256(),
       source_sha256: spec.sourceSha,
-      cloud: spec.cloudBilled
-        ? {
-            provider: CLOUD_PROVIDER,
-            model: ENGINE_INFO.cloud.version,
-            request_id: `req-${spec.rng.sha256().slice(0, 16)}`,
-            tier: CLOUD_TIER,
-            cost: CLOUD_COST,
-          }
-        : null,
+      // A cloud render records its own (`mock.js#commitCloudResult`).
+      cloud: null,
       created: spec.created,
     },
   }

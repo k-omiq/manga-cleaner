@@ -187,5 +187,41 @@ class TestHelperProtocol(unittest.TestCase):
         self.assertEqual(len(data["error"]["remedy_steps"]), 2)
 
 
+    def test_ic1_carve_out_keeps_only_the_runtime_credential_and_endpoint(self):
+        """Everything is redacted except the credential and endpoint apply or resume issue."""
+        credential = {"kind": "modal_proxy", "token_id": "wk-abcdef123456", "token_secret": "ws-abcdef123456"}
+        resp = make_success_response(
+            "req-ic1",
+            {
+                "installation_id": "mc-ab12cd",
+                "setup_token": "as-setup-secret-123456",
+                "runtime_credential": dict(credential),
+                "note": "setup used as-setup-secret-123456",
+            },
+            verbatim={"runtime_credential": credential, "endpoint_url": "https://ws--mc-ab12cd-gateway.modal.run/mc/v1"},
+        )
+        data = json.loads(resp.serialize())["data"]
+        self.assertEqual(data["runtime_credential"], credential)
+        self.assertEqual(data["endpoint_url"], "https://ws--mc-ab12cd-gateway.modal.run/mc/v1")
+        self.assertEqual(data["setup_token"], "[REDACTED_CREDENTIAL]")
+        self.assertNotIn("as-setup-secret-123456", json.dumps(data))
+        # to_dict never carries the carve-out, so no other path can leak it
+        self.assertEqual(resp.to_dict()["data"]["runtime_credential"]["token_secret"], "ws-abcdef123456")
+        self.assertNotIn("verbatim", resp.to_dict())
+
+    def test_carve_out_is_limited_to_two_fields_and_success(self):
+        with self.assertRaises(ValueError):
+            make_success_response("req-x", {}, verbatim={"setup_token": "as-nope"})
+        failed = HelperResponse(HELPER_PROTOCOL_VERSION, "req-f", False, {}, {"code": "E"}, verbatim={"endpoint_url": "x"})
+        self.assertEqual(json.loads(failed.serialize())["data"], {})
+
+    def test_without_carve_out_the_runtime_credential_is_redacted(self):
+        resp = make_success_response(
+            "req-plain", {"runtime_credential": {"kind": "beam_bearer", "token": "b9_secret_token_value"}}
+        )
+        data = json.loads(resp.serialize())["data"]
+        self.assertEqual(data["runtime_credential"], {"kind": "beam_bearer", "token": "[REDACTED_CREDENTIAL]"})
+
+
 if __name__ == "__main__":
     unittest.main()

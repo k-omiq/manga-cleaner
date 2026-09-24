@@ -274,12 +274,17 @@ import { createTauriBackend, isTauri } from './tauri.js'
  * a full track under a "not cleaned" mark - the same reason `deleteMask`,
  * `rerunMask` and `cleanAnyway` all report it. Present on `'applied'` only.
  *
+ * `needs-confirmation` is the answer to a cloud engine named without a grant:
+ * the interface asks for consent (`editor/cloudflow.svelte.js`) and calls
+ * again with one. A cloud render that did not commit answers `failed`,
+ * `cancelled` or `unknown`, with the reason in `errorCode`.
+ *
  * @typedef {Object} ApplyResult
- * @property {'applied'|'needs-confirmation'|'blocked'|'run-started'|'not-found'} status
+ * @property {'applied'|'needs-confirmation'|'blocked'|'run-started'|'not-found'|'failed'|'cancelled'|'unknown'} status
+ * @property {string} [errorCode] - why a cloud render did not commit
  * @property {ApiRegion} [region]
  * @property {import('../model/types.js').Mask} [mask]
  * @property {string} [pageStatus]
- * @property {{ kind: 'cloud-transmission'|'cloud-cost', regionId: string, estimatedCost: number }} [confirmation]
  * @property {string|null} [runId]
  * @property {Array<{chapterId: string, pageId: string, pageIndex: number}>} [pages]
  */
@@ -339,8 +344,8 @@ import { createTauriBackend, isTauri } from './tauri.js'
  * @property {(spec: {chapterId: string, pageIndex: number, bbox: {x: number, y: number, w: number, h: number}, tool: string, params?: Object}) => Promise<{region: ApiRegion, pageStatus: string}|null>} createRegion - a region drawn by hand, with a hand mask already committed
  * @property {(spec: {maskId: string}) => Promise<{region: null, pageStatus: string}|null>} deleteMask - deleting a mask deletes the row: the text under it comes back and the region goes off the page, so there is no region to answer with. `null` (rather than `{region: null}`) means the mask was not found
  * @property {(spec: {regionId: string, region: ApiRegion|null, pageStatus?: string}) => Promise<ApiRegion|null>} restoreRegion - put a region back as it was; the undo half of every region-level edit. `region: null` means it was not there
- * @property {(spec: {maskId: string, kind: 'stronger'|'simpler'|'cycleFill'|'reopenInTool'|'retry'|'engine', engine?: string}) => Promise<{region: ApiRegion, mask: import('../model/types.js').Mask, reopenTool: string|null, pageStatus: string}|null>} rerunMask - `engine` names the rung `kind: 'engine'` runs at; `'retry'` re-runs the rung the mask already used
- * @property {(spec: {regionId: string, engine?: string}) => Promise<{region: ApiRegion, mask: import('../model/types.js').Mask, pageStatus: string}|null>} cleanAnyway - `engine` is the starting rung: the user's `fill`/`redraw` pick for this kind of text, or a rung named outright. The automatic pass never cleans an out-of-balloon region; this is where the pick for one bites
+ * @property {(spec: {maskId: string, kind: 'stronger'|'simpler'|'cycleFill'|'reopenInTool'|'retry'|'engine', engine?: string, params?: CloudRunParams}) => Promise<{region: ApiRegion, mask: import('../model/types.js').Mask, reopenTool: string|null, pageStatus: string}|null>} rerunMask - `engine` names the rung `kind: 'engine'` runs at; `'retry'` re-runs the rung the mask already used
+ * @property {(spec: {regionId: string, engine?: string, params?: CloudRunParams}) => Promise<{region: ApiRegion, mask: import('../model/types.js').Mask, pageStatus: string}|null>} cleanAnyway - `engine` is the starting rung: the user's `fill`/`redraw` pick for this kind of text, or a rung named outright. The automatic pass never cleans an out-of-balloon region; this is where the pick for one bites
  * @property {(opts: {chapterId: string, format?: string, destination?: 'new-folder'|'source-folder'|string, masks?: 'flattened'|'separate-layer', layout?: 'per-page'|'stitched'}) => Promise<{status: 'exported'|'refused', fileCount?: number, path?: string, reasonKey?: string, gutterPixels?: number}|null>} exportChapter - `format` is `'PNG' | 'TIFF' | 'PSD' | 'CBZ'`; `destination` also takes an absolute path; `layout: 'stitched'` is longstrip only and never PSD; `masks: 'separate-layer'` is a mask file beside each raster page or a layer per region in a PSD, and is refused for CBZ; `gutterPixels` comes back on a stitched export alone
  * @property {() => Promise<Object>} readSettings
  * @property {(patch: Object) => Promise<Object>} writeSettings
@@ -357,7 +362,7 @@ import { createTauriBackend, isTauri } from './tauri.js'
  * @property {(spec: { attemptId: string, handle?: string }) => Promise<import('../model/types.js').CloudAttemptStatus>} getCloudAttemptStatus - poll authoritative remote attempt lifecycle status
  * @property {(spec: { attemptId: string, handle?: string }) => Promise<import('../model/types.js').CloudAttemptResult>} getCloudAttemptResult - retry-safe, idempotent retrieval of validated output crop
  * @property {(spec: { attemptId: string, handle?: string }) => Promise<import('../model/types.js').CloudCancelResult>} cancelCloudAttempt - request nonterminal attempt cancellation
- * @property {(spec?: { attemptId?: string, chapterId?: string, pageIndex?: number, regionId?: string, regionRevision?: number|string, sourceImageHash?: string, simulateStale?: boolean }) => Promise<import('../model/types.js').CloudRecoveryDecision>} reconcileCloudRecovery - evaluate crash discovery and attempt recovery against local project snapshot
+ * @property {(spec?: { apply?: boolean, attemptId?: string, chapterId?: string, pageIndex?: number, regionId?: string, regionRevision?: number|string, sourceImageHash?: string, simulateStale?: boolean }) => Promise<import('../model/types.js').CloudRecoveryDecision|CloudRecoveryReport>} reconcileCloudRecovery - evaluate crash discovery against the local project. With `apply: true` it recovers - resumes accepted attempts, attaches cached results, never resubmits an unknown one - and answers a `CloudRecoveryReport`
  * @property {() => Promise<{available: boolean, reasonKey: string|null}>} sidecarAvailable - whether rung 3a (the FLUX sidecar) can be offered on this machine. `reasonKey` is null when there is nothing to say, which is the ordinary case of nothing installed
  * @property {() => Promise<Array<{id: string, label: string}>>} listSidecarModels - list available model directories discovered under the sidecar weights root
  * @property {() => Promise<{appVersion: string, facts: Array<{labelKey: string, value: string}>}>} about
@@ -372,6 +377,61 @@ import { createTauriBackend, isTauri } from './tauri.js'
  * @property {(spec: {id: string}) => Promise<boolean>} discardPartial - throw away the unfinished download the row reports as `partialBytes`, and say whether there was one. `false` is also what a transfer in flight answers: its `.part` is a file being written and is not deleted out from under it
  * @property {() => Promise<DownloadStart>} downloadRuntime - fetch and unpack the ONNX Runtime build this platform is set to; reports under the id `runtime`
  * @property {() => Promise<DeleteOutcome>} deleteRuntime - remove it from the app-data runtimes directory only, with the same three answers `deleteModel` gives
+ * @property {(spec: { op: string, provider: string, params?: Object }) => Promise<Object>} runCloudProvisioner - execute bounded cloud provisioner helper operation (inspect/plan/apply/resume/cleanup/probe) with secrets via stdin only
+ * @property {() => Promise<unknown>} cancelCloudProvisioner - stop the helper that is running. Its journal makes a later `resume` safe, so a stop loses nothing already created
+ * @property {(handler: (event: ProvisionProgress) => void) => Promise<() => void>} onProvisionProgress - `provision://progress`: one event per step the helper starts, finishes, skips or fails. Answers with a promise of the unlisten function
+ * @property {(handler: (event: CloudAttemptEvent) => void) => Promise<() => void>} onCloudAttempt - `cloud://attempt`: one event per phase of an interactive cloud render. Answers with a promise of the unlisten function
+ */
+
+/**
+ * One step of a running provisioner, as the core relays it from the helper's
+ * progress lines. Every field is from a fixed set; no free text crosses.
+ *
+ * @typedef {Object} ProvisionProgress
+ * @property {string} op - the helper op the step belongs to (`apply`, `resume`, `cleanup_apply`, ...)
+ * @property {'modal'|'beam'} provider
+ * @property {'inspect'|'validate'|'volume'|'state'|'secret'|'image'|'deploy'|'weights'|'token'|'endpoint'|'health'|'cleanup'} step
+ * @property {'start'|'done'|'fail'|'skip'} state
+ * @property {number|null} pct - 0..100 where the step can tell, null where it cannot
+ */
+
+/**
+ * One phase change of an interactive cloud render.
+ *
+ * `attemptId` is `att-` plus the first 24 hex digits of the SHA-256 of the
+ * grant's nonce, so the first event of a render already names it and a Cancel
+ * can be offered from the first moment.
+ *
+ * @typedef {Object} CloudAttemptEvent
+ * @property {string} attemptId
+ * @property {string} regionId
+ * @property {string} chapterId
+ * @property {number} pageIndex
+ * @property {'preparing'|'submitting'|'queued'|'running'|'downloading'|'compositing'|'committed'|'failed'|'cancelled'|'unknown'} phase
+ * @property {number} elapsedMs - since the render started
+ * @property {string|null} errorCode - a stable snake_case code on `failed`, null otherwise
+ */
+
+/**
+ * What `reconcileCloudRecovery({apply: true})` did at startup. Each entry names
+ * where the attempt belongs; `reason` says why one needs a person.
+ *
+ * @typedef {Object} CloudRecoveryReport
+ * @property {Array<{attemptId: string, chapterId: string, pageIndex: number, regionId: string}>} attached
+ * @property {Array<{attemptId: string, chapterId: string, pageIndex: number, regionId: string}>} stillRunning
+ * @property {Array<{attemptId: string, chapterId: string, pageIndex: number, regionId: string, reason: 'ambiguous'|'stale'|'failed'}>} needsAttention
+ */
+
+/**
+ * The four fields a cloud run carries, on every command that can start one:
+ * the grant `confirmCloudConsent` minted, and the target, recipe and intent it
+ * was minted for. A command given a grant it cannot match refuses the run.
+ *
+ * @typedef {Object} CloudRunParams
+ * @property {string} grantNonce
+ * @property {ExecutionTarget} executionTarget
+ * @property {import('../model/types.js').RenderRecipe} recipe
+ * @property {import('../model/types.js').OperationIntent} intent
  */
 
 /**
@@ -637,6 +697,20 @@ export const TAURI_REGISTERED_CLOUD_COMMANDS = Object.freeze([
 export const TAURI_PENDING_CLOUD_COMMANDS = Object.freeze([])
 
 /**
+ * The cloud provisioner helper IPC commands registered in `src-tauri/src/lib.rs`.
+ */
+export const TAURI_PROVISIONER_COMMANDS = Object.freeze([
+  'run_cloud_provisioner',
+  'cancel_cloud_provisioner',
+  'provision_inspect',
+  'provision_plan',
+  'provision_apply',
+  'provision_resume',
+  'provision_cleanup',
+  'provision_probe',
+])
+
+/**
  * Truthfully reports whether all required remote execution lifecycle commands are registered in Tauri IPC.
  * Registration indicates that genuine backend handlers exist in `src-tauri/src/lib.rs` and are mapped in the adapter.
  *
@@ -647,14 +721,135 @@ export function isCloudExecutionRegistered() {
 }
 
 /**
- * Reports whether remote cloud execution is ready for live operations.
+ * Whether a cloud render can be offered right now, and when it cannot, why.
  *
- * Semantic split: while Tauri IPC command registration truth is true (`isCloudExecutionRegistered() === true`),
- * execution readiness must remain false until an authoritative backend capability exists.
- * Caller-supplied attestation is rejected to prevent untrusted premature readiness bypass.
+ * Composed from three commands that already exist rather than asked of a
+ * fourth, because each answers a different question and each is the
+ * authority for its own: the permission is a setting, the default target is
+ * the inference configuration, and whether a runtime secret is stored for it
+ * is the credential store's summary - which says *present* and never says
+ * the secret.
  *
- * @returns {boolean}
+ * `reason` is the first thing missing, in the order a person fixes them:
+ * `off` (the permission switch), `noTarget` (no cloud endpoint is the
+ * default, or the default names a profile that is gone), `noSecret` (the
+ * endpoint has no runtime token), `unknown` (a read failed; not ready, and
+ * nothing more can honestly be said).
+ *
+ * The target, the profile and `configured` (a default cloud endpoint whose
+ * profile exists and has a runtime token stored) are read whether or not the
+ * permission is on, so a status line can say which endpoint would be used and
+ * whether switching cloud on is all that is left. `ready` is `allowed` and
+ * `configured` together, and is the only field that may enable a cloud action.
+ *
+ * @typedef {Object} CloudReadiness
+ * @property {boolean} allowed
+ * @property {boolean} configured
+ * @property {boolean} ready
+ * @property {'off'|'noTarget'|'noSecret'|'unknown'|null} reason - null when ready
+ * @property {ExecutionTarget|null} target
+ * @property {CloudProfile|null} profile
+ * @property {CloudEndpoint[]} endpoints - every saved endpoint, read in the same pass
  */
-export function isCloudExecutionReady() {
-  return false
+
+/**
+ * A saved cloud endpoint as the interface names it: never a secret.
+ *
+ * @typedef {Object} CloudEndpoint
+ * @property {'modal'|'beam'} provider
+ * @property {string} id
+ * @property {string} name
+ * @property {string} endpointUrl
+ */
+
+/**
+ * @param {any} config - an inference config
+ * @returns {CloudEndpoint[]}
+ */
+function cloudEndpointsOf(config) {
+  /** @type {CloudEndpoint[]} */
+  const list = []
+  for (const provider of /** @type {const} */ (['modal', 'beam'])) {
+    const profiles = config?.[provider === 'modal' ? 'modalProfiles' : 'beamProfiles']
+    if (!profiles || typeof profiles !== 'object') continue
+    for (const [id, profile] of Object.entries(profiles)) {
+      if (!profile || typeof profile !== 'object') continue
+      list.push({
+        provider,
+        id,
+        name: typeof profile.name === 'string' ? profile.name.trim() : '',
+        endpointUrl: typeof profile.endpointUrl === 'string' ? profile.endpointUrl : '',
+      })
+    }
+  }
+  return list
+}
+
+/**
+ * @param {Backend} [backend]
+ * @returns {Promise<CloudReadiness>}
+ */
+export async function readCloudReadiness(backend = getBackend()) {
+  /** @type {CloudReadiness} */
+  const verdict = {
+    allowed: false,
+    configured: false,
+    ready: false,
+    reason: 'unknown',
+    target: null,
+    profile: null,
+    endpoints: [],
+  }
+  try {
+    const settings = await backend.readSettings()
+    verdict.allowed = settings?.cloudEngines === 'allowed'
+    const config = await backend.readInferenceConfig()
+    verdict.endpoints = cloudEndpointsOf(config)
+    const selected = config?.selectedTarget
+    const profiles =
+      selected?.type === 'modal'
+        ? config.modalProfiles
+        : selected?.type === 'beam'
+          ? config.beamProfiles
+          : null
+    const profile = profiles && selected.profile_id ? (profiles[selected.profile_id] ?? null) : null
+    let secret = false
+    if (profile) {
+      verdict.target = { type: selected.type, profile_id: selected.profile_id }
+      verdict.profile = profile
+      const summary = await backend.getCloudSecretSummary({
+        provider: verdict.target.type,
+        profileId: verdict.target.profile_id,
+        role: 'runtime',
+      })
+      secret = summary?.present === true
+    }
+    verdict.configured = verdict.target !== null && secret
+    verdict.reason = !verdict.allowed
+      ? 'off'
+      : !verdict.target
+        ? 'noTarget'
+        : !verdict.configured
+          ? 'noSecret'
+          : null
+    verdict.ready = verdict.allowed && verdict.configured
+    return verdict
+  } catch {
+    verdict.configured = false
+    verdict.ready = false
+    verdict.reason = 'unknown'
+    return verdict
+  }
+}
+
+/**
+ * Whether cloud execution is ready: the permission is on, the default target
+ * is a cloud endpoint whose profile exists, and a runtime secret is stored for
+ * it. Anything it cannot read counts as not ready.
+ *
+ * @param {Backend} [backend]
+ * @returns {Promise<boolean>}
+ */
+export async function isCloudExecutionReady(backend = getBackend()) {
+  return (await readCloudReadiness(backend)).ready
 }

@@ -15,14 +15,31 @@
  *
  * **It adds no seam method.** The run is `downloadRuntime` and then
  * `downloadModel` per row, one at a time, with progress arriving on the
- * process-wide `model-progress` channel Settings reads as well.
+ * process-wide `model-progress` channel Settings reads as well. The settings
+ * the later steps change go through the session's own setters and
+ * `writeSettings`, which is the path Settings takes.
  */
 
 import { getBackend } from '../api/backend.js'
-import { markFirstLaunchOffered } from '../state/session.svelte.js'
+import {
+  backendSettingsPatch,
+  markFirstLaunchOffered,
+  session,
+  setCloudAllowed,
+  setFluxModel,
+} from '../state/session.svelte.js'
 import { setDialogOutsideStack } from '../shortcuts.js'
-import { loadCapabilities } from '../state/capabilities.svelte.js'
-import { RUNTIME_ID, downloadQueue, firstLaunchPlan, initialSelection, plannedBytes } from './firstlaunch.js'
+import { capabilities, loadCapabilities } from '../state/capabilities.svelte.js'
+import {
+  RUNTIME_ID,
+  FIRST_LAUNCH_STEPS,
+  defaultFluxModel,
+  downloadQueue,
+  firstLaunchPlan,
+  initialSelection,
+  plannedBytes,
+  runtimeReady,
+} from './firstlaunch.js'
 
 /**
  * The offer, as the dialog reads it.
@@ -32,6 +49,8 @@ import { RUNTIME_ID, downloadQueue, firstLaunchPlan, initialSelection, plannedBy
  */
 export const firstLaunch = $state({
   open: false,
+  /** Which of `FIRST_LAUNCH_STEPS` is on screen. @type {string} */
+  step: 'welcome',
   /** @type {import('./firstlaunch.js').FirstLaunchPlan|null} */
   plan: null,
   /** Which ids the press will fetch. @type {Record<string, boolean>} */
@@ -44,11 +63,38 @@ export const firstLaunch = $state({
   failure: null,
   /** Whether the sequence ended because the user cancelled the transfer in flight. */
   stopped: false,
+  paused: false,
   /** Whether the whole queue arrived. */
   sequenceDone: false,
   running: false,
   /** The id being fetched, which is the one Cancel would stop. @type {string|null} */
   current: null,
+  /** Whether the cloud step is showing the provisioner rather than its two lines. */
+  provisioning: false,
+  /**
+   * Whether the provisioner is creating or removing things in the user's
+   * account. The setup offers no way out then but the provisioner's own: the
+   * helper would carry on with nothing left to read its answer.
+   */
+  provisionerBusy: false,
+  /**
+   * The cloud GPU a setup in this offer finished, as much of it as the step
+   * says back, and whether it answered its first check. Never the endpoint or
+   * a credential: the provisioner keeps those. Kept whether or not it
+   * answered, so the step does not offer a second setup, which would be a
+   * second installation in the account.
+   *
+   * @type {{provider: 'modal'|'beam', name: string|null, healthy: boolean}|null}
+   */
+  cloud: null,
+  /** Whether that setup finished and the permission it turns on could not be saved. */
+  cloudSaveFailed: false,
+  /** The runtime's answer to `listAccelerators`, once it can be asked. @type {import('../api/backend.js').Accelerators|null} */
+  accelerators: null,
+  /** Whether that question was asked and refused, which `null` alone cannot say. */
+  acceleratorsFailed: false,
+  /** What the AI redraw helper lists, when there is one. @type {Array<{id: string, label: string}>} */
+  sidecarModels: [],
 })
 
 /**
@@ -77,23 +123,39 @@ let cancelRequested = false
  * the user is looking at - and the run underneath it - must not be rebuilt by
  * a stray relaunch of the check.
  *
+ * `force` is Settings' "Run setup again": without it an offer already made is
+ * not made twice. A replay while an earlier run is still fetching keeps that
+ * run and its plan, because rebuilding the plan under it would quote bytes
+ * already on their way and drop the waiters the run is parked on.
+ *
  * @param {import('../api/backend.js').ModelsView} view
+ * @param {{force?: boolean}} [options]
  * @returns {boolean} whether the offer is now open
  */
-export function offerFirstLaunch(view) {
+export function offerFirstLaunch(view, { force = false } = {}) {
   if (firstLaunch.open) return true
-  const plan = firstLaunchPlan(view)
-  if (!plan.offer) return false
-  firstLaunch.plan = plan
-  firstLaunch.selection = initialSelection(plan)
-  firstLaunch.progress = {}
-  firstLaunch.finished = {}
-  firstLaunch.failure = null
-  firstLaunch.stopped = false
-  firstLaunch.sequenceDone = false
-  firstLaunch.running = false
-  firstLaunch.current = null
-  cancelRequested = false
+  if (!force && session.firstLaunchOffered) return false
+  if (!firstLaunch.running) {
+    const plan = firstLaunchPlan(view)
+    firstLaunch.plan = plan
+    firstLaunch.selection = initialSelection(plan)
+    firstLaunch.progress = {}
+    firstLaunch.finished = {}
+    firstLaunch.failure = null
+    firstLaunch.stopped = false
+    firstLaunch.paused = false
+    firstLaunch.sequenceDone = false
+    firstLaunch.current = null
+    cancelRequested = false
+  }
+  firstLaunch.step = FIRST_LAUNCH_STEPS[0]
+  firstLaunch.provisioning = false
+  firstLaunch.provisionerBusy = false
+  firstLaunch.cloud = null
+  firstLaunch.cloudSaveFailed = false
+  firstLaunch.accelerators = null
+  firstLaunch.acceleratorsFailed = false
+  firstLaunch.sidecarModels = []
   listen()
   firstLaunch.open = true
   // The offer is a dialog the shortcut table cannot see, because it is not on
@@ -103,17 +165,34 @@ export function offerFirstLaunch(view) {
   return true
 }
 
+/** @param {string} step - one of `FIRST_LAUNCH_STEPS`; anything else is ignored */
+export function setFirstLaunchStep(step) {
+  if (FIRST_LAUNCH_STEPS.includes(/** @type {any} */ (step))) firstLaunch.step = step
+}
+
+export function nextFirstLaunchStep() {
+  const index = FIRST_LAUNCH_STEPS.indexOf(/** @type {any} */ (firstLaunch.step))
+  if (index >= 0 && index < FIRST_LAUNCH_STEPS.length - 1) firstLaunch.step = FIRST_LAUNCH_STEPS[index + 1]
+}
+
+export function prevFirstLaunchStep() {
+  const index = FIRST_LAUNCH_STEPS.indexOf(/** @type {any} */ (firstLaunch.step))
+  if (index > 0) firstLaunch.step = FIRST_LAUNCH_STEPS[index - 1]
+}
+
 /**
  * Close it, and remember that the user was asked.
  *
- * Both answers come here - `Not now`, Escape, the backdrop, and `Done` at the
- * end of a run - because what the flag records is that the offer was *made*.
- * A run still in flight is not cancelled by closing: the transfers belong to
- * the backend and Settings › Models is watching the same events.
+ * Every way out comes here - Skip setup, Escape, and the last step's button -
+ * because what the flag records is that the offer was *made*. A run still in
+ * flight is not cancelled by closing: the transfers belong to the backend and
+ * Settings › Models is watching the same events.
  */
 export function dismissFirstLaunch() {
   markFirstLaunchOffered()
   firstLaunch.open = false
+  firstLaunch.provisioning = false
+  firstLaunch.provisionerBusy = false
   setDialogOutsideStack(false)
   if (!firstLaunch.running) stopListening()
 }
@@ -188,6 +267,7 @@ export async function startFirstLaunchDownloads() {
   markFirstLaunchOffered()
   firstLaunch.failure = null
   firstLaunch.stopped = false
+  firstLaunch.paused = false
   firstLaunch.sequenceDone = false
   firstLaunch.running = true
   cancelRequested = false
@@ -222,6 +302,7 @@ export async function startFirstLaunchDownloads() {
       // one: the run stops and says where the rest of them live.
       if (error === 'cancelled') {
         firstLaunch.stopped = true
+        firstLaunch.paused = true
         return
       }
       if (error) {
@@ -255,6 +336,139 @@ export async function cancelFirstLaunchDownload() {
   const id = firstLaunch.current
   if (!id) return
   await getBackend().cancelDownload({ id })
+}
+
+/** Pause the active transfer. The backend keeps its partial file for resume. */
+export async function pauseFirstLaunchDownloads() {
+  await cancelFirstLaunchDownload()
+}
+
+/* ------------------------------------------------------------------ */
+/* The settings the later steps change                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Change one setting the way Settings does: the session's own setter, then
+ * the backend half of the whole session, then the capabilities that read it.
+ *
+ * Unlike Settings, a refused write puts the session back. The step shows the
+ * value it holds as the choice that was made, and a choice the backend did
+ * not keep would be shown as kept.
+ *
+ * @template T
+ * @param {(value: T) => void} apply - a session setter
+ * @param {T} next
+ * @param {T} previous - what `apply` restores when the write is refused
+ * @returns {Promise<boolean>} whether the backend kept it
+ */
+export async function saveFirstLaunchSetting(apply, next, previous) {
+  apply(next)
+  try {
+    await getBackend().writeSettings(backendSettingsPatch())
+  } catch {
+    apply(previous)
+    return false
+  }
+  await loadCapabilities()
+  return true
+}
+
+/**
+ * Ask the runtime which processors it can run on, when it can be asked
+ * (`runtimeReady`). Until then the defaults step offers Automatic alone and
+ * says why.
+ */
+export async function loadFirstLaunchAccelerators() {
+  if (!runtimeReady(firstLaunch.plan, firstLaunch.finished, firstLaunch.current)) return
+  try {
+    firstLaunch.accelerators = await getBackend().listAccelerators()
+    firstLaunch.acceleratorsFailed = false
+  } catch {
+    firstLaunch.accelerators = null
+    firstLaunch.acceleratorsFailed = true
+  }
+}
+
+/**
+ * What the AI redraw helper can run, and the first choice when none was made.
+ *
+ * The first choice is Settings' (`defaultFluxModel`), and it is written
+ * through rather than held in the session alone: the backend falls back to
+ * its own default when the setting is empty, and that default need not be a
+ * model this helper has.
+ */
+export async function loadFirstLaunchSidecarModels() {
+  if (!capabilities.sidecar) {
+    firstLaunch.sidecarModels = []
+    return
+  }
+  try {
+    const models = await getBackend().listSidecarModels()
+    firstLaunch.sidecarModels = Array.isArray(models) ? models : []
+  } catch {
+    firstLaunch.sidecarModels = []
+    return
+  }
+  const chosen = defaultFluxModel(firstLaunch.sidecarModels)
+  if (!session.fluxModel && chosen) await saveFirstLaunchSetting(setFluxModel, chosen, '')
+}
+
+/** Show the provisioner in place of the cloud step's two lines. */
+export function openFirstLaunchProvisioner() {
+  firstLaunch.provisioning = true
+}
+
+/**
+ * Back to the two lines, which say what the setup did if it finished.
+ *
+ * The provisioner goes with them, so nothing is left to be busy: a
+ * provisioner that closed itself mid-run must not leave the setup with no
+ * way out.
+ */
+export function closeFirstLaunchProvisioner() {
+  firstLaunch.provisioning = false
+  firstLaunch.provisionerBusy = false
+}
+
+/**
+ * The provisioner's `onbusychange`: true while it creates or removes things
+ * in the user's account, false once that has ended however it ended.
+ *
+ * @param {boolean} busy
+ */
+export function setFirstLaunchProvisionerBusy(busy) {
+  firstLaunch.provisionerBusy = busy === true
+}
+
+/**
+ * The provisioner's `onconfigured`.
+ *
+ * The provisioner saves the endpoint and selects it itself (IC-5), so what is
+ * left here is the cloud permission, which "Set up now" promises to turn on.
+ * It never throws: the setup did succeed, and a provisioner told otherwise
+ * would offer to run it again. A refused write is said on the step instead.
+ *
+ * Only for an endpoint that answered its first check. One that did not is
+ * kept and said back, so the step does not offer the setup again, but the
+ * permission stays as it was: on, it would promise cloud cleaning nobody has
+ * seen work. The person tests it and turns it on in Settings > Cloud.
+ *
+ * An answer that names no saved profile has left nothing to run on, so the
+ * permission stays as it was: on alone, it would promise cloud cleaning that
+ * cannot happen.
+ *
+ * @param {{provider?: string, profileId?: string, name?: string, healthy?: boolean}|null|undefined} info
+ */
+export async function configureFirstLaunchCloud(info) {
+  if (typeof info?.profileId !== 'string' || !info.profileId.trim()) return
+  const provider = info?.provider === 'beam' ? 'beam' : 'modal'
+  const name = typeof info?.name === 'string' && info.name.trim() ? info.name.trim() : null
+  const healthy = info?.healthy === true
+  firstLaunch.cloud = { provider, name, healthy }
+  firstLaunch.cloudSaveFailed = false
+  if (!healthy) return
+  const previous = session.cloudAllowed
+  firstLaunch.cloudSaveFailed = !(await saveFirstLaunchSetting(setCloudAllowed, true, previous))
 }
 
 /* ------------------------------------------------------------------ */
@@ -312,14 +526,23 @@ export function resetFirstLaunch() {
   stopListening()
   cancelRequested = false
   firstLaunch.open = false
+  firstLaunch.step = 'welcome'
   firstLaunch.plan = null
   firstLaunch.selection = {}
   firstLaunch.progress = {}
   firstLaunch.finished = {}
   firstLaunch.failure = null
   firstLaunch.stopped = false
+  firstLaunch.paused = false
   firstLaunch.sequenceDone = false
   firstLaunch.running = false
   firstLaunch.current = null
+  firstLaunch.provisioning = false
+  firstLaunch.provisionerBusy = false
+  firstLaunch.cloud = null
+  firstLaunch.cloudSaveFailed = false
+  firstLaunch.accelerators = null
+  firstLaunch.acceleratorsFailed = false
+  firstLaunch.sidecarModels = []
   setDialogOutsideStack(false)
 }

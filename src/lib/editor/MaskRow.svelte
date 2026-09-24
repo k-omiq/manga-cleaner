@@ -2,6 +2,7 @@
   import { isHighlighted, hover, select } from '../state/editor.svelte.js'
   import { rowEngines, engineChoiceLabel } from '../model/masks.js'
   import { capabilities } from '../state/capabilities.svelte.js'
+  import { cloudUsable } from '../state/cloud.svelte.js'
   import { actionHint } from './maskrows.js'
   import { menuPoint } from './gesture.js'
   import { deleteRow, rerunMask, runMaskAction } from './maskactions.svelte.js'
@@ -54,18 +55,29 @@
   const title = $derived(t(row.titleKey))
   const sub = $derived(row.sub.map((part) => t(part.key, part.params)).join(' · '))
 
-  // The rung the mask actually used, even when it is one the picker does not
-  // offer - `cloud`, and now also a rung whose weights this machine no longer
-  // has. A picker that silently showed the wrong entry as selected would be
-  // worse than one that is not shown at all, which is what `row.reRunnable`
-  // decides; and a mask cleaned with FLUX on another machine still has to
-  // read as FLUX here.
-  const offered = $derived(rowEngines(capabilities.engines))
+  // What this machine can clean with now, and Cloud last while a cloud
+  // endpoint is ready and allowed: left out otherwise, like a rung whose
+  // weights are missing. The engine the mask actually used leads the list
+  // when it is not among them - Cloud while the cloud is not ready, a rung
+  // this machine no longer has - because a picker that silently showed the
+  // wrong entry as selected would be worse than one that is not shown at
+  // all, which is what `row.reRunnable` decides; and a mask cleaned with FLUX
+  // on another machine still has to read as FLUX here.
+  const offered = $derived(rowEngines(capabilities.engines, { cloud: cloudUsable() }))
   const engineOptions = $derived(
     (row.engine && !offered.includes(row.engine) ? [row.engine, ...offered] : offered).map(
       (rung) => ({ value: rung, label: t(engineChoiceLabel(rung)) }),
     ),
   )
+
+  // The entry last picked, while its re-run is under way. The picker shows it
+  // until that re-run has answered, then the engine the mask has: the new
+  // one, or the old one again when nothing changed - a cloud consent
+  // cancelled, a re-run refused. Without this a native select goes on
+  // showing the pick, since the value it is given never moved.
+  /** @type {string|null} */
+  let picking = $state(null)
+  let pickSeq = 0
 
   // Pointer and focus are two ways into the same highlight, and either can
   // outlast the other: tabbing into an expanded row's buttons with the pointer
@@ -86,9 +98,16 @@
   }
 
   /** @param {string} next */
-  function onEngineChange(next) {
-    if (!next || next === row.engine) return
-    rerunMask(region, 'engine', next)
+  async function onEngineChange(next) {
+    if (!next || next === (picking ?? row.engine)) return
+    const mine = ++pickSeq
+    picking = next
+    try {
+      await rerunMask(region, 'engine', next)
+    } finally {
+      // A later pick owns the picker until its own answer.
+      if (mine === pickSeq) picking = null
+    }
   }
 
   /**
@@ -185,7 +204,7 @@
             id={pickerId}
             size="row"
             options={engineOptions}
-            value={row.engine}
+            value={picking ?? row.engine}
             title={t('masks.action.engineHint')}
             onchange={onEngineChange}
           />

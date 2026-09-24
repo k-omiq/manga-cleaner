@@ -11,7 +11,7 @@
  * this module is user-visible text - labels are i18n keys, and the values are
  * the ids `src/lib/state/editor.svelte.js` stores in `editor.toolParams`.
  *
- * The tool ids and their `1`–`6` order come from `TOOLS` in the state module;
+ * The tool ids and their `1` to `6` order come from `TOOLS` in the state module;
  * this file must stay in step with it, which `toolSpec()` asserts by returning
  * the Auto clean spec for anything it does not recognise.
  */
@@ -348,18 +348,17 @@ export const TOOL_SPECS = [
       ]),
       // There is deliberately no engine-ceiling row. It offered two rungs of
       // src/lib/model/ladder.js - the highest local engine, or the whole ladder
-      // including cloud - and the cloud rung was a way to spend money that
-      // never met the disclosure: `needs-confirmation` lives on `applyTool`,
-      // and `runClean` has no equivalent, so a run at that ceiling sent pages
-      // off the machine with neither the transmission statement nor the cost
-      // confirmation. Rather than grow the run protocol, the user ruled that
-      // a batch run is local-only:
-      // an unbounded batch spend is the hardest kind to confirm meaningfully,
-      // and cloud stays reachable per-region through Content-aware fill, which
-      // carries the whole flow. `startRun` pins the ceiling to LOCAL_CEILING,
-      // so this is enforced where the sending happens, not merely unoffered
-      // here. With the cloud rung gone the row held one option, and a
-      // radiogroup of one is worse than no row at all.
+      // including cloud - and the cloud rung sent pages off the machine
+      // without the consent every cloud render asks for first:
+      // `needs-confirmation` lives on `applyTool`, and `runClean` has no
+      // equivalent. Rather than grow the run protocol, the user ruled that a
+      // batch run is local-only: an unbounded batch of renders on a GPU the
+      // user pays for is the hardest kind to consent to meaningfully, and the
+      // cloud stays reachable per region through Content-aware fill and a
+      // Layers row, each of which asks. `startRun` pins the ceiling to
+      // LOCAL_CEILING, so this is enforced where the sending happens, not
+      // merely unoffered here. With the cloud rung gone the row held one
+      // option, and a radiogroup of one is worse than no row at all.
     ],
     runnable: true,
   },

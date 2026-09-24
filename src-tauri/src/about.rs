@@ -51,7 +51,7 @@ pub fn about(app: tauri::AppHandle) -> About {
             },
             Fact {
                 label_key: "about.fact.cloud",
-                value: "Google, paid tier only, opt-in per request".into(),
+                value: "Modal or Beam, your own account, off by default, confirmed per request".into(),
             },
             Fact { label_key: "about.fact.runtime", value: runtime_fact(&app) },
         ],

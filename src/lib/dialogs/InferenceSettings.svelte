@@ -1,20 +1,5 @@
 <script module>
   /**
-   * Validate that a profile identifier is bounded, non-empty, and conforms to
-   * the backend format rules (1..=64 chars, ASCII alphanumeric, '-', '_',
-   * starting with alphanumeric).
-   *
-   * @param {string} id
-   * @returns {boolean}
-   */
-  export function isValidProfileId(id) {
-    if (!id || typeof id !== 'string') return false
-    if (id !== id.trim()) return false
-    if (id.length === 0 || id.length > 64) return false
-    return /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(id)
-  }
-
-  /**
    * Validate human-readable display name (1..=128 chars, non-empty, trimmed, no control chars).
    *
    * @param {string} name
@@ -72,1225 +57,1281 @@
       return false
     }
   }
-
-  /**
-   * Compare two endpoint URLs to check if their canonical origins differ.
-   *
-   * @param {string} urlA
-   * @param {string} urlB
-   * @returns {boolean}
-   */
-  export function isOriginChanged(urlA, urlB) {
-    if (!urlA || !urlB) return false
-    try {
-      const originA = new URL(urlA).origin.toLowerCase()
-      const originB = new URL(urlB).origin.toLowerCase()
-      return originA !== originB
-    } catch {
-      return urlA !== urlB
-    }
-  }
 </script>
 
 <script>
   /**
-   * Inference Settings Tab (P3c2)
+   * Settings > Cloud: whether the cloud may be used, where it runs, and what
+   * to do when something about it needs attention.
    *
-   * Manages public cloud inference profiles for Modal and Beam alongside
-   * the execution target selector (defaulting to Local).
+   * From the top:
    *
-   * Invariants:
-   * 1. Dual-Provider Persistence: Both Beam and Modal profiles persist simultaneously.
-   * 2. Zero Plaintext Secrets: This component manages ONLY public metadata (names, endpoints).
-   *    Credentials are not collected or managed here.
-   * 3. Safe Backend Error Handling: Raw backend error strings (which may contain secret URLs)
-   *    are never echoed. Localized status messages are used.
-   * 4. Target Integrity: Deleting the currently selected profile resets the target to Local.
-   * 5. Draft Isolation: Form edits use local drafts; changes commit atomically to backend.
+   * 1. **Status**, one line: off, ready on the default endpoint, or the first
+   *    thing that needs attention. It is `state/cloud.svelte.js`'s readiness,
+   *    the same verdict the tool bar gates the Cloud engine on, so the two
+   *    never disagree.
+   * 2. **The permission switch.** This is its only place; General points here.
+   * 3. **Needs attention**, only when something does: a setup that did not
+   *    finish, a default endpoint with no access token, a render the last
+   *    session could not settle.
+   * 4. **Endpoints**: name, provider, token, which one is the default, a
+   *    connection test, and Remove. Remove can also delete what setup created
+   *    in the account; that runs the provisioner's cleanup, which lists what
+   *    it will delete and asks for the key again.
+   * 5. **Set up with Modal or Beam**: the provisioner, inline.
+   * 6. **Connect an existing endpoint**, collapsed: the manual form, for an
+   *    endpoint deployed some other way.
+   *
+   * **Tokens.** A token typed here goes to the system keychain through
+   * `storeCloudSecret`, and the field is wiped as soon as that call returns,
+   * whatever it answered. None is ever read back: the list only asks whether
+   * one is there.
    */
-  import { onMount, tick } from 'svelte'
-  import { Button, Field, Select, TextInput } from '../ui/index.js'
+  import { onMount, tick, untrack } from 'svelte'
+  import Icon from '../icons/Icon.svelte'
+  import { Button, Disclosure, Field, Segmented, TextInput } from '../ui/index.js'
+  import CloudProvisioner from './CloudProvisioner.svelte'
   import { getBackend } from '../api/backend.js'
+  import { notify } from '../state/app.svelte.js'
+  import { session } from '../state/session.svelte.js'
+  import { cloud, dismissRecovered, refreshCloudReadiness, setCloudPermission } from '../state/cloud.svelte.js'
+  import { forgetUnfinished, healthKey, removeEndpoint, setup } from './provisioning.svelte.js'
   import { t } from '../i18n/index.js'
 
-  /** @type {boolean} */
-  let loading = $state(true)
-  /** @type {boolean} */
-  let saving = $state(false)
+  /** @type {{ backend?: import('../api/backend.js').Backend }} */
+  let { backend: givenBackend } = $props()
+
+  const backend = untrack(() => givenBackend ?? getBackend())
+
+  /** The ids setup gives what it creates. Only those can be found again in the account and cleaned up. */
+  const INSTALLATION_ID = /^[a-z0-9][a-z0-9-]{2,40}$/
+
+  const uid = $props.id()
+  const ids = {
+    endpoints: `${uid}-endpoints`,
+    attention: `${uid}-attention`,
+    removeText: `${uid}-remove-text`,
+    tokenId: `${uid}-token-id`,
+    tokenSecret: `${uid}-token-secret`,
+    name: `${uid}-name`,
+    url: `${uid}-url`,
+    manualTokenId: `${uid}-manual-token-id`,
+    manualSecret: `${uid}-manual-secret`,
+  }
+
+  const permissionOptions = [
+    { value: 'off', label: t('settings.inference.permission.off') },
+    { value: 'on', label: t('settings.inference.permission.on') },
+  ]
+  const providerOptions = [
+    { value: 'modal', label: t('settings.inference.provider.modal') },
+    { value: 'beam', label: t('settings.inference.provider.beam') },
+  ]
+
+  /* ---------- what is saved ---------- */
+
   /** @type {import('../api/backend.js').InferenceConfig|null} */
   let config = $state(null)
+  let loaded = $state(false)
+  let loadFailed = $state(false)
+  /**
+   * Whether each endpoint has an access token, keyed `provider:id`: null when
+   * it could not be read, absent while it is being read.
+   *
+   * @type {Record<string, boolean|null>}
+   */
+  let tokens = $state({})
+  /**
+   * The last connection test of each endpoint.
+   *
+   * @type {Record<string, {state: 'testing'}|{state: 'done', ok: boolean, status: string, latency: number|null}>}
+   */
+  let tests = $state({})
+  /** @type {string|null} an i18n key */
+  let listError = $state(null)
+  let saving = $state(false)
+  let permissionSaving = false
 
-  /** @type {number} Key used to force re-mounting and re-evaluating Select when target write fails */
-  let targetSelectKey = $state(0)
+  /* ---------- one endpoint's token form, one Remove confirmation ---------- */
 
   /** @type {string|null} */
-  let errorMessage = $state(null)
+  let tokenFor = $state(null)
+  let tokenId = $state('')
+  let tokenSecret = $state('')
+  let tokenSaving = $state(false)
   /** @type {string|null} */
-  let statusMessage = $state(null)
-
-  /**
-   * Current draft being added or edited.
-   * @type {{ isNew: boolean, provider: 'modal'|'beam', id: string, name: string, endpointUrl: string, originalEndpointUrl: string, createdAtMs: number }|null}
-   */
-  let editingProfile = $state(null)
-
-  /**
-   * Profile currently pending removal confirmation.
-   * @type {{ provider: 'modal'|'beam', id: string, name: string }|null}
-   */
-  let removingProfile = $state(null)
-
-  /**
-   * DOM element reference to the inline removal confirmation card.
-   * @type {HTMLElement|null}
-   */
-  let removalCardEl = $state(null)
-
-  /**
-   * Originating trigger button that opened removal confirmation, to restore focus upon cancel.
-   * @type {HTMLElement|null}
-   */
-  let removalTriggerEl = null
+  let tokenError = $state(null)
 
   /** @type {string|null} */
-  let formError = $state(null)
+  let removingKey = $state(null)
+  let alsoDelete = $state(false)
+  let removeBusy = $state(false)
+  /** @type {string|null} */
+  let removeError = $state(null)
 
-  /** Sequence counter preventing stale async write races */
-  let operationSeq = 0
-
-  /** @type {Record<string, { checking?: boolean, ok?: boolean, latencyMs?: number, notRegistered?: boolean, message?: string }>} */
-  let connectionChecks = $state({})
-
-  /** @type {boolean} */
-  let checkingRecovery = $state(false)
-
-  /** @type {'none'|'ambiguous'|'cached'|'stale'|null} */
-  let recoveryState = $state(null)
+  /* ---------- the provisioner ---------- */
 
   /**
-   * Compute the string key for the current selected target.
+   * What the inline provisioner is open for: a new setup, or Resume or Clean
+   * up of one installation. Null while it is closed.
+   *
+   * @type {{action: 'setup'}|{action: 'resume'|'cleanup', provider: 'modal'|'beam', installationId: string}|null}
    */
-  const currentTargetValue = $derived.by(() => {
-    if (!config?.selectedTarget) return 'local'
-    const target = config.selectedTarget
-    if (target.type === 'modal' && target.profile_id) {
-      return `modal:${target.profile_id}`
-    }
-    if (target.type === 'beam' && target.profile_id) {
-      return `beam:${target.profile_id}`
-    }
-    return 'local'
-  })
+  let task = $state(null)
 
   /**
-   * Compute the list of options for the execution target picker.
+   * The control the task was opened from, as the data attribute that finds it
+   * again: it is drawn anew rather than kept while the task is open (the Set
+   * up button, Resume and Get a new token all make way for the provisioner),
+   * so the element itself would be gone by the time the task closes.
+   *
+   * @type {[string, string]|null}
    */
-  const targetOptions = $derived.by(() => {
-    const options = [
-      { value: 'local', label: t('settings.inference.target.local') },
-    ]
-    if (!config) return options
+  let taskOpener = null
 
-    for (const [id, profile] of Object.entries(config.modalProfiles || {})) {
-      options.push({
-        value: `modal:${id}`,
-        label: t('settings.inference.target.option', {
-          provider: t('settings.inference.provider.modal'),
-          name: profile.name || id,
-          id,
-        }),
-      })
-    }
+  /* ---------- the manual form ---------- */
 
-    for (const [id, profile] of Object.entries(config.beamProfiles || {})) {
-      options.push({
-        value: `beam:${id}`,
-        label: t('settings.inference.target.option', {
-          provider: t('settings.inference.provider.beam'),
-          name: profile.name || id,
-          id,
-        }),
-      })
-    }
+  let manualOpen = $state(false)
+  /** @type {'modal'|'beam'} */
+  let manualProvider = $state('modal')
+  let manualName = $state('')
+  let manualUrl = $state('')
+  let manualTokenId = $state('')
+  let manualSecret = $state('')
+  let manualSaving = $state(false)
+  /** @type {string|null} */
+  let manualError = $state(null)
+  /** @type {{key: string, params: Record<string, unknown>, ok: boolean}|null} */
+  let manualNote = $state(null)
 
-    return options
-  })
+  /** @type {HTMLElement|undefined} */
+  let root = $state()
+  /** @type {HTMLElement|undefined} */
+  let slot = $state()
+  let alive = true
+
+  /* ---------- derived ---------- */
 
   /**
-   * Load public inference configuration from backend.
+   * @param {unknown} url
+   * @returns {string}
    */
-  async function loadConfig() {
-    const currentSeq = ++operationSeq
-    loading = true
-    errorMessage = null
-    statusMessage = null
-    removingProfile = null
-    removalTriggerEl = null
+  function hostOf(url) {
     try {
-      const loaded = await getBackend().readInferenceConfig()
-      if (operationSeq === currentSeq) {
-        config = loaded
-        targetSelectKey += 1
-      }
+      return new URL(String(url)).host
     } catch {
-      if (operationSeq === currentSeq) {
-        errorMessage = 'settings.inference.error.loadFailed'
-        config = null
-      }
-    } finally {
-      if (operationSeq === currentSeq) {
-        loading = false
+      return String(url ?? '')
+    }
+  }
+
+  const endpoints = $derived.by(() => {
+    if (!config) return []
+    /** @type {Array<{provider: 'modal'|'beam', id: string, key: string, name: string, host: string, createdAtMs: number}>} */
+    const list = []
+    for (const provider of /** @type {const} */ (['modal', 'beam'])) {
+      const profiles = (provider === 'modal' ? config.modalProfiles : config.beamProfiles) ?? {}
+      for (const [id, profile] of Object.entries(profiles)) {
+        if (!profile || typeof profile !== 'object') continue
+        list.push({
+          provider,
+          id,
+          key: `${provider}:${id}`,
+          name: typeof profile.name === 'string' && profile.name.trim() ? profile.name : id,
+          host: hostOf(profile.endpointUrl),
+          createdAtMs: typeof profile.createdAtMs === 'number' ? profile.createdAtMs : 0,
+        })
       }
     }
+    return list.sort((a, b) => a.createdAtMs - b.createdAtMs || a.name.localeCompare(b.name))
+  })
+
+  const selectedKey = $derived.by(() => {
+    const target = config?.selectedTarget
+    return target && target.type !== 'local' ? `${target.type}:${target.profile_id}` : null
+  })
+  const selectedEndpoint = $derived(endpoints.find((ep) => ep.key === selectedKey) ?? null)
+
+  const status = $derived.by(() => {
+    if (!session.cloudAllowed) return { tone: 'off', text: t('settings.inference.status.off') }
+    const readiness = cloud.readiness
+    // Still the answer from before the switch was turned on.
+    if (!cloud.checked || readiness.reason === 'off') {
+      return { tone: 'checking', text: t('settings.inference.status.checking') }
+    }
+    if (readiness.ready && readiness.profile) {
+      return { tone: 'ready', text: t('settings.inference.status.ready', { name: readiness.profile.name }) }
+    }
+    const reasonKey =
+      readiness.reason === 'noTarget'
+        ? loaded && endpoints.length === 0
+          ? 'settings.inference.reason.none'
+          : 'settings.inference.reason.noTarget'
+        : readiness.reason === 'noSecret'
+          ? 'settings.inference.reason.noSecret'
+          : 'settings.inference.reason.unknown'
+    return { tone: 'attention', text: t('settings.inference.status.attention', { reasonKey }) }
+  })
+
+  const setupRunning = $derived(setup.run?.status === 'running')
+  const unfinished = $derived(!task && !setupRunning ? setup.unfinished : null)
+  const missingToken = $derived(selectedEndpoint && tokens[selectedEndpoint.key] === false ? selectedEndpoint : null)
+  const attempts = $derived(cloud.recovery?.needsAttention ?? [])
+  const attention = $derived(Boolean(unfinished || missingToken || attempts.length > 0))
+
+  /* ---------- labels ---------- */
+
+  /** @param {'modal'|'beam'} which */
+  function providerKey(which) {
+    return which === 'beam' ? 'settings.inference.provider.beam' : 'settings.inference.provider.modal'
+  }
+
+  /** @param {string|undefined} reason */
+  function attemptReasonKey(reason) {
+    if (reason === 'ambiguous') return 'settings.inference.recovery.reason.ambiguous'
+    if (reason === 'stale') return 'settings.inference.recovery.reason.stale'
+    return 'settings.inference.recovery.reason.failed'
+  }
+
+  /** @param {string} key */
+  function tokenText(key) {
+    const present = tokens[key]
+    if (present === true) return t('settings.inference.token.saved')
+    if (present === false) return t('settings.inference.token.missing')
+    if (present === null) return t('settings.inference.token.unknown')
+    return ''
+  }
+
+  /** @param {{id: string}} ep */
+  function madeBySetup(ep) {
+    return INSTALLATION_ID.test(ep.id)
+  }
+
+  /* ---------- loading ---------- */
+
+  let loadSeq = 0
+
+  /** Read the endpoints, then whether each has a token. */
+  async function load() {
+    loadSeq += 1
+    const mine = loadSeq
+    /** @type {any} */
+    let next
+    try {
+      next = await backend.readInferenceConfig()
+    } catch {
+      next = null
+    }
+    if (!alive || mine !== loadSeq) return
+    loaded = true
+    loadFailed = !next || typeof next !== 'object'
+    if (loadFailed) return
+    config = next
+    /** @type {Record<string, boolean|null>} */
+    const present = {}
+    await Promise.all(
+      endpoints.map(async (ep) => {
+        try {
+          const summary = await backend.getCloudSecretSummary({ provider: ep.provider, profileId: ep.id, role: 'runtime' })
+          present[ep.key] = summary?.present === true
+        } catch {
+          present[ep.key] = null
+        }
+      }),
+    )
+    if (alive && mine === loadSeq) tokens = present
+  }
+
+  /** After anything that changes an endpoint or its token. */
+  async function reload() {
+    await load()
+    void refreshCloudReadiness(backend)
   }
 
   onMount(() => {
-    loadConfig()
+    void load()
+    void refreshCloudReadiness(backend)
+    // Settings was closed while a setup ran: show its checklist again.
+    if (setup.run?.status === 'running') {
+      task = { action: 'setup' }
+      taskOpener = ['data-setup', 'open']
+    }
+    return () => {
+      alive = false
+      wipeTokenForm()
+      wipeManualSecrets()
+    }
   })
 
+  /* ---------- focus ---------- */
+
   /**
-   * Change the default execution target and save to backend.
+   * Move focus once the DOM has caught up. Only from inside this panel: a
+   * change that finishes after the person has moved on does not pull focus
+   * back.
    *
+   * @param {() => HTMLElement|null|undefined} find
+   */
+  async function focusSoon(find) {
+    await tick()
+    if (!alive || !root) return
+    const active = document.activeElement
+    if (active && active !== document.body && !root.contains(active)) return
+    const element = find()
+    element?.focus()
+    element?.scrollIntoView?.({ block: 'nearest' })
+  }
+
+  /**
+   * @param {string} attribute
    * @param {string} value
    */
-  async function chooseTarget(value) {
-    if (!config || saving || loading) return
-    const currentSeq = ++operationSeq
-
-    let nextTarget = { type: 'local' }
-    if (value.startsWith('modal:')) {
-      const profileId = value.slice('modal:'.length)
-      if (config.modalProfiles && config.modalProfiles[profileId]) {
-        nextTarget = { type: 'modal', profile_id: profileId }
-      }
-    } else if (value.startsWith('beam:')) {
-      const profileId = value.slice('beam:'.length)
-      if (config.beamProfiles && config.beamProfiles[profileId]) {
-        nextTarget = { type: 'beam', profile_id: profileId }
-      }
+  function byData(attribute, value) {
+    for (const element of root?.querySelectorAll(`[${attribute}]`) ?? []) {
+      if (element.getAttribute(attribute) === value) return /** @type {HTMLElement} */ (element)
     }
+    return null
+  }
 
-    const nextConfig = {
-      schemaVersion: config.schemaVersion ?? 1,
-      selectedTarget: nextTarget,
-      beamProfiles: { ...config.beamProfiles },
-      modalProfiles: { ...config.modalProfiles },
-    }
+  /* ---------- permission ---------- */
 
-    saving = true
-    errorMessage = null
-    statusMessage = null
+  /** @param {string} value */
+  async function changePermission(value) {
+    const allowed = value === 'on'
+    if (permissionSaving || allowed === session.cloudAllowed) return
+    permissionSaving = true
     try {
-      const saved = await getBackend().writeInferenceConfig({ config: $state.snapshot(nextConfig) })
-      if (operationSeq === currentSeq) {
-        config = saved
-        statusMessage = 'settings.inference.status.saved'
-      }
-    } catch {
-      if (operationSeq === currentSeq) {
-        errorMessage = 'settings.inference.error.saveFailed'
-        // Force the Select component to reset and re-render with persisted currentTargetValue
-        targetSelectKey += 1
-      }
+      await setCloudPermission(allowed, backend)
     } finally {
-      if (operationSeq === currentSeq) {
-        saving = false
-      }
+      permissionSaving = false
     }
   }
 
   /**
-   * Start adding a new profile for a provider.
+   * A setup that ends with a healthy endpoint turns the cloud on, as the
+   * first-launch setup does: approving the plan was the choice to use it, and
+   * every render still asks first. One whose first check failed leaves the
+   * switch alone, and the endpoint is tested from its row.
    *
-   * @param {'modal'|'beam'} provider
+   * @param {{healthy?: boolean}} [info]
    */
-  function startAdd(provider = 'modal') {
-    if (saving || loading) return
-    formError = null
-    errorMessage = null
-    statusMessage = null
-    removingProfile = null
-    removalTriggerEl = null
-    editingProfile = {
-      isNew: true,
-      provider,
-      id: '',
-      name: '',
-      endpointUrl: '',
-      originalEndpointUrl: '',
-      createdAtMs: Date.now(),
+  function configured(info) {
+    void reload()
+    if (info?.healthy === true) void changePermission('on')
+  }
+
+  /* ---------- the default endpoint ---------- */
+
+  /**
+   * The radios are the browser's until the write answers. When it fails,
+   * put them back where the config says.
+   */
+  function syncRadios() {
+    for (const input of root?.querySelectorAll(`input[name="${uid}-default"]`) ?? []) {
+      const radio = /** @type {HTMLInputElement} */ (input)
+      radio.checked = radio.value === selectedKey
     }
   }
 
-  /**
-   * Start editing an existing profile.
-   *
-   * @param {'modal'|'beam'} provider
-   * @param {import('../api/backend.js').CloudProfile} profile
-   */
-  function startEdit(provider, profile) {
-    if (saving || loading) return
-    formError = null
-    errorMessage = null
-    statusMessage = null
-    removingProfile = null
-    removalTriggerEl = null
-    editingProfile = {
-      isNew: false,
-      provider,
-      id: profile.id,
-      name: profile.name,
-      endpointUrl: profile.endpointUrl,
-      originalEndpointUrl: profile.endpointUrl,
-      createdAtMs: profile.createdAtMs || Date.now(),
-    }
-  }
-
-  /**
-   * Cancel profile creation or editing.
-   */
-  function cancelEdit() {
-    editingProfile = null
-    formError = null
-  }
-
-  /**
-   * Validate and save the current draft profile.
-   */
-  async function saveProfile() {
-    if (!editingProfile || !config || saving || loading) return
-    formError = null
-    errorMessage = null
-    statusMessage = null
-
-    const { isNew, provider, id: rawId, name: rawName, endpointUrl: rawUrl, createdAtMs } = editingProfile
-    const id = rawId.trim()
-    const name = rawName.trim()
-    const endpointUrl = rawUrl.trim()
-
-    if (!isValidProfileId(id)) {
-      formError = 'settings.inference.error.invalidId'
+  /** @param {{provider: 'modal'|'beam', id: string, key: string}} ep */
+  async function selectDefault(ep) {
+    if (saving || selectedKey === ep.key) {
+      syncRadios()
       return
     }
-
-    if (isNew) {
-      const targetMap = provider === 'beam' ? config.beamProfiles : config.modalProfiles
-      if (targetMap && targetMap[id]) {
-        formError = 'settings.inference.error.idTaken'
-        return
-      }
+    saving = true
+    listError = null
+    try {
+      const current = await backend.readInferenceConfig()
+      const written = await backend.writeInferenceConfig({
+        config: { ...current, selectedTarget: { type: ep.provider, profile_id: ep.id } },
+      })
+      if (!alive) return
+      config = written && typeof written === 'object' ? written : { ...current, selectedTarget: { type: ep.provider, profile_id: ep.id } }
+      void refreshCloudReadiness(backend)
+    } catch {
+      if (!alive) return
+      listError = 'settings.inference.error.saveFailed'
+      syncRadios()
+    } finally {
+      if (alive) saving = false
     }
+  }
 
+  /* ---------- test ---------- */
+
+  /** @param {{provider: 'modal'|'beam', id: string, key: string}} ep */
+  async function testEndpoint(ep) {
+    if (tests[ep.key]?.state === 'testing') return
+    tests = { ...tests, [ep.key]: { state: 'testing' } }
+    /** @type {{state: 'done', ok: boolean, status: string, latency: number|null}} */
+    let result
+    try {
+      const answer = await backend.checkCloudConnection({ provider: ep.provider, profileId: ep.id })
+      result = {
+        state: 'done',
+        ok: answer?.ok === true,
+        status: typeof answer?.status === 'string' ? answer.status : 'unknown',
+        latency: typeof answer?.latencyMs === 'number' && Number.isFinite(answer.latencyMs) ? Math.round(answer.latencyMs) : null,
+      }
+    } catch {
+      result = { state: 'done', ok: false, status: 'unknown', latency: null }
+    }
+    if (alive) tests = { ...tests, [ep.key]: result }
+  }
+
+  /* ---------- token ---------- */
+
+  function wipeTokenForm() {
+    tokenId = ''
+    tokenSecret = ''
+  }
+
+  /** @param {{provider: 'modal'|'beam', key: string}} ep */
+  function openTokenForm(ep) {
+    wipeTokenForm()
+    tokenError = null
+    removingKey = null
+    tokenFor = ep.key
+    void focusSoon(() => document.getElementById(ep.provider === 'modal' ? ids.tokenId : ids.tokenSecret))
+  }
+
+  /** @param {{key: string}} ep */
+  function closeTokenForm(ep) {
+    wipeTokenForm()
+    tokenFor = null
+    tokenError = null
+    void focusSoon(() => byData('data-token', ep.key))
+  }
+
+  /** @param {{provider: 'modal'|'beam', id: string, key: string}} ep */
+  async function saveToken(ep) {
+    if (tokenSaving) return
+    const secret = tokenSecret.trim()
+    const id = tokenId.trim()
+    if (!secret || (ep.provider === 'modal' && !id)) {
+      tokenError = 'settings.inference.error.tokenRequired'
+      return
+    }
+    tokenSaving = true
+    tokenError = null
+    let saved = false
+    try {
+      await backend.storeCloudSecret({
+        provider: ep.provider,
+        profileId: ep.id,
+        role: 'runtime',
+        secret,
+        ...(ep.provider === 'modal' ? { tokenId: id } : {}),
+      })
+      saved = true
+    } catch {
+      saved = false
+    } finally {
+      wipeTokenForm()
+    }
+    if (!alive) return
+    tokenSaving = false
+    if (!saved) {
+      tokenError = 'settings.inference.token.saveFailed'
+      return
+    }
+    tokenFor = null
+    const { [ep.key]: _stale, ...rest } = tests
+    tests = rest
+    await reload()
+    void focusSoon(() => byData('data-token', ep.key))
+  }
+
+  /* ---------- remove ---------- */
+
+  /** @param {{key: string}} ep */
+  function askRemove(ep) {
+    wipeTokenForm()
+    tokenFor = null
+    removingKey = ep.key
+    alsoDelete = false
+    removeError = null
+    void focusSoon(() => document.getElementById(ids.removeText))
+  }
+
+  /** @param {{key: string}} ep */
+  function cancelRemove(ep) {
+    removingKey = null
+    removeError = null
+    void focusSoon(() => byData('data-remove', ep.key))
+  }
+
+  /** @param {{provider: 'modal'|'beam', id: string, key: string, name: string}} ep */
+  async function confirmRemove(ep) {
+    if (removeBusy) return
+    if (alsoDelete && madeBySetup(ep) && !setupRunning) {
+      removingKey = null
+      // Opened from the confirmation, which closes; the row's Remove is
+      // what is left of that control once the task is done with.
+      void openTask({ action: 'cleanup', provider: ep.provider, installationId: ep.id }, ['data-remove', ep.key])
+      return
+    }
+    removeBusy = true
+    removeError = null
+    try {
+      await removeEndpoint({ provider: ep.provider, profileId: ep.id }, backend)
+    } catch {
+      if (alive) {
+        removeError = 'settings.inference.remove.failed'
+        removeBusy = false
+      }
+      return
+    }
+    if (!alive) return
+    removeBusy = false
+    removingKey = null
+    const { [ep.key]: _gone, ...rest } = tests
+    tests = rest
+    notify({ key: 'notice.cloud.endpointRemoved', params: { name: ep.name } })
+    await load()
+    void focusSoon(() => document.getElementById(ids.endpoints))
+  }
+
+  /* ---------- the provisioner ---------- */
+
+  /**
+   * @param {NonNullable<typeof task>} next
+   * @param {[string, string]} opener - the data attribute and value of the control it is opened from
+   */
+  async function openTask(next, opener) {
+    task = next
+    taskOpener = opener
+    await tick()
+    if (!alive || !slot) return
+    const heading = /** @type {HTMLElement|null} */ (slot.querySelector('[tabindex="-1"]'))
+    heading?.focus()
+    slot.scrollIntoView?.({ block: 'nearest' })
+  }
+
+  async function closeTask() {
+    const opener = taskOpener
+    task = null
+    taskOpener = null
+    // Whatever the provisioner did, the list shows what is saved now. Focus
+    // waits for it, because the control the task was opened from may not
+    // outlive what the task did: Resume goes once the setup has finished,
+    // Get a new token once the token is there, Remove once the endpoint is
+    // deleted. Then it goes back to that control if it is still there, and
+    // to the heading of the section the task was shown in if it is not.
+    await reload()
+    void focusSoon(() => (opener && byData(opener[0], opener[1])) || document.getElementById(ids.endpoints))
+  }
+
+  /** @param {NonNullable<typeof unfinished>} marker */
+  function resumeUnfinished(marker) {
+    void openTask({ action: 'resume', provider: marker.provider, installationId: marker.installationId }, [
+      'data-resume',
+      marker.installationId,
+    ])
+  }
+
+  /* ---------- manual connect ---------- */
+
+  function wipeManualSecrets() {
+    manualTokenId = ''
+    manualSecret = ''
+  }
+
+  /** A profile id for an endpoint added by hand: never one setup would make. */
+  function newProfileId() {
+    const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789'
+    const bytes = new Uint8Array(6)
+    globalThis.crypto.getRandomValues(bytes)
+    return `ep_${Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join('')}`
+  }
+
+  async function connectManual() {
+    if (manualSaving) return
+    manualError = null
+    manualNote = null
+    const which = manualProvider
+    const name = manualName.trim()
+    const endpointUrl = manualUrl.trim()
+    const secret = manualSecret.trim()
+    const id = manualTokenId.trim()
     if (!isValidProfileName(name)) {
-      formError = 'settings.inference.error.invalidName'
+      manualError = 'settings.inference.error.invalidName'
       return
     }
-
     if (!isValidEndpointUrl(endpointUrl)) {
-      formError = 'settings.inference.error.invalidUrl'
+      manualError = 'settings.inference.error.invalidUrl'
+      return
+    }
+    if (!secret || (which === 'modal' && !id)) {
+      manualError = 'settings.inference.error.tokenRequired'
       return
     }
 
-    const currentSeq = ++operationSeq
-    const nextBeamProfiles = { ...config.beamProfiles }
-    const nextModalProfiles = { ...config.modalProfiles }
-
-    const updatedProfile = {
-      id,
-      name,
-      endpointUrl,
-      canonicalOrigin: '',
-      canonicalOriginFingerprint: '',
-      createdAtMs: createdAtMs || Date.now(),
-      updatedAtMs: Date.now(),
-    }
-
-    if (provider === 'beam') {
-      nextBeamProfiles[id] = updatedProfile
-    } else {
-      nextModalProfiles[id] = updatedProfile
-    }
-
-    const nextConfig = {
-      schemaVersion: config.schemaVersion ?? 1,
-      selectedTarget: config.selectedTarget,
-      beamProfiles: nextBeamProfiles,
-      modalProfiles: nextModalProfiles,
-    }
-
-    saving = true
+    manualSaving = true
+    const profileId = newProfileId()
+    const listKey = which === 'beam' ? 'beamProfiles' : 'modalProfiles'
+    /** @type {any} */
+    let previous = null
+    let written = false
+    let stored = false
     try {
-      const saved = await getBackend().writeInferenceConfig({ config: $state.snapshot(nextConfig) })
-      if (operationSeq === currentSeq) {
-        config = saved
-        editingProfile = null
-        statusMessage = 'settings.inference.status.saved'
-        targetSelectKey += 1
-      }
+      previous = await backend.readInferenceConfig()
+      const now = Date.now()
+      const selected = previous?.selectedTarget
+      await backend.writeInferenceConfig({
+        config: {
+          ...previous,
+          [listKey]: {
+            ...(previous?.[listKey] ?? {}),
+            [profileId]: {
+              id: profileId,
+              name,
+              endpointUrl,
+              canonicalOrigin: '',
+              canonicalOriginFingerprint: '',
+              createdAtMs: now,
+              updatedAtMs: now,
+            },
+          },
+          selectedTarget: !selected || selected.type === 'local' ? { type: which, profile_id: profileId } : selected,
+        },
+      })
+      written = true
+      await backend.storeCloudSecret({
+        provider: which,
+        profileId,
+        role: 'runtime',
+        secret,
+        ...(which === 'modal' ? { tokenId: id } : {}),
+      })
+      stored = true
     } catch {
-      if (operationSeq === currentSeq) {
-        errorMessage = 'settings.inference.error.saveFailed'
-      }
+      stored = false
     } finally {
-      if (operationSeq === currentSeq) {
-        saving = false
-      }
-    }
-  }
-
-  /**
-   * Request removal confirmation for a profile.
-   *
-   * @param {'modal'|'beam'} provider
-   * @param {import('../api/backend.js').CloudProfile} profile
-   * @param {Event|HTMLElement} [trigger]
-   */
-  async function startRemove(provider, profile, trigger) {
-    if (saving || loading || editingProfile || removingProfile) return
-    const button = trigger instanceof HTMLElement
-      ? trigger
-      : trigger?.currentTarget instanceof HTMLElement
-        ? trigger.currentTarget
-        : document.activeElement instanceof HTMLElement
-          ? document.activeElement
-          : null
-    removalTriggerEl = button
-    formError = null
-    errorMessage = null
-    statusMessage = null
-    editingProfile = null
-    removingProfile = {
-      provider,
-      id: profile.id,
-      name: profile.name,
+      wipeManualSecrets()
     }
 
-    await tick()
-
-    if (removalCardEl) {
-      const cancelBtn = removalCardEl.querySelectorAll('button')[1]
-      if (cancelBtn && !cancelBtn.disabled && (cancelBtn.isConnected ?? document.contains(cancelBtn))) {
-        cancelBtn.focus()
-      }
-    }
-  }
-
-  /**
-   * Cancel profile removal confirmation.
-   */
-  async function cancelRemoval() {
-    const trigger = removalTriggerEl
-    removingProfile = null
-    removalTriggerEl = null
-
-    await tick()
-
-    if (trigger && !trigger.disabled && (trigger.isConnected ?? document.contains(trigger))) {
-      trigger.focus()
-    }
-  }
-
-  /**
-   * Narrowly scoped keydown handler on confirmation card to intercept Escape,
-   * prevent default and stop propagation so parent Modal does not close,
-   * invoke cancelRemoval() to restore focus, and leave all other keys untouched.
-   *
-   * @param {KeyboardEvent} e
-   */
-  function handleRemovalKeydown(e) {
-    if (e.key === 'Escape') {
-      e.preventDefault()
-      e.stopPropagation()
-      cancelRemoval()
-    }
-  }
-
-  /**
-   * Confirm removal of the currently pending profile.
-   */
-  async function confirmRemoval() {
-    if (!removingProfile || !config || saving || loading) return
-    const { provider, id: profileId } = removingProfile
-    await deleteProfile(provider, profileId)
-  }
-
-  /**
-   * Delete a profile from a provider and persist to backend.
-   * If the deleted profile was the selected target, resets selectedTarget to local.
-   *
-   * @param {'modal'|'beam'} provider
-   * @param {string} profileId
-   */
-  async function deleteProfile(provider, profileId) {
-    if (!config || saving || loading) return
-    const currentSeq = ++operationSeq
-
-    const nextBeamProfiles = { ...config.beamProfiles }
-    const nextModalProfiles = { ...config.modalProfiles }
-
-    if (provider === 'beam') {
-      delete nextBeamProfiles[profileId]
-    } else if (provider === 'modal') {
-      delete nextModalProfiles[profileId]
-    }
-
-    let nextTarget = config.selectedTarget
-    if (
-      nextTarget &&
-      nextTarget.type === provider &&
-      nextTarget.profile_id === profileId
-    ) {
-      nextTarget = { type: 'local' }
-    }
-
-    const nextConfig = {
-      schemaVersion: config.schemaVersion ?? 1,
-      selectedTarget: nextTarget,
-      beamProfiles: nextBeamProfiles,
-      modalProfiles: nextModalProfiles,
-    }
-
-    saving = true
-    errorMessage = null
-    statusMessage = null
-    try {
-      const saved = await getBackend().writeInferenceConfig({ config: $state.snapshot(nextConfig) })
-      if (operationSeq === currentSeq) {
-        config = saved
-        if (
-          editingProfile &&
-          editingProfile.provider === provider &&
-          editingProfile.id === profileId
-        ) {
-          editingProfile = null
+    if (!stored) {
+      // An endpoint with no token is one nobody asked for: take it back out.
+      if (written && previous) {
+        try {
+          await backend.writeInferenceConfig({ config: previous })
+        } catch {
+          // Still listed, with no token; Remove takes it away.
         }
-        if (
-          removingProfile &&
-          removingProfile.provider === provider &&
-          removingProfile.id === profileId
-        ) {
-          removingProfile = null
-          removalTriggerEl = null
-        }
-        statusMessage = 'settings.inference.status.profileRemoved'
-        targetSelectKey += 1
       }
-    } catch {
-      if (operationSeq === currentSeq) {
-        errorMessage = 'settings.inference.error.saveFailed'
-      }
-    } finally {
-      if (operationSeq === currentSeq) {
-        saving = false
-      }
+      if (!alive) return
+      manualError = written ? 'settings.inference.error.tokenSaveFailed' : 'settings.inference.error.saveFailed'
+      manualSaving = false
+      void reload()
+      return
     }
-  }
 
-  /**
-   * Test control-plane reachability for a profile.
-   * Ordinary connection check: strictly reachability/auth, never triggers GPU work.
-   *
-   * @param {'modal'|'beam'} provider
-   * @param {string} profileId
-   */
-  async function checkConnection(provider, profileId) {
-    connectionChecks[profileId] = { checking: true }
+    await reload()
+    /** @type {any} */
+    let check = null
     try {
-      const res = await getBackend().checkCloudConnection({ provider, profileId })
-      if (res && res.ok) {
-        connectionChecks[profileId] = { ok: true, latencyMs: res.latencyMs }
-      } else {
-        connectionChecks[profileId] = { ok: false, message: res?.message }
-      }
-    } catch (err) {
-      const msg = String(err?.message ?? err ?? '')
-      if (msg.includes('not found') || msg.includes('not registered') || msg.includes('was constructed outside')) {
-        connectionChecks[profileId] = { notRegistered: true }
-      } else {
-        connectionChecks[profileId] = { ok: false }
-      }
-    }
-  }
-
-  /**
-   * Reconcile interrupted attempt recovery state.
-   */
-  async function checkRecovery() {
-    checkingRecovery = true
-    try {
-      const res = await getBackend().reconcileCloudRecovery()
-      if (!res || res.decision === 'terminal' || res.decision === 'already_committed') {
-        recoveryState = 'none'
-      } else if (res.decision === 'ambiguous_unknown') {
-        recoveryState = 'ambiguous'
-      } else if (res.decision === 'result_cached_ready') {
-        recoveryState = 'cached'
-      } else if (res.decision === 'stale_attachment') {
-        recoveryState = 'stale'
-      } else {
-        recoveryState = 'none'
-      }
+      check = await backend.checkCloudConnection({ provider: which, profileId })
     } catch {
-      recoveryState = 'none'
-    } finally {
-      checkingRecovery = false
+      check = null
     }
+    if (!alive) return
+    const checkStatus = typeof check?.status === 'string' ? check.status : 'unknown'
+    const ok = check?.ok === true
+    tests = {
+      ...tests,
+      [`${which}:${profileId}`]: {
+        state: 'done',
+        ok,
+        status: checkStatus,
+        latency: typeof check?.latencyMs === 'number' && Number.isFinite(check.latencyMs) ? Math.round(check.latencyMs) : null,
+      },
+    }
+    manualNote = ok
+      ? { key: 'settings.inference.connect.connected', params: { name }, ok }
+      : { key: 'settings.inference.connect.savedUnchecked', params: { name, reasonKey: healthKey(checkStatus) }, ok }
+    manualName = ''
+    manualUrl = ''
+    manualSaving = false
   }
 </script>
 
-<div class="inference-settings">
-  <div class="disclaimer-box">
-    <p class="disclaimer-text">{t('settings.inference.disclaimer')}</p>
-    <p class="execution-status-text">
-      <strong>{t('settings.inference.executionStatus.label')}:</strong> {t('settings.inference.executionStatus.unavailable')}
-    </p>
+{#snippet secretField(id, label, value, onchange)}
+  <div class="key">
+    <label class="key-label" for={id}>{label}</label>
+    <TextInput
+      {id}
+      {value}
+      {onchange}
+      type="password"
+      autocomplete="off"
+      autocapitalize="off"
+      spellcheck="false"
+    />
   </div>
+{/snippet}
 
-  {#if loading}
-    <p class="note">{t('settings.inference.loading')}</p>
-  {:else if errorMessage && !config}
-    <div class="load-error-wrap">
-      <div class="status-banner error" role="alert">
-        {t(errorMessage)}
+<div class="cloud" bind:this={root}>
+  <p class="status {status.tone}" role="status">
+    <span class="light" aria-hidden="true"></span>
+    <span>{status.text}</span>
+  </p>
+
+  <Field
+    label={t('settings.inference.permission.label')}
+    description={t('settings.inference.permission.description')}
+    layout="row"
+  >
+    {#snippet children({ labelId })}
+      <Segmented
+        options={permissionOptions}
+        value={session.cloudAllowed ? 'on' : 'off'}
+        labelledBy={labelId}
+        onchange={changePermission}
+      />
+    {/snippet}
+  </Field>
+
+  {#if attention}
+    <section class="attention" aria-labelledby={ids.attention}>
+      <h4 class="title" id={ids.attention}>{t('settings.inference.recovery.title')}</h4>
+      <ul class="issues">
+        {#if unfinished}
+          <li class="issue">
+            <Icon name="warning-triangle" size={13} />
+            <div class="issue-body">
+              <p>
+                {t('settings.inference.recovery.unfinished', {
+                  providerKey: providerKey(unfinished.provider),
+                  id: unfinished.installationId,
+                })}
+              </p>
+              <p class="note">{t('settings.inference.recovery.forgetNote')}</p>
+              <div class="actions">
+                <Button
+                  size="sm"
+                  variant="soft"
+                  data-resume={unfinished.installationId}
+                  onclick={() => resumeUnfinished(unfinished)}
+                >
+                  {t('settings.inference.recovery.resume')}
+                </Button>
+                <Button size="sm" onclick={forgetUnfinished}>{t('settings.inference.recovery.forget')}</Button>
+              </div>
+            </div>
+          </li>
+        {/if}
+        {#if missingToken}
+          <li class="issue">
+            <Icon name="warning-triangle" size={13} />
+            <div class="issue-body">
+              <p>{t('settings.inference.recovery.noToken', { name: missingToken.name })}</p>
+              <div class="actions">
+                {#if madeBySetup(missingToken) && !task && !setupRunning}
+                  <Button
+                    size="sm"
+                    variant="soft"
+                    data-newtoken={missingToken.key}
+                    onclick={() =>
+                      openTask({ action: 'resume', provider: missingToken.provider, installationId: missingToken.id }, [
+                        'data-newtoken',
+                        missingToken.key,
+                      ])}
+                  >
+                    {t('settings.inference.recovery.newToken')}
+                  </Button>
+                {/if}
+                <Button size="sm" onclick={() => openTokenForm(missingToken)}>{t('settings.inference.token.add')}</Button>
+              </div>
+            </div>
+          </li>
+        {/if}
+        {#each attempts as entry (entry.attemptId)}
+          <li class="issue">
+            <Icon name="warning-triangle" size={13} />
+            <div class="issue-body">
+              <p>
+                {typeof entry.pageIndex === 'number'
+                  ? t('settings.inference.recovery.attempt', {
+                      page: entry.pageIndex + 1,
+                      reasonKey: attemptReasonKey(entry.reason),
+                    })
+                  : t('settings.inference.recovery.attemptNoPage', { reasonKey: attemptReasonKey(entry.reason) })}
+              </p>
+              <div class="actions">
+                <Button size="sm" onclick={() => dismissRecovered(entry.attemptId)}>
+                  {t('settings.inference.recovery.dismiss')}
+                </Button>
+              </div>
+            </div>
+          </li>
+        {/each}
+      </ul>
+    </section>
+  {/if}
+
+  <section class="endpoints" aria-labelledby={ids.endpoints}>
+    <h4 class="title" id={ids.endpoints} tabindex="-1">{t('settings.inference.endpoints.title')}</h4>
+
+    {#if loadFailed}
+      <div class="problem" role="alert">
+        <Icon name="warning-triangle" size={13} />
+        <p>{t('settings.inference.endpoints.loadFailed')}</p>
+        <Button size="sm" onclick={() => void reload()}>{t('settings.inference.endpoints.retry')}</Button>
       </div>
-      <Button size="sm" onclick={loadConfig}>
-        {t('home.action.retry')}
-      </Button>
+    {:else if loaded && endpoints.length === 0}
+      <p class="empty">{t('settings.inference.endpoints.empty')}</p>
+    {:else if endpoints.length > 0}
+      <ul class="list">
+        {#each endpoints as ep, index (ep.key)}
+          {@const test = tests[ep.key]}
+          {@const chosen = selectedKey === ep.key}
+          <li class="row" class:chosen>
+            <div class="main">
+              <input
+                type="radio"
+                class="pick"
+                id="{uid}-pick-{index}"
+                name="{uid}-default"
+                value={ep.key}
+                checked={chosen}
+                aria-label={t('settings.inference.endpoints.useDefault', { name: ep.name })}
+                onchange={() => selectDefault(ep)}
+              />
+              <div class="text">
+                <div class="name-line">
+                  <label class="name" for="{uid}-pick-{index}">{ep.name}</label>
+                  {#if chosen}<span class="badge">{t('settings.inference.endpoints.default')}</span>{/if}
+                </div>
+                <div class="meta">
+                  {t('settings.inference.endpoints.meta', { providerKey: providerKey(ep.provider), host: ep.host })}
+                </div>
+                <div class="facts">
+                  <span class="token" class:missing={tokens[ep.key] === false}>{tokenText(ep.key)}</span>
+                  <button type="button" class="link" data-token={ep.key} onclick={() => openTokenForm(ep)}>
+                    {tokens[ep.key] === true ? t('settings.inference.token.replace') : t('settings.inference.token.add')}
+                  </button>
+                </div>
+                <p class="check" class:bad={test?.state === 'done' && !test.ok} aria-live="polite">
+                  {#if test?.state === 'testing'}
+                    {t('settings.inference.endpoints.testing')}
+                  {:else if test?.state === 'done'}
+                    <span>{t(healthKey(test.status))}</span>
+                    {#if test.ok && test.latency !== null}
+                      <span class="latency">{t('settings.inference.health.latency', { latency: test.latency })}</span>
+                    {/if}
+                  {/if}
+                </p>
+              </div>
+              <div class="row-actions">
+                <Button size="sm" onclick={() => testEndpoint(ep)}>{t('settings.inference.endpoints.test')}</Button>
+                <Button size="sm" data-remove={ep.key} onclick={() => askRemove(ep)}>
+                  {t('settings.inference.endpoints.remove')}
+                </Button>
+              </div>
+            </div>
+
+            {#if tokenFor === ep.key}
+              <form
+                class="inline"
+                onsubmit={(event) => {
+                  event.preventDefault()
+                  void saveToken(ep)
+                }}
+              >
+                {#if ep.provider === 'modal'}
+                  {@render secretField(ids.tokenId, t('settings.inference.token.modalTokenId'), tokenId, (/** @type {string} */ value) => (tokenId = value))}
+                  {@render secretField(ids.tokenSecret, t('settings.inference.token.modalTokenSecret'), tokenSecret, (/** @type {string} */ value) => (tokenSecret = value))}
+                {:else}
+                  {@render secretField(ids.tokenSecret, t('settings.inference.token.beamToken'), tokenSecret, (/** @type {string} */ value) => (tokenSecret = value))}
+                {/if}
+                {#if tokenError}<p class="error" role="alert">{t(tokenError)}</p>{/if}
+                <div class="actions end">
+                  <Button size="sm" onclick={() => closeTokenForm(ep)}>{t('shell.action.cancel')}</Button>
+                  <Button size="sm" variant="primary" type="submit">
+                    {tokenSaving ? t('settings.inference.token.saving') : t('settings.inference.token.save')}
+                  </Button>
+                </div>
+              </form>
+            {/if}
+
+            {#if removingKey === ep.key}
+              <div class="inline confirm" role="group" aria-labelledby={ids.removeText}>
+                <p class="confirm-text" id={ids.removeText} tabindex="-1">
+                  {t('settings.inference.remove.confirm', { name: ep.name })}
+                </p>
+                {#if madeBySetup(ep)}
+                  <label class="check-row">
+                    <input
+                      type="checkbox"
+                      checked={alsoDelete}
+                      disabled={setupRunning}
+                      onchange={(event) => (alsoDelete = event.currentTarget.checked)}
+                    />
+                    <span>{t('settings.inference.remove.alsoDelete')}</span>
+                  </label>
+                {/if}
+                <p class="note">
+                  {alsoDelete
+                    ? t('settings.inference.remove.deleteNote', { providerKey: providerKey(ep.provider) })
+                    : t('settings.inference.remove.keepNote', { providerKey: providerKey(ep.provider) })}
+                </p>
+                {#if removeError}<p class="error" role="alert">{t(removeError)}</p>{/if}
+                <div class="actions end">
+                  <Button size="sm" onclick={() => cancelRemove(ep)}>{t('shell.action.cancel')}</Button>
+                  <Button size="sm" variant="primary" onclick={() => confirmRemove(ep)}>
+                    {alsoDelete ? t('settings.inference.remove.review') : t('settings.inference.remove.confirmButton')}
+                  </Button>
+                </div>
+              </div>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    {/if}
+    {#if listError}<p class="error" role="alert">{t(listError)}</p>{/if}
+
+    <div class="slot" bind:this={slot}>
+      {#if task}
+        {#key task}
+          <CloudProvisioner
+            inline
+            existing={task.action === 'setup' ? null : task}
+            onclose={closeTask}
+            onconfigured={configured}
+            oncleaned={() => void reload()}
+            {backend}
+          />
+        {/key}
+      {:else}
+        <div class="setup">
+          <Button
+            variant={loaded && endpoints.length === 0 ? 'primary' : 'soft'}
+            data-setup="open"
+            onclick={() => openTask({ action: 'setup' }, ['data-setup', 'open'])}
+          >
+            {t('settings.inference.setup.action')}
+          </Button>
+          <p class="note">{t('settings.inference.setup.description')}</p>
+        </div>
+      {/if}
     </div>
-  {:else if config}
-    <div class="target-field-wrap">
-      <Field label={t('settings.inference.target.label')} layout="row">
+  </section>
+
+  <Disclosure
+    variant="plain"
+    open={manualOpen}
+    ontoggle={(/** @type {boolean} */ open) => {
+      manualOpen = open
+      if (!open) wipeManualSecrets()
+    }}
+  >
+    {#snippet summary()}{t('settings.inference.connect.title')}{/snippet}
+    <form
+      class="manual"
+      onsubmit={(event) => {
+        event.preventDefault()
+        void connectManual()
+      }}
+    >
+      <p class="note">{t('settings.inference.connect.description')}</p>
+      <Field label={t('settings.inference.provider.label')}>
         {#snippet children({ labelId })}
-          {#key targetSelectKey}
-            <Select
-              options={targetOptions}
-              value={currentTargetValue}
-              labelledBy={labelId}
-              disabled={saving || loading}
-              onchange={chooseTarget}
-            />
-          {/key}
+          <Segmented
+            options={providerOptions}
+            value={manualProvider}
+            labelledBy={labelId}
+            align="start"
+            onchange={(value) => {
+              manualProvider = value === 'beam' ? 'beam' : 'modal'
+              wipeManualSecrets()
+            }}
+          />
         {/snippet}
       </Field>
-    </div>
-
-    {#if editingProfile}
-      <div
-        class="profile-form-card"
-        role="region"
-        aria-label={editingProfile.isNew
-          ? t('settings.inference.addProfile')
-          : t('settings.inference.editProfile')}
-      >
-        <div class="form-header">
-          <h4 class="form-title">
-            {editingProfile.isNew
-              ? t('settings.inference.addProfile')
-              : t('settings.inference.editProfile')}
-          </h4>
-        </div>
-
-        {#if editingProfile.isNew}
-          <div class="form-field-wrap">
-            <Field
-              label={t('settings.inference.provider.label')}
-              layout="stack"
-              controlId="inference-provider-select"
-            >
-              {#snippet children()}
-                <select
-                  id="inference-provider-select"
-                  class="sidecar-model-select"
-                  value={editingProfile.provider}
-                  disabled={saving}
-                  onchange={(e) => {
-                    if (editingProfile) {
-                      editingProfile = {
-                        ...editingProfile,
-                        provider: /** @type {'modal'|'beam'} */ (e.currentTarget.value),
-                      }
-                    }
-                  }}
-                >
-                  <option value="modal">{t('settings.inference.provider.modal')}</option>
-                  <option value="beam">{t('settings.inference.provider.beam')}</option>
-                </select>
-              {/snippet}
-            </Field>
-          </div>
-
-          <div class="form-field-wrap">
-            <Field
-              label={t('settings.inference.id.label')}
-              layout="stack"
-              controlId="inference-profile-id"
-            >
-              {#snippet children()}
-                <TextInput
-                  id="inference-profile-id"
-                  value={editingProfile.id}
-                  disabled={saving}
-                  placeholder={t('settings.inference.id.placeholder')}
-                  onchange={(val) => {
-                    if (editingProfile) {
-                      editingProfile = { ...editingProfile, id: val }
-                    }
-                  }}
-                />
-              {/snippet}
-            </Field>
-          </div>
-        {/if}
-
-        <div class="form-field-wrap">
-          <Field
-            label={t('settings.inference.name.label')}
-            layout="stack"
-            controlId="inference-profile-name"
-          >
-            {#snippet children()}
-              <TextInput
-                id="inference-profile-name"
-                value={editingProfile.name}
-                disabled={saving}
-                placeholder={t('settings.inference.name.placeholder')}
-                onchange={(val) => {
-                  if (editingProfile) {
-                    editingProfile = { ...editingProfile, name: val }
-                  }
-                }}
-              />
-            {/snippet}
-          </Field>
-        </div>
-
-        <div class="form-field-wrap">
-          <Field
-            label={t('settings.inference.endpoint.label')}
-            layout="stack"
-            controlId="inference-profile-endpoint"
-          >
-            {#snippet children()}
-              <TextInput
-                id="inference-profile-endpoint"
-                value={editingProfile.endpointUrl}
-                disabled={saving}
-                placeholder={t('settings.inference.endpoint.placeholder')}
-                onchange={(val) => {
-                  if (editingProfile) {
-                    editingProfile = { ...editingProfile, endpointUrl: val }
-                  }
-                }}
-              />
-            {/snippet}
-          </Field>
-        </div>
-
-        {#if !editingProfile.isNew && isOriginChanged(editingProfile.originalEndpointUrl, editingProfile.endpointUrl)}
-          <div class="warning-note" role="alert">
-            {t('settings.inference.originWarning')}
-          </div>
-        {/if}
-
-        {#if formError}
-          <div class="form-error" role="alert">
-            {t(formError)}
-          </div>
-        {/if}
-
-        <div class="form-actions">
-          <Button variant="primary" onclick={saveProfile} disabled={saving}>
-            {t('settings.inference.save')}
-          </Button>
-          <Button onclick={cancelEdit} disabled={saving}>
-            {t('settings.inference.cancel')}
-          </Button>
-        </div>
-      </div>
-    {:else if removingProfile}
-      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-      <div
-        class="profile-form-card removal-confirm-card"
-        role="region"
-        aria-label={t('settings.inference.removal.confirmTitle')}
-        bind:this={removalCardEl}
-        onkeydown={handleRemovalKeydown}
-      >
-        <div class="form-header">
-          <h4 class="form-title">
-            {t('settings.inference.removal.confirmTitleNamed', {
-              name: removingProfile.name,
-              id: removingProfile.id,
-            })}
-          </h4>
-        </div>
-
-        <p class="removal-description">
-          {t('settings.inference.removal.description')}
-        </p>
-
-        <div class="warning-note" role="note">
-          {t('settings.inference.removal.scopeWarning')}
-        </div>
-
-        <div class="form-actions">
-          <Button variant="primary" onclick={confirmRemoval} disabled={saving}>
-            {t('settings.inference.removal.confirmButton')}
-          </Button>
-          <Button onclick={cancelRemoval} disabled={saving}>
-            {t('settings.inference.cancel')}
-          </Button>
-        </div>
-      </div>
-    {/if}
-
-    <div class="provider-section">
-      <div class="section-head">
-        <h4 class="section-title">{t('settings.inference.modalSection')}</h4>
-        <Button
-          size="sm"
-          onclick={() => startAdd('modal')}
-          disabled={saving || !!editingProfile || !!removingProfile}
-        >
-          {t('settings.inference.addProfile')}
-        </Button>
-      </div>
-
-      {#if Object.keys(config.modalProfiles || {}).length === 0}
-        <p class="empty-note">{t('settings.inference.noProfiles')}</p>
+      <Field label={t('settings.inference.connect.name')} controlId={ids.name}>
+        {#snippet children()}
+          <TextInput id={ids.name} value={manualName} onchange={(/** @type {string} */ value) => (manualName = value)} />
+        {/snippet}
+      </Field>
+      <Field label={t('settings.inference.connect.endpoint')} controlId={ids.url}>
+        {#snippet children()}
+          <TextInput
+            id={ids.url}
+            value={manualUrl}
+            placeholder={t('settings.inference.endpoint.placeholder')}
+            autocapitalize="off"
+            spellcheck="false"
+            onchange={(/** @type {string} */ value) => (manualUrl = value)}
+          />
+        {/snippet}
+      </Field>
+      {#if manualProvider === 'modal'}
+        {@render secretField(ids.manualTokenId, t('settings.inference.token.modalTokenId'), manualTokenId, (/** @type {string} */ value) => (manualTokenId = value))}
+        {@render secretField(ids.manualSecret, t('settings.inference.token.modalTokenSecret'), manualSecret, (/** @type {string} */ value) => (manualSecret = value))}
       {:else}
-        <ul class="rows">
-          {#each Object.entries(config.modalProfiles) as [id, profile] (id)}
-            <li class="row">
-              <div class="row-text">
-                <span class="row-name">
-                  {profile.name} <span class="profile-id">({profile.id})</span>
-                </span>
-                <span class="row-meta">{profile.endpointUrl}</span>
-                {#if connectionChecks[id]}
-                  <div class="connection-status" role="status" aria-live="polite">
-                    {#if connectionChecks[id].checking}
-                      <span class="status-indicator checking">{t('settings.inference.testingConnection')}</span>
-                    {:else if connectionChecks[id].ok}
-                      <span class="status-indicator ok">{t('settings.inference.connectionReachable', { latency: connectionChecks[id].latencyMs ?? 0 })}</span>
-                    {:else if connectionChecks[id].notRegistered}
-                      <span class="status-indicator unavail">{t('settings.inference.commandNotRegistered')}</span>
-                    {:else}
-                      <span class="status-indicator failed">{t('settings.inference.connectionFailed')}</span>
-                    {/if}
-                  </div>
-                {/if}
-              </div>
-              <div class="row-actions">
-                <Button
-                  size="sm"
-                  aria-label={t("settings.inference.testNamed", { name: profile.name, id })}
-                  onclick={() => checkConnection('modal', id)}
-                  disabled={saving || connectionChecks[id]?.checking}
-                >
-                  {t('settings.inference.testConnection')}
-                </Button>
-                <Button
-                  size="sm"
-                  aria-label={t("settings.inference.editNamed", { name: profile.name, id })}
-                  onclick={() => startEdit('modal', profile)}
-                  disabled={saving || !!editingProfile || !!removingProfile}
-                >
-                  {t('settings.inference.edit')}
-                </Button>
-                <Button
-                  size="sm"
-                  aria-label={t("settings.inference.deleteNamed", { name: profile.name, id })}
-                  onclick={(e) => startRemove('modal', profile, e?.currentTarget)}
-                  disabled={saving || !!editingProfile || !!removingProfile}
-                >
-                  {t('settings.inference.deleteProfile')}
-                </Button>
-              </div>
-            </li>
-          {/each}
-        </ul>
+        {@render secretField(ids.manualSecret, t('settings.inference.token.beamToken'), manualSecret, (/** @type {string} */ value) => (manualSecret = value))}
       {/if}
-    </div>
-
-    <div class="provider-section">
-      <div class="section-head">
-        <h4 class="section-title">{t('settings.inference.beamSection')}</h4>
-        <Button
-          size="sm"
-          onclick={() => startAdd('beam')}
-          disabled={saving || !!editingProfile || !!removingProfile}
-        >
-          {t('settings.inference.addProfile')}
+      {#if manualError}<p class="error" role="alert">{t(manualError)}</p>{/if}
+      {#if manualNote}
+        <p class="result" class:bad={!manualNote.ok} role="status">{t(manualNote.key, manualNote.params)}</p>
+      {/if}
+      <div class="actions end">
+        <Button variant="primary" type="submit">
+          {manualSaving ? t('settings.inference.connect.connecting') : t('settings.inference.connect.connect')}
         </Button>
       </div>
-
-      {#if Object.keys(config.beamProfiles || {}).length === 0}
-        <p class="empty-note">{t('settings.inference.noProfiles')}</p>
-      {:else}
-        <ul class="rows">
-          {#each Object.entries(config.beamProfiles) as [id, profile] (id)}
-            <li class="row">
-              <div class="row-text">
-                <span class="row-name">
-                  {profile.name} <span class="profile-id">({profile.id})</span>
-                </span>
-                <span class="row-meta">{profile.endpointUrl}</span>
-                {#if connectionChecks[id]}
-                  <div class="connection-status" role="status" aria-live="polite">
-                    {#if connectionChecks[id].checking}
-                      <span class="status-indicator checking">{t('settings.inference.testingConnection')}</span>
-                    {:else if connectionChecks[id].ok}
-                      <span class="status-indicator ok">{t('settings.inference.connectionReachable', { latency: connectionChecks[id].latencyMs ?? 0 })}</span>
-                    {:else if connectionChecks[id].notRegistered}
-                      <span class="status-indicator unavail">{t('settings.inference.commandNotRegistered')}</span>
-                    {:else}
-                      <span class="status-indicator failed">{t('settings.inference.connectionFailed')}</span>
-                    {/if}
-                  </div>
-                {/if}
-              </div>
-              <div class="row-actions">
-                <Button
-                  size="sm"
-                  aria-label={t("settings.inference.testNamed", { name: profile.name, id })}
-                  onclick={() => checkConnection('beam', id)}
-                  disabled={saving || connectionChecks[id]?.checking}
-                >
-                  {t('settings.inference.testConnection')}
-                </Button>
-                <Button
-                  size="sm"
-                  aria-label={t("settings.inference.editNamed", { name: profile.name, id })}
-                  onclick={() => startEdit('beam', profile)}
-                  disabled={saving || !!editingProfile || !!removingProfile}
-                >
-                  {t('settings.inference.edit')}
-                </Button>
-                <Button
-                  size="sm"
-                  aria-label={t("settings.inference.deleteNamed", { name: profile.name, id })}
-                  onclick={(e) => startRemove('beam', profile, e?.currentTarget)}
-                  disabled={saving || !!editingProfile || !!removingProfile}
-                >
-                  {t('settings.inference.deleteProfile')}
-                </Button>
-              </div>
-            </li>
-          {/each}
-        </ul>
-      {/if}
-    </div>
-
-    <div class="recovery-section">
-      <div class="section-head">
-        <h4 class="section-title">{t('settings.inference.recovery.title')}</h4>
-        <Button
-          size="sm"
-          onclick={checkRecovery}
-          disabled={saving || checkingRecovery}
-        >
-          {t('settings.inference.recovery.check')}
-        </Button>
-      </div>
-
-      {#if recoveryState}
-        <div class="recovery-status-box" role="status" aria-live="polite">
-          {#if recoveryState === 'ambiguous'}
-            <p class="recovery-text">{t('settings.inference.recovery.ambiguous')}</p>
-          {:else if recoveryState === 'cached'}
-            <p class="recovery-text">{t('settings.inference.recovery.cached')}</p>
-          {:else if recoveryState === 'stale'}
-            <p class="recovery-text">{t('settings.inference.recovery.stale')}</p>
-          {:else}
-            <p class="recovery-text">{t('settings.inference.recovery.none')}</p>
-          {/if}
-        </div>
-      {/if}
-    </div>
-  {/if}
-
-  {#if errorMessage && config}
-    <div class="status-banner error" role="alert">
-      {t(errorMessage)}
-    </div>
-  {/if}
-
-  {#if statusMessage}
-    <div class="status-banner success" role="status">
-      {t(statusMessage)}
-    </div>
-  {/if}
+    </form>
+  </Disclosure>
 </div>
 
 <style>
-  .inference-settings {
-    display: flex;
-    flex-direction: column;
-    gap: var(--s-3);
+  .cloud {
+    display: grid;
+    gap: var(--s-4);
+    min-width: 0;
   }
 
-  .disclaimer-box {
-    padding: var(--s-2) var(--s-3);
-    border: 1px solid var(--line2);
-    border-radius: var(--r-md);
-    background: var(--surface);
-  }
-
-  .disclaimer-text {
-    margin: 0;
+  .title {
+    margin: 0 0 var(--s-2);
     font-size: 11px;
-    color: var(--t2);
-    line-height: 1.45;
-  }
-
-  .execution-status-text {
-    margin: var(--s-1) 0 0 0;
-    font-size: 11px;
-    color: var(--t2);
-    line-height: 1.4;
-  }
-
-  .connection-status {
-    margin-top: 2px;
-  }
-
-  .status-indicator {
-    font-size: 10px;
-    line-height: 1.4;
-  }
-
-  .status-indicator.checking {
-    color: var(--t2);
-  }
-
-  .status-indicator.ok {
-    color: #10b981;
-  }
-
-  .status-indicator.failed {
-    color: var(--warn);
-  }
-
-  .status-indicator.unavail {
-    color: var(--t3);
-  }
-
-  .recovery-section {
-    display: flex;
-    flex-direction: column;
-    padding-top: var(--s-2);
-    border-top: 1px solid var(--line);
-  }
-
-  .recovery-status-box {
-    padding: var(--s-2) var(--s-3);
-    border-radius: var(--r-md);
-    background: var(--surface);
-    border: 1px solid var(--line2);
-    margin-top: var(--s-1);
-  }
-
-  .recovery-text {
-    margin: 0;
-    font-size: 11px;
-    color: var(--t2);
-    line-height: 1.45;
-  }
-
-  .target-field-wrap {
-    padding-bottom: var(--s-2);
-  }
-
-  .provider-section {
-    display: flex;
-    flex-direction: column;
-    padding-top: var(--s-2);
-    border-top: 1px solid var(--line);
-  }
-
-  .section-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: var(--s-2);
-  }
-
-  .section-title {
-    margin: 0;
-    font-size: 12px;
     font-weight: 600;
-    color: var(--text);
-  }
-
-  .empty-note {
-    margin: var(--s-1) 0;
-    font-size: 11px;
     color: var(--t3);
+    outline: none;
   }
 
-  .profile-id {
-    font-size: 10.5px;
-    color: var(--t3);
-    font-family: monospace;
+  .note,
+  .empty,
+  .error,
+  .result {
+    margin: 0;
+    font-size: 11.5px;
+    line-height: 1.5;
   }
+  .note,
+  .empty { color: var(--t3) }
+  .error { color: var(--warn) }
+  .result { color: var(--t2) }
+  .result.bad { color: var(--warn) }
 
-  .profile-form-card {
+  .actions {
     display: flex;
-    flex-direction: column;
+    flex-wrap: wrap;
     gap: var(--s-2);
-    padding: var(--s-3);
-    border: 1px solid var(--line2);
+  }
+  .actions.end { justify-content: flex-end }
+
+  /* ---------- status ---------- */
+
+  .status {
+    display: flex;
+    gap: var(--s-3);
+    align-items: center;
+    margin: 0;
+    padding: 9px 12px;
     border-radius: var(--r-md);
     background: var(--panel2);
-    margin: var(--s-2) 0;
-  }
-
-  .form-header {
-    margin-bottom: var(--s-1);
-  }
-
-  .form-title {
-    margin: 0;
-    font-size: 12px;
-    font-weight: 600;
     color: var(--text);
-  }
-
-  .form-field-wrap {
-    margin-bottom: var(--s-1);
-  }
-
-  .warning-note {
-    padding: var(--s-2);
-    border-radius: var(--r-sm);
-    background: var(--surface);
-    color: var(--warn);
-    font-size: 10.5px;
-    line-height: 1.4;
-  }
-
-  .removal-description {
-    margin: 0;
-    font-size: 11px;
-    color: var(--t2);
     line-height: 1.45;
   }
-
-  .form-error {
-    color: var(--warn);
-    font-size: 11px;
-    line-height: 1.4;
+  .light {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--t3);
   }
+  .status.ready .light { background: var(--accent) }
+  .status.attention .light { background: var(--warn) }
+  .status.checking .light { animation: mcBlink 1.2s var(--ease) infinite }
+  .status.off { color: var(--t2) }
 
-  .form-actions {
-    display: flex;
+  /* ---------- needs attention ---------- */
+
+  .issues {
+    display: grid;
     gap: var(--s-2);
-    margin-top: var(--s-2);
-  }
-
-  .load-error-wrap {
-    display: flex;
-    flex-direction: column;
-    gap: var(--s-2);
-    align-items: flex-start;
-  }
-
-  .status-banner {
-    padding: var(--s-2) var(--s-3);
-    border-radius: var(--r-sm);
-    font-size: 11px;
-    line-height: 1.4;
-  }
-
-  .status-banner.error {
-    color: var(--warn);
-    background: var(--surface);
-  }
-
-  .status-banner.success {
-    color: var(--text);
-    background: var(--surface);
-  }
-
-  .rows {
     margin: 0;
     padding: 0;
     list-style: none;
   }
-
-  .row {
+  .issue {
     display: flex;
-    align-items: center;
     gap: var(--s-3);
-    padding: var(--s-2) 0;
-    border-bottom: 1px solid var(--line);
+    align-items: flex-start;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    color: var(--warn);
   }
-
-  .row:last-child {
-    border-bottom: none;
-  }
-
-  .row-text {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    flex: 1;
+  .issue :global(svg) { flex: none; margin-top: 2px }
+  .issue-body {
+    display: grid;
+    gap: var(--s-2);
     min-width: 0;
   }
-
-  .row-name {
-    font-size: 12px;
+  .issue-body > p:first-child {
+    margin: 0;
+    line-height: 1.5;
     color: var(--text);
   }
 
-  .row-meta {
-    font-size: 10.5px;
-    color: var(--t3);
-    line-height: 1.4;
-    word-break: break-all;
+  /* ---------- endpoints ---------- */
+
+  .problem {
+    display: flex;
+    gap: var(--s-3);
+    align-items: center;
+    padding: 10px 12px;
+    border-radius: var(--r-md);
+    background: var(--panel2);
+    color: var(--warn);
+  }
+  .problem p {
+    flex: 1;
+    margin: 0;
+    line-height: 1.5;
+    color: var(--text);
   }
 
+  .list {
+    display: grid;
+    margin: 0;
+    padding: 0;
+    border-top: 1px solid var(--line);
+    list-style: none;
+  }
+  .row {
+    display: grid;
+    gap: var(--s-3);
+    padding: 10px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .main {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: var(--s-3);
+    align-items: start;
+  }
+  .pick {
+    margin: 3px 0 0;
+    accent-color: var(--accent);
+  }
+  .text {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+  }
+  .name-line {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--s-2);
+    align-items: baseline;
+  }
+  .name {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    color: var(--text);
+    cursor: pointer;
+  }
+  .badge {
+    padding: 0 6px;
+    border-radius: var(--r-pill);
+    background: var(--accent-soft);
+    color: var(--text);
+    font-size: 10.5px;
+    line-height: 16px;
+  }
+  .meta {
+    font-size: 11.5px;
+    color: var(--t3);
+    overflow-wrap: anywhere;
+  }
+  .facts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 var(--s-3);
+    align-items: baseline;
+    font-size: 11.5px;
+  }
+  .token { color: var(--t2) }
+  .token.missing { color: var(--warn) }
+  .link {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--t2);
+    font: inherit;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+  }
+  .link:hover,
+  .link:focus { color: var(--text) }
+  .check {
+    margin: 0;
+    font-size: 11.5px;
+    color: var(--t2);
+  }
+  .check.bad { color: var(--warn) }
+  .latency {
+    margin-left: var(--s-2);
+    color: var(--t3);
+    font-variant-numeric: tabular-nums;
+  }
   .row-actions {
     display: flex;
-    flex: none;
     gap: var(--s-2);
   }
 
-  .note {
-    margin: 0 0 var(--s-2);
-    font-size: 10.5px;
-    color: var(--t3);
-    line-height: 1.45;
-  }
-
-  .sidecar-model-select {
-    width: 100%;
-    height: 28px;
-    padding: 0 var(--s-2);
-    border: 1px solid var(--line2);
+  .inline {
+    display: grid;
+    gap: var(--s-3);
+    margin-left: 22px;
+    padding: 10px 12px;
     border-radius: var(--r-md);
-    background: var(--panel);
+    background: var(--panel2);
+  }
+  .confirm-text {
+    margin: 0;
+    line-height: 1.5;
     color: var(--text);
-    font: inherit;
-    font-size: 11.5px;
-    cursor: pointer;
-    transition:
-      background var(--dur-fast) var(--ease),
-      border-color var(--dur-fast) var(--ease);
-  }
-
-  .sidecar-model-select:hover:not(:disabled) {
-    border-color: var(--accent);
-  }
-
-  .sidecar-model-select:focus-visible {
     outline: none;
-    border-color: var(--accent);
+  }
+  .check-row {
+    display: flex;
+    gap: var(--s-3);
+    align-items: flex-start;
+    line-height: 1.5;
+    color: var(--text);
+    cursor: pointer;
+  }
+  .check-row input {
+    flex: none;
+    margin: 3px 0 0;
+    accent-color: var(--accent);
   }
 
-  .sidecar-model-select:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
+  .key { display: grid; gap: var(--s-1) }
+  .key-label { font-size: 11.5px; color: var(--t2) }
+
+  .slot { margin-top: var(--s-3) }
+  .setup {
+    display: grid;
+    gap: var(--s-2);
+    justify-items: start;
+  }
+
+  /* ---------- manual ---------- */
+
+  .manual {
+    display: grid;
+    gap: var(--s-3);
+    padding-top: var(--s-2);
+  }
+
+  @media (max-width: 560px) {
+    .main { grid-template-columns: auto minmax(0, 1fr) }
+    .row-actions { grid-column: 2 }
   }
 </style>

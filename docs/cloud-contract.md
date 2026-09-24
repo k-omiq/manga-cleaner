@@ -1,7 +1,7 @@
 # Manga Cleaner Provider-Neutral Cloud Wire Contract (`/mc/v1`)
 
 **Protocol Version:** `1.0.0`
-**Status:** Canonical P2c Wire Contract (Offline Shared Schema & Validation Only; Gateway Implementations Absent)
+**Status:** Canonical P2c Wire Contract (Offline Shared Schema & Validation Only). Gateway implementations now exist in `deploy/cloud/` and follow this contract. They have not run live.
 
 ---
 

@@ -1,164 +1,163 @@
-"""Modal Cloud Deployment Template and Adapter.
+"""Modal app: CPU gateway, GPU worker and weights seeding.
 
-Provides the production-shaped Modal app template with CPU ASGI control gateway
-and GPU diffusion worker, plus an offline test adapter that exercises the
-application-owned `/mc/v1` contract without importing paid SDKs or incurring costs.
+The provisioner exports the MC_MODAL_* variables (see settings.py), imports this
+module and deploys `app`. Each image carries the same variables, so a container that
+imports this module again rebuilds exactly the app that was deployed.
+
+- `gateway` serves /mc/v1 on a small CPU container behind Modal proxy auth. It keeps
+  job documents in a modal.Dict, so health and model-info never start a GPU.
+- `Worker` loads the pinned pipeline from the weights volume once per GPU container
+  and renders one job per call. It scales to zero after the idle window.
+- `seed_weights` downloads the pinned snapshot into the weights volume on a CPU
+  container. GPU containers never download.
+
+Only this package's Python files are uploaded (include_source=False plus one
+filtered add_local_dir), never anything else from the machine that deploys.
 """
 
 from __future__ import annotations
 
-import logging
-import uuid
-from typing import Any, Callable, Dict, Optional, Tuple
+import time
+from pathlib import Path
+from typing import Any, Dict
 
-from deploy.cloud.common.contract import (
-    PROTOCOL_VERSION,
-    CloudProvider,
-    JobAcceptedResponse,
-    JobExecutionStatus,
-    JobRequestMetadata,
-    JobStatusResponse,
-    ModelInfoResponse,
-    ServiceLimits,
-    TypedError,
-    provisional_fixture_limits,
+import modal
+
+from deploy.cloud.common.deployment import (
+    JOB_TIMEOUT_SECONDS,
+    SEED_TIMEOUT_SECONDS,
+    WORKER_STARTUP_TIMEOUT_SECONDS,
 )
-from deploy.cloud.common.api import CloudGateway
-from deploy.cloud.common.flux import FluxWorker
-from deploy.cloud.common.handle_mapping import InMemoryHandleRegistry, JobRecord
-from deploy.cloud.common.manifest import get_default_model_info
-from deploy.cloud.common.redact import redact_text
+from deploy.cloud.common.manifest import get_production_model_info, production_limits
+from deploy.cloud.common.weights import run_seed
+from deploy.cloud.common.worker import WorkerRuntime
+from deploy.cloud.modal.backend import ModalDictStore, ModalWorkerDispatcher, worker_render
+from deploy.cloud.modal.settings import WEIGHTS_MOUNT, ModalSettings
 
-logger = logging.getLogger("deploy.cloud.modal")
+SETTINGS = ModalSettings.from_env()
 
-# Lazy, optional import of the official Modal SDK
-try:
-    import modal  # type: ignore
-    _MODAL_SDK_AVAILABLE: bool = True
-except ImportError:
-    modal = None
-    _MODAL_SDK_AVAILABLE: bool = False
+PYTHON_VERSION = "3.12"
+TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu129"
+TORCH_REQUIREMENT = "torch==2.13.0"
+GPU_REQUIREMENTS = (
+    "diffusers==0.39.0",
+    "sdnq==0.2.4",
+    "transformers==5.15.0",
+    "accelerate==1.14.0",
+    "safetensors==0.8.0",
+    "huggingface-hub==1.24.0",
+    "pillow==12.3.0",
+    "numpy==2.4.6",
+)
+SEED_REQUIREMENTS = ("huggingface-hub==1.24.0",)
 
+# deploy/cloud/modal/app.py -> deploy/
+DEPLOY_ROOT = Path(__file__).resolve().parents[2]
+REMOTE_DEPLOY_ROOT = "/root/deploy"  # /root is on PYTHONPATH in Modal containers
 
-class ModalAppAdapter:
-    """Offline-testable Modal provider adapter implementing `/mc/v1`."""
-
-    def __init__(
-        self,
-        token_id: Optional[str] = None,
-        token_secret: Optional[str] = None,
-        model_info: Optional[ModelInfoResponse] = None,
-        limits: Optional[ServiceLimits] = None,
-        handle_registry: Optional[InMemoryHandleRegistry] = None,
-        worker: Optional[FluxWorker] = None,
-        auth_validator: Optional[Callable[[Dict[str, str]], bool]] = None,
-        auto_execute: bool = True,
-    ):
-        self.provider = CloudProvider.MODAL
-        self.token_id = token_id
-        self.token_secret = token_secret
-        self.auth_validator = auth_validator
-        self.limits = limits or provisional_fixture_limits()
-        self.model_info = model_info or get_default_model_info("modal", limits=self.limits)
-        self.handle_registry = handle_registry or InMemoryHandleRegistry()
-        self.worker = worker or FluxWorker(provider="modal", limits=self.limits)
-        self.auto_execute = auto_execute
-
-        # Instantiate shared CPU Gateway bound to Modal proxy auth
-        self.gateway = CloudGateway(
-            provider=self.provider,
-            model_info=self.model_info,
-            limits=self.limits,
-            handle_registry=self.handle_registry,
-            worker=self.worker,
-            auth_validator=self.auth_validator,
-            proxy_token_id=self.token_id,
-            proxy_token_secret=self.token_secret,
-            auto_execute=self.auto_execute,
-        )
-
-    def handle_request(
-        self,
-        method: str,
-        path: str,
-        headers: Dict[str, str],
-        body: bytes,
-    ) -> Tuple[int, Dict[str, str], bytes]:
-        """Dispatch HTTP request through the Modal-configured CPU gateway."""
-        return self.gateway.handle_http_request(method, path, headers, body)
-
-    def as_asgi_app(self) -> Callable:
-        """Expose ASGI 3.0 application for Modal web endpoint serving."""
-        return self.gateway.as_asgi_app()
-
-    def as_wsgi_app(self) -> Callable:
-        """Expose WSGI application callable."""
-        return self.gateway.as_wsgi_app()
-
-    def simulate_function_call(
-        self,
-        job_meta: JobRequestMetadata,
-        img_bytes: bytes,
-        hint_bytes: bytes,
-    ) -> str:
-        """Simulate native Modal FunctionCall spawning and return native call handle."""
-        native_id = f"fc-{uuid.uuid4().hex}"
-        app_handle = f"handle-modal-{uuid.uuid4().hex}"
-        record = self.handle_registry.register_job(
-            job_meta=job_meta,
-            native_handle=native_id,
-            app_handle=app_handle,
-            provider="modal",
-        )
-        self.gateway.execute_worker_job(record, img_bytes, hint_bytes)
-        return record.native_handle
-
-    @staticmethod
-    def deploy_live() -> None:
-        """Explicit refusal of unverified live cloud deployments."""
-        raise NotImplementedError(
-            "Live Modal deployment requires authorized platform credentials and explicit staging approval. "
-            "Offline verification mode only."
-        )
+_SHIPPED_DIRS = {("cloud", "common"), ("cloud", "modal")}
 
 
-def create_modal_gateway(
-    token_id: Optional[str] = None,
-    token_secret: Optional[str] = None,
-    limits: Optional[ServiceLimits] = None,
-    auth_validator: Optional[Callable[[Dict[str, str]], bool]] = None,
-) -> CloudGateway:
-    """Factory helper creating a Modal-bound CloudGateway with required secrets validation."""
-    if not (token_id and token_secret) and auth_validator is None:
-        raise ValueError(
-            "Production Modal gateway construction requires injected secrets (token_id, token_secret) or auth_validator"
-        )
-    adapter = ModalAppAdapter(
-        token_id=token_id,
-        token_secret=token_secret,
+def _not_shipped(relative: Path) -> bool:
+    """add_local_dir ignore predicate: ship the package inits plus common/ and modal/ sources."""
+    parts = relative.parts
+    if relative.suffix != ".py":
+        return True
+    if parts in {("__init__.py",), ("cloud", "__init__.py")}:
+        return False
+    return not (len(parts) == 3 and parts[:2] in _SHIPPED_DIRS)
+
+
+def _finish(image: modal.Image, extra_env: Dict[str, str] | None = None) -> modal.Image:
+    env = {**SETTINGS.to_env(), **(extra_env or {})}
+    # add_local_dir must be the last step: files are attached at container start.
+    return image.env(env).add_local_dir(DEPLOY_ROOT, REMOTE_DEPLOY_ROOT, ignore=_not_shipped)
+
+
+gateway_image = _finish(modal.Image.debian_slim(python_version=PYTHON_VERSION))
+
+seed_image = _finish(
+    modal.Image.debian_slim(python_version=PYTHON_VERSION).pip_install(*SEED_REQUIREMENTS),
+    {"HF_HUB_DISABLE_TELEMETRY": "1", "HF_HUB_DISABLE_PROGRESS_BARS": "1"},
+)
+
+gpu_image = _finish(
+    modal.Image.debian_slim(python_version=PYTHON_VERSION)
+    .pip_install(TORCH_REQUIREMENT, index_url=TORCH_INDEX_URL)
+    .pip_install(*GPU_REQUIREMENTS),
+    {"HF_HUB_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1"},
+)
+
+weights_volume = modal.Volume.from_name(SETTINGS.volume_name, environment_name=SETTINGS.environment)
+jobs_dict = modal.Dict.from_name(SETTINGS.dict_name, environment_name=SETTINGS.environment)
+
+app = modal.App(SETTINGS.app_name, include_source=False)
+
+
+@app.function(
+    image=seed_image,
+    volumes={WEIGHTS_MOUNT: weights_volume},
+    cpu=2.0,
+    memory=4096,
+    timeout=SEED_TIMEOUT_SECONDS,
+    max_containers=1,
+)
+def seed_weights() -> Dict[str, Any]:
+    # Idempotent: a seeded volume returns at once and a partial download resumes.
+    # run_seed retries internally, publishes progress to the job Dict for the
+    # provisioner and returns failures as a typed result instead of raising.
+    return run_seed(WEIGHTS_MOUNT, ModalDictStore(jobs_dict), commit=weights_volume.commit)
+
+
+@app.cls(
+    image=gpu_image,
+    gpu=SETTINGS.gpu,
+    volumes={WEIGHTS_MOUNT: weights_volume},
+    cpu=2.0,
+    memory=12288,
+    timeout=JOB_TIMEOUT_SECONDS,
+    startup_timeout=WORKER_STARTUP_TIMEOUT_SECONDS,
+    scaledown_window=SETTINGS.idle_seconds,
+    max_containers=1,
+)
+class Worker:
+    @modal.enter()
+    def load(self) -> None:
+        # A missing snapshot is reported per job, not raised here: the container stays
+        # up and loads on its next job once the volume is seeded.
+        self.runtime = WorkerRuntime(WEIGHTS_MOUNT, reload=weights_volume.reload, marker_attempts=2)
+        self.runtime.load()
+
+    @modal.method()
+    def render(self, handle: str, metadata_json: str, image_png: bytes, hint_png: bytes) -> Dict[str, Any]:
+        return worker_render(self.runtime, ModalDictStore(jobs_dict), handle, metadata_json, image_png, hint_png)
+
+
+@app.function(
+    image=gateway_image,
+    cpu=0.25,
+    memory=512,
+    max_containers=1,
+)
+@modal.concurrent(max_inputs=32)
+@modal.asgi_app(requires_proxy_auth=True)
+def gateway():
+    from deploy.cloud.common.api import CloudGateway
+    from deploy.cloud.common.jobs import DispatchJobBackend
+
+    limits = production_limits()
+    store = ModalDictStore(jobs_dict)
+    dispatcher = ModalWorkerDispatcher(
+        spawn=Worker().render.spawn,
+        function_call_from_id=modal.FunctionCall.from_id,
+        exceptions=modal.exception,
+        store=store,
+    )
+    gateway_app = CloudGateway(
+        provider="modal",
+        model_info=get_production_model_info("modal"),
         limits=limits,
-        auth_validator=auth_validator,
+        backend=DispatchJobBackend("modal", store, dispatcher, limits, clock=time.time),
+        trust_edge_auth=True,
     )
-    return adapter.gateway
-
-
-def build_modal_app(
-    app_name: str = "manga-cleaner-modal",
-    volume_name: str = "manga-cleaner-weights",
-    secret_name: str = "manga-cleaner-modal-secret",
-    token_id: Optional[str] = None,
-    token_secret: Optional[str] = None,
-) -> Any:
-    """Explicit factory builder for Modal production app definition.
-
-    Fails closed before resource definitions to avoid advertising or deploying
-    a non-inferencing stub worker. Live deployment requires authorized platform
-    credentials and verified model pipeline.
-    """
-    if not _MODAL_SDK_AVAILABLE or modal is None:
-        raise RuntimeError("Modal SDK is not installed; cannot build Modal production app")
-
-    raise NotImplementedError(
-        "Live Modal deployment requires authorized platform credentials and verified model pipeline. "
-        "build_modal_app fails closed before resource definitions to prevent deploying an unverified stub."
-    )
+    return gateway_app.as_asgi_app()

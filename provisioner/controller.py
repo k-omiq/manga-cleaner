@@ -5,16 +5,37 @@ Coordinates:
 - Driver dispatching (Modal vs Beam).
 - Resumable staged execution with journal persistence at each milestone.
 - Approved plan enforcement (plan hash verification).
-- Non-billable compatibility validation.
-- Setup credential wiping / forgetting.
-- Ownership-verified cleanup.
+- IC-2 progress records on stderr and the IC-1 result of apply and resume.
+- Ownership-verified cleanup of exactly what the journal recorded.
+
+Which ops report which IC-2 steps:
+- inspect: inspect
+- plan: inspect, validate
+- apply and resume: inspect, validate, then volume, state, secret, image, deploy,
+  weights, token, endpoint, health in that order. A step the provider does not have is
+  reported skip (Modal: secret; Beam: token), and so is a step a previous run finished.
+  Modal repeats token and health on every run; Beam repeats secret and health.
+- cleanup_plan: validate
+- cleanup_apply: validate, inspect, cleanup (pct per deleted resource)
+- probe_compatibility: health
+- forget_credential: none
 """
 
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+import time
+from typing import IO, Any, Callable, Dict, List, Optional, Tuple, Union
 
-from provisioner.driver_base import BaseProviderDriver
-from provisioner.real_drivers import RealBeamDriver, RealModalDriver
+from provisioner.driver_base import (
+    BaseProviderDriver,
+    CleanupPlan,
+    CompatibilityValidationResult,
+    Deadline,
+    StepContext,
+    compute_canonical_hash,
+    production_model,
+    utc_now,
+)
+from provisioner.endpoint import parse_runtime_credential, validate_endpoint_url
 from provisioner.journal import (
     STAGE_CLEANED_UP,
     STAGE_CLEANUP_PLANNED,
@@ -24,15 +45,17 @@ from provisioner.journal import (
     STAGE_DEPLOYING,
     STAGE_DISCOVERED,
     STAGE_FAILED,
-    STAGE_PLANNED,
     STAGE_SEEDED,
     STAGE_SEEDING,
     STAGE_VALIDATED,
     InstallationJournal,
+    transition_allowed,
 )
+from provisioner.progress import Progress
 from provisioner.protocol import (
-    ERR_ACTIONABLE_PERMISSION,
     ERR_EXECUTION_FAILED,
+    ERR_EXECUTION_TIMEOUT,
+    ERR_PROVIDER_UNAVAILABLE,
     ERR_UNAPPROVED_PLAN,
     ERR_UNSUPPORTED_OP,
     ERR_UNSUPPORTED_PROVIDER,
@@ -54,10 +77,45 @@ from provisioner.protocol import (
     make_success_response,
     parse_request,
     validate_hash,
-    validate_https_url,
     validate_identifier,
 )
-from provisioner.redaction import GLOBAL_REGISTRY, is_sensitive_key, redact_data
+from provisioner.redaction import GLOBAL_REGISTRY, is_sensitive_key, redact_string
+
+# The desktop kills apply, resume and cleanup_apply after 30 minutes and every other
+# op after 60 seconds; the helper stops itself with a typed error before that.
+OP_BUDGET_SECONDS: Dict[str, float] = {
+    OP_INSPECT: 50.0,
+    OP_PLAN: 50.0,
+    OP_APPLY: 27 * 60.0,
+    OP_RESUME: 27 * 60.0,
+    OP_CLEANUP_PLAN: 50.0,
+    OP_CLEANUP_APPLY: 25 * 60.0,
+    OP_FORGET_CREDENTIAL: 50.0,
+    OP_PROBE_COMPATIBILITY: 50.0,
+}
+# A cleanup that stopped on one of these is finished by running cleanup again.
+RETRY_CLEANUP_CODES = (ERR_EXECUTION_FAILED, ERR_EXECUTION_TIMEOUT, ERR_PROVIDER_UNAVAILABLE)
+
+PIPELINE_STEPS = ("volume", "state", "secret", "image", "deploy", "weights", "token", "endpoint", "health")
+# (stage while the step runs, stage once it finished)
+STEP_STAGES: Dict[str, Tuple[str, str]] = {
+    "volume": (STAGE_DEPLOYING, STAGE_DEPLOYING),
+    "state": (STAGE_DEPLOYING, STAGE_DEPLOYING),
+    "secret": (STAGE_DEPLOYING, STAGE_DEPLOYING),
+    "image": (STAGE_DEPLOYING, STAGE_DEPLOYING),
+    "deploy": (STAGE_DEPLOYING, STAGE_DEPLOYED),
+    "weights": (STAGE_SEEDING, STAGE_SEEDED),
+    "token": (STAGE_CREDENTIAL_CREATED, STAGE_CREDENTIAL_CREATED),
+    "endpoint": (STAGE_DISCOVERED, STAGE_DISCOVERED),
+    "health": (STAGE_VALIDATED, STAGE_VALIDATED),
+}
+
+
+def _default_drivers() -> Tuple[BaseProviderDriver, BaseProviderDriver]:
+    from provisioner.beam_driver import BeamDriver
+    from provisioner.modal_driver import ModalDriver
+
+    return ModalDriver(), BeamDriver()
 
 
 class ProvisioningController:
@@ -68,21 +126,27 @@ class ProvisioningController:
         journal_root: Path,
         modal_driver: Optional[BaseProviderDriver] = None,
         beam_driver: Optional[BaseProviderDriver] = None,
+        progress_stream: Optional[IO[str]] = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.journal_root = journal_root.resolve()
-        self.modal_driver = modal_driver if modal_driver is not None else RealModalDriver()
-        self.beam_driver = beam_driver if beam_driver is not None else RealBeamDriver()
+        if modal_driver is None or beam_driver is None:
+            default_modal, default_beam = _default_drivers()
+            modal_driver = modal_driver or default_modal
+            beam_driver = beam_driver or default_beam
+        self.modal_driver = modal_driver
+        self.beam_driver = beam_driver
+        self.progress_stream = progress_stream
+        self.clock = clock
 
     def get_driver(self, provider: str) -> BaseProviderDriver:
         if provider == PROVIDER_MODAL:
             return self.modal_driver
-        elif provider == PROVIDER_BEAM:
+        if provider == PROVIDER_BEAM:
             return self.beam_driver
-        else:
-            raise ProtocolError(
-                ERR_UNSUPPORTED_PROVIDER,
-                f"Unknown provider: '{provider}'",
-            )
+        raise ProtocolError(ERR_UNSUPPORTED_PROVIDER, f"Unknown provider: '{provider}'")
+
+    # ---------- envelope ----------
 
     def handle_request(self, raw_request: Union[str, bytes, Dict[str, Any]]) -> str:
         """Entry point for JSON/dict helper protocol messages. Returns serialized redacted response."""
@@ -91,49 +155,43 @@ class ProvisioningController:
             req = parse_request(raw_request)
             request_id = req.request_id
 
-            # Register any supplied credentials in session redaction registry
+            # One request is one redaction session (the helper answers one request per
+            # process): only this request's credentials are redacted, so an id from an
+            # earlier request, like a proxy token ID, is never scrubbed from the journal.
+            GLOBAL_REGISTRY.clear()
             self._register_credentials_from_params(req.params)
 
-            if req.op == OP_INSPECT:
-                response = self._handle_inspect(req)
-            elif req.op == OP_PLAN:
-                response = self._handle_plan(req)
-            elif req.op == OP_APPLY:
-                response = self._handle_apply(req)
-            elif req.op == OP_RESUME:
-                response = self._handle_resume(req)
-            elif req.op == OP_FORGET_CREDENTIAL:
-                response = self._handle_forget_credential(req)
-            elif req.op == OP_CLEANUP_PLAN:
-                response = self._handle_cleanup_plan(req)
-            elif req.op == OP_CLEANUP_APPLY:
-                response = self._handle_cleanup_apply(req)
-            elif req.op == OP_PROBE_COMPATIBILITY:
-                response = self._handle_probe_compatibility(req)
-            else:
-                raise ProtocolError(
-                    ERR_UNSUPPORTED_OP,
-                    f"Unsupported operation: '{req.op}'",
-                )
-
-            return response.serialize()
+            handler = {
+                OP_INSPECT: self._handle_inspect,
+                OP_PLAN: self._handle_plan,
+                OP_APPLY: self._handle_apply,
+                OP_RESUME: self._handle_resume,
+                OP_FORGET_CREDENTIAL: self._handle_forget_credential,
+                OP_CLEANUP_PLAN: self._handle_cleanup_plan,
+                OP_CLEANUP_APPLY: self._handle_cleanup_apply,
+                OP_PROBE_COMPATIBILITY: self._handle_probe_compatibility,
+            }.get(req.op)
+            if handler is None:
+                raise ProtocolError(ERR_UNSUPPORTED_OP, f"Unsupported operation: '{req.op}'")
+            progress = Progress(req.op, self.progress_stream)
+            deadline = Deadline(OP_BUDGET_SECONDS[req.op], self.clock)
+            return handler(req, progress, deadline).serialize()
 
         except ProtocolError as e:
-            err_resp = make_error_response(
+            return make_error_response(
                 request_id=request_id,
                 code=e.code,
                 message=e.message,
                 actionable_guidance=e.actionable_guidance,
                 remedy_steps=e.remedy_steps,
-            )
-            return err_resp.serialize()
-        except Exception as e:
-            err_resp = make_error_response(
+            ).serialize()
+        except (Exception, SystemExit) as e:
+            # SystemExit: some SDK code calls sys.exit on errors; the helper still answers.
+            return make_error_response(
                 request_id=request_id,
                 code=ERR_EXECUTION_FAILED,
-                message=f"Internal provisioner error: {e}",
-            )
-            return err_resp.serialize()
+                message=f"Internal provisioner error: {type(e).__name__}: {e}",
+            ).serialize()
 
     def _register_credentials_from_params(self, params: Dict[str, Any]) -> None:
         def _extract(obj: Any, key_name: str = "") -> None:
@@ -168,43 +226,62 @@ class ProvisioningController:
 
         _extract(params)
 
-    def _handle_inspect(self, req: HelperRequest) -> HelperResponse:
-        driver = self.get_driver(req.provider)
-        credentials = req.params.get("credentials", {})
-        result = driver.inspect_account(credentials, req.params.get("options"))
-        return make_success_response(req.request_id, result.to_dict())
+    # ---------- shared pieces ----------
 
-    def _handle_plan(self, req: HelperRequest) -> HelperResponse:
-        driver = self.get_driver(req.provider)
-        credentials = req.params.get("credentials", {})
+    @staticmethod
+    def _installation_id(req: HelperRequest) -> str:
         installation_id = req.params.get("installation_id")
         if not installation_id:
             raise ProtocolError(ERR_VALIDATION, "Missing parameter: 'installation_id'")
         validate_identifier("installation_id", installation_id)
+        return installation_id
 
-        inspection = driver.inspect_account(credentials, req.params.get("options"))
-        plan = driver.create_deployment_plan(inspection, installation_id, req.params.get("options"))
+    def _journal(self, req: HelperRequest, installation_id: str) -> InstallationJournal:
+        return InstallationJournal(self.journal_root, installation_id, req.provider)
 
-        # Initialize or update journal
-        journal = InstallationJournal(self.journal_root, installation_id, req.provider)
-        journal.load_or_initialize(
-            plan_hash=plan.plan_hash,
-            approved_plan_hash="",
-            app_name=plan.app_name,
-        )
+    @staticmethod
+    def _run(progress: Progress, step: str, action: Callable[[], Any]) -> Any:
+        with progress.step(step):
+            return action()
 
+    def _inspect(self, driver: BaseProviderDriver, req: HelperRequest, progress: Progress, deadline: Deadline, stack: Any):
+        """Validate the setup credential, open the SDK session and read the account."""
+        credentials = driver.parse_credentials(req.params.get("credentials"))
+        with progress.step("inspect"):
+            session = stack.enter_context(driver.session(credentials, deadline))
+            inspection = driver.inspect(session)
+        return session, inspection
+
+    # ---------- inspect and plan ----------
+
+    def _handle_inspect(self, req: HelperRequest, progress: Progress, deadline: Deadline) -> HelperResponse:
+        from contextlib import ExitStack
+
+        driver = self.get_driver(req.provider)
+        with ExitStack() as stack:
+            _, inspection = self._inspect(driver, req, progress, deadline, stack)
+        return make_success_response(req.request_id, inspection.to_dict())
+
+    def _handle_plan(self, req: HelperRequest, progress: Progress, deadline: Deadline) -> HelperResponse:
+        """Read-only: nothing is written locally or in the cloud."""
+        from contextlib import ExitStack
+
+        driver = self.get_driver(req.provider)
+        installation_id = self._installation_id(req)
+        options = driver.normalize_options(req.params.get("options"))
+        with ExitStack() as stack:
+            _, inspection = self._inspect(driver, req, progress, deadline, stack)
+            plan = self._run(progress, "validate", lambda: driver.plan(inspection, installation_id, options))
         return make_success_response(req.request_id, plan.to_dict())
 
-    def _handle_apply(self, req: HelperRequest) -> HelperResponse:
+    # ---------- apply and resume ----------
+
+    def _handle_apply(self, req: HelperRequest, progress: Progress, deadline: Deadline) -> HelperResponse:
+        from contextlib import ExitStack
+
         driver = self.get_driver(req.provider)
-        credentials = req.params.get("credentials", {})
-        installation_id = req.params.get("installation_id")
+        installation_id = self._installation_id(req)
         approved_hash = req.params.get("approved_plan_hash")
-
-        if not installation_id:
-            raise ProtocolError(ERR_VALIDATION, "Missing parameter: 'installation_id'")
-        validate_identifier("installation_id", installation_id)
-
         if not approved_hash:
             raise ProtocolError(
                 ERR_UNAPPROVED_PLAN,
@@ -212,305 +289,227 @@ class ProvisioningController:
                 actionable_guidance="Review the proposed deployment plan and supply its exact SHA-256 hash to approve.",
             )
         validate_hash("approved_plan_hash", approved_hash)
+        options = driver.normalize_options(req.params.get("options"))
+        journal = self._journal(req, installation_id)
 
-        # Generate fresh expected plan
-        inspection = driver.inspect_account(credentials, req.params.get("options"))
-        plan = driver.create_deployment_plan(inspection, installation_id, req.params.get("options"))
+        with ExitStack() as stack:
+            session, inspection = self._inspect(driver, req, progress, deadline, stack)
 
-        if approved_hash.lower() != plan.plan_hash.lower():
-            raise ProtocolError(
-                ERR_UNAPPROVED_PLAN,
-                f"Approved plan hash mismatch: got '{approved_hash}', expected '{plan.plan_hash}'",
-                actionable_guidance="The proposed resource plan was modified or generated with different parameters. Review and re-approve.",
-            )
+            def validate() -> None:
+                plan = driver.plan(inspection, installation_id, options)
+                if approved_hash.lower() != plan.plan_hash.lower():
+                    raise ProtocolError(
+                        ERR_UNAPPROVED_PLAN,
+                        f"Approved plan hash mismatch: got '{approved_hash}', expected '{plan.plan_hash}'",
+                        actionable_guidance="The plan changed since it was approved. Review and approve it again.",
+                    )
+                if journal.exists():
+                    rec = journal.load()
+                    if rec.stage in {STAGE_COMPLETED, STAGE_CLEANUP_PLANNED, STAGE_CLEANED_UP}:
+                        raise ProtocolError(
+                            ERR_VALIDATION,
+                            f"Cannot apply: installation '{installation_id}' is already in stage '{rec.stage}'",
+                            actionable_guidance="Use Resume for a finished installation, or start a new one with a new installation ID.",
+                            remedy_steps=[
+                                f"Installation '{installation_id}' is in stage '{rec.stage}'",
+                                "Supply a new unique installation_id in params to deploy a new instance",
+                            ],
+                        )
+                    if rec.plan_hash.lower() != plan.plan_hash.lower() or (
+                        rec.approved_plan_hash and rec.approved_plan_hash.lower() != approved_hash.lower()
+                    ):
+                        raise ProtocolError(
+                            ERR_UNAPPROVED_PLAN,
+                            f"Plan hash mismatch with existing journal: stored '{rec.plan_hash}', expected '{plan.plan_hash}'",
+                            actionable_guidance="A different plan is already recorded for this installation. Resume it, or use a new installation ID.",
+                        )
+                    self._record_account(journal, inspection)
+                else:
+                    journal.initialize(
+                        plan.plan_hash, approved_hash, plan.app_name, options, provider_state=self._account_state(inspection)
+                    )
 
-        # Load or initialize journal
-        journal = InstallationJournal(self.journal_root, installation_id, req.provider)
-        if journal.exists():
-            rec = journal.load()
-            if rec.provider != req.provider:
-                raise ProtocolError(
-                    ERR_VALIDATION,
-                    f"Existing journal provider mismatch: stored '{rec.provider}', requested '{req.provider}'",
-                )
-            if rec.app_name and rec.app_name != plan.app_name:
-                raise ProtocolError(
-                    ERR_VALIDATION,
-                    f"Existing journal app_name mismatch: stored '{rec.app_name}', expected '{plan.app_name}'",
-                )
-            if rec.stage in {STAGE_COMPLETED, STAGE_CLEANED_UP}:
-                raise ProtocolError(
-                    ERR_VALIDATION,
-                    f"Cannot apply: installation '{installation_id}' is already in terminal stage '{rec.stage}'",
-                    actionable_guidance="Completed or cleaned-up installations cannot be re-applied. Create a new deployment with a new unique installation ID, or use resume/cleanup.",
-                    remedy_steps=[
-                        f"Installation '{installation_id}' is in terminal stage '{rec.stage}'",
-                        "Supply a new unique installation_id in params to deploy a new instance",
-                    ],
-                )
-            if rec.plan_hash and rec.plan_hash.lower() != plan.plan_hash.lower():
-                raise ProtocolError(
-                    ERR_UNAPPROVED_PLAN,
-                    f"Plan hash mismatch with existing journal: stored '{rec.plan_hash}', expected '{plan.plan_hash}'",
-                    actionable_guidance="A different deployment plan is already recorded for this installation. Re-plan or use a new installation ID.",
-                )
-            if rec.approved_plan_hash and rec.approved_plan_hash.lower() != approved_hash.lower():
-                raise ProtocolError(
-                    ERR_UNAPPROVED_PLAN,
-                    f"Approved plan hash mismatch with existing journal: stored '{rec.approved_plan_hash}', expected '{approved_hash}'",
-                    actionable_guidance="An approved plan is already recorded with a different hash. Re-plan or use a new installation ID.",
-                )
-            rec.approved_plan_hash = approved_hash
-            journal.save()
-        else:
-            rec = journal.load_or_initialize(
-                plan_hash=plan.plan_hash,
-                approved_plan_hash=approved_hash,
-                app_name=plan.app_name,
-            )
-            rec.approved_plan_hash = approved_hash
-            journal.save()
+            self._run(progress, "validate", validate)
+            return self._pipeline(driver, session, journal, req, progress, deadline)
 
-        # Run staged pipeline
-        return self._run_staged_pipeline(journal, driver, plan, credentials, req)
+    def _handle_resume(self, req: HelperRequest, progress: Progress, deadline: Deadline) -> HelperResponse:
+        from contextlib import ExitStack
 
-    def _handle_resume(self, req: HelperRequest) -> HelperResponse:
         driver = self.get_driver(req.provider)
-        credentials = req.params.get("credentials", {})
-        installation_id = req.params.get("installation_id")
-
-        if not installation_id:
-            raise ProtocolError(ERR_VALIDATION, "Missing parameter: 'installation_id'")
-        validate_identifier("installation_id", installation_id)
-
-        journal = InstallationJournal(self.journal_root, installation_id, req.provider)
+        installation_id = self._installation_id(req)
+        journal = self._journal(req, installation_id)
         if not journal.exists():
-            raise ProtocolError(
-                ERR_VALIDATION,
-                f"No existing installation journal found for '{installation_id}' to resume",
-            )
-
+            raise ProtocolError(ERR_VALIDATION, f"No existing installation journal found for '{installation_id}' to resume")
         rec = journal.load()
         if not journal.can_resume():
-            return make_success_response(
-                req.request_id,
-                {
-                    "installation_id": installation_id,
-                    "stage": rec.stage,
-                    "resumed": False,
-                    "message": f"Installation is already in stage '{rec.stage}'",
-                    "record": rec.to_dict(),
-                },
+            raise ProtocolError(
+                ERR_VALIDATION,
+                f"Cannot resume installation '{installation_id}' in stage '{rec.stage}'",
+                actionable_guidance="Cleanup has started for this installation. Finish the cleanup instead.",
             )
-
-        # Invariant: Must have non-empty approved_plan_hash before resuming
         if not rec.approved_plan_hash:
             raise ProtocolError(
                 ERR_UNAPPROVED_PLAN,
                 f"Cannot resume installation '{installation_id}': no approved plan hash recorded in journal",
                 actionable_guidance="Approve the deployment plan via apply operation before attempting resume.",
             )
-
-        # Inspect and regenerate expected plan
-        inspection = driver.inspect_account(credentials, req.params.get("options"))
-        plan = driver.create_deployment_plan(inspection, installation_id, req.params.get("options"))
-
-        # Compare regenerated plan against both stored plan_hash and approved_plan_hash before ANY driver mutation
-        if plan.plan_hash.lower() != rec.plan_hash.lower():
+        # The approved options are the journal's; a request may repeat them but not change them.
+        options = driver.normalize_options(rec.options)
+        requested = req.params.get("options")
+        if requested and driver.normalize_options(requested) != options:
             raise ProtocolError(
                 ERR_UNAPPROVED_PLAN,
-                f"Plan drift detected on resume: regenerated plan hash '{plan.plan_hash}' does not match stored plan hash '{rec.plan_hash}'",
-                actionable_guidance="The deployment options or parameters have changed since the plan was recorded. Review and re-approve.",
+                "Plan drift detected on resume: the options differ from the approved plan",
+                actionable_guidance="Resume keeps the approved GPU and idle time. Clean up and set up again to change them.",
             )
 
-        if plan.plan_hash.lower() != rec.approved_plan_hash.lower():
-            raise ProtocolError(
-                ERR_UNAPPROVED_PLAN,
-                f"Plan drift detected on resume: regenerated plan hash '{plan.plan_hash}' does not match approved plan hash '{rec.approved_plan_hash}'",
-                actionable_guidance="The regenerated deployment plan does not match the approved plan hash. Review and re-approve.",
-            )
+        with ExitStack() as stack:
+            session, inspection = self._inspect(driver, req, progress, deadline, stack)
 
-        return self._run_staged_pipeline(journal, driver, plan, credentials, req)
+            def validate() -> None:
+                plan = driver.plan(inspection, installation_id, options)
+                for stored, what in ((rec.plan_hash, "stored plan hash"), (rec.approved_plan_hash, "approved plan hash")):
+                    if plan.plan_hash.lower() != stored.lower():
+                        raise ProtocolError(
+                            ERR_UNAPPROVED_PLAN,
+                            f"Plan drift detected on resume: regenerated plan hash '{plan.plan_hash}' does not match {what} '{stored}'",
+                            actionable_guidance="These credentials or options do not match the approved installation. Use the same account.",
+                        )
+                self._record_account(journal, inspection)
 
-    def _run_staged_pipeline(
+            self._run(progress, "validate", validate)
+            return self._pipeline(driver, session, journal, req, progress, deadline)
+
+    @staticmethod
+    def _account_state(inspection: Any) -> Dict[str, str]:
+        state = {"account_id": inspection.account_id, "environment_name": inspection.environment_name}
+        return {key: value for key, value in state.items() if value}
+
+    def _record_account(self, journal: InstallationJournal, inspection: Any) -> None:
+        # The approved plan hash covers the account and the environment, so once it
+        # matched they are the installation's; a journal written without them gets them.
+        missing = {key: value for key, value in self._account_state(inspection).items() if not journal.get_state(key)}
+        if missing:
+            journal.set_state(**missing)
+
+    def _pipeline(
         self,
-        journal: InstallationJournal,
         driver: BaseProviderDriver,
-        plan: Any,
-        credentials: Dict[str, Any],
+        session: Any,
+        journal: InstallationJournal,
         req: HelperRequest,
+        progress: Progress,
+        deadline: Deadline,
     ) -> HelperResponse:
-        installation_id = journal.installation_id
-        app_name = plan.app_name
         rec = journal.record
-
+        ctx = StepContext(journal=journal, options=driver.normalize_options(rec.options), deadline=deadline)
         try:
-            # Stage 1: Seed Volume (if not already seeded)
-            vol_name = f"mc-{driver.provider_id}-vol-{installation_id}"
-            if not journal.has_resource("volume", vol_name):
-                journal.transition_to(STAGE_SEEDING)
-                vol_res = driver.seed_volume(installation_id, credentials)
-                journal.record_resource(
-                    resource_id=vol_res["resource_id"],
-                    resource_type="volume",
-                    name=vol_res["name"],
-                    stage_created=STAGE_SEEDING,
-                    ownership_tags=vol_res.get("ownership_tags"),
-                )
-                journal.transition_to(STAGE_SEEDED)
-
-            # Stage 2: Deploy Service (if not already deployed)
-            app_type = "app" if driver.provider_id == "modal" else "service"
-            if not journal.has_resource(app_type, app_name):
-                journal.transition_to(STAGE_DEPLOYING)
-                svc_res = driver.deploy_service(installation_id, app_name, credentials)
-                journal.record_resource(
-                    resource_id=svc_res["resource_id"],
-                    resource_type=app_type,
-                    name=svc_res["name"],
-                    stage_created=STAGE_DEPLOYING,
-                    ownership_tags=svc_res.get("ownership_tags"),
-                )
-                journal.transition_to(STAGE_DEPLOYED)
-
-            # Stage 3: Endpoint Discovery
-            if not rec.endpoint_url:
-                endpoint_url = driver.discover_endpoint(installation_id, app_name, credentials)
-                validate_https_url("endpoint_url", endpoint_url)
-                rec.endpoint_url = endpoint_url
-                journal.transition_to(STAGE_DISCOVERED)
-
-            # Stage 4: Runtime Credential Creation
-            cred_type = "proxy_token" if driver.provider_id == "modal" else "restricted_token"
-            if not journal.has_resource(cred_type, f"tok-proxy-{installation_id}") and not journal.has_resource(
-                cred_type, f"b9-tok-{installation_id}"
-            ):
-                tok_res = driver.create_runtime_credential(installation_id, credentials)
-                journal.record_resource(
-                    resource_id=tok_res["resource_id"],
-                    resource_type=cred_type,
-                    name=tok_res["name"],
-                    stage_created=STAGE_DISCOVERED,
-                    ownership_tags=tok_res.get("ownership_tags"),
-                )
-                # Store opaque runtime reference in journal (NEVER raw secret)
-                rec.runtime_credential_ref = {
-                    "resource_id": tok_res["resource_id"],
-                    "resource_type": cred_type,
-                    "name": tok_res["name"],
-                    "token_type": tok_res.get("token_type", "scoped"),
-                }
-                journal.transition_to(STAGE_CREDENTIAL_CREATED)
-
-            # Stage 5: Compatibility Validation
-            if rec.compatibility_status != "healthy":
-                validate_https_url("endpoint_url", rec.endpoint_url)
-                runtime_cred = rec.runtime_credential_ref or {}
-                compat = driver.validate_compatibility(rec.endpoint_url, runtime_cred)
-                if not compat.healthy:
-                    rec.compatibility_status = compat.status
-                    journal.transition_to(STAGE_FAILED, error="Compatibility probe failed")
-                    return make_error_response(
-                        request_id=req.request_id,
-                        code=ERR_EXECUTION_FAILED,
-                        message=f"Endpoint compatibility validation failed: {compat.details}",
-                    )
-                rec.compatibility_status = "healthy"
-                journal.transition_to(STAGE_VALIDATED)
-
-            # Stage 6: Finalize Completion
+            for step in PIPELINE_STEPS:
+                if step not in driver.pipeline_steps or (journal.step_done(step) and step not in driver.repeat_steps):
+                    progress.skip(step)
+                    continue
+                running, finished = STEP_STAGES[step]
+                journal.advance(running)
+                with progress.step(step) as reporter:
+                    ctx.reporter = reporter
+                    driver.run_step(step, session, ctx)
+                if step not in driver.repeat_steps:
+                    journal.mark_step_done(step)
+                journal.advance(finished)
+            credential = driver.issued_credential(session, ctx)
+            endpoint_url = validate_endpoint_url(rec.endpoint_url)
             journal.transition_to(STAGE_COMPLETED)
-
-            # Optional: Forget setup credential if requested
-            if req.params.get("forget_setup_credential", False):
-                journal.forget_setup_credential()
-                GLOBAL_REGISTRY.clear()
-
-            return make_success_response(
-                req.request_id,
-                {
-                    "installation_id": installation_id,
-                    "stage": rec.stage,
-                    "endpoint_url": rec.endpoint_url,
-                    "runtime_credential_ref": rec.runtime_credential_ref,
-                    "compatibility_status": rec.compatibility_status,
-                    "setup_credential_forgotten": rec.setup_credential_forgotten,
-                    "resources_created": len(rec.resources),
-                },
-            )
-
-        except ProtocolError as pe:
-            journal.transition_to(STAGE_FAILED, error=pe.message)
-            raise
-        except Exception as e:
-            journal.transition_to(STAGE_FAILED, error=str(e))
+        except (ProtocolError, Exception, SystemExit) as exc:
+            message = exc.message if isinstance(exc, ProtocolError) else f"{type(exc).__name__}: {exc}"
+            if transition_allowed(journal.record.stage, STAGE_FAILED):
+                journal.transition_to(STAGE_FAILED, error=redact_string(message)[:1000])
             raise
 
-    def _handle_forget_credential(self, req: HelperRequest) -> HelperResponse:
-        """Purge setup credentials from memory registry and mark journal."""
-        GLOBAL_REGISTRY.clear()
+        if req.params.get("forget_setup_credential", False) is True:
+            journal.forget_setup_credential()
+        model = production_model()
+        data = {
+            "installation_id": rec.installation_id,
+            "provider": rec.provider,
+            "stage": rec.stage,
+            "gpu": ctx.options["gpu"],
+            "idle_seconds": ctx.options["idle_seconds"],
+            "model": model,
+            "compatibility_status": rec.compatibility_status,
+            "resources_created": [{"type": r.resource_type, "name": r.name} for r in rec.resources],
+            "setup_credential_forgotten": rec.setup_credential_forgotten,
+        }
+        # IC-1: the runtime credential and the endpoint travel unredacted, only here.
+        return make_success_response(
+            req.request_id,
+            data,
+            verbatim={"runtime_credential": credential, "endpoint_url": endpoint_url},
+        )
+
+    # ---------- forget ----------
+
+    def _handle_forget_credential(self, req: HelperRequest, progress: Progress, deadline: Deadline) -> HelperResponse:
+        """Record that the desktop dropped the setup credential. The helper never stored it."""
         installation_id = req.params.get("installation_id")
         if installation_id:
             validate_identifier("installation_id", installation_id)
-            journal = InstallationJournal(self.journal_root, installation_id, req.provider)
+            journal = self._journal(req, installation_id)
             if journal.exists():
                 journal.forget_setup_credential()
+        return make_success_response(req.request_id, {"status": "forgotten", "setup_credential_cleared": True})
 
-        return make_success_response(
-            req.request_id,
-            {
-                "status": "forgotten",
-                "setup_credential_cleared": True,
-            },
+    # ---------- cleanup ----------
+
+    def _cleanup_plan(self, driver: BaseProviderDriver, journal: InstallationJournal, installation_id: str, provider: str) -> Tuple[CleanupPlan, List[Any]]:
+        resources = list(journal.record.resources) if journal.exists() else []
+        order = {kind: index for index, kind in enumerate(driver.cleanup_order)}
+        resources.sort(key=lambda r: (order.get(r.resource_type, len(order)), r.name))
+        listed = [
+            {"resource_type": r.resource_type, "type": r.resource_type, "name": r.name, "resource_id": r.resource_id}
+            for r in resources
+        ]
+        identity = {"installation_id": installation_id, "provider": provider, "resources": listed}
+        plan_hash = compute_canonical_hash(identity, set())
+        plan = CleanupPlan(
+            plan_id=f"cleanup-{plan_hash[:16]}",
+            installation_id=installation_id,
+            provider=provider,
+            resources_to_delete=listed,
+            # Only what this installation recorded is ever deleted; nothing else is looked at.
+            foreign_resources_ignored=[],
+            persistent_storage_requires_explicit_confirmation=any(r.resource_type == "volume" for r in resources),
+            plan_hash=plan_hash,
+            created_at_utc=utc_now(),
         )
+        return plan, resources
 
-    def _handle_cleanup_plan(self, req: HelperRequest) -> HelperResponse:
+    def _handle_cleanup_plan(self, req: HelperRequest, progress: Progress, deadline: Deadline) -> HelperResponse:
+        """Read-only: lists what cleanup_apply would delete. Needs no credentials."""
         driver = self.get_driver(req.provider)
-        installation_id = req.params.get("installation_id")
-        if not installation_id:
-            raise ProtocolError(ERR_VALIDATION, "Missing parameter: 'installation_id'")
-        validate_identifier("installation_id", installation_id)
+        installation_id = self._installation_id(req)
+        journal = self._journal(req, installation_id)
+        plan, _ = self._run(progress, "validate", lambda: self._cleanup_plan(driver, journal, installation_id, req.provider))
+        return make_success_response(req.request_id, plan.to_dict())
 
-        journal = InstallationJournal(self.journal_root, installation_id, req.provider)
-        known_resources = [r.to_dict() for r in journal.record.resources] if journal.exists() else []
+    def _handle_cleanup_apply(self, req: HelperRequest, progress: Progress, deadline: Deadline) -> HelperResponse:
+        from contextlib import ExitStack
 
-        cleanup_plan = driver.create_cleanup_plan(installation_id, known_resources)
-        if journal.exists():
-            journal.transition_to(STAGE_CLEANUP_PLANNED)
-
-        return make_success_response(req.request_id, cleanup_plan.to_dict())
-
-    def _handle_cleanup_apply(self, req: HelperRequest) -> HelperResponse:
         driver = self.get_driver(req.provider)
-        credentials = req.params.get("credentials", {})
-        installation_id = req.params.get("installation_id")
+        installation_id = self._installation_id(req)
         approved_hash = req.params.get("approved_cleanup_plan_hash")
-
-        if not installation_id:
-            raise ProtocolError(ERR_VALIDATION, "Missing parameter: 'installation_id'")
-        validate_identifier("installation_id", installation_id)
-
         if not approved_hash:
-            raise ProtocolError(
-                ERR_UNAPPROVED_PLAN,
-                "Cleanup rejected: 'approved_cleanup_plan_hash' is required to execute deletion",
-            )
+            raise ProtocolError(ERR_UNAPPROVED_PLAN, "Cleanup rejected: 'approved_cleanup_plan_hash' is required to execute deletion")
         validate_hash("approved_cleanup_plan_hash", approved_hash)
+        journal = self._journal(req, installation_id)
 
-        journal = InstallationJournal(self.journal_root, installation_id, req.provider)
-        known_resources = [r.to_dict() for r in journal.record.resources] if journal.exists() else []
-
-        cleanup_plan = driver.create_cleanup_plan(installation_id, known_resources)
-        if approved_hash.lower() != cleanup_plan.plan_hash.lower():
-            raise ProtocolError(
-                ERR_UNAPPROVED_PLAN,
-                f"Approved cleanup plan hash mismatch: got '{approved_hash}', expected '{cleanup_plan.plan_hash}'",
-            )
-
-        # Enforce explicit boolean confirmation for persistent storage volumes before any mutation
-        if cleanup_plan.persistent_storage_requires_explicit_confirmation:
-            has_volume = any(r.get("resource_type") == "volume" for r in cleanup_plan.resources_to_delete)
-            if has_volume and req.params.get("confirm_delete_persistent_storage") is not True:
+        def validate() -> Tuple[CleanupPlan, List[Any]]:
+            plan, resources = self._cleanup_plan(driver, journal, installation_id, req.provider)
+            if approved_hash.lower() != plan.plan_hash.lower():
+                raise ProtocolError(
+                    ERR_UNAPPROVED_PLAN,
+                    f"Approved cleanup plan hash mismatch: got '{approved_hash}', expected '{plan.plan_hash}'",
+                )
+            if plan.persistent_storage_requires_explicit_confirmation and req.params.get("confirm_delete_persistent_storage") is not True:
                 raise ProtocolError(
                     ERR_VALIDATION,
                     "Cleanup rejected: deletion of persistent storage volume requires explicit boolean parameter: 'confirm_delete_persistent_storage=true'",
@@ -520,30 +519,92 @@ class ProvisioningController:
                         "Resubmit cleanup_apply request with 'confirm_delete_persistent_storage': true.",
                     ],
                 )
+            return plan, resources
 
-        if journal.exists():
-            journal.transition_to(STAGE_CLEANUP_PLANNED)
-
-        try:
-            result = driver.execute_cleanup(cleanup_plan, credentials)
-            if journal.exists():
+        plan, resources = self._run(progress, "validate", validate)
+        deleted: List[Dict[str, str]] = []
+        missing: List[Dict[str, str]] = []
+        if not resources:
+            if journal.exists() and journal.record.stage != STAGE_CLEANED_UP:
+                journal.transition_to(STAGE_CLEANUP_PLANNED)
                 journal.transition_to(STAGE_CLEANED_UP)
-            return make_success_response(req.request_id, result)
-        except ProtocolError as pe:
-            if journal.exists():
-                journal.transition_to(STAGE_FAILED, error=pe.message)
-            raise
-        except Exception as e:
-            if journal.exists():
-                journal.transition_to(STAGE_FAILED, error=str(e))
-            raise
+            progress.skip("inspect")
+            progress.skip("cleanup")
+            return self._cleanup_result(req, installation_id, journal, deleted, missing)
 
-    def _handle_probe_compatibility(self, req: HelperRequest) -> HelperResponse:
+        with ExitStack() as stack:
+            session, inspection = self._inspect(driver, req, progress, deadline, stack)
+            recorded_account = journal.get_state("account_id")
+            if not recorded_account:
+                # Without the account, a key for another one would find nothing to delete
+                # and the journal would forget resources that still cost money.
+                raise ProtocolError(
+                    ERR_UNAPPROVED_PLAN,
+                    "The installation journal does not record which account it was set up in",
+                    actionable_guidance="Run Resume once with the key of that account; it records the account. Then clean up.",
+                )
+            if recorded_account != inspection.account_id:
+                raise ProtocolError(
+                    ERR_UNAPPROVED_PLAN,
+                    "These credentials belong to a different account than the installation",
+                    actionable_guidance="Use a key for the account the installation was set up in.",
+                )
+            # From here on the installation is being taken apart: never resumed again.
+            journal.transition_to(STAGE_CLEANUP_PLANNED)
+            with progress.step("cleanup") as reporter:
+                try:
+                    for index, resource in enumerate(resources):
+                        outcome = driver.delete_resource(session, journal, resource, deadline)
+                        (deleted if outcome == "deleted" else missing).append(
+                            {"type": resource.resource_type, "name": resource.name}
+                        )
+                        journal.remove_resource(resource.resource_type, resource.name)
+                        reporter.pct((index + 1) * 100 // len(resources))
+                except (ProtocolError, Exception, SystemExit) as exc:
+                    message = exc.message if isinstance(exc, ProtocolError) else f"{type(exc).__name__}: {exc}"
+                    journal.record.last_error = redact_string(message)[:1000]
+                    journal.save()
+                    if isinstance(exc, ProtocolError) and exc.code in RETRY_CLEANUP_CODES:
+                        # Driver guidance speaks of Resume, which cleanup has ruled out.
+                        exc.actionable_guidance = "Run cleanup again; what was already deleted is skipped."
+                    raise
+            journal.transition_to(STAGE_CLEANED_UP)
+        return self._cleanup_result(req, installation_id, journal, deleted, missing)
+
+    @staticmethod
+    def _cleanup_result(
+        req: HelperRequest, installation_id: str, journal: InstallationJournal, deleted: List[Any], missing: List[Any]
+    ) -> HelperResponse:
+        return make_success_response(
+            req.request_id,
+            {
+                "installation_id": installation_id,
+                "provider": req.provider,
+                "stage": journal.record.stage if journal.exists() else STAGE_CLEANED_UP,
+                "deleted": deleted,
+                "missing": missing,
+            },
+        )
+
+    # ---------- probe ----------
+
+    def _handle_probe_compatibility(self, req: HelperRequest, progress: Progress, deadline: Deadline) -> HelperResponse:
         driver = self.get_driver(req.provider)
-        endpoint_url = req.params.get("endpoint_url")
-        runtime_credential = req.params.get("runtime_credential", {})
-
-        validate_https_url("endpoint_url", endpoint_url)
-
-        res = driver.validate_compatibility(endpoint_url, runtime_credential)
-        return make_success_response(req.request_id, res.to_dict())
+        endpoint_url = validate_endpoint_url(req.params.get("endpoint_url"))
+        credential = parse_runtime_credential(req.params.get("runtime_credential"))
+        expected_kind = "modal_proxy" if req.provider == PROVIDER_MODAL else "beam_bearer"
+        if credential["kind"] != expected_kind:
+            raise ProtocolError(ERR_VALIDATION, f"A {req.provider} endpoint needs a '{expected_kind}' runtime credential")
+        report = self._run(progress, "health", lambda: driver.probe(endpoint_url, credential, deadline))
+        model = report.get("model", {})
+        result = CompatibilityValidationResult(
+            endpoint_url=endpoint_url,
+            status=report.get("status", "compatible"),
+            api_version=str(report.get("protocol_version", "")),
+            model_recipe=str(model.get("recipe_id", "")),
+            healthy=bool(report.get("ok")),
+            gpu_incurred=False,
+            latency_ms=float(report.get("latency_ms") or 0.0),
+            details={"model": model, "http_status": report.get("http_status")},
+        )
+        return make_success_response(req.request_id, result.to_dict())

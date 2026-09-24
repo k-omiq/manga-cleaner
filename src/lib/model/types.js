@@ -65,10 +65,12 @@
  */
 
 /**
- * Pipeline telemetry for a mask attempt that reached the cloud rung,
- * independent of `Provenance.cloud` - this is set even when the attempt was
- * rejected and the mask's final provenance records the rung-2 fallback
- * which is exactly the case review needs to surface.
+ * A legacy cloud outcome. Nothing sets one when a cloud render commits: a
+ * render is recorded in `Provenance.cloud` and is not flagged for review. The
+ * native side still restores one from a job saved with an old cloud review
+ * state (`src-tauri/src/library.rs#review_flags`), which is why the field is
+ * on every mask it sends; `model/review.js` reads it the same way the native
+ * page counts do.
  *
  * @typedef {Object} CloudOutcome
  * @property {boolean} accepted
@@ -89,7 +91,7 @@
  */
 
 /**
- * Authoritative backend consent proposal prepared before spend/transmission confirmation.
+ * What the native side proposes to send for one cloud render, prepared before the consent dialog asks.
  *
  * @typedef {Object} ConsentProposal
  * @property {string} proposalId
@@ -237,7 +239,7 @@
  * @property {'match-surround'|'reconstruct'|'solid'} fillMode
  * @property {number} elapsedMs
  * @property {boolean} fittingReconstructed - planar fit failed and a model reconstructed the area
- * @property {CloudOutcome|null} cloudOutcome
+ * @property {CloudOutcome|null} cloudOutcome - legacy; null on every mask made today
  * @property {Provenance} provenance
  */
 

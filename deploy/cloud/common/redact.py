@@ -6,7 +6,6 @@ storage URLs in logging, error messages, and API response payloads.
 
 from __future__ import annotations
 
-import logging
 import re
 from typing import Any, Dict, List, Optional, Set, Union
 
@@ -110,28 +109,3 @@ def redact_dict(
     elif isinstance(data, str):
         return redact_text(data, custom_secrets)
     return data
-
-
-class RedactingLoggingFormatter(logging.Formatter):
-    """Logging formatter that intercepts and sanitizes log lines to prevent secret leakage."""
-
-    def __init__(
-        self,
-        fmt: Optional[str] = None,
-        datefmt: Optional[str] = None,
-        custom_secrets: Optional[List[str]] = None,
-    ):
-        super().__init__(fmt=fmt, datefmt=datefmt)
-        self.custom_secrets = custom_secrets or []
-
-    def format(self, record: logging.LogRecord) -> str:
-        original = super().format(record)
-        return redact_text(original, self.custom_secrets)
-
-    def formatException(self, ei) -> str:
-        original = super().formatException(ei)
-        return redact_text(original, self.custom_secrets)
-
-    def formatStack(self, stack) -> str:
-        original = super().formatStack(stack)
-        return redact_text(original, self.custom_secrets)

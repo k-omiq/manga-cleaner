@@ -1,8 +1,8 @@
-# Manga Cleaner — Backend Authorization Preparation & Consent Service (P3b2)
+# Manga Cleaner: Backend Authorization Preparation & Consent Service (P3b2)
 
 **Status: P3b2 accepted after two final source re-reviews.** The backend consent and authorization foundation has atomic epoch validation inside grant issuance, a hard bounded grant cache (`MAX_CACHED_GRANTS = 256`), full operation/source/geometry binding against the edit pipeline, and focused concurrency/boundary tests. No consent IPC or paid dispatch is exposed.
 
-**Remaining Milestone Scope:** P3b3 (Frontend Consent Dialogs, i18n copy, and UI integration), P4 (Durable Attempt Journal & Crash Recovery integration), P5–P11 (Remote Network Dispatch, Cloud Provisioning, Chapter Batching, Release Gates). **P3 and P4 are not claimed complete.**
+**Remaining Milestone Scope (at P3b2):** P3b3 (Frontend Consent Dialogs, i18n copy, and UI integration), P4 (Durable Attempt Journal & Crash Recovery integration), P5 to P11 (Remote Network Dispatch, Cloud Provisioning, Chapter Batching, Release Gates). Later work implemented P3b3, P4 and P5 to P9 offline. P10 (cloud-assisted chapters) is not implemented: chapter runs stay local only. No phase from P5 on has run live. See [cloud-work-log.md](cloud-work-log.md).
 
 ---
 
@@ -73,7 +73,7 @@ sequenceDiagram
    - `GrantService` keeps profile mutation epochs and grants under one mutex. Epoch comparison and grant insertion therefore occur in the same critical section.
    - Any modification or deletion of configuration profiles (`write_inference_config`) or credentials (`store_cloud_secret`, `delete_cloud_secret`) invalidates before and after mutation, advancing the epoch, consuming pending proposals, and revoking issued grants. Malformed on-disk public configuration can be replaced only after global invalidation.
    - Proposal preparation captures the epoch before raster work and rechecks it while inserting into the proposal cache. Confirmation passes the captured epoch into atomic grant issuance. Concurrent mutation therefore either invalidates the stored proposal/grant or returns [`ConsentError::ProfileMutated`].
-   - Real remote dispatch does not exist in P3b2. P5 must keep grant consumption and submission coordinated rather than treating a successful preflight check as permission that survives a later mutation.
+   - Real remote dispatch does not exist in P3b2. P5 must keep grant consumption and submission coordinated rather than treating a successful preflight check as permission that survives a later mutation. Grant consumption and submission are now coordinated in `execute_cloud_render` (`src-tauri/src/inference/service.rs`).
 
 7. **Operation Intent Binding & Replay Prevention:**
    - Proposals bind the exact [`OperationIntent`] (`ApplyTool`, `CreateRegion`, `RerunMask`, `CleanAnyway`), including optional tool parameters and `RerunMask` engine parameters.
@@ -89,8 +89,8 @@ sequenceDiagram
    - Proposal preparation is 100% offline. No remote HTTP sockets, DNS lookups, or remote containers are warmed during proposal preparation.
 
 10. **Fail-Closed Region Pipeline Guards:**
-    - All existing region edit entrypoints ([`apply_tool`], [`create_region`], [`rerun_mask`], [`clean_anyway`]) fail closed when explicit remote execution targets are provided until real network dispatch is enabled in P5.
-    - Rerun of patches with cloud provenance (`record.provenance.cloud.is_some()`) will NOT silently rerun locally; they fail closed with `notice.cloud.unavailable` or `notice.cloud.blocked`.
+    - Explicit remote targets now reach the cloud only with a valid single-use grant from the consent flow. Without one, nothing is sent.
+    - A re-run of a patch with cloud provenance (`record.provenance.cloud.is_some()`) does not silently re-run locally. It goes to the cloud with a grant, runs locally only when the user names a local engine, and otherwise fails closed with `decline.reason.rungUnavailable`, or `notice.cloud.blocked` when cloud is off.
     - Local Flux and automatic LaMa behavior remain fully preserved.
 
 ---
@@ -101,7 +101,7 @@ sequenceDiagram
   - `prepare_proposal` currently narrows to existing stored regions (`region_id: Some(...)`).
   - Preparing proposals for unsaved new manual region gestures without stored project state is explicitly refused with [`ConsentError::UnsupportedNewRegion`].
 - **Future Tauri Commands (Not Yet Exposed):**
-  - Once frontend consent modals (P3b3) and durable attempt dispatch (P4/P5) are integrated, dedicated commands (e.g. `prepare_cloud_consent`, `confirm_cloud_consent`) will be registered with capability permissions.
+  - Dedicated cloud commands are now registered: `prepare_cloud_consent`, `confirm_cloud_consent`, `submit_cloud_attempt`, `get_cloud_attempt_status`, `get_cloud_attempt_result`, `cancel_cloud_attempt`, `reconcile_cloud_recovery`, `check_cloud_connection`, `get_cloud_model_info`, `read_inference_config`, `write_inference_config`, `store_cloud_secret`, `delete_cloud_secret`, `get_cloud_secret_summary`, `run_cloud_provisioner`, and `cancel_cloud_provisioner`.
   - To prevent spoofed readiness, no fake or mock Tauri commands are registered in this milestone.
 
 ## Stop-point verification
@@ -109,7 +109,7 @@ sequenceDiagram
 - 69 inference tests pass: `cargo test -p manga-cleaner --lib inference::`.
 - 42 region tests pass: `cargo test -p manga-cleaner --lib region::`.
 - Strict app-library Clippy passes: `cargo clippy -p manga-cleaner --no-deps --lib -- -D warnings`.
-- Both post-fix source re-reviews approve with no P0–P3 findings:
+- Both post-fix source re-reviews approve with no P0 to P3 findings:
   `/tmp/manga-cloud-p3b2-rereview-vesper.json` and
   `/tmp/manga-cloud-p3b2-rereview-onyx.json`.
 - `run::lock_job` remains an in-process lock. Cross-process attempt locking in the journal does not make project writers cross-process safe.

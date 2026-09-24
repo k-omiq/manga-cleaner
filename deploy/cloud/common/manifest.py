@@ -10,7 +10,7 @@ import dataclasses
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from deploy.cloud.common.contract import (
     PROTOCOL_VERSION,
@@ -28,10 +28,61 @@ RECIPE_TEST_SDNQ: str = "test-sdnq-v1"
 MODEL_TEST_FLUX: str = "test-flux-schnell"
 REVISION_TEST_FLUX: str = "0123456789abcdef0123456789abcdef01234567"
 
-# Production FLUX SDNQ identifiers
-RECIPE_PROD_SDNQ: str = "sdnq-v1"
-MODEL_PROD_FLUX: str = "bghira/flux-1-schnell-sdnq-v1"
-REVISION_PROD_FLUX: str = "0123456789abcdef0123456789abcdef01234567"
+# Production recipe. The local engine is the single source of truth for every value
+# below: crates/cleaner-core/src/engines/flux.rs holds PROMPT, STEPS, SEED and
+# GUIDANCE, and sidecar/manga_cleaner_sidecar/backend/sdnq.py holds WORK_LONG_SIDE
+# and LATENT_STRIDE. deploy/cloud/tests/test_recipe_parity.py parses both files so
+# a change on either side fails the suite instead of silently drifting.
+RECIPE_PROD_SDNQ: str = "mc-flux2-klein-edit-v1"
+MODEL_PROD_FLUX: str = "Disty0/FLUX.2-klein-4B-SDNQ-4bit-dynamic"
+REVISION_PROD_FLUX: str = "45e9cc76cb70f84473ce5c6c2e2282d0ef3c6ecd"
+
+# The prompt belongs to the recipe on the server and never travels on the wire.
+RECIPE_PROMPT: str = "Remove all text."
+# Crops whose long side is below this are upscaled before inference, as locally.
+WORK_LONG_SIDE: int = 768
+
+
+@dataclass(frozen=True)
+class PinnedSampling:
+    """Sampling values a recipe fixes. A request that differs is not the same render."""
+
+    seed: int
+    steps: int
+    guidance_scaled: int
+
+
+# Wire values: guidance is sent times 100 (GUIDANCE 1.0 -> 100) and divided back on the server.
+PINNED_SAMPLING: Dict[str, PinnedSampling] = {
+    RECIPE_PROD_SDNQ: PinnedSampling(seed=1, steps=4, guidance_scaled=100),
+}
+
+# Files of the pinned snapshot, exactly as the Hub lists them at REVISION_PROD_FLUX.
+# The Hub does not publish per-file SHA-256 for the small files, so the seed job checks
+# the file set and every size; the commit hash pins the content itself.
+PROD_SNAPSHOT_FILES: Tuple[Tuple[str, int], ...] = (
+    (".gitattributes", 1580),
+    ("README.md", 2338),
+    ("model_index.json", 498),
+    ("scheduler/scheduler_config.json", 486),
+    ("text_encoder/config.json", 15367),
+    ("text_encoder/generation_config.json", 218),
+    ("text_encoder/model.safetensors", 2824093272),
+    ("text_encoder/quantization_config.json", 13146),
+    ("tokenizer/added_tokens.json", 707),
+    ("tokenizer/chat_template.jinja", 4168),
+    ("tokenizer/merges.txt", 1671853),
+    ("tokenizer/special_tokens_map.json", 613),
+    ("tokenizer/tokenizer.json", 11422654),
+    ("tokenizer/tokenizer_config.json", 5404),
+    ("tokenizer/vocab.json", 2776833),
+    ("transformer/config.json", 7328),
+    ("transformer/diffusion_pytorch_model.safetensors", 2467785416),
+    ("transformer/quantization_config.json", 6496),
+    ("vae/config.json", 925),
+    ("vae/diffusion_pytorch_model.safetensors", 168120878),
+)
+PROD_SNAPSHOT_TOTAL_BYTES: int = 5475930180
 
 
 @dataclass(frozen=True)
@@ -196,6 +247,20 @@ def verify_model_manifest(
     }
 
 
+def get_pinned_sampling(recipe_id: str) -> Optional[PinnedSampling]:
+    """Sampling values a recipe fixes, or None when the recipe leaves them to the request."""
+    return PINNED_SAMPLING.get(recipe_id)
+
+
+def production_limits() -> ServiceLimits:
+    """Limits a deployed gateway advertises.
+
+    Same payload bounds as the fixture limits; the worker deadline matches the provider
+    job timeout (600 s) so the client does not give up on a job the worker still runs.
+    """
+    return dataclasses.replace(provisional_fixture_limits(), worker_timeout_seconds=600)
+
+
 def get_default_model_info(
     provider: str,
     recipe_id: str = RECIPE_TEST_SDNQ,
@@ -216,3 +281,8 @@ def get_default_model_info(
         native_mask_conditioning=False,
         limits=limits or provisional_fixture_limits(),
     )
+
+
+def get_production_model_info(provider: str) -> ModelInfoResponse:
+    """Model info a deployed gateway serves on GET /model-info."""
+    return get_default_model_info(provider, RECIPE_PROD_SDNQ, production_limits())

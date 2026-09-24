@@ -45,7 +45,6 @@ export const en = {
       cancel: 'Cancel',
       close: 'Close',
       done: 'Done',
-      continue: 'I understand, continue',
       confirmSpend: 'Send to the cloud',
       convert: 'Convert',
       dismissNotice: 'Dismiss',
@@ -71,23 +70,24 @@ export const en = {
       renameProject: 'Rename project',
       removeProject: 'Remove this project?',
       formatConversion: 'Convert to an editable format?',
-      cloudTransmission: 'This sends part of your page to a third party',
-      cloudCost: 'Send one region to the cloud',
+      cloudConsent: 'Send this region to your cloud GPU?',
       overwriteRefusal: 'Refusing to overwrite the source',
     },
-    meta: {
-      cloudTransmission: 'first cloud request this session',
+    // The one question before every cloud render. Three facts: what leaves
+    // the machine, where it goes, what it costs. The crop's surrounding pixels
+    // are the point (the reconstruction needs the ring around the text), so
+    // the first fact says it is more than the masked region.
+    cloudConsent: {
+      what: 'What is sent',
+      whatValue: 'A {width} by {height} pixel crop around this region and its mask. The rest of the page and the project stay on this computer.',
+      where: 'Where it goes',
+      whereValue: '{name}, your endpoint on {providerKey}',
+      whereUnnamed: 'Your endpoint on {providerKey}',
+      cost: 'Cost',
+      costEstimate: 'About {cost:currency}, billed by the provider to your account.',
+      costUnknown: 'No estimate. The provider bills your account for the GPU time this render uses.',
     },
     body: {
-      // The surrounding pixels are the point: the
-      // reconstruction steps need the ring around the text, so the crop is
-      // never only the masked region, and the statement has to say so.
-      cloudTransmission:
-        'A bounded crop of the page, including the image content surrounding the text and not just the masked region, is transmitted to Google, processed there, and returned. Nothing else about the page or the project is sent. Local engines never leave this machine.',
-      cloudCost:
-        'One region, reconstructed in the cloud. Estimated {cost:currency}.',
-      cloudCostUnknown:
-        'One region, reconstructed in the cloud. Cost estimate unavailable; provider charges may apply.',
       formatConversion: {
         one: 'Convert one {from} file to {to} so it can be edited? The original stays.',
         other: 'Convert {count} {from} files to {to} so they can be edited? The originals stay.',
@@ -101,6 +101,11 @@ export const en = {
   /* settings - the Settings dialog's own rows                           */
   /* ================================================================== */
   settings: {
+    background: {
+      label: 'Keep running when closed',
+      description: 'The window hides while downloads continue. Use the tray icon to reopen or quit. Off: the close button quits the app.',
+      saveFailed: 'Could not save the close behavior. Try again.',
+    },
     theme: {
       label: 'Theme',
       light: 'Light',
@@ -112,19 +117,164 @@ export const en = {
       rtl: 'Right to left',
       ltr: 'Left to right',
     },
+    // General's pointer to the Cloud tab, and the provisioner. The switch
+    // itself is on the Cloud tab (`settings.inference.permission`); the off
+    // half of each sentence here is the same guarantee `notice.cloud.blocked`
+    // makes, so it says nothing is sent, not merely that cloud is off.
     cloud: {
-      label: 'Cloud engines',
-      description:
-        // The last clause used to promise "still asks before every spend",
-        // which the app does not do and never did: the cost dialog's own
-        // footnote says it asks before the FIRST spend of a session and after
-        // that only while Confirm before spending is on, and an Auto clean run
-        // with the cloud ceiling escalates without asking at all. The blocked
-        // half of this sentence is a guarantee and is kept verbatim; the
-        // allowed half now claims only what allowing actually does.
-        'Blocked by default. While blocked, nothing is sent to a cloud provider: the cloud rung is refused before any request is made. Allowing it makes the cloud rung available to the tools that can use it.',
-      allowed: 'Allowed',
-      blocked: 'Blocked',
+      label: 'Cloud GPU',
+      descriptionOff: 'Off. Nothing from your pages is sent to a cloud provider. Turn it on and set up a GPU on the Cloud tab.',
+      descriptionOn: 'On. Each cloud render asks first and says what it sends. The switch and your endpoints are on the Cloud tab.',
+      open: 'Open Cloud settings',
+      setup: {
+        title: 'Set up a cloud GPU',
+        heading: {
+          connect: 'Connect your account',
+          review: 'Review the setup',
+          running: 'Setting up',
+          cleaning: 'Deleting cloud resources',
+          stopped: 'Setup stopped',
+          failed: 'Setup did not finish',
+          cleanupFailed: 'Some resources were not deleted',
+          done: 'Your cloud GPU is ready',
+          finished: 'Setup finished',
+          resume: 'Resume setup',
+          cleanup: 'Delete cloud resources',
+          cleaned: 'Cloud resources deleted',
+        },
+        connect: {
+          lead: 'Setup creates a private GPU endpoint in your own account. The provider bills you for it directly.',
+          provider: 'Provider',
+          modalNote: 'Needs a token ID and a token secret.',
+          beamNote: 'Needs an API key.',
+          modalTokenId: 'Modal token ID',
+          modalTokenSecret: 'Modal token secret',
+          beamToken: 'Beam API key',
+          help: 'Where do I find this?',
+          helpModal: 'Sign in at modal.com, open Settings, then API Tokens, and create a new token. Modal shows the ID and the secret once, so copy both.',
+          helpBeam: 'Sign in at beam.cloud, open Settings, then API Keys, and create a key. Copy it when Beam shows it.',
+          copyLink: 'Copy link',
+          copied: 'Copied',
+          keyNoteModal: 'Your Modal token is used for this setup only and is not saved. Setup makes a separate access token that can only call the new endpoint.',
+          keyNoteBeam: 'Beam endpoints are called with your own API key, so the app keeps it in this computer’s keychain. Nothing else stores it.',
+          notEligible: 'This account cannot run a GPU endpoint yet. Check that GPU access and billing are turned on with the provider, then try again.',
+          continue: 'Continue',
+          checking: 'Checking…',
+        },
+        review: {
+          lead: 'Setup will create these in your {providerKey} account:',
+          gpu: 'GPU',
+          idle: 'Stay on after a render',
+          idleOption: {
+            one: '{count} minute',
+            other: '{count} minutes',
+          },
+          weights: 'Setup downloads about {size} GB of model weights into your account. This happens once.',
+          costGpu: '{providerKey} bills your account for GPU time while a render runs.',
+          costIdle: 'After each render the GPU stays on for the time above, which is billed too, and then stops. Storing the model weights may add a small charge.',
+          tokenModal: 'Setup also creates an access token that can only call this endpoint. The app keeps it in this computer’s keychain.',
+          tokenBeam: 'Beam has no separate access token. The endpoint is called with your own Beam API key, which the app keeps in this computer’s keychain. Setup also stores the key as a secret in your Beam account, so the gateway can start GPU jobs.',
+          approve: 'I approve creating these in my {providerKey} account and paying for what they use.',
+          details: 'Technical details',
+          hash: 'Plan hash',
+          installation: 'Installation ID',
+          back: 'Back',
+          start: 'Start setup',
+        },
+        running: {
+          lead: 'This can take several minutes the first time. You can close Settings; setup keeps going.',
+          cleanupLead: 'Deleting what setup created. You can close Settings; this keeps going.',
+          starting: 'Starting…',
+          elapsed: 'Elapsed {time}',
+          stop: 'Stop',
+          stopping: 'Stopping…',
+        },
+        // Read after each step's name by a screen reader; the checklist's
+        // marks say the same thing to the eye.
+        state: {
+          running: 'in progress',
+          done: 'done',
+          fail: 'failed',
+          skip: 'skipped',
+        },
+        failed: {
+          code: 'Code: {code}',
+          kept: 'What finished is kept. Resume picks up from there.',
+          keys: 'Enter your key again to resume or clean up.',
+          resume: 'Resume',
+          cleanup: 'Clean up',
+          retry: 'Try again',
+          again: 'Start again',
+        },
+        done: {
+          saved: 'Saved and selected as your cloud GPU: {name}.',
+          unchecked: '{name} is saved and selected as your cloud GPU. Test it from Settings > Cloud.',
+          fallbackName: '{providerKey} ({id})',
+          tryIt: 'Try it: choose Cloud as the engine in the tool bar. The first render can take 1 to 3 minutes while the GPU starts.',
+          nothing: 'That setup had already finished. Nothing was changed.',
+        },
+        resume: {
+          lead: 'A setup in your {providerKey} account did not finish ({id}). Enter your key to pick up where it stopped.',
+          reissue: 'Enter your {providerKey} key to give this endpoint ({id}) a new access token. Setup checks what is already there and only redoes what is missing.',
+        },
+        cleanup: {
+          planning: 'Checking what to delete…',
+          none: 'Nothing that setup created is left in your {providerKey} account.',
+          lead: 'These will be deleted from your {providerKey} account, including the downloaded model weights:',
+          ignored: {
+            one: 'One other resource in the account was not made by this setup and is left alone.',
+            other: '{count} other resources in the account were not made by this setup and are left alone.',
+          },
+          approve: 'I understand these are deleted for good, and a new setup downloads the weights again.',
+          forget: 'Forget this setup',
+          delete: 'Delete',
+          done: 'Deleted from your {providerKey} account. The endpoint is removed from this computer too.',
+          doneEmpty: 'Nothing was left in your {providerKey} account. The endpoint is removed from this computer.',
+        },
+        // One per IC-2 step id, in the order the helper runs them.
+        step: {
+          inspect: 'Check the account',
+          validate: 'Check the plan',
+          volume: 'Create storage for the model',
+          state: 'Create job storage',
+          secret: 'Store the endpoint’s secret',
+          image: 'Build the container image',
+          deploy: 'Deploy the endpoint',
+          weights: 'Download the model weights',
+          token: 'Create an access token',
+          endpoint: 'Save the endpoint',
+          health: 'Check the endpoint',
+          cleanup: 'Delete resources',
+          working: 'Working',
+        },
+        resource: {
+          volume: 'Storage for the model weights',
+          app: 'GPU endpoint',
+          token: 'Access token',
+          state: 'Job storage',
+          gateway: 'Gateway',
+          worker: 'GPU worker',
+          secret: 'Secret',
+          unknown: 'Other resource',
+        },
+        // One per helper error code. The helper's own message is never shown:
+        // provider errors can carry a key or a signed URL.
+        error: {
+          permission: 'Your key does not have permission for this. Check that it can create apps and storage, then try again.',
+          validation: 'The details were not accepted. Check the key and try again.',
+          planChanged: 'The plan changed after you reviewed it, so nothing was created. Start again to review the new plan.',
+          platform: 'This account cannot run GPU endpoints yet. Check GPU access and billing with the provider.',
+          unavailable: 'The provider could not be reached. Check your connection and try again.',
+          failed: 'Something went wrong during setup.',
+          timeout: 'Setup took too long and was stopped.',
+          secretStore: 'The access token could not be saved in this computer’s keychain. Resume creates a new one.',
+          configWrite: 'The endpoint could not be saved on this computer. Resume tries again.',
+          cancelled: 'You stopped setup.',
+          request: 'The app and its setup helper did not understand each other. Update the app and try again.',
+          cleanup: 'Some resources could not be deleted. Try again, or delete them in your provider’s dashboard.',
+          generic: 'Setup did not finish.',
+        },
+      },
     },
     originalView: {
       label: 'Original view',
@@ -284,86 +434,122 @@ export const en = {
         shift: 'Shift',
       },
     },
+    // Settings > Cloud. The tab's id stays `inference` (the modal spec and the
+    // tests name it); what it says is Cloud.
     inference: {
-      target: {
-        label: 'Default execution target',
-        local: 'Local (default)',
-        option: '{provider}: {name} ({id})',
+      status: {
+        off: 'Cloud GPU is off. Nothing from your pages is sent.',
+        checking: 'Checking…',
+        ready: 'Ready on “{name}”.',
+        attention: 'Needs attention: {reasonKey}',
       },
-      disclaimer:
-        'Remote execution is unavailable in this build. Selecting a profile configures endpoint settings only and does not transmit crops, contact remote hosts, or authorize paid work.',
-      executionStatus: {
-        label: 'Remote execution',
-        unavailable: 'Unavailable (provider execution is not enabled in this build)',
+      reason: {
+        none: 'no cloud GPU is set up yet.',
+        noTarget: 'no endpoint is chosen as the default.',
+        noSecret: 'the default endpoint has no access token on this computer.',
+        unknown: 'the cloud settings could not be read.',
       },
-      testConnection: 'Test connection',
-      testNamed: 'Test connection for {name} ({id})',
-      testingConnection: 'Testing connection…',
-      connectionReachable: 'Reachable ({latency} ms)',
-      connectionFailed: 'Connection check failed',
-      commandNotRegistered: 'Connection check command not registered in this build',
-      recovery: {
-        title: 'Attempt recovery status',
-        check: 'Check recovery',
-        none: 'No interrupted remote attempts found.',
-        ambiguous: 'Interrupted attempt detected (status unknown). Automatic re-dispatch is forbidden.',
-        cached: 'Validated remote result cached and ready for local project review.',
-        stale: 'Interrupted attempt result retained in cache; region was modified locally (stale attachment rejected).',
+      permission: {
+        label: 'Use a cloud GPU',
+        description:
+          'Off: nothing from your pages leaves this computer. On: Cloud can be chosen as an engine, and each cloud render asks first and says what it sends.',
+        off: 'Off',
+        on: 'On',
       },
-      modalSection: 'Modal profiles',
-      beamSection: 'Beam profiles',
-      noProfiles: 'No profiles configured.',
-      addProfile: 'Add profile',
-      editProfile: 'Edit profile',
-      deleteProfile: 'Delete',
-      editNamed: 'Edit {name} ({id})',
-      deleteNamed: 'Delete {name} ({id})',
-      edit: 'Edit',
-      cancel: 'Cancel',
-      save: 'Save profile',
-      loading: 'Loading inference configuration…',
+      setup: {
+        action: 'Set up with Modal or Beam',
+        description:
+          'Creates a private GPU endpoint in your own account, billed by the provider. You review and approve the plan before anything is created.',
+      },
       provider: {
         label: 'Provider',
         modal: 'Modal',
         beam: 'Beam',
       },
-      id: {
-        label: 'Profile ID',
-        placeholder: 'e.g. modal-prod-1',
+      endpoints: {
+        title: 'Endpoints',
+        empty: 'No cloud endpoints yet.',
+        loadFailed: 'The cloud settings could not be read.',
+        retry: 'Try again',
+        useDefault: 'Use {name} by default',
+        meta: '{providerKey} · {host}',
+        default: 'Default',
+        test: 'Test',
+        testing: 'Testing…',
+        remove: 'Remove',
       },
-      name: {
-        label: 'Display name',
-        placeholder: 'e.g. Production GPU Worker',
+      token: {
+        saved: 'Access token saved',
+        missing: 'No access token',
+        unknown: 'Token not checked',
+        add: 'Add token',
+        replace: 'Replace token',
+        save: 'Save token',
+        saving: 'Saving…',
+        modalTokenId: 'Token ID',
+        modalTokenSecret: 'Token secret',
+        beamToken: 'Beam API key',
+        saveFailed: 'The token could not be saved in this computer’s keychain. Enter it again to retry.',
+      },
+      // A connection check's answer, and the one setup runs at its end.
+      health: {
+        reachable: 'The endpoint is reachable.',
+        httpError: 'The endpoint answered with an error.',
+        unauthorized: 'The endpoint refused the access token.',
+        credentialMissing: 'No access token is saved for this endpoint.',
+        configuration: 'The endpoint settings are not valid.',
+        unreachable: 'The endpoint could not be reached.',
+        unknown: 'The endpoint could not be checked.',
+        latency: '{latency} ms',
+      },
+      remove: {
+        confirm: 'Remove “{name}” from this computer?',
+        keepNote: 'The endpoint and its storage stay in your {providerKey} account until you delete them there.',
+        alsoDelete: 'Also delete the cloud resources',
+        deleteNote:
+          'Next you see what will be deleted from your {providerKey} account, including the model weights, and enter your key to confirm.',
+        review: 'Review what is deleted',
+        confirmButton: 'Remove',
+        failed: 'The endpoint could not be removed. Try again.',
+      },
+      recovery: {
+        title: 'Needs attention',
+        unfinished: 'A setup in your {providerKey} account did not finish ({id}).',
+        forgetNote:
+          'Resume picks up where it stopped, and can clean up from there. Forget only clears this reminder: anything already created stays in your account.',
+        resume: 'Resume',
+        forget: 'Forget',
+        noToken: '“{name}” has no access token on this computer.',
+        newToken: 'Get a new token',
+        attempt: 'A cloud render for page {page} was interrupted. {reasonKey}',
+        attemptNoPage: 'A cloud render was interrupted. {reasonKey}',
+        dismiss: 'Dismiss',
+        reason: {
+          ambiguous: 'It is not known whether the provider ran it, so it was not sent again.',
+          stale: 'The region changed after it was sent, so the result was not applied.',
+          failed: 'It did not finish. Run it again if you still want it.',
+        },
+      },
+      connect: {
+        title: 'Connect an existing endpoint',
+        description:
+          'For an endpoint you deployed yourself. Enter its HTTPS address and the access token it expects: a proxy auth token for Modal, your API key for Beam.',
+        name: 'Name',
+        endpoint: 'Endpoint URL',
+        connect: 'Connect',
+        connecting: 'Connecting…',
+        connected: 'Connected and saved: {name}.',
+        savedUnchecked: 'Saved {name}. {reasonKey}',
       },
       endpoint: {
-        label: 'Endpoint URL',
         placeholder: 'https://…',
       },
-      originWarning:
-        'Changing the endpoint URL changes the target origin. Any credentials previously stored for this profile remain bound to the previous origin and must be replaced separately.',
       error: {
-        invalidId:
-          'Profile ID must be 1 to 64 ASCII alphanumeric characters, hyphens, or underscores, starting with an alphanumeric character.',
-        idTaken: 'A profile with this ID already exists for this provider.',
-        invalidName: 'Profile name must be 1 to 128 characters.',
-        invalidUrl:
-          'Endpoint URL must be a valid HTTPS URL (no query parameters, fragments, or user credentials).',
-        saveFailed: 'Failed to save inference configuration.',
-        loadFailed: 'Failed to load inference configuration.',
-      },
-      status: {
-        saved: 'Inference configuration saved.',
-        profileRemoved:
-          'Profile removed from local configuration. Remote resources, tokens, and secret-store entries were not modified.',
-      },
-      removal: {
-        confirmTitle: 'Confirm profile removal',
-        confirmTitleNamed: 'Remove {name} ({id})',
-        description:
-          'Removing this profile deletes its endpoint configuration from local application settings only.',
-        scopeWarning:
-          'This action does not revoke API tokens, delete secret-store entries, stop running services, or uninstall provider resources. Status polling and result retrieval for any active remote attempts will be interrupted until this profile is restored.',
-        confirmButton: 'Confirm removal',
+        invalidName: 'Enter a name of 1 to 128 characters.',
+        invalidUrl: 'Enter an HTTPS address on a public host name, with no user name, query or fragment.',
+        tokenRequired: 'Enter the access token.',
+        tokenSaveFailed: 'The token could not be saved, so the endpoint was not added. Try again.',
+        saveFailed: 'The cloud settings could not be saved. Nothing was changed.',
       },
     },
     // The tab strip. `general` heads the five preference rows, which had no
@@ -372,7 +558,7 @@ export const en = {
       general: 'General',
       models: 'Models',
       acceleration: 'Acceleration',
-      inference: 'Inference',
+      inference: 'Cloud',
       shortcuts: 'Shortcuts',
       about: 'About',
     },
@@ -401,11 +587,11 @@ export const en = {
         'Manga Cleaner is free software under the GNU General Public License, version 3 or later. The complete corresponding source is available at the address above, and will be supplied on physical media on request for no more than the cost of distribution.',
     },
     note: {
-      // Names Google, as `modal.body.cloudTransmission` does. About is where a
-      // user reads about the cloud when they are *not* mid-request, so it is
-      // the worse of the two places to leave the provider unnamed.
+      // Names the providers, as the consent dialog names the endpoint. About is
+      // where a user reads about the cloud when they are *not* mid-request, so
+      // it is the worse of the two places to leave the provider unnamed.
       cloudTerms:
-        'Cloud requests go to Google and are governed by Google’s own terms, not by this licence. They are opt-in for every request, and they send a bounded crop of the page, including the image content around the text, off this machine.',
+        'Cloud requests go to the Modal or Beam account you set up, and that provider’s terms govern them, not this licence. The cloud is off until you turn it on, you confirm every request, and each one sends only a crop of the page around the region.',
     },
   },
 
@@ -739,7 +925,7 @@ export const en = {
     state: {
       opening: 'Opening the chapter…',
       noPages: 'This chapter has no pages.',
-      cloudBlocked: 'Cloud engines are blocked in Settings.',
+      cloudBlocked: 'Cloud GPU is off in Settings.',
       // Auto clean's three files are missing. Disabled with a sentence rather
       // than hidden: an engine option has four alternatives beside it and this
       // button has none, so a tool that quietly lost its only action would
@@ -1113,43 +1299,146 @@ export const en = {
     },
     hint: {
     },
-    /* The offer made on a first launch. The
-       downloader has always been there; until this it was one the user had to
-       go and find, and a fresh install opened an editor whose only cleaning
-       action was disabled. Every sentence here names Settings › Models,
-       because that is the way back for a user who declines, cancels, or is
-       interrupted. */
-    firstLaunch: {
-      title: 'Download the engines?',
-      description: 'The engines download once and stay on this computer. Anything skipped here can be added later in Settings › Models.',
-      requiredLabel: 'Needed to clean a page',
-      // A platform with no published ONNX Runtime - an Intel Mac. The weights
-      // are still offered, because they are what an offline install needs
-      // beside a library placed by hand, and this says why they are not enough
-      // on their own.
-      runtimeUnavailable:
-        'There is no engine runtime published for this computer, so nothing here can run until one is installed by hand. The files below are still worth having: they are what such an install needs beside it.',
-      requiredNote: '{bytes:memory} in all. Auto clean stays disabled until these are here.',
-      optionalLabel: 'Redraw engine',
-      // One engine rather than two since MI-GAN was removed, so the sentence
-      // no longer compares a pair. What is left is the only thing a user
-      // actually has to decide
-      // here: what this download buys them, and what they give up by skipping
-      // it. The size is on the row itself and is not repeated.
-      optionalNote: 'Rebuilds the artwork under the text. Without it, anything over artwork or screentone is left for you.',
-      // A failure stops the sequence rather than carrying on into the next
-      // download: the artefacts are wanted together, and four failures in a row
-      // read as a broken application rather than as one bad connection.
-      failed:
-        '{nameKey} could not be downloaded, so the rest were not started. Settings › Models can try again.',
-      stopped: 'Stopped. Settings › Models is where the rest are downloaded.',
-      done: 'Everything chosen is installed.',
-      action: {
-        download: 'Download {bytes:memory}',
-        // Not "Cancel": nothing is being undone, and the offer is not a
-        // question the user has to answer now.
-        notNow: 'Not now',
+  },
+
+  /* ================================================================== */
+  /* onboarding - the setup shown on a first launch                      */
+  /* ================================================================== */
+  // Six short steps, one choice each, every one of them skippable and every
+  // choice also in Settings, which is why so much of this names Settings: it
+  // is the way back for a user who skips, declines, or is interrupted. The
+  // sizes are real byte counts and the copy says what a thing does rather
+  // than what it is, for `models.kind.*`'s reason. Settings' own names are
+  // reused where a row is the same setting, so one setting has one name.
+  onboarding: {
+    title: 'Set up Manga Cleaner',
+    stepOf: 'Step {current} of {total}',
+    saveFailed: 'This setting could not be saved. Try again, or change it later in Settings.',
+    action: {
+      start: 'Get started',
+      next: 'Continue',
+      back: 'Back',
+      skip: 'Skip setup',
+      notNow: 'Not now',
+      close: 'Close',
+    },
+    welcome: {
+      heading: 'Welcome to Manga Cleaner',
+      body: 'Manga Cleaner finds the text on scanned comic pages, removes it, and redraws the art underneath.',
+      local: 'Cleaning runs on this computer.',
+      steps: 'Each step is one choice. Skip any of them and change it later in Settings.',
+    },
+    models: {
+      heading: 'Download the models',
+      body: 'Cleaning needs these files on this computer. They download once, then work offline.',
+      // The required files are one line rather than five: there is no
+      // cleaning without all of them, so there is nothing to choose between.
+      // Settings > Models keeps the one-row-per-file list.
+      required: {
+        label: 'Required for cleaning',
+        note: 'The engine runtime and the models that find text and speech bubbles.',
+        // An Intel Mac, where no runtime is published and the row is absent.
+        noteNoRuntime: 'The models that find text and speech bubbles.',
       },
+      redraw: {
+        note: 'Redraws tones and lines where text covered the art.',
+      },
+      japanese: {
+        note: 'Reads Japanese the language checker cannot make out, so fewer lines land in review.',
+      },
+      status: {
+        installed: 'Installed',
+        waiting: 'Waiting',
+        downloading: 'Downloading',
+        paused: 'Paused',
+        failed: 'Failed',
+      },
+      download: 'Download {bytes:memory}',
+      pause: 'Pause',
+      resume: 'Resume',
+      retry: 'Try again',
+      progressLabel: 'Download progress',
+      run: {
+        downloading: 'Downloading: {nameKey}',
+        working: 'Downloading…',
+        paused: 'Paused. Resume picks up where it stopped.',
+        done: 'Downloads finished.',
+        failed: '{nameKey} could not be downloaded. Check your connection, then try again.',
+        failedAny: 'A download failed. Check your connection, then try again.',
+      },
+      amount: '{done:memory} of {total:memory}',
+      background: 'You can continue setup while this runs.',
+      ready: 'Everything cleaning needs is installed.',
+      runtimeUnavailable:
+        'No engine runtime is published for this computer, so cleaning needs one installed by hand. The models still download.',
+    },
+    defaults: {
+      heading: 'Choose the defaults',
+      body: 'The recommended choices are already selected. Change any of them later in Settings.',
+      accel: {
+        auto: 'Automatic (recommended)',
+        note: 'Automatic picks the processor or graphics card for each model.',
+        // Asking what this machine can run on loads the runtime, so the
+        // question waits for the runtime to be here (`runtimeReady`).
+        later: 'More choices appear once the engine runtime is installed.',
+        unreadable: 'The list of processors could not be read, so Automatic is the only choice. Settings > Models shows why.',
+      },
+      flux: {
+        folderNote: 'Optional. AI redraw runs in a separate helper. Choose its folder if you have installed it.',
+        modelNote: 'Used when a region is redrawn with AI redraw.',
+        engineNote: 'Automatic uses MLX on Apple silicon and SDNQ elsewhere.',
+      },
+    },
+    cloud: {
+      heading: 'Cloud GPU',
+      body: 'Optional: run AI redraw on your own Modal or Beam GPU. You pay the provider directly.',
+      consent: 'Nothing is sent to it until you confirm, every time.',
+      setUp: 'Set up now',
+      on: 'Cloud cleaning is already on. Manage it in Settings.',
+      ready: '{name} is set up, and cloud cleaning is on.',
+      readyUnnamed: 'Your cloud GPU is set up, and cloud cleaning is on.',
+      unchecked: '{name} is set up, but it did not answer its first check. Test it and turn cloud cleaning on in Settings > Cloud.',
+      uncheckedUnnamed:
+        'Your cloud GPU is set up, but it did not answer its first check. Test it and turn cloud cleaning on in Settings > Cloud.',
+      saveFailed: 'Your cloud GPU is set up, but cloud cleaning could not be turned on. Turn it on in Settings.',
+    },
+    behavior: {
+      heading: 'App behavior',
+      body: 'Change these later in Settings > General.',
+      trayNote: 'Closing the window hides it and downloads keep going. Quit from the tray icon.',
+      directionNote: 'The default for new projects. Right to left suits manga.',
+    },
+    done: {
+      heading: 'Setup is done',
+      body: 'Start a new project to clean your first chapter. You can run this setup again from Settings.',
+      bodyDownloading: 'Downloads are still running. You can start a project now; Auto clean is ready when they finish.',
+      bodyMissing: 'Auto clean needs the required models. Download them any time from Settings > Models.',
+      summary: {
+        models: 'Models',
+        cloud: 'Cloud cleaning',
+        tray: 'Closing the window',
+      },
+      value: {
+        installed: 'Installed',
+        downloading: 'Downloading, {percent}%',
+        paused: 'Paused at {percent}%',
+        failed: 'Download failed',
+        notDownloaded: 'Not downloaded',
+        accelCustom: 'As set in Settings',
+        cloudOff: 'Off',
+        cloudOffSaved: 'Off, {name} saved',
+        cloudOn: 'On',
+        cloudOnNamed: 'On, {name}',
+        trayKeep: 'Keeps running in the tray',
+        trayQuit: 'Quits the app',
+      },
+    },
+    // Settings > General, for anyone who skipped a step or wants the tour.
+    replay: {
+      label: 'Setup',
+      description: 'Walk through downloads, defaults, the cloud GPU and app behavior again.',
+      action: 'Run setup again',
+      failed: 'Setup could not open because the model list could not be read. Try again.',
     },
   },
 
@@ -1235,6 +1524,7 @@ export const en = {
       // The only currency in the app. `currency` runs Intl.NumberFormat; no
       // other string may write a `$`.
       cloudCost: '{cost:currency}',
+      cloudCostUnknown: 'not reported by the provider',
       nothingApplied: 'nothing (the original text is untouched)',
       detectedYes: 'yes, by the automatic pass',
       detectedNo: 'no, the automatic pass missed it',
@@ -1253,9 +1543,9 @@ export const en = {
       // Rung 3a, offered only where the sidecar is
       // actually installed - `rowEngines` in `src/lib/model/masks.js`.
       flux: 'FLUX',
-      // Not offered by a row's picker - see `ROW_ENGINES` in
-      // `src/lib/model/masks.js` - but a mask that already ran on the cloud
-      // still has to be able to name its own entry.
+      // Offered by a row's picker and the region menu while a cloud endpoint
+      // is ready (`rowEngines` in `src/lib/model/masks.js`), and always the
+      // entry of a mask the cloud rendered.
       cloud: 'Cloud',
     },
     action: {
@@ -1412,6 +1702,10 @@ export const en = {
       polygon: 'Polygon',
       engineLocal: 'Local',
       engineCloud: 'Cloud',
+      // Beside the Cloud engine while it cannot be chosen, with the one
+      // button that fixes it.
+      engineCloudNotReady: 'No cloud GPU is ready. Set one up in Settings.',
+      engineCloudSettings: 'Open Cloud settings',
       // There is no `engineFill` / `engineRedraw` pair any more. Auto clean's
       // two rows named a *family* - "Fill", "Redraw" - and the user ruled that
       // a picker must name the model; both rows
@@ -1668,15 +1962,69 @@ export const en = {
       // The whole user-facing content of a privacy guarantee: the request was
       // refused in the interface, before any adapter call, so the page did not
       // leave the machine. It has to say that, not merely that cloud is off.
-      blocked: 'Cloud engines are blocked in Settings. Nothing was sent. No part of this page left your machine.',
-      returned: 'Cloud region returned in {seconds} s · {cost:currency} billed.',
-      rejected: 'Cloud request rejected: {causeKey}. Fell back to the local inpainter.',
-      // Not blocked - *absent*. This build has no online engine at all, and the
-      // difference matters to the reader: nothing they can change in Settings
-      // will make this request work. What it shares with `blocked` is the only
-      // part that is a promise: nothing was sent.
-      unavailable:
-        'This build has no online engine yet. Nothing was sent. No part of this page left your machine.',
+      blocked: 'Cloud GPU is off in Settings. Nothing was sent. No part of this page left your machine.',
+      notReady: 'No cloud GPU is ready. Nothing was sent. Set one up in Settings, Cloud.',
+      consentFailed: 'The cloud request could not be prepared. Nothing was sent.',
+      permissionFailed: 'The cloud setting could not be saved. It is unchanged.',
+      // How a render ended: exactly one of these per render.
+      finished: 'Cloud render finished in {seconds} s.',
+      cancelled: 'Cloud render cancelled.',
+      unknown: 'It is not known whether the cloud render ran. Nothing was applied, and it was not sent again.',
+      failed: 'The cloud render did not finish. {reasonKey}',
+      cancelFailed: 'The cloud render could not be cancelled. It may still finish.',
+      recovered: {
+        one: 'A cloud render from last time finished and was applied.',
+        other: '{count} cloud renders from last time finished and were applied.',
+      },
+      needsAttention: {
+        one: 'A cloud render from last time needs attention. See Settings, Cloud.',
+        other: '{count} cloud renders from last time need attention. See Settings, Cloud.',
+      },
+      setupDone: 'Your cloud GPU is set up and selected.',
+      setupFailed: 'Cloud setup did not finish. Open Settings, Cloud, to resume or clean up.',
+      cleanupDone: 'Cloud resources deleted.',
+      cleanupFailed: 'Some cloud resources could not be deleted. Open Settings, Cloud, to try again.',
+      endpointRemoved: 'Removed {name} from this computer.',
+      // The phase line of a render in flight (IC-3).
+      phase: {
+        preparing: 'Preparing',
+        submitting: 'Sending',
+        queued: 'Waiting for a GPU',
+        running: 'Rendering',
+        downloading: 'Receiving the result',
+        compositing: 'Applying the result',
+      },
+      // Why a render did not finish, one sentence per group of error codes.
+      error: {
+        disabled: 'Cloud GPU is off in Settings.',
+        target: 'The cloud endpoint changed or is missing. Check Settings, Cloud.',
+        credential: 'The endpoint has no access token on this computer. Add one in Settings, Cloud.',
+        consent: 'The approval for this render was no longer valid. Try again.',
+        region: 'The region changed while it was in the cloud, so the result was not applied.',
+        regionUnsupported: 'This region cannot be rendered in the cloud.',
+        busy: 'This region is already rendering in the cloud.',
+        local: 'Something went wrong on this computer. Nothing was changed.',
+        result: 'The endpoint sent back a result that could not be used. Nothing was changed.',
+        unauthorized: 'The endpoint refused the access token. Replace it in Settings, Cloud.',
+        gateway: 'The endpoint answered with an error.',
+        unreachable: 'The endpoint could not be reached.',
+        submission: 'It is not known whether the endpoint received the render. It was not sent again.',
+        remote: 'The render failed on the cloud GPU.',
+        remoteCancelled: 'The provider cancelled the render.',
+        cancelled: 'It was cancelled.',
+        timeout: 'The render took too long and was stopped.',
+        generic: 'Something went wrong.',
+      },
+      // The status element, bottom left, while renders are in flight.
+      job: {
+        title: 'Cloud',
+        elapsed: 'Time since it started',
+        page: 'Page {page}',
+        region: 'One region',
+        cancel: 'Cancel',
+        cancelling: 'Cancelling…',
+        firstRun: 'The first render can take 1 to 3 minutes while the GPU starts.',
+      },
     },
     mask: {
       deleted: 'Mask deleted. The original text under it is back.',

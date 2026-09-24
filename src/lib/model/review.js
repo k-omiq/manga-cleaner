@@ -8,8 +8,15 @@
  *  2. the region is unusually large for the page
  *  3. the app declined
  *  4. the script gate skipped it - low confidence, or text outside a bubble
- *  5. a cloud request was rejected, by one of five causes
- *  6. a cloud request was accepted - unconditionally
+ *  5. a legacy cloud outcome on the mask (see below)
+ *
+ * **The cloud outcome is legacy.** A cloud render today runs the same recipe
+ * as local FLUX and is not flagged: nothing sets `mask.cloudOutcome` when one
+ * commits. The native side still fills the field in from a job saved with one
+ * of the old cloud review states (`src-tauri/src/library.rs#review_flags`),
+ * and flags such a region in its own page counts and review index
+ * (`library.rs#review_reason`), so this reads it the same way, to keep the
+ * panel's list and the page's count in agreement. It goes when those do.
  *
  * A region can technically match more than one (e.g. declined *and*
  * unusually large); `reviewReason` reports the first match in the order

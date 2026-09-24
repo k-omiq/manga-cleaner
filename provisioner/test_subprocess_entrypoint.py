@@ -1,15 +1,23 @@
-"""Subprocess execution tests for `python -m provisioner` module entrypoint.
+"""`python -m provisioner` as the desktop runs it: a subprocess with piped streams.
 
 Proves:
-1. No fake success: CLI entrypoint never defaults to fake drivers; fails closed when real SDKs absent/unverified.
-2. Bounded input: Rejection of oversized payloads (> 64 KiB) before memory bloat.
-3. One-response protocol: Exactly ONE redacted JSON response envelope emitted on stdout.
-4. Stderr/log redaction: No sensitive credentials leaked to stderr, argv, or response logs.
-5. Provider/platform gating: Truthful failure on unverified platforms or unsupported providers.
+1. Bounded input: oversized, empty and malformed requests get a typed error.
+2. One response: stdout carries exactly one JSON document, whatever the SDKs print.
+3. Progress only: every stderr line is an IC-2 record, and no credential reaches either stream.
+4. Typed failures: no credentials is a validation error; a provider that cannot be
+   reached (no SDK installed, or the SDK pointed at a closed local port) is
+   ERR_PROVIDER_UNAVAILABLE.
+
+Every run is hermetic: token variables are removed, HOME is a scratch directory,
+and both SDKs are pointed at 127.0.0.1 port 9, so no test can reach a real provider
+even when the SDKs are installed.
 """
 
+import importlib.util
 import json
+import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -18,277 +26,158 @@ import unittest
 from provisioner.protocol import (
     ERR_INVALID_PAYLOAD,
     ERR_PAYLOAD_TOO_LARGE,
-    ERR_PLATFORM_GATED,
     ERR_PROVIDER_UNAVAILABLE,
     ERR_UNSUPPORTED_OP,
     ERR_UNSUPPORTED_PROVIDER,
     ERR_VALIDATION,
     HELPER_PROTOCOL_VERSION,
     MAX_REQUEST_BYTES,
-    OP_APPLY,
-    OP_INSPECT,
-    OP_PLAN,
-    PROVIDER_BEAM,
-    PROVIDER_MODAL,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+RUN_TIMEOUT_SECONDS = 120
+IC2_LINE = re.compile(r'^\{"mc_progress":1,"op":"[a-z_]+","step":"[a-z]+","state":"(start|done|fail|skip)","pct":(null|\d{1,3})\}$')
+MODAL_CREDENTIALS = {"token_id": "ak-subprocess-token-id", "token_secret": "as-subprocess-token-secret-123456"}
+BEAM_CREDENTIALS = {"token": "subprocess-beam-token-7890abcdef"}
+HAS_SDKS = importlib.util.find_spec("modal") is not None and importlib.util.find_spec("beta9") is not None
+
+NOISY_HELPER = r"""
+import logging, os, sys, warnings
+from provisioner import cli
+from provisioner.progress import Progress
+
+class Noisy:
+    def handle_request(self, raw):
+        print("print to stdout")
+        print("print to stderr", file=sys.stderr)
+        os.write(1, b"fd 1 noise\n")
+        os.write(2, b"fd 2 noise\n")
+        logging.getLogger("grpc").error("log noise")
+        warnings.warn("warning noise")
+        Progress("inspect", PROGRESS).emit("inspect", "start")
+        return '{"success": true}'
+
+RESPONSE, PROGRESS = cli.isolate_standard_streams()
+sys.exit(cli.run_helper(sys.stdin.buffer, RESPONSE, PROGRESS, controller=Noisy()))
+"""
+
+
+def hermetic_env(home: Path) -> dict:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("MODAL_", "BEAM_", "BETA9_", "MC_BEAM_", "MANGA_CLEANER_"))
+        and key not in ("CONFIG_PATH", "GATEWAY_HOST", "GATEWAY_PORT", "API_HOST", "API_PORT")
+    }
+    env.update(
+        HOME=str(home),
+        USERPROFILE=str(home),
+        MODAL_SERVER_URL="http://127.0.0.1:9",
+        MC_BEAM_GATEWAY_HOST="127.0.0.1",
+        MC_BEAM_GATEWAY_PORT="9",
+        PYTHONDONTWRITEBYTECODE="1",
+    )
+    return env
 
 
 class TestSubprocessEntrypoint(unittest.TestCase):
-    """Subprocess integration tests for python -m provisioner entrypoint."""
-
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.journal_root = Path(self.temp_dir.name)
+        self.scratch = Path(self.temp_dir.name)
+        self.journal_root = self.scratch / "journal"
+        self.home = self.scratch / "home"
+        self.home.mkdir()
 
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def _run_provisioner(
-        self,
-        input_data: str,
-        extra_args: list = None,
-    ) -> subprocess.CompletedProcess:
-        """Run python3 -m provisioner in a subprocess with piped stdin/stdout/stderr."""
-        cmd = [sys.executable, "-m", "provisioner"]
-        if extra_args:
-            cmd.extend(extra_args)
-        else:
-            cmd.extend(["--journal-root", str(self.journal_root)])
-
+    def run_helper(self, stdin: str, args=None) -> subprocess.CompletedProcess:
+        command = args or [sys.executable, "-m", "provisioner", "--journal-root", str(self.journal_root)]
         return subprocess.run(
-            cmd,
-            input=input_data.encode("utf-8"),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            command,
+            input=stdin.encode("utf-8"),
+            capture_output=True,
             cwd=str(REPO_ROOT),
+            env=hermetic_env(self.home),
+            timeout=RUN_TIMEOUT_SECONDS,
         )
 
-    # --- 1. No Fake Success In Production ---
-
-    def test_subprocess_no_fake_success_modal_inspect(self):
-        """Proves python -m provisioner does not return simulated fake success for Modal."""
-        req = {
-            "protocol_version": HELPER_PROTOCOL_VERSION,
-            "request_id": "req-sub-modal-1",
-            "op": OP_INSPECT,
-            "provider": PROVIDER_MODAL,
-            "params": {
-                "credentials": {
-                    "token_id": "ak-test-token-id",
-                    "token_secret": "as-test-token-secret",
-                }
-            },
-        }
-        res = self._run_provisioner(json.dumps(req))
-        self.assertEqual(res.returncode, 0)
-
-        stdout_text = res.stdout.decode("utf-8").strip()
-        data = json.loads(stdout_text)
-
-        # Invariant: Must fail closed with real driver error, NOT return fake driver account
-        self.assertFalse(data["success"])
-        self.assertNotIn("acc_modal_simulated_user", stdout_text)
-        self.assertIn(
-            data["error"]["code"],
-            (ERR_PROVIDER_UNAVAILABLE, ERR_PLATFORM_GATED),
+    def request(self, op: str, provider: str, params: dict) -> str:
+        return json.dumps(
+            {"protocol_version": HELPER_PROTOCOL_VERSION, "request_id": f"req-{op}", "op": op, "provider": provider, "params": params}
         )
 
-    def test_subprocess_no_fake_success_beam_inspect(self):
-        """Proves python -m provisioner does not return simulated fake success for Beam."""
-        req = {
-            "protocol_version": HELPER_PROTOCOL_VERSION,
-            "request_id": "req-sub-beam-1",
-            "op": OP_INSPECT,
-            "provider": PROVIDER_BEAM,
-            "params": {
-                "credentials": {
-                    "token": "b9_secret_token_12345678",
-                }
-            },
-        }
-        res = self._run_provisioner(json.dumps(req))
-        self.assertEqual(res.returncode, 0)
+    def response(self, result: subprocess.CompletedProcess) -> dict:
+        """The one stdout document, after checking both streams keep their contract."""
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout.decode("utf-8")
+        self.assertTrue(stdout.startswith("{") and stdout.endswith("}\n"), f"stdout is not one JSON document: {stdout!r}")
+        for line in result.stderr.decode("utf-8").splitlines():
+            self.assertRegex(line, IC2_LINE)
+        return json.loads(stdout)  # raises on anything after the document
 
-        stdout_text = res.stdout.decode("utf-8").strip()
-        data = json.loads(stdout_text)
+    # --- 1. bounded input ---
 
-        # Invariant: Must fail closed with real driver error, NOT return fake driver account
-        self.assertFalse(data["success"])
-        self.assertNotIn("acc_beam_simulated_user", stdout_text)
-        self.assertIn(
-            data["error"]["code"],
-            (ERR_PROVIDER_UNAVAILABLE, ERR_PLATFORM_GATED),
-        )
+    def test_oversized_empty_and_malformed_requests(self):
+        for stdin, code in (("x" * (MAX_REQUEST_BYTES + 4096), ERR_PAYLOAD_TOO_LARGE), ("", ERR_INVALID_PAYLOAD), ("{not json", ERR_INVALID_PAYLOAD)):
+            with self.subTest(code=code, size=len(stdin)):
+                data = self.response(self.run_helper(stdin))
+                self.assertEqual((data["success"], data["error"]["code"]), (False, code))
 
-    def test_subprocess_no_fake_success_modal_apply(self):
-        """Proves apply operation fails closed without fake resource creation."""
-        req = {
-            "protocol_version": HELPER_PROTOCOL_VERSION,
-            "request_id": "req-sub-modal-apply",
-            "op": OP_APPLY,
-            "provider": PROVIDER_MODAL,
-            "params": {
-                "installation_id": "inst-real-sub-1",
-                "approved_plan_hash": "a" * 64,
-                "credentials": {
-                    "token_id": "ak-test-token",
-                    "token_secret": "as-test-secret",
-                },
-            },
-        }
-        res = self._run_provisioner(json.dumps(req))
-        self.assertEqual(res.returncode, 0)
-
-        data = json.loads(res.stdout.decode("utf-8").strip())
-        self.assertFalse(data["success"])
-        self.assertIn(
-            data["error"]["code"],
-            (ERR_PROVIDER_UNAVAILABLE, ERR_PLATFORM_GATED),
-        )
-
-    # --- 2. Bounded Input Protocol ---
-
-    def test_subprocess_bounded_input_payload_too_large(self):
-        """Proves payloads exceeding 64 KiB are rejected with ERR_PAYLOAD_TOO_LARGE."""
-        oversized_str = "x" * (MAX_REQUEST_BYTES + 4096)
-        res = self._run_provisioner(oversized_str)
-        self.assertEqual(res.returncode, 0)
-
-        data = json.loads(res.stdout.decode("utf-8").strip())
-        self.assertFalse(data["success"])
-        self.assertEqual(data["error"]["code"], ERR_PAYLOAD_TOO_LARGE)
-
-    def test_subprocess_empty_stdin_rejected(self):
-        """Proves empty stdin is rejected with ERR_INVALID_PAYLOAD."""
-        res = self._run_provisioner("")
-        self.assertEqual(res.returncode, 0)
-
-        data = json.loads(res.stdout.decode("utf-8").strip())
-        self.assertFalse(data["success"])
-        self.assertEqual(data["error"]["code"], ERR_INVALID_PAYLOAD)
-
-    def test_subprocess_malformed_json_rejected(self):
-        """Proves malformed JSON is rejected with ERR_INVALID_PAYLOAD."""
-        res = self._run_provisioner("{not valid json: 123")
-        self.assertEqual(res.returncode, 0)
-
-        data = json.loads(res.stdout.decode("utf-8").strip())
-        self.assertFalse(data["success"])
-        self.assertEqual(data["error"]["code"], ERR_INVALID_PAYLOAD)
-
-    # --- 3. One-Response Protocol ---
-
-    def test_subprocess_emits_exactly_one_valid_json_response(self):
-        """Proves stdout contains exactly one parseable JSON response and nothing else."""
-        req = {
-            "protocol_version": HELPER_PROTOCOL_VERSION,
-            "request_id": "req-one-resp-test",
-            "op": OP_INSPECT,
-            "provider": PROVIDER_MODAL,
-            "params": {
-                "credentials": {
-                    "token_id": "ak-test-id",
-                    "token_secret": "as-test-secret",
-                }
-            },
-        }
-        res = self._run_provisioner(json.dumps(req))
-        self.assertEqual(res.returncode, 0)
-
-        stdout_text = res.stdout.decode("utf-8")
-        # Ensure it parses as a single JSON object without trailing extraneous output
-        parsed = json.loads(stdout_text.strip())
-        self.assertEqual(parsed["protocol_version"], HELPER_PROTOCOL_VERSION)
-        self.assertEqual(parsed["request_id"], "req-one-resp-test")
-        self.assertIn("success", parsed)
-
-    # --- 4. Stderr and Log Credential Redaction ---
-
-    def test_subprocess_stderr_and_logs_never_leak_secrets(self):
-        """Proves credentials supplied via stdin do not appear in stderr or stdout error responses."""
-        secret_modal = "as-verysecretmodaltoken123456"
-        secret_beam = "b9_verysecretbeamtoken789012"
-        req = {
-            "protocol_version": HELPER_PROTOCOL_VERSION,
-            "request_id": "req-redact-test",
-            "op": OP_INSPECT,
-            "provider": PROVIDER_MODAL,
-            "params": {
-                "credentials": {
-                    "token_id": "ak-test-modal",
-                    "token_secret": secret_modal,
-                    "beam_token": secret_beam,
-                }
-            },
-        }
-        res = self._run_provisioner(json.dumps(req))
-        self.assertEqual(res.returncode, 0)
-
-        stdout_text = res.stdout.decode("utf-8")
-        stderr_text = res.stderr.decode("utf-8")
-
-        # Invariant: raw secrets must NEVER appear in stdout or stderr
-        self.assertNotIn(secret_modal, stdout_text)
-        self.assertNotIn(secret_beam, stdout_text)
-        self.assertNotIn(secret_modal, stderr_text)
-        self.assertNotIn(secret_beam, stderr_text)
-
-    # --- 5. Provider and Platform Gating ---
-
-    def test_subprocess_unsupported_provider_rejected(self):
-        """Proves unknown/unsupported provider fails closed with ERR_UNSUPPORTED_PROVIDER."""
-        req = {
-            "protocol_version": HELPER_PROTOCOL_VERSION,
-            "request_id": "req-bad-prov",
-            "op": OP_INSPECT,
-            "provider": "unsupported_cloud",
-            "params": {},
-        }
-        res = self._run_provisioner(json.dumps(req))
-        self.assertEqual(res.returncode, 0)
-
-        data = json.loads(res.stdout.decode("utf-8").strip())
-        self.assertFalse(data["success"])
+    def test_unknown_provider_and_operation(self):
+        data = self.response(self.run_helper(self.request("inspect", "unsupported_cloud", {})))
         self.assertEqual(data["error"]["code"], ERR_UNSUPPORTED_PROVIDER)
-
-    def test_subprocess_unsupported_operation_rejected(self):
-        """Proves unknown operation fails closed with ERR_UNSUPPORTED_OP."""
-        req = {
-            "protocol_version": HELPER_PROTOCOL_VERSION,
-            "request_id": "req-bad-op",
-            "op": "arbitrary_bad_op",
-            "provider": PROVIDER_MODAL,
-            "params": {},
-        }
-        res = self._run_provisioner(json.dumps(req))
-        self.assertEqual(res.returncode, 0)
-
-        data = json.loads(res.stdout.decode("utf-8").strip())
-        self.assertFalse(data["success"])
+        data = self.response(self.run_helper(self.request("arbitrary_bad_op", "modal", {})))
         self.assertEqual(data["error"]["code"], ERR_UNSUPPORTED_OP)
 
-    def test_subprocess_custom_journal_root_flag(self):
-        """Proves --journal-root CLI argument is accepted without error."""
-        custom_root = self.journal_root / "custom_sub"
-        custom_root.mkdir(parents=True, exist_ok=True)
-        req = {
-            "protocol_version": HELPER_PROTOCOL_VERSION,
-            "request_id": "req-custom-root",
-            "op": OP_INSPECT,
-            "provider": PROVIDER_MODAL,
-            "params": {
-                "credentials": {
-                    "token_id": "ak-test",
-                    "token_secret": "as-test",
-                }
-            },
-        }
-        res = self._run_provisioner(
-            json.dumps(req),
-            extra_args=["--journal-root", str(custom_root)],
+    # --- 4. typed failures ---
+
+    def test_no_credentials_is_a_validation_error(self):
+        for provider in ("modal", "beam"):
+            with self.subTest(provider=provider):
+                data = self.response(self.run_helper(self.request("inspect", provider, {})))
+                self.assertEqual((data["success"], data["error"]["code"]), (False, ERR_VALIDATION))
+                self.assertEqual(data["request_id"], "req-inspect")
+
+    def test_unreachable_provider_is_typed_and_streams_stay_clean(self):
+        # With the SDKs installed the Modal case waits out the sign-in bound (40 s).
+        cases = (
+            ("modal", MODAL_CREDENTIALS, "plan", {"installation_id": "mc-ab12cd"}),
+            ("beam", BEAM_CREDENTIALS, "inspect", {}),
+            ("beam", BEAM_CREDENTIALS, "apply", {"installation_id": "mc-ab12cd", "approved_plan_hash": "a" * 64}),
         )
-        self.assertEqual(res.returncode, 0)
-        data = json.loads(res.stdout.decode("utf-8").strip())
-        self.assertFalse(data["success"])
+        for provider, credentials, op, params in cases:
+            with self.subTest(provider=provider, op=op):
+                result = self.run_helper(self.request(op, provider, dict(params, credentials=credentials)))
+                data = self.response(result)
+                self.assertEqual((data["success"], data["error"]["code"]), (False, ERR_PROVIDER_UNAVAILABLE), data)
+                for secret in credentials.values():
+                    self.assertNotIn(secret.encode(), result.stdout)
+                    self.assertNotIn(secret.encode(), result.stderr)
+                progress = [json.loads(line) for line in result.stderr.decode().splitlines()]
+                self.assertEqual([(p["op"], p["step"], p["state"]) for p in progress], [(op, "inspect", "start"), (op, "inspect", "fail")])
+                self.assertFalse((self.journal_root / "installations" / "mc-ab12cd").exists(), "nothing was recorded")
+
+    # --- 2 and 3. stream isolation ---
+
+    def test_sdk_noise_never_reaches_the_desktop(self):
+        result = self.run_helper("{}", args=[sys.executable, "-c", NOISY_HELPER])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b'{"success": true}\n')
+        self.assertEqual(result.stderr, b'{"mc_progress":1,"op":"inspect","step":"inspect","state":"start","pct":null}\n')
+
+    def test_self_check_reports_one_json_line(self):
+        result = self.run_helper("", args=[sys.executable, "-m", "provisioner", "--self-check"])
+        self.assertEqual(result.stderr, b"")
+        lines = result.stdout.decode("utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        report = json.loads(lines[0])
+        self.assertEqual(report["ok"], HAS_SDKS, report)
+        self.assertEqual(result.returncode, 0 if HAS_SDKS else 1)
+        if HAS_SDKS:
+            self.assertEqual(report["modal_app"], ["Worker.*", "gateway", "seed_weights", "Worker"])
+            self.assertEqual(report["beam_app"], ["gateway", "render", "seed"])
+
+
+if __name__ == "__main__":
+    unittest.main()

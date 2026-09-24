@@ -35,6 +35,7 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/svelte'
 import { setBackend } from '../api/backend.js'
 import { t } from '../i18n/index.js'
 import SettingsDialog from './SettingsDialog.svelte'
+import { resetFirstLaunch } from './firstlaunch.svelte.js'
 
 /** The spec `pushModal({kind: 'settings'})` would have handed the dialog. */
 const SPEC = {
@@ -115,6 +116,7 @@ function stub(answer) {
 
 afterEach(() => {
   cleanup()
+  resetFirstLaunch()
   setBackend(null)
   vi.clearAllMocks()
 })

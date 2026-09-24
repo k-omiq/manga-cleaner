@@ -103,6 +103,7 @@ function viewport() {
  * @property {string} accelerator - `auto`, `cpu`, or an execution provider id; see `setAccelerator`
  * @property {'alt'|'meta'|'control'|'shift'} cloneSourceModifier - held while clicking to set Clone / heal's source; see `setCloneSourceModifier`
  * @property {boolean} firstLaunchOffered - whether the first-launch download offer has been made on this machine
+ * @property {boolean} closeToTray - close control hides the window and keeps downloads running
  * @property {Record<string, import('../shortcuts.js').Chord|null>} shortcuts - rebindings, by shortcut id; only the differences from the defaults
  * @property {Record<string, WindowState>} windows
  */
@@ -125,6 +126,7 @@ function defaults() {
     accelerator: 'auto',
     cloneSourceModifier: DEFAULT_POINTER_MODIFIER,
     firstLaunchOffered: false,
+    closeToTray: false,
     shortcuts: {},
     windows,
   }
@@ -217,6 +219,7 @@ export function sanitizeSession(raw) {
     // the offer, and a machine that has already been asked carries a `true` it
     // wrote itself.
     firstLaunchOffered: boolOr(record.firstLaunchOffered, base.firstLaunchOffered),
+    closeToTray: boolOr(record.closeToTray, base.closeToTray),
     // The shortcut table owns this vocabulary and validates it: an id the
     // table no longer has, a chord that will not parse, or a chord that is
     // only the default written out is dropped here rather than kept as a
@@ -286,6 +289,7 @@ function persistable() {
     accelerator: session.accelerator,
     cloneSourceModifier: session.cloneSourceModifier,
     firstLaunchOffered: session.firstLaunchOffered,
+    closeToTray: session.closeToTray,
     shortcuts: shortcutOverrides(),
     windows,
   }
@@ -346,6 +350,12 @@ export function setTheme(theme) {
 /* ------------------------------------------------------------------ */
 /* Everything else                                                     */
 /* ------------------------------------------------------------------ */
+
+/** @param {boolean} enabled */
+export function setCloseToTray(enabled) {
+  session.closeToTray = boolOr(enabled, session.closeToTray)
+  save()
+}
 
 /** @param {'rtl'|'ltr'} direction */
 export function setReadingDirection(direction) {
@@ -694,6 +704,7 @@ export function resetAllShortcutBindings() {
  */
 export function adoptBackendSettings(settings) {
   const record = plainObject(settings)
+  if (record.closeToTray !== undefined) setCloseToTray(record.closeToTray === true)
   if (record.theme !== undefined) setTheme(/** @type {any} */ (record.theme))
   if (record.readingDirection !== undefined) {
     setReadingDirection(/** @type {any} */ (record.readingDirection))
@@ -738,6 +749,7 @@ export function adoptBackendSettings(settings) {
  */
 export function backendSettingsPatch() {
   return {
+    closeToTray: session.closeToTray,
     theme: session.theme,
     readingDirection: session.readingDirection,
     cloudEngines: session.cloudAllowed ? 'allowed' : 'blocked',

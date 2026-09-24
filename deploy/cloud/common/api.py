@@ -6,6 +6,7 @@ payload parsing, authenticated control plane dispatch, and secure result streami
 
 from __future__ import annotations
 
+import asyncio
 import email
 import email.policy
 import hmac
@@ -35,10 +36,16 @@ from deploy.cloud.common.contract import (
     validate_recipe_compatibility,
     validate_worker_result,
 )
-from deploy.cloud.common.flux import FluxWorker
+from deploy.cloud.common.flux import FluxWorker, sampling_mismatch
 from deploy.cloud.common.handle_mapping import InMemoryHandleRegistry, JobRecord
-from deploy.cloud.common.manifest import get_default_model_info, is_recipe_supported
-from deploy.cloud.common.redact import redact_dict, redact_text
+from deploy.cloud.common.jobs import (
+    LocalJobBackend,
+    PreEnqueueError,
+    ResultUnavailableError,
+    execute_worker_job,
+)
+from deploy.cloud.common.manifest import get_default_model_info
+from deploy.cloud.common.redact import redact_text
 
 logger = logging.getLogger("deploy.cloud.gateway")
 
@@ -113,53 +120,6 @@ def parse_multipart_payload(
         return None, None, None, f"Malformed multipart body: {exc}"
 
 
-def execute_worker_job(
-    handle_registry: InMemoryHandleRegistry,
-    worker: Optional[FluxWorker],
-    record: JobRecord,
-    img_bytes: bytes,
-    hint_bytes: bytes,
-    limits: ServiceLimits,
-    internal_storage_ref: Optional[str] = None,
-    auto_execute: bool = True,
-) -> bool:
-    """Execute worker inference, validate result buffer against contract, and persist result or typed failure."""
-    if not auto_execute or worker is None:
-        return False
-
-    # Atomically claim job transition from PENDING to RUNNING; refuses cancelled or terminal states
-    if not handle_registry.claim_execution(record.app_handle):
-        return False
-    cost = None
-    try:
-        result_bytes, result_digest, cost = worker.infer(record, img_bytes, hint_bytes)
-        validate_worker_result(
-            result_bytes=result_bytes,
-            result_digest=result_digest,
-            expected_width=record.width,
-            expected_height=record.height,
-            limits=limits,
-            reported_cost_usd=cost,
-        )
-        handle_registry.store_result(
-            app_handle=record.app_handle,
-            result_data=result_bytes,
-            result_digest=result_digest,
-            reported_cost_usd=cost,
-            internal_storage_ref=internal_storage_ref,
-        )
-        return True
-    except Exception as exc:
-        logger.error("Worker inference or result validation failed: %s", redact_text(str(exc)))
-        handle_registry.fail_job(
-            app_handle=record.app_handle,
-            error_code="execution_failed",
-            message=str(exc),
-            cost=cost,
-        )
-        return False
-
-
 class CloudGateway:
     """Provider-agnostic CPU Control Gateway implementing `/mc/v1`."""
 
@@ -175,6 +135,8 @@ class CloudGateway:
         proxy_token_secret: Optional[str] = None,
         bearer_token: Optional[str] = None,
         auto_execute: bool = True,
+        backend: Optional[Any] = None,
+        trust_edge_auth: bool = False,
     ):
         if isinstance(provider, str):
             provider = CloudProvider(provider.lower())
@@ -182,18 +144,36 @@ class CloudGateway:
         self.limits = limits or provisional_fixture_limits()
         self.model_info = model_info or get_default_model_info(self.provider.value, limits=self.limits)
         self.handle_registry = handle_registry or InMemoryHandleRegistry()
-        self.worker = worker or FluxWorker(provider=self.provider.value, limits=self.limits)
+        # The in-process fake worker only exists for the local backend; a deployed
+        # gateway dispatches to the provider and must never render a stand-in result.
+        if worker is None and backend is None:
+            worker = FluxWorker(provider=self.provider.value, limits=self.limits)
+        self.worker = worker
         self.auth_validator = auth_validator
         self.proxy_token_id = proxy_token_id
         self.proxy_token_secret = proxy_token_secret
         self.bearer_token = bearer_token
         self.auto_execute = auto_execute
+        # Deployed gateways sit behind provider edge auth (Modal proxy auth, Beam
+        # authorized endpoints): requests without valid credentials never reach this
+        # code, and the gateway holds no copy of those credentials to compare against.
+        self.trust_edge_auth = trust_edge_auth
+        self.backend = backend or LocalJobBackend(
+            provider=self.provider.value,
+            registry=self.handle_registry,
+            worker=self.worker,
+            limits=self.limits,
+            auto_execute=auto_execute,
+        )
 
     def check_auth(self, headers: Dict[str, str]) -> bool:
         """Authenticate incoming request according to provider configuration.
 
         Fails closed when credentials / auth validator are absent.
         """
+        if self.trust_edge_auth:
+            return True
+
         # Custom validator takes precedence if provided
         if self.auth_validator is not None:
             return self.auth_validator(headers)
@@ -429,30 +409,48 @@ class CloudGateway:
             )
             return 400, {"Content-Type": "application/json"}, json.dumps(rejection.to_dict()).encode("utf-8")
 
-        # 5. Enforce request digest consistency and register atomically under registry lock
-        native_handle = f"native-{self.provider.value}-{job_meta.job_id}-{job_meta.attempt_id}"
-        try:
-            record = self.handle_registry.register_job(
-                job_meta=job_meta,
-                native_handle=native_handle,
-                provider=self.provider.value,
+        # 4b. A recipe that pins its sampling (the production recipe) only renders with
+        # exactly those values; anything else would be a different image under the same id.
+        mismatch = sampling_mismatch(job_meta)
+        if mismatch:
+            rejection = PreEnqueueRejectionResponse(
+                enqueued=False,
+                error_code="unsupported_recipe",
+                message=redact_text(mismatch),
+                job_id=job_meta.job_id,
+                attempt_id=job_meta.attempt_id,
+                request_digest=job_meta.request_digest,
+                retryable=False,
             )
+            return 400, {"Content-Type": "application/json"}, json.dumps(rejection.to_dict()).encode("utf-8")
+
+        # 5. Register (deduplicated on job_id + attempt_id) and hand to the worker
+        try:
+            record = self.backend.submit(job_meta, img_bytes, hint_bytes)
         except ContractValidationError as exc:
             rejection = PreEnqueueRejectionResponse(
                 enqueued=False,
                 error_code="invalid_digest",
-                message=str(exc),
+                message=redact_text(str(exc)),
                 job_id=job_meta.job_id,
                 attempt_id=job_meta.attempt_id,
                 request_digest=job_meta.request_digest,
                 retryable=False,
             )
             return 409, {"Content-Type": "application/json"}, json.dumps(rejection.to_dict()).encode("utf-8")
+        except PreEnqueueError as exc:
+            rejection = PreEnqueueRejectionResponse(
+                enqueued=False,
+                error_code=exc.error_code,
+                message=redact_text(str(exc)) or exc.error_code,
+                job_id=job_meta.job_id,
+                attempt_id=job_meta.attempt_id,
+                request_digest=job_meta.request_digest,
+                retryable=exc.retryable,
+            )
+            return exc.http_status, {"Content-Type": "application/json"}, json.dumps(rejection.to_dict()).encode("utf-8")
 
-        # 6. Execute via worker (synchronously in fake offline mode)
-        self.execute_worker_job(record, img_bytes, hint_bytes)
-
-        # 7. Return 202 Accepted reporting pending per contract (status endpoint holds actual state)
+        # 6. Return 202 Accepted reporting pending per contract (status endpoint holds actual state)
         accepted = JobAcceptedResponse(
             handle=record.app_handle,
             status=JobExecutionStatus.PENDING.value,
@@ -469,7 +467,7 @@ class CloudGateway:
 
     def _route_job_status(self, handle: str) -> Tuple[int, Dict[str, str], bytes]:
         """GET /jobs/{handle} - Status polling accepting only opaque app handles."""
-        record = self.handle_registry.get_by_app_handle(handle)
+        record = self.backend.get(handle)
         if not record:
             err = TypedError(error_code="not_found", message=f"Job handle '{handle}' not found")
             return 404, {"Content-Type": "application/json"}, json.dumps(err.to_dict()).encode("utf-8")
@@ -494,12 +492,19 @@ class CloudGateway:
 
     def _route_job_result(self, handle: str) -> Tuple[int, Dict[str, str], bytes]:
         """GET /jobs/{handle}/result - Validated result download accepting only opaque app handles."""
-        record = self.handle_registry.get_by_app_handle(handle)
+        try:
+            record, result_png = self.backend.result_png(handle)
+        except ResultUnavailableError as exc:
+            err = TypedError(
+                error_code="result_unavailable",
+                message=redact_text(f"Result for '{handle}' is not readable right now: {exc}")[:1024],
+            )
+            return 503, {"Content-Type": "application/json"}, json.dumps(err.to_dict()).encode("utf-8")
         if not record:
             err = TypedError(error_code="not_found", message=f"Job handle '{handle}' not found")
             return 404, {"Content-Type": "application/json"}, json.dumps(err.to_dict()).encode("utf-8")
 
-        if record.status != JobExecutionStatus.COMPLETED or record.result_data is None:
+        if record.status != JobExecutionStatus.COMPLETED or result_png is None:
             err = TypedError(
                 error_code="job_not_ready",
                 message=f"Job '{handle}' is not completed (status: {record.status.value})",
@@ -512,31 +517,20 @@ class CloudGateway:
         }
         if record.reported_cost_usd is not None:
             resp_headers["X-MC-Reported-Cost-Usd"] = str(record.reported_cost_usd)
-        return 200, resp_headers, record.result_data
+        return 200, resp_headers, result_png
 
     def _route_job_cancel(self, handle: str) -> Tuple[int, Dict[str, str], bytes]:
         """POST /jobs/{handle}/cancel - Request cancellation accepting only opaque app handles."""
-        record = self.handle_registry.get_by_app_handle(handle)
-        if not record:
+        # The backend flags cancel atomically and refuses terminal jobs without mutating them.
+        updated_record, accepted = self.backend.cancel(handle)
+        if updated_record is None:
             err = TypedError(error_code="not_found", message=f"Job handle '{handle}' not found")
             return 404, {"Content-Type": "application/json"}, json.dumps(err.to_dict()).encode("utf-8")
 
-        # Reject cancellation on terminal jobs with typed 409 Conflict without mutating
-        if record.status in (JobExecutionStatus.COMPLETED, JobExecutionStatus.FAILED, JobExecutionStatus.CANCELLED):
+        if not accepted:
             err = TypedError(
                 error_code="job_terminal",
-                message=f"Cannot cancel job '{handle}' in terminal state '{record.status.value}'",
-            )
-            return 409, {"Content-Type": "application/json"}, json.dumps(err.to_dict()).encode("utf-8")
-
-        # Mark cancel requested atomically; check result to guard against racing terminal transitions
-        updated_record = self.handle_registry.request_cancel(record.app_handle)
-        if updated_record is None:
-            latest = self.handle_registry.get_by_app_handle(handle)
-            terminal_status = latest.status.value if latest else record.status.value
-            err = TypedError(
-                error_code="job_terminal",
-                message=f"Cannot cancel job '{handle}' in terminal state '{terminal_status}'",
+                message=f"Cannot cancel job '{handle}' in terminal state '{updated_record.status.value}'",
             )
             return 409, {"Content-Type": "application/json"}, json.dumps(err.to_dict()).encode("utf-8")
 
@@ -552,12 +546,11 @@ class CloudGateway:
 
     def _route_warmup(self) -> Tuple[int, Dict[str, str], bytes]:
         """POST /warmup - Explicit worker readiness probe."""
-        warm_res = self.worker.warmup()
         resp = WarmupResponse(
             status="ok",
             provider=self.provider.value,
             protocol_version=PROTOCOL_VERSION,
-            worker_state=warm_res.get("worker_state", "warm"),
+            worker_state=self.backend.warmup(),
         )
         return 200, {"Content-Type": "application/json"}, json.dumps(resp.to_dict()).encode("utf-8")
 
@@ -665,6 +658,8 @@ class CloudGateway:
                 status_line = "413 Payload Too Large"
             elif status_code == 500:
                 status_line = "500 Internal Server Error"
+            elif status_code == 503:
+                status_line = "503 Service Unavailable"
 
             start_response(status_line, list(resp_headers.items()))
             return [resp_body]
@@ -729,11 +724,14 @@ class CloudGateway:
                         return
                     more_body = message.get("more_body", False)
 
-                status_code, resp_headers, resp_body = self.handle_http_request(
-                    method=method,
-                    raw_path=path,
-                    headers=headers,
-                    body=bytes(body),
+                # Backends make blocking provider calls; a worker thread keeps the event
+                # loop free for concurrent status polls.
+                status_code, resp_headers, resp_body = await asyncio.to_thread(
+                    self.handle_http_request,
+                    method,
+                    path,
+                    headers,
+                    bytes(body),
                 )
 
                 asgi_headers = [

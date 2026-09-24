@@ -1,10 +1,11 @@
 # Manga Cleaner: what the app does
 
-Manga Cleaner is a desktop app that removes Japanese text from manga and webtoon pages. It runs entirely on your
-machine: no account, no upload, no Python. It finds speech bubbles and free text, keeps only the Japanese, fits a mask
-at the page's own resolution, and cleans each region with the lightest engine that can do the job. Pixels outside an
-edited region are unchanged, and colour mode, bit depth, embedded colour profile and metadata are carried through to
-export.
+Manga Cleaner is a desktop app that removes Japanese text from manga and webtoon pages. By default it runs entirely on
+your machine: no account, no upload, no Python. An optional cloud GPU is off by default, runs on your own Modal or Beam
+account, and a confirmed render uploads only a crop around one region. It finds speech bubbles and free text, keeps only
+the Japanese, fits a mask at the page's own resolution, and cleans each region with the lightest engine that can do the
+job. Pixels outside an edited region are unchanged, and colour mode, bit depth, embedded colour profile and metadata
+are carried through to export.
 
 ## Home and projects
 
@@ -116,7 +117,7 @@ flat balloon is slower and often worse, because it can invent marks where there 
 | **Denoise fill** | Tight masks on noisy or JPEG scans | Smooths the fill together with the grain around it, so no seam is left. |
 | **LaMa** | Screentone, halftone, line art behind the text | The default redraw engine, and the top of an automatic run. About 0.6 s a region on a GPU, 1.5 s on the CPU. |
 | **FLUX** | The rare region nothing else reconstructs | Optional helper app you install yourself. Gigabytes of memory, around 20 s a region. Per region only. |
-| **Cloud** | Complex art on a weak machine | Off by default, opt in, your own paid Google key. Per region only. |
+| **Cloud** | Complex art on a weak machine | Off by default, opt in, your own Modal or Beam account, confirmed per render. Per region only. |
 
 Only the engines actually installed appear in a picker. A missing one is left out rather than shown greyed, and the
 way to add it is Settings, Models. When no engine's output passes the quality check, the region is **declined**: the
@@ -170,7 +171,8 @@ LaMa gets LaMa. The list is the same four engines a Layers row offers, under the
 Options: fill mode (Match surround, Reconstruct or Solid), and engine (Local or Cloud). This one fills a mask that
 already exists, so it is a click on a region rather than a stroke. Match surround is the planar fill from the ring of
 paper, exact on flat and gently graded paper; Reconstruct is the redraw engine, for screentone and art crossing the
-mask. This is the one tool that can reach the cloud, and it carries the whole confirmation flow for it.
+mask. A Layers row and the region menu can also send a region to the cloud, and every cloud render asks first in one
+dialog.
 
 ### Clone / Heal
 
@@ -186,27 +188,25 @@ set tells you so.
 The **Layers** window lists every region on the current page, newest first. Collapsed, a row names the engine that
 produced it and carries a delete control. Expanded, it shows provenance: engine, model version, fill mode, elapsed
 time, whether it was made by hand or automatically, whether the automatic pass detected it, and for a cloud region the
-cost and request id.
+provider, endpoint, job and attempt, recipe and model revision, and cost only when reported.
 
-Each row can be re-run: **Try again** with the same setting, **Clean with** a different engine, or reopened in the
-tool that made it with the mask intact. **Delete** removes the mask, brings the original text back, and takes the row
-off the list, leaving no empty placeholder. **Dismiss** takes a flagged region off the list and leaves the page as it
-is, and **Show on page** scrolls to a region and selects it. Everything here is undoable, and a cloud region is the
-one thing a row cannot re-run. Clicking a region on the page selects it under every tool, lights its outline and
-scrolls the matching row into view. A right click, or Shift+F10 from the keyboard, selects the region and offers the
-same three things the row does.
+Each row can be re-run: **Try again** with the same setting, **Clean with** a different engine, or reopened in the tool
+that made it with the mask intact. **Delete** removes the mask, brings the original text back, and takes the row off the
+list, leaving no empty placeholder. **Dismiss** takes a flagged region off the list and leaves the page as it is, and
+**Show on page** scrolls to a region and selects it. Everything here is undoable. Clean with offers Cloud when a cloud
+GPU is ready, and Try again on a cloud region asks for confirmation again, as every cloud render does. Clicking a region
+on the page selects it under every tool, lights its outline and scrolls the matching row into view. A right click, or
+Shift+F10 from the keyboard, selects the region and offers the same three things the row does.
 
 **Needs review** is a filter at the top of the panel with a count, and it is the review surface. A region is flagged
 when fitting failed and a model reconstructed the area; when the region is unusually large for the page; when every
 engine failed the quality check, so the text was left alone; when the script gate skipped it, because it read as not
 Japanese or because the gate was not confident enough (with the optional Japanese text reader installed, a balloon the
-gate could not read is read once more before it lands here); when the text is outside a speech bubble; when a cloud
-request was rejected, for any of five separate causes; or when a cloud request was **accepted**, unconditionally,
-because a remote model can return something plausible and wrong. Gate-skipped regions carry a **Clean anyway** action.
-Declined regions carry a marker on the page itself, since they are the one case where nothing visibly happened. The
-bottom bar's up and down arrows step through the filtered set without entering the panel. Undo and redo are global
-across every tool and are **written to the project folder**, capped at 500 entries, so a chapter reopened tomorrow can
-still take back what was done today. Their tooltips name the edit they will reverse.
+gate could not read is read once more before it lands here); or when the text is outside a speech bubble. Gate-skipped
+regions carry a **Clean anyway** action. Declined regions carry a marker on the page itself, since they are the one
+case where nothing visibly happened. The bottom bar's up and down arrows step through the filtered set without entering
+the panel. Undo and redo are global across every tool and are **written to the project folder**, capped at 500 entries,
+so a chapter reopened tomorrow can still take back what was done today. Their tooltips name the edit they will reverse.
 
 ## Long-strip mode
 
@@ -271,14 +271,17 @@ silently.
 
 ## Settings
 
-Settings is on **,** from anywhere. Changes apply at once and are remembered between sessions. It is five tabs,
-General, Models, Acceleration, Shortcuts and About, and it opens on General, so the preference rows are the first
-thing on screen with nothing to press. Every tab is one fixed-height scroller, so the dialog is the same size and the
-Done button sits in the same place whichever tab you are on. General rows: **Theme**
-(light, dark or system), **Reading direction** (the default for new projects; an open project keeps the direction it
-was made with), **Cloud engines** (below), **Original view** (whether O shows the original only while held or toggles
-it on), and **Language** (English is the only catalogue that ships today, though every string in the app, errors
-included, is in it).
+Settings is on **,** from anywhere. Changes apply at once and are remembered between sessions. It is six tabs,
+General, Models, Acceleration, Cloud, Shortcuts and About, and it opens on General (or on the Cloud tab when opened
+from a cloud link), so the preference rows are the first thing on screen with nothing to press. Every tab is one
+fixed-height scroller, so the dialog is the same size and the Done button sits in the same place whichever tab you are
+on. General rows, in order: **Theme** (light, dark or system), **Keep running when closed** (close to tray: the window
+hides while downloads continue, and the tray icon reopens or quits; off, the close button quits; shown only when a tray
+icon exists), **Reading direction** (the default for new projects; an open project keeps the direction it was made
+with), **Cloud GPU** (says whether it is on, plus **Open Cloud settings**), **Original view** (whether O shows the
+original only while held or toggles it on), **Language** (English is the only catalogue that ships today, though every
+string in the app, errors included, is in it), and **Setup** with **Run setup again** (walks through downloads,
+defaults, the cloud GPU and app behavior again).
 
 ### Models
 
@@ -289,22 +292,29 @@ behind, **Discard partial**. A row with a remainder says how much is already her
 from there. Downloads are verified against a published checksum, and Check re-reads a file you suspect.
 
 One row is optional in the strongest sense. The **Japanese text reader** (manga-ocr, three files, about 460 MB) is
-offered here and nowhere else: nothing depends on it, it is not in the first-launch offer, and a machine without it
-reads scripts exactly as this app did before the reader existed. Installed, it re-reads a balloon the language checker
-could not name a script for, and a reading that is at least two characters and at least 60 per cent Japanese lets the
-region clean instead of going to review.
+offered here and, unticked, in the first-launch setup: nothing depends on it, and a machine without it reads scripts
+exactly as this app did before the reader existed. Installed, it re-reads a balloon the language checker could not name
+a script for, and a reading that is at least two characters and at least 60 per cent Japanese lets the region clean
+instead of going to review.
 
-On a first launch, if anything Auto clean needs is missing, the app offers the whole set in one dialog: the required
-group (the text finder, the speech bubble finder, the language checker and its labels, plus the runtime) with no
-ticks, and the redraw engine, manga-LaMa, as a tick that starts on. One press downloads what is ticked, runtime
-first, one at a time. Where the redraw engine is already installed the choice section is not drawn at all, since there
-would be nothing in it. The offer is made once; Settings, Models is the way back for anything declined. A weight the app
-did not download (found beside the executable, in the bundle, or in a folder you set) reads as installed elsewhere and
-has no Delete button. For an offline install, put the verified files in one of those folders by hand and the rows read
-Installed. On Windows and on Linux x64, where more than one runtime build is published, the runtime row carries a
-picker: the default works with every graphics card, and the CUDA builds need CUDA and cuDNN installed by you. Changing
-the picker downloads nothing on its own, and the row says which build is actually installed when that differs from
-the one chosen.
+On a first launch, the app walks through a six-step setup with one choice per step, each skippable with Skip setup, and
+Run setup again in Settings, General replays it. Step 1 is Welcome. Step 2 downloads the models: the required set (the
+engine runtime and the models that find text and speech bubbles) as one locked row, the redraw engine, manga-LaMa, as a
+tick that starts on, and the Japanese text reader as a tick that starts off, with one Download button, pause, resume and
+retry, and you can continue while it runs. Step 3 chooses the defaults: accelerator (Automatic recommended), and when
+the AI redraw helper is installed, its folder, model and engine. Step 4 is Cloud GPU (optional): Not now leaves cloud
+off; Set up now opens the setup in place and turns the cloud permission on when setup succeeds and the new endpoint
+answers its first health check (if the check fails, the endpoint is still saved and selected, the permission stays off,
+and it can be tested later from Settings, Cloud); while the setup helper is at work (checking the account, planning, or
+creating or removing resources in it), the first-launch setup cannot be closed (Escape and Skip do nothing). Step 5 sets
+app behavior: keep running when closed (close to tray), and the default reading direction for new projects. Step 6 is
+Done: a summary read back from the settings in force, and New project. The setup is shown once; Settings, Models is the
+way back for anything declined. A weight the app did not download (found beside the executable, in the bundle, or in a
+folder you set) reads as installed elsewhere and has no Delete button. For an offline install, put the verified files in
+one of those folders by hand and the rows read Installed. On Windows and on Linux x64, where more than one runtime build
+is published, the runtime row carries a picker: the default works with every graphics card, and the CUDA builds need
+CUDA and cuDNN installed by you. Changing the picker downloads nothing on its own, and the row says which build is
+actually installed when that differs from the one chosen.
 
 An optional **Hugging Face token** field sits at the bottom, because some downloads come from huggingface.co, which
 limits anonymous transfers. It is kept in the operating system's credential store, sent to huggingface.co and no other
@@ -343,17 +353,42 @@ from the defaults are stored, so a binding survives a build that renames a defau
 
 ### Cloud
 
-Cloud engines are **blocked by default**. While blocked, nothing is sent to a provider: the request is refused before
-it is made, and the notice says so outright. Allowing it makes the cloud engine available to Content-aware fill, the
-only tool that can reach it; an automatic run stays local whatever this is set to.
+The cloud GPU is **off by default**. The main switch, **Use a cloud GPU**, is on the Settings Cloud tab, and the
+General tab has a **Cloud GPU** row that reports its state and links to the Cloud tab. While off, nothing leaves your
+computer, and any cloud action is refused before anything is sent. An automatic run (Auto clean) never goes to the
+cloud, and the local FLUX helper remains its own separate engine choice.
 
-Before the first send of a session the app states what is transmitted: a bounded crop of the page, including the image
-content around the text and not just the masked region, goes to Google, is processed there, and comes back. Nothing
-else about the page or the project is sent. You bring your own key, stored in the operating system's keychain, never
-in project files and never logged; a free-tier key is refused with the reason stated, because the unpaid tier trains
-on submissions. The estimated cost is shown and confirmed before the first spend of a session unconditionally, and the
-**Confirm before spending** setting governs the spends after that. A rejected request is not billed and falls back to
-the local redraw engine.
+Setting up a cloud GPU uses your own Modal or Beam account, which bills you directly. You can start from **Set up with
+Modal or Beam** on the Cloud tab, or from step 4 of the first-launch setup. After you paste a Modal token or Beam API
+key, the app presents a plan for approval showing the GPU type, idle timeout, cost notes, and the about 5.5 GB weight
+download into your account. Nothing is created until you approve it. A bundled helper then creates, in your account, a
+volume for the model weights (seeded on a CPU, never on the GPU), job storage, a GPU worker running the same FLUX.2
+Klein 4B recipe as the local helper, and a gateway that the provider opens only to calls carrying the endpoint's
+credential; it checks the new endpoint, and the app saves it and selects it as your cloud GPU. For Modal, setup also
+creates an access token that can only call that endpoint, and your Modal token is not kept. Beam has no separate access
+token, so the endpoint is called with your own Beam API key. Either one is kept in the operating system's credential
+store, never in a settings or project file. On Beam, setup also stores your key as a secret in your Beam account,
+because the gateway uses it to start the GPU jobs. Setup shows each step as it runs and can be stopped. What finished is
+kept, an unfinished setup is listed under **Needs attention** with Resume and Forget, and Resume continues from where it
+stopped without redoing what is done. Removing an endpoint takes it off this computer only, unless you also choose to
+delete its cloud resources: then the app lists what will be deleted, including the model weights, and deletes only what
+this app created. You can also connect an existing public HTTPS endpoint by hand under **Connect an existing endpoint**.
+
+When enabled and an endpoint is ready, **Cloud** can be selected as the engine in Content-aware fill, or from a Layers
+row or region menu under **Clean with**, including **Try again** on a cloud region. Every cloud render asks first, every
+time, in a dialog ("Send this region to your cloud GPU?"): it states what is sent (a crop of a given size around the
+region and its mask, while the rest of the page and project stay local), the destination endpoint, and the cost billed
+by your provider. A confirmation allows that one render and nothing else, and nothing is sent without one.
+
+A running cloud render displays a status card in the bottom corner with elapsed time, current phase, a Cancel button,
+and a note that the first render can take 1 to 3 minutes while the GPU starts. Cancelling stops the render at the next
+safe point and asks the gateway to cancel the job; a render that finished before the cancel reached it is still applied,
+because it has already run and been billed. A failed cloud render does not fall back to a local engine: the region is
+left unchanged and a notice explains why. When it is not known whether the endpoint received a render, it is never sent
+again on its own. At the next start (or, when the cloud GPU is off then, the first time it is turned on) the app applies
+results that finished while it was closed and lists anything that needs attention on the Cloud tab; nothing is ever
+resubmitted. Completed regions store cloud provenance (provider, profile, job and attempt identifiers, recipe, model
+revision, and cost only when reported) and can be re-run after asking for consent again.
 
 ### The optional redraw helper
 

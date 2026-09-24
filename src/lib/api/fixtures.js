@@ -43,18 +43,14 @@ const WEEKS_AGO_3 = { key: 'time.relative.weeksAgo', params: { count: 3 } }
 /** @typedef {import('./pagebuilder.js').BuildContext} BuildContext */
 
 /**
- * Every cause `review.js` can report, one region each - eleven of them, on
- * Wandering Moon Ch. 12. Nothing that is not a review cause belongs in here.
+ * Every cause a region can be flagged for today, one region each - five of
+ * them, on Wandering Moon Ch. 12. Nothing that is not a review cause belongs
+ * in here. `review.js`'s legacy cloud causes are not: nothing makes them any
+ * more (see `pagebuilder.js#flagCause`).
  */
 const EVERY_REVIEW_CAUSE = Object.freeze([
   [2, 0, 'fitting'],
   [2, 1, 'large'],
-  [2, 2, 'cloud-accepted'],
-  [3, 0, 'cloud-rejected:safety-filter'],
-  [3, 1, 'cloud-rejected:transport-error'],
-  [3, 2, 'cloud-rejected:parameter-test'],
-  [4, 0, 'cloud-rejected:residual-test'],
-  [4, 1, 'cloud-rejected:structural'],
   [5, 0, 'gate-low'],
   [6, 0, 'declined'],
   [6, 1, 'gate-outside'],
@@ -86,8 +82,6 @@ function decorateNineSkies(project, ctx) {
   const chapter = project.chapters[0]
   flagCause(chapter.pages[0], 0, 'fitting', ctx)
   flagCause(chapter.pages[3], 0, 'large', ctx)
-  flagCause(chapter.pages[6], 0, 'cloud-accepted', ctx)
-  flagCause(chapter.pages[9], 1, 'cloud-rejected:safety-filter', ctx)
 }
 
 /** @type {ReadonlyArray<Object>} */
@@ -346,7 +340,7 @@ export function aboutInfo() {
       },
       {
         labelKey: 'about.fact.cloud',
-        value: 'Google gemini-3.1-flash-image, paid tier only, opt-in per request',
+        value: 'Modal or Beam, your own account, off by default, confirmed per request',
       },
       { labelKey: 'about.fact.runtime', value: 'ONNX Runtime, CPU execution provider' },
     ],

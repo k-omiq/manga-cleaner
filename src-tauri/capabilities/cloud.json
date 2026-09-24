@@ -4,6 +4,7 @@
   "description": "Permissions for cloud inference configuration, credential management, and read-only status checks in the main window.",
   "windows": ["main"],
   "permissions": [
-    "allow-inference-commands"
+    "allow-inference-commands",
+    "allow-provision-commands"
   ]
 }

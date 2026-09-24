@@ -18,12 +18,21 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  DEFAULT_FLUX_MODEL,
+  FIRST_LAUNCH_STEPS,
   RUNTIME_ID,
+  defaultFluxModel,
   downloadQueue,
   firstLaunchPlan,
+  groupBytes,
+  groupState,
   initialSelection,
   labelKeyFor,
+  planGroups,
   plannedBytes,
+  runProgress,
+  runtimeNotice,
+  runtimeReady,
 } from './firstlaunch.js'
 
 const LAMA_BYTES = 207_482_644
@@ -178,6 +187,21 @@ describe('what a first launch has to offer', () => {
 })
 
 describe('what the press will cost and fetch', () => {
+  it('skips Japanese OCR unless the reader is selected', () => {
+    const catalogue = view()
+    catalogue.models.push(
+      { id: 'ocrEncoder', kindKey: 'models.kind.ocr', bytes: 343, requiredBy: [], installed: false },
+      { id: 'ocrDecoder', kindKey: 'models.kind.ocrDecoder', bytes: 117, requiredBy: [], installed: false },
+      { id: 'ocrVocab', kindKey: 'models.kind.ocrVocab', bytes: 1, requiredBy: [], installed: false },
+    )
+    const plan = firstLaunchPlan(catalogue)
+    const selection = initialSelection(plan)
+    expect(downloadQueue(plan, selection)).not.toContain('ocrEncoder')
+    const selected = { ...selection, ocrEncoder: true, ocrDecoder: true, ocrVocab: true }
+    expect(downloadQueue(plan, selected).slice(-3)).toEqual(['ocrEncoder', 'ocrDecoder', 'ocrVocab'])
+    expect(plannedBytes(plan, selected) - plannedBytes(plan, selection)).toBe(461)
+  })
+
   it('counts the ticked rows and only the ticked rows', () => {
     const plan = firstLaunchPlan(view())
     const selection = initialSelection(plan)
@@ -232,5 +256,117 @@ describe('what the press will cost and fetch', () => {
     // Settings gives it.
     expect(labelKeyFor(plan, RUNTIME_ID)).toBe('settings.models.runtime.label')
     expect(labelKeyFor(plan, 'somethingNewer')).toBe(null)
+  })
+})
+
+/** The catalogue with the Japanese reader's three files in it as well. */
+function withReader(options) {
+  const catalogue = view(options)
+  catalogue.models.push(
+    { id: 'ocrEncoder', kindKey: 'models.kind.ocr', bytes: 343, requiredBy: [], installed: false },
+    { id: 'ocrDecoder', kindKey: 'models.kind.ocrDecoder', bytes: 117, requiredBy: [], installed: false },
+    { id: 'ocrVocab', kindKey: 'models.kind.ocrVocab', bytes: 1, requiredBy: [], installed: false },
+  )
+  return catalogue
+}
+
+/** A run that has not started. @param {Object} [overrides] */
+function run(overrides = {}) {
+  return { selection: {}, finished: {}, failure: null, current: null, running: false, paused: false, ...overrides }
+}
+
+describe('the setup around the offer', () => {
+  it('walks six steps, one choice each, in this order', () => {
+    expect(FIRST_LAUNCH_STEPS).toEqual(['welcome', 'models', 'defaults', 'cloud', 'behavior', 'done'])
+    // No token step: every default download is from a public repository.
+    expect(FIRST_LAUNCH_STEPS).not.toContain('token')
+  })
+
+  it('draws the download step as three choices, leaving out an empty one', () => {
+    const plan = firstLaunchPlan(withReader())
+    const groups = planGroups(plan)
+    expect(groups.map((group) => [group.id, group.optional])).toEqual([
+      ['required', false],
+      ['redraw', true],
+      ['japanese', true],
+    ])
+    expect(groups[2].rows.map((row) => row.id)).toEqual(['ocrEncoder', 'ocrDecoder', 'ocrVocab'])
+    // The redraw engine is here already, and the reader is not in this view.
+    expect(planGroups(firstLaunchPlan(view({ installed: ['inpainter'] }))).map((group) => group.id)).toEqual([
+      'required',
+    ])
+    expect(planGroups(null)).toEqual([])
+  })
+
+  it('prices a group by what is still to come', () => {
+    const plan = firstLaunchPlan(view({ installed: ['balloonDetector'] }))
+    const [required] = planGroups(plan)
+    expect(groupBytes(required, {})).toBe(AUTO_CLEAN_BYTES - BALLOON_BYTES + RUNTIME_BYTES)
+    expect(groupBytes(required, { [RUNTIME_ID]: true })).toBe(AUTO_CLEAN_BYTES - BALLOON_BYTES)
+  })
+
+  it('names each group\'s part in a run, the finished and the failed first', () => {
+    const plan = firstLaunchPlan(withReader())
+    const [required, redraw, japanese] = planGroups(plan)
+    const selection = initialSelection(plan)
+
+    expect(groupState(required, run({ selection }))).toBe(null)
+    expect(groupState(required, run({ selection, running: true, current: RUNTIME_ID }))).toBe('downloading')
+    expect(groupState(redraw, run({ selection, running: true, current: RUNTIME_ID }))).toBe('waiting')
+    // Not ticked, so not part of the run: the size stays.
+    expect(groupState(japanese, run({ selection, running: true, current: RUNTIME_ID }))).toBe(null)
+    expect(groupState(redraw, run({ selection, paused: true }))).toBe('paused')
+    expect(groupState(required, run({ selection, failure: { id: 'scriptGate' } }))).toBe('failed')
+
+    const everything = Object.fromEntries(required.rows.map((row) => [row.id, true]))
+    // Complete says so even while another group's download failed.
+    expect(groupState(required, run({ selection, finished: everything, failure: { id: 'inpainter' } }))).toBe(
+      'installed',
+    )
+  })
+
+  it('measures a run against the whole selection, so a resume never moves the bar back', () => {
+    const plan = firstLaunchPlan(view())
+    const selection = initialSelection(plan)
+    const total = AUTO_CLEAN_BYTES + RUNTIME_BYTES + LAMA_BYTES
+    expect(runProgress(plan, selection, {}, {})).toEqual({ done: 0, total })
+    expect(
+      runProgress(plan, selection, { [RUNTIME_ID]: true }, { textDetector: { downloaded: 1_000, total: null } }),
+    ).toEqual({ done: RUNTIME_BYTES + 1_000, total })
+    // A runtime package reports its archive, which can be larger than the row.
+    expect(runProgress(plan, selection, {}, { [RUNTIME_ID]: { downloaded: RUNTIME_BYTES * 2, total: null } }).done).toBe(
+      RUNTIME_BYTES,
+    )
+    expect(runProgress(null, selection, {}, {})).toEqual({ done: 0, total: 0 })
+  })
+
+  it('asks the runtime what it can run on only once it is here and not being replaced', () => {
+    const plan = firstLaunchPlan(view())
+    expect(runtimeReady(plan, {}, null)).toBe(false)
+    expect(runtimeReady(plan, { [RUNTIME_ID]: true }, 'textDetector')).toBe(true)
+    expect(runtimeReady(firstLaunchPlan(view({ installed: [RUNTIME_ID] })), {}, null)).toBe(true)
+    expect(runtimeReady(firstLaunchPlan(view({ installed: [RUNTIME_ID] })), {}, RUNTIME_ID)).toBe(false)
+    expect(runtimeReady(firstLaunchPlan(view({ runtime: { available: false } })), {}, null)).toBe(false)
+    // An adapter older than the runtime row is answered the way capabilities answers it.
+    expect(runtimeReady(firstLaunchPlan(view({ runtime: null })), {}, null)).toBe(true)
+    expect(runtimeReady(null, {}, null)).toBe(false)
+  })
+
+  it('reads the runtime\'s refusals and nothing that merely looks like a key', () => {
+    expect(runtimeNotice('notice.runtime.noSpace needed=253000000 free=1200000 junk =3 bad=x')).toEqual({
+      key: 'notice.runtime.noSpace',
+      params: { needed: 253_000_000, free: 1_200_000 },
+    })
+    expect(runtimeNotice('notice.runtime.inUse')).toEqual({ key: 'notice.runtime.inUse', params: {} })
+    expect(runtimeNotice('settings.models.status.failed')).toBe(null)
+    expect(runtimeNotice('connection reset')).toBe(null)
+    expect(runtimeNotice(undefined)).toBe(null)
+  })
+
+  it('lands the AI redraw model on Settings\' first choice', () => {
+    expect(defaultFluxModel([{ id: 'other' }, { id: DEFAULT_FLUX_MODEL }])).toBe(DEFAULT_FLUX_MODEL)
+    expect(defaultFluxModel([{ id: 'other' }])).toBe('other')
+    expect(defaultFluxModel([])).toBe(null)
+    expect(defaultFluxModel(undefined)).toBe(null)
   })
 })

@@ -55,3 +55,6 @@ freeditor/
 # They come from the build machine and are never committed - only the note that
 # explains the directory is.
 src-tauri/vendor/windows-crt/*.dll
+
+# Frozen platform-specific cloud setup helper built on release runners.
+src-tauri/binaries/manga-cleaner-provisioner-*

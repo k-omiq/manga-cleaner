@@ -33,6 +33,8 @@
 
 import { getBackend } from '../api/backend.js'
 import { hasKey } from '../i18n/index.js'
+import { CLOUD_ENGINE, isCloudMask } from '../model/masks.js'
+import { requestCloudConsent, runCloudJob } from './cloudflow.svelte.js'
 import { notify } from '../state/app.svelte.js'
 import {
   applyRegionDelta,
@@ -212,6 +214,11 @@ async function restoreRegionThroughSeam(regionId, state) {
  * back to the tool that made it with the mask intact, so there is nothing to
  * undo and nothing to record.
  *
+ * Two of them go to the cloud, each after its own consent (`rerunInCloud`):
+ * Clean with > Cloud, and Try again on a mask the cloud rendered. The second
+ * is not a local re-run of the model the endpoint happened to serve; asked
+ * without a grant, the native side refuses it rather than run it here.
+ *
  * @param {import('../api/backend.js').ApiRegion} region
  * @param {'stronger'|'simpler'|'cycleFill'|'reopenInTool'|'retry'|'engine'} kind
  * @param {string} [engine] - the rung `kind: 'engine'` should run at
@@ -219,6 +226,8 @@ async function restoreRegionThroughSeam(regionId, state) {
  */
 export async function rerunMask(region, kind, engine) {
   if (!region.mask) return false
+  if (kind === 'engine' && engine === CLOUD_ENGINE) return rerunInCloud(region)
+  if (kind === 'retry' && isCloudMask(region.mask)) return rerunInCloud(region)
   const before = snapshot(region)
   /** @type {any} */
   let result
@@ -262,6 +271,12 @@ export async function rerunMask(region, kind, engine) {
  * A starting rung and never a ceiling, exactly as it is for a run: the ladder
  * still escalates when the quality metric declines a patch.
  *
+ * **Always local.** The native side renders Clean anyway in the cloud only
+ * over a patch the region already has, because consent binds to a stored
+ * crop and mask, and a region the gate held back has none. Once it is
+ * cleaned here it has one, and Clean with > Cloud is the way to the cloud
+ * from there, with its own consent.
+ *
  * @param {import('../api/backend.js').ApiRegion} region
  * @returns {Promise<boolean>}
  */
@@ -286,6 +301,71 @@ export async function cleanAnyway(region) {
     pageStatus: result.pageStatus,
   })
   return true
+}
+
+/* ------------------------------------------------------------------ */
+/* The cloud half                                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The open chapter's page index for a region, or null when it is not open.
+ *
+ * @param {string} regionId
+ * @returns {number|null}
+ */
+function pageIndexOf(regionId) {
+  for (const page of editor.chapter?.pages ?? []) {
+    if (page.regions.some((candidate) => candidate.id === regionId)) return page.index
+  }
+  return null
+}
+
+/**
+ * Render a region in the cloud with one consent, and land what comes back as
+ * one undoable edit. A render that does not commit has had its notice from the
+ * status element; the region is as it was.
+ *
+ * The chapter can change while the dialog is up or the render runs. A result
+ * for a chapter that is no longer open is not swapped into the one that is:
+ * the native side stored it on its own page.
+ *
+ * @param {import('../api/backend.js').ApiRegion} region
+ * @param {import('../model/types.js').OperationIntent} intent
+ * @param {(params: import('../api/backend.js').CloudRunParams) => Promise<any>} call
+ * @param {string} label - the undo entry's i18n key
+ * @returns {Promise<boolean>}
+ */
+async function renderInCloud(region, intent, call, label) {
+  const chapterId = editor.chapter?.id
+  const pageIndex = pageIndexOf(region.id)
+  if (!chapterId || pageIndex === null) return false
+  const where = { chapterId, pageIndex, regionId: region.id }
+  const before = snapshot(region)
+  const grant = await requestCloudConsent({ ...where, intent })
+  if (!grant) return false
+  const result = await runCloudJob(grant, where, call, (answer) => (answer ? { phase: 'committed' } : null))
+  if (!result?.region || editor.chapter?.id !== chapterId) return false
+  replaceRegion(result.region, result.pageStatus)
+  recordEdit(label, region.id, before, { region: result.region, pageStatus: result.pageStatus })
+  return true
+}
+
+/**
+ * Re-run a mask on the cloud GPU: Clean with > Cloud, or Try again on a cloud
+ * mask. The same request either way, so the same consent and the same intent.
+ *
+ * @param {import('../api/backend.js').ApiRegion} region
+ * @returns {Promise<boolean>}
+ */
+function rerunInCloud(region) {
+  const maskId = region.mask?.id
+  if (!maskId) return Promise.resolve(false)
+  return renderInCloud(
+    region,
+    { action: 'rerunMask', mask_id: maskId, kind: 'engine', engine: CLOUD_ENGINE },
+    (params) => getBackend().rerunMask({ maskId, kind: 'engine', engine: CLOUD_ENGINE, params }),
+    'masks.command.rerunMask',
+  )
 }
 
 /**

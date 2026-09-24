@@ -10,7 +10,7 @@
 //! 2. **Durable Dispatching Before Request:** Transitions to `Dispatching` and fsyncs before HTTP POST.
 //! 3. **Crash During Intent/Dispatching Recovers as Ambiguous Unknown:** Process crash or interruption
 //!    recovers as `Unknown` unless explicitly guaranteed by caller that no network transmission occurred.
-//! 4. **Billing Safety — Unknown NEVER Auto-Retried:** `Unknown` attempts strictly forbid auto-retry.
+//! 4. **Billing Safety: Unknown NEVER Auto-Retried:** `Unknown` attempts strictly forbid auto-retry.
 //! 5. **Accepted Handle Persisted Before Polling:** Server handles from `202 Accepted` are persisted
 //!    and fsynced before status polling or result fetching commences.
 //! 6. **Existing Known Handle Reusable:** Status/polling/download failures preserve durable handle for retry.
@@ -653,6 +653,17 @@ impl AttemptJournal {
     }
 
     pub fn read_cached_png(&self, guard: &AttemptLockGuard) -> Result<Vec<u8>, JournalError> {
+        self.read_cached(guard).map(|(bytes, _)| bytes)
+    }
+
+    /// The cached result, validated exactly as [`Self::read_cached_png`] does
+    /// and decoded, for an attach that happens after the process that
+    /// downloaded it is gone.
+    pub fn read_cached_crop(&self, guard: &AttemptLockGuard) -> Result<DecodedResultCrop, JournalError> {
+        self.read_cached(guard).map(|(_, decoded)| decoded)
+    }
+
+    fn read_cached(&self, guard: &AttemptLockGuard) -> Result<(Vec<u8>, DecodedResultCrop), JournalError> {
         self.verify_guard(guard)?;
         let record = self.read_record_locked(guard)?;
         let (expected_digest, expected_bytes, expected_cost, handle) = match &record.phase {
@@ -704,8 +715,8 @@ impl AttemptJournal {
             byte_length: expected_bytes,
         };
 
-        decode_result_crop(&buf, &result_meta, &record.to_request_metadata(), &self.limits, &handle)?;
-        Ok(buf)
+        let decoded = decode_result_crop(&buf, &result_meta, &record.to_request_metadata(), &self.limits, &handle)?;
+        Ok((buf, decoded))
     }
 
     pub fn prepare_attachment(

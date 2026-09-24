@@ -1,7 +1,7 @@
-# Manga Cleaner — Cloud Attempt Journal & Validated Result Cache Foundation (P4a)
+# Manga Cleaner: Cloud Attempt Journal & Validated Result Cache Foundation (P4a)
 
 **Protocol Version:** `1.0.0`
-**Milestone Status:** P4a Offline Foundation Delivered (Durable Local State Machine, Cross-Process RAII Locking, Two-Phase Attachment Reconciler, Crash-Discovery Recovery Decider); Network Dispatch (P5/P8) & Live Project Attachment Integration (P4b/P6) Pending.
+**Milestone Status:** P4a Offline Foundation Delivered (Durable Local State Machine, Cross-Process RAII Locking, Two-Phase Attachment Reconciler, Crash-Discovery Recovery Decider); network dispatch and project attachment were implemented offline later, and have not run live.
 
 ---
 
@@ -10,14 +10,14 @@
 This specification defines the bounded local transactional attempt journal, cross-process exclusive locking RAII, atomic filesystem durability model, and validated PNG result cache implemented in `src-tauri/src/inference/journal.rs`.
 
 > [!IMPORTANT]
-> **P4a Foundation Scope:** Remote HTTP dispatching (`POST /mc/v1/jobs`), remote container provisioning, live polling loops, and direct project patch attachment are **absent** from P4a. P4a establishes the billing-safe durable local state machine, OS-level cross-process locking, crash recovery evaluation, and mandatory result decoding gates before any production GPU requests can be issued in subsequent phases (P4b/P5).
+> **P4a Foundation Scope:** Remote HTTP dispatching (`POST /mc/v1/jobs`), remote container provisioning, live polling loops, and direct project patch attachment are **absent** from P4a. P4a establishes the billing-safe durable local state machine, OS-level cross-process locking, crash recovery evaluation, and mandatory result decoding gates before any production GPU requests can be issued in subsequent phases (P4b/P5). Later work added them offline.
 
 ### Key Architectural Invariants
 
 1. **Durable Intent Before Dispatch:** An attempt's immutable parameters and intent must be persisted and fsynced to disk before any network dispatch permit is issued to the caller.
 2. **Durable Dispatching Before Request:** Phase transitions to `Dispatching` and fsyncs to disk before the caller initiates the network HTTP POST request.
 3. **Crash During Intent/Dispatching Recovers as Ambiguous Unknown:** If the process terminates, loses power, or crashes while in `Intent` or `Dispatching`, recovery treats the attempt as `Unknown` unless the caller explicitly guaranteed via [`AttemptJournal::abort_intent_no_dispatch`] that no network transmission occurred.
-4. **Billing Safety — Unknown NEVER Auto-Retried:** Attempts in the `Unknown` state must never be automatically retried by the system, preventing double-billing on remote GPU infrastructure. `is_auto_retryable()` always returns `false`.
+4. **Billing Safety: Unknown NEVER Auto-Retried:** Attempts in the `Unknown` state must never be automatically retried by the system, preventing double-billing on remote GPU infrastructure. `is_auto_retryable()` always returns `false`.
 5. **Accepted Handle Persisted Before Polling:** Remote handles returned by `202 Accepted` must be persisted and fsynced to disk before status polling or result fetching commences.
 6. **Existing Known Handle Reusable:** Network disconnections, HTTP timeouts, or parsing errors during polling or result downloads preserve the durable remote handle for subsequent resume/retry without re-submitting a new job.
 7. **Non-Terminal Cancellation Request:** `CancelRequested` remains non-terminal until remote completion or cancellation is confirmed by authoritative gateway status.

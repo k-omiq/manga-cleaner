@@ -1,7 +1,7 @@
-# Manga Cleaner — Cloud Security Architecture & Backend Foundation
+# Manga Cleaner: Cloud Security Architecture & Backend Foundation
 
 **Milestone Status:** P3a Delivered (Backend Security, Profiles, Credentials, Policy & Grant Foundation)
-**Remaining Milestone Scope:** P3b (Backend Region Binding Integration & Consent Copy), P4–P11 (Durable Transport, Adapters, Provisioning, Batching, Release Gates)
+**Remaining Milestone Scope (at P3a):** P3b (Backend Region Binding Integration & Consent Copy), P4 to P11 (Durable Transport, Adapters, Provisioning, Batching, Release Gates). Later work implemented P3b, P4 and P5 to P9 offline. P10 is not implemented, and no phase from P5 on has run live. See [cloud-work-log.md](cloud-work-log.md).
 
 ---
 
@@ -124,11 +124,11 @@ Exposed Command Surface:
 | Phase | Description | Status |
 |---|---|---|
 | **P3a** | Backend security foundation, public profiles, secrets, policy, grants, and settings guards | **Completed** |
-| **P3b** | Backend region binding integration, frontend consent dialogs, i18n copy updates | Pending |
-| **P4** | Durable attempt journal, local result caching, crash recovery, and cancellation | Pending |
-| **P5** | First real cloud crop via Modal staging adapter | Pending |
-| **P6** | Beam runtime parity and token permission verification | Pending |
-| **P7–P8** | Automatic provisioning helpers for Modal and Beam | Pending |
-| **P9** | Complete account connection and lifecycle UX | Pending |
-| **P10** | Cloud-assisted chapter workflows and conservative routing | Pending |
-| **P11** | End-to-end integration and release gating | Pending |
+| **P3b** | Backend region binding integration, frontend consent dialogs, i18n copy updates | Implemented offline |
+| **P4** | Durable attempt journal, local result caching, crash recovery, and cancellation | Implemented offline |
+| **P5** | First real cloud crop via Modal staging adapter | Implemented offline, not yet run live |
+| **P6** | Beam runtime parity and token permission verification | Implemented offline, not yet run live |
+| **P7 to P8** | Automatic provisioning helpers for Modal and Beam | Implemented offline, not yet run live |
+| **P9** | Complete account connection and lifecycle UX | Implemented offline |
+| **P10** | Cloud-assisted chapter workflows and conservative routing | Not implemented: chapter runs stay local only |
+| **P11** | End-to-end integration and release gating | Partial: CPU-only CI and the release install step; no live end-to-end run |

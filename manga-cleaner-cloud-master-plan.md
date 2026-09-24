@@ -1,4 +1,4 @@
-# Manga Cleaner — User-Owned Cloud Inference and Automatic Deployment
+# Manga Cleaner: User-Owned Cloud Inference and Automatic Deployment
 
 ## Master implementation plan
 
@@ -70,7 +70,7 @@ A new remote FLUX patch records FLUX as its engine and its provider in cloud pro
 ### 3.2 Two independent services
 
 ```text
-Svelte UI — sanitized state, explicit user approvals
+Svelte UI - sanitized state, explicit user approvals
     |
 Tauri / Rust
     |-- InferenceService
@@ -132,14 +132,14 @@ Local durability and unique database rows do not provide cross-provider exactly-
 | P7 | Automatic Modal setup | Account credential + approved plan produces a usable configured installation. |
 | P8 | Automatic Beam setup | Same outcome with verified SDK/token/platform support and resumable setup. |
 | P9 | Complete connection/update/removal UX | Users can inspect, repair, update, rotate, stop, forget, and safely uninstall. |
-| P10 | Explicit cloud-assisted chapters | Approved 20–60-page sessions recover per-region and apply conservative routing. |
+| P10 | Explicit cloud-assisted chapters | Approved 20 to 60-page sessions recover per-region and apply conservative routing. |
 | P11 | Production release gates | Clean packaged-app, security, migration, GPU, recovery, and cleanup evidence. |
 
-P1 and P2 can proceed in parallel after P0. P3 builds on the domain decisions in P2. P4 is required before a real paid inference path is enabled. P5 requires the relevant P1 feasibility results and P2–P4. After P5, Beam runtime work (P6) and Modal provisioning (P7) can proceed in parallel. P8 builds on P6 and the shared provisioning machinery from P7. P9 requires both provisioning implementations. P10 requires both runtime implementations and the authorization/recovery foundation. P11 validates the integrated result.
+P1 and P2 can proceed in parallel after P0. P3 builds on the domain decisions in P2. P4 is required before a real paid inference path is enabled. P5 requires the relevant P1 feasibility results and P2 to P4. After P5, Beam runtime work (P6) and Modal provisioning (P7) can proceed in parallel. P8 builds on P6 and the shared provisioning machinery from P7. P9 requires both provisioning implementations. P10 requires both runtime implementations and the authorization/recovery foundation. P11 validates the integrated result.
 
 **Release checkpoints:** after P6, manual-endpoint cloud beta; after P9, automatic-setup beta; after P10 and P11, full cloud-assisted chapter release. Do not call the P5 milestone a complete two-provider product.
 
-## P0 — Freeze the baseline and define the compatibility contract
+## P0: Freeze the baseline and define the compatibility contract
 
 **Goal:** Establish what must remain unchanged and give every later task a testable starting point.
 
@@ -155,7 +155,7 @@ Write architecture decision records covering engine/location separation, local-o
 
 **Acceptance:** Every planned entry point is tied to an existing source path and a test or explicit test gap. No local behavior, deployment permission, or cloud billing is changed in this phase.
 
-## P1 — Prove deployment-tooling and permission feasibility before building the wizard
+## P1: Prove deployment-tooling and permission feasibility before building the wizard
 
 **Goal:** Eliminate the largest platform/account uncertainties early.
 
@@ -171,7 +171,7 @@ Beam documents Windows setup through WSL. Prove a native packaged deployment pat
 
 **Acceptance:** The matrix distinguishes supported, permission-limited, unverified, and unavailable cases. Repeated inspection is non-mutating. Experiments do not overwrite global CLI profiles. OAuth and complete programmatic account creation are not assumed.
 
-## P2 — Extract rendering and stabilize the domain/wire contracts
+## P2: Extract rendering and stabilize the domain/wire contracts
 
 **Goal:** Make cloud rendering replace only the expensive crop-generation step.
 
@@ -187,7 +187,7 @@ Extend provenance to record cloud provider/profile-safe identity, remote request
 
 **Acceptance:** Fake-renderer tests prove unchanged decoded pixel samples outside the approved mask, preserved alpha, correct padded crop mapping, and unchanged refusal of unsupported source modes. Undo/project exports do not trigger inference. Local regression fixtures remain valid without network access.
 
-## P3 — Secure profiles, credentials, command permissions, and consent
+## P3: Secure profiles, credentials, command permissions, and consent
 
 **Goal:** Make it possible to configure both providers without exposing account keys or permitting accidental paid work.
 
@@ -205,11 +205,11 @@ Update real Tauri mappings and mock implementations deliberately. New production
 
 **Acceptance:** Both profiles persist simultaneously; automated scans find no cloud secret in settings/export/logs; blocked cloud permission prevents all transmission regardless of frontend tool path; wrong-origin redirects do not receive credentials; no paid GPU operation occurs during an ordinary connection check.
 
-## P4 — Implement durable attempts, cancellation, and crash recovery
+## P4: Implement durable attempts, cancellation, and crash recovery
 
 **Goal:** Establish billing-safe lifecycle behavior before a production GPU request is possible.
 
-**Work:** Implement a local transactional attempt journal and result cache. Persist intent before dispatch and accepted handles immediately after receipt. If the app exits between remote acceptance and local receipt persistence, recover as ambiguous—not as safe to resubmit. Persist each validated output before patch attachment or page completion.
+**Work:** Implement a local transactional attempt journal and result cache. Persist intent before dispatch and accepted handles immediately after receipt. If the app exits between remote acceptance and local receipt persistence, recover as ambiguous, not as safe to resubmit. Persist each validated output before patch attachment or page completion.
 
 Use bounded network calls and a cancellation registry that can be reached without acquiring the job lock held by a running render. Initially preserve the existing single-writer project discipline. Do not casually release project locks around network work without snapshot/revision validation.
 
@@ -221,7 +221,7 @@ Use a local fake gateway to inject acceptance followed by disconnect, expired re
 
 **Acceptance:** Automated fault tests count submissions. Ambiguous acceptance never creates an automatic replacement. Polling/download failures reuse the known handle. A crash after result persistence requires no new inference. Undo/redo uses saved patches. Recovery does not attach results to changed/deleted regions.
 
-## P5 — First real cloud crop through Modal
+## P5: First real cloud crop through Modal
 
 **Goal:** Deliver the smallest useful cloud feature through a manually supplied endpoint.
 
@@ -237,7 +237,7 @@ Add a minimal real endpoint/token configuration view and connection check. The c
 
 **Acceptance:** On a supported desktop without local Python/FLUX weights, one approved region is cleaned using the staging endpoint. Tests cover cold start, a reused warm worker, cancellation, malformed results, and recovery after restart. Outside-mask samples and alpha remain unchanged. Required local detection models remain separately accounted for.
 
-## P6 — Beam runtime parity in the same build
+## P6: Beam runtime parity in the same build
 
 **Goal:** Add Beam without creating a second image-processing implementation or a provider-specific fork of the editor.
 
@@ -251,7 +251,7 @@ Record the runtime credential's actual permissions. If narrower hosted credentia
 
 **Acceptance:** Beam and Modal stay configured simultaneously; runtime switching needs no rebuild; the same contract fixtures work against both. A failed result download never submits fresh inference. The credential-permission matrix and server retry behavior are backed by staging evidence.
 
-## P7 — Automatic Modal provisioning from account credentials
+## P7: Automatic Modal provisioning from account credentials
 
 **Goal:** Replace manual endpoint preparation with a recoverable in-app deployment workflow.
 
@@ -267,7 +267,7 @@ Persist installation names, resource IDs, template/model versions, endpoint, tok
 
 **Acceptance:** A fresh eligible account credential plus approved plan yields a configured endpoint without console copying. Interrupted setup resumes without duplicate resources. Missing privileges produce a specific blocked operation. Successful setup leaves only the disclosed credentials/resources and can forget the local setup credential.
 
-## P8 — Automatic Beam provisioning with platform-specific gates
+## P8: Automatic Beam provisioning with platform-specific gates
 
 **Goal:** Provide the same automatic-setup contract using Beam's official deployment tools.
 
@@ -281,7 +281,7 @@ For Windows, use only the native helper path proven by P1, or a clearly labeled 
 
 **Acceptance:** Setup can resume after each resource-creation stage without duplicates, recover endpoint discovery, and remove its own experimental installation. Missing account prerequisites produce actionable instructions, not speculative permission changes. Packaged-platform claims match tested evidence.
 
-## P9 — Complete the account-connection and installation lifecycle UX
+## P9: Complete the account-connection and installation lifecycle UX
 
 **Goal:** Turn provider plumbing into a manageable user-owned installation.
 
@@ -295,9 +295,9 @@ Updates must preserve compatibility for outstanding jobs or drain them before ch
 
 **Acceptance:** A user can understand resource scope and manage an installation without a terminal. A half-completed setup is visible and recoverable. Forgetting a local credential is not mislabeled as provider revocation. Logs reveal neither tokens nor presigned result URLs. Worker caps are not described as a guaranteed currency budget.
 
-## P10 — Explicit cloud-assisted chapters and conservative failover
+## P10: Explicit cloud-assisted chapters and conservative failover
 
-**Goal:** Support the requested 20–60-page workload without silently converting automatic local cleaning into paid cloud processing.
+**Goal:** Support the requested 20 to 60-page workload without silently converting automatic local cleaning into paid cloud processing.
 
 **Work:** Implement a separate cloud-assisted second pass over approved eligible regions. Preserve the default local automatic run. Build a plan that names target regions, provider chain, recipe, permitted attempts, and execution limits. Require backend authorization for that bounded session; do not upload review-gated content just because it was detected.
 
@@ -309,7 +309,7 @@ Select the preferred provider before submission. Failover must preserve compatib
 
 **Acceptance:** 20-page and 60-page staged sessions can stop, restart, recover accepted jobs, reuse saved outputs, and continue without blind replay. Warm/cold measurements are factual, not invented progress. Unknown submissions block automatic replacement. Local-only operation remains unaffected offline.
 
-## P11 — Integrated testing, packaging, and release
+## P11: Integrated testing, packaging, and release
 
 **Goal:** Establish a release claim that matches actual runtime, deployment, security, and platform evidence.
 
@@ -354,18 +354,18 @@ All paths in this section were inspected at the reviewed commit. A filename belo
 | `crates/cleaner-core/src/engines/mod.rs` | Export new render contracts. | P2 |
 | `crates/cleaner-core/src/patch.rs` | Typed cloud provenance, nullable cost, preserve legacy Cloud records. | P2 |
 | `crates/cleaner-core/src/project/mod.rs` | Schema migration, durable patch/cache reconciliation tests, compatibility. | P2/P4 |
-| `src-tauri/src/region.rs` | Route manual FLUX across execution targets; enforce authorization for apply/create/rerun/clean-anyway paths. | P3–P6 |
+| `src-tauri/src/region.rs` | Route manual FLUX across execution targets; enforce authorization for apply/create/rerun/clean-anyway paths. | P3 to P6 |
 | `src-tauri/src/run.rs` | Preserve local ceiling; connect explicit batch flow and cancellation safely; do not promise current per-region remote durability. | P4/P10 |
 | `src-tauri/src/library.rs` | Public provenance conversion and recovery attachment checks. | P2/P4 |
-| `src-tauri/src/events.rs` | Sanitized inference/provisioning events with stable operation IDs and real states. | P3–P9 |
+| `src-tauri/src/events.rs` | Sanitized inference/provisioning events with stable operation IDs and real states. | P3 to P9 |
 | `src-tauri/src/settings.rs` | Versioned public cloud preferences; prevent cloud secrets in generic settings writes without disturbing unrelated settings behavior. | P3 |
-| `src-tauri/src/lib.rs` | Register application services and explicit commands. | P3–P10 |
+| `src-tauri/src/lib.rs` | Register application services and explicit commands. | P3 to P10 |
 | `src-tauri/Cargo.toml` | Reuse HTTP/keyring infrastructure; add journal/helper dependencies only when justified. | P3/P4/P7 |
 | `src-tauri/build.rs` | Command permission manifest and helper packaging integration as needed. | P3/P7/P11 |
 | `src-tauri/tauri.conf.json` | Package trusted helper/resources; retain restrictive frontend networking. | P7/P11 |
-| `src/lib/api/backend.js` | Public profiles, execution selection, authorization, remote/provisioning lifecycle contracts. | P2–P10 |
-| `src/lib/api/tauri.js` | Explicit real command mappings; no mock fallback for cloud mutations or results. | P3–P10 |
-| `src/lib/api/mock.js` | Deterministic mock states for both providers, failed setup, unknown acceptance, cancellation, and recovery. | P3–P10 |
+| `src/lib/api/backend.js` | Public profiles, execution selection, authorization, remote/provisioning lifecycle contracts. | P2 to P10 |
+| `src/lib/api/tauri.js` | Explicit real command mappings; no mock fallback for cloud mutations or results. | P3 to P10 |
+| `src/lib/api/mock.js` | Deterministic mock states for both providers, failed setup, unknown acceptance, cancellation, and recovery. | P3 to P10 |
 | `src/lib/api/fixtures.js` | Safe public defaults; no credentials; local-only default. | P3 |
 | `src/lib/api/tauri-events.js` | Event types/dispatch compatibility and consumer tests. | P4/P7 |
 | `src/lib/model/types.js` | JSDoc engine/location/provenance/state types and nullable cost. | P2/P3 |
@@ -375,10 +375,10 @@ All paths in this section were inspected at the reviewed commit. A filename belo
 | `src/lib/state/editor.svelte.js` | Policy snapshots, progress/recovery, explicit cloud pass. | P4/P10 |
 | `src/lib/editor/cloudflow.svelte.js` | Correct cost/transmission handling and backend authorization integration. | P3/P9 |
 | `src/lib/editor/tools.js` | Cloud-spend detection based on execution target, not engine label alone. | P3 |
-| `src/lib/editor/toolapply.svelte.js` | Route selected target, approval, progress, and existing undo behavior. | P3–P6 |
+| `src/lib/editor/toolapply.svelte.js` | Route selected target, approval, progress, and existing undo behavior. | P3 to P6 |
 | `src/lib/editor/ToolBar.svelte` | Valid engine/target combinations without extra cloud-engine rungs. | P5/P9 |
 | `src/lib/dialogs/SettingsDialog.svelte` | Integrate Inference settings and setup components. | P3/P9 |
-| `src/lib/i18n/en.js` | Replace legacy Google/no-charge copy; add scoped consent, setup, recovery, and honest cost messages. | P3–P10 |
+| `src/lib/i18n/en.js` | Replace legacy Google/no-charge copy; add scoped consent, setup, recovery, and honest cost messages. | P3 to P10 |
 | `.github/workflows/ci.yml` | CPU-only new regression/contract/helper checks. | P0/P11 |
 | `.github/workflows/release.yml` | Helper packaging/signing and release-target checks. | P1/P11 |
 
@@ -534,4 +534,4 @@ The following primary sources were read for this review. Repository links are pi
 
 ### User-supplied requirements
 
-U01: `Pasted text.txt`, 507 lines. Especially lines 5–29 (scope and ownership), 67–107 (simultaneous providers and safe failover), 124–138 (crop fidelity), 169–203 (caching and chapters), 407–420 (verified file plan), and 483–507 (milestones, source grounding, and no modifications). The account-level automatic-setup requirement comes from the subsequent messages in this conversation.
+U01: `Pasted text.txt`, 507 lines. Especially lines 5 to 29 (scope and ownership), 67 to 107 (simultaneous providers and safe failover), 124 to 138 (crop fidelity), 169 to 203 (caching and chapters), 407 to 420 (verified file plan), and 483 to 507 (milestones, source grounding, and no modifications). The account-level automatic-setup requirement comes from the subsequent messages in this conversation.

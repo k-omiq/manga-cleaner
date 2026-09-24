@@ -840,10 +840,7 @@ impl ConsentService {
         app: &tauri::AppHandle,
         request: PrepareProposalRequest,
     ) -> Result<ConsentProposal, ConsentError> {
-        let cloud_allowed = crate::settings::read(app)
-            .ok()
-            .and_then(|s| s.get("cloudEngines").and_then(|v| v.as_str()).map(|v| v == "allowed"))
-            .unwrap_or(false);
+        let cloud_allowed = crate::inference::cloud_allowed(app);
 
         if !cloud_allowed {
             return Err(ConsentError::CloudDisabled);
@@ -869,10 +866,7 @@ impl ConsentService {
         grant_ttl: Duration,
         max_attempts: u32,
     ) -> Result<Grant, ConsentError> {
-        let cloud_allowed = crate::settings::read(app)
-            .ok()
-            .and_then(|s| s.get("cloudEngines").and_then(|v| v.as_str()).map(|v| v == "allowed"))
-            .unwrap_or(false);
+        let cloud_allowed = crate::inference::cloud_allowed(app);
 
         if !cloud_allowed {
             return Err(ConsentError::CloudDisabled);
@@ -2075,6 +2069,38 @@ mod tests {
         assert_eq!(
             grant_svc.validate_and_consume(&grant.nonce, &grant.scope),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn intents_read_the_shapes_the_editor_sends() {
+        // `rename_all` renames the tag's values, not a variant's own fields,
+        // so a rerun names its mask as `mask_id`.
+        let rerun: OperationIntent = serde_json::from_value(serde_json::json!({
+            "action": "rerunMask",
+            "mask_id": "r1-m1",
+            "kind": "engine",
+            "engine": "cloud",
+        }))
+        .unwrap();
+        assert_eq!(
+            rerun,
+            OperationIntent::RerunMask {
+                mask_id: "r1-m1".into(),
+                kind: "engine".into(),
+                engine: Some("cloud".into()),
+            }
+        );
+        assert!(serde_json::from_value::<OperationIntent>(serde_json::json!({
+            "action": "rerunMask",
+            "maskId": "r1-m1",
+            "kind": "engine",
+        }))
+        .is_err());
+        assert_eq!(
+            serde_json::from_value::<OperationIntent>(serde_json::json!({ "action": "cleanAnyway" }))
+                .unwrap(),
+            OperationIntent::CleanAnyway
         );
     }
 }

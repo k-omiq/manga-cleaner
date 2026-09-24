@@ -36,13 +36,25 @@
 //! to - where [`Choice::Ladder`] keeps the run's own behaviour, escalating past
 //! a declined rung and refusing when the top one declines too.
 //!
-//! ## The cloud rung is not reachable from here either
+//! ## The cloud rung is reached only with a grant
 //!
-//! There is no cloud client in this build - [`Engine::Cloud`] exists in the
-//! manifest vocabulary so that a patch made by one could be *read*, and nothing
-//! can make one. A request for it is refused with
-//! `notice.cloud.unavailable`, which says the one thing that matters: nothing
-//! was sent.
+//! A region is rendered in the cloud only when the caller brings a grant:
+//! `grantNonce`, `executionTarget`, `recipe` and `intent` in `params`, the
+//! four things consent minted it for. `applyTool`, `rerunMask` and
+//! `cleanAnyway` then hand the region to
+//! [`crate::inference::service::InferenceService::execute_cloud_render`],
+//! which checks the grant against the region as it is on disk before anything
+//! is sent. Its phases go out as `cloud://attempt` events, and a render that
+//! does not commit is answered with a stable code, never with an error's text.
+//!
+//! Everything else stays local. With the permission switch off, a cloud
+//! request is `blocked` with `notice.cloud.blocked`, grant or no grant. A cloud
+//! engine named without a grant is `needs-confirmation` from `applyTool` and a
+//! refusal from the other edits. `createRegion` never renders in the cloud:
+//! consent binds to a stored region, which a hand-drawn one is not until this
+//! command writes it, so the region is created with the local default for its
+//! fill mode and the interface asks for the cloud render on it next. Automatic
+//! runs never reach the cloud at all.
 
 use std::path::PathBuf;
 use std::borrow::Cow;
@@ -54,6 +66,7 @@ use cleaner_core::accel::Preference;
 use cleaner_core::detect::{Detector, build_regions_separated};
 use cleaner_core::engines::flux;
 use cleaner_core::engines::model::Error as ModelError;
+use cleaner_core::engines::render::{ExecutionTarget, RenderRecipe};
 use cleaner_core::fit::{self, EdgeMap, Fitted};
 use cleaner_core::image::{Raster, decode};
 use cleaner_core::ingest::sha256_hex;
@@ -64,6 +77,8 @@ use cleaner_core::project::{Job, PatchRecord};
 use cleaner_core::quality;
 use cleaner_core::sidecar::{self, Backend, Budget};
 
+use crate::inference::consent::OperationIntent;
+use crate::inference::service::{attempt_id_for_nonce, CloudAttemptProgress, PollOptions, RenderPhase};
 use crate::library::{ApiMask, ApiRegion, Bbox, Library, LibraryError};
 use crate::run::{self, EnginePick, Picks};
 
@@ -73,14 +88,21 @@ use crate::run::{self, EnginePick, Picks};
 
 /// The discriminated union of outcomes.
 ///
-/// Four of its five statuses are reachable here: `applied`, `run-started`,
-/// `blocked` and `not-found`. `needs-confirmation` belongs to the cloud rung's
-/// two-tier protocol and cannot be reached by a build with no cloud client -
-/// a request for one is `blocked` before any confirmation would be asked for.
+/// `applied`, `run-started`, `blocked` and `not-found` as for any edit, and
+/// `needs-confirmation` for a cloud engine named without a grant. A cloud
+/// render that did not commit answers where it stopped, `failed`,
+/// `cancelled` or `unknown` (the gateway may hold the job, and it is never
+/// resubmitted), with the reason in `errorCode`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplyResult {
     pub status: &'static str,
+    /// Why a cloud request did not commit: one of
+    /// [`crate::inference::service::InferenceServiceError::code`], or a code
+    /// of this module's own (`invalid_request`, `target_changed`,
+    /// `config_unreadable`, `journal_error`, `cloud_disabled`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<ApiRegion>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -97,6 +119,7 @@ impl ApplyResult {
     fn of(status: &'static str) -> ApplyResult {
         ApplyResult {
             status,
+            error_code: None,
             region: None,
             mask: None,
             page_status: None,
@@ -108,6 +131,7 @@ impl ApplyResult {
     fn applied(edited: Edited) -> ApplyResult {
         ApplyResult {
             status: "applied",
+            error_code: None,
             mask: edited.region.mask.clone(),
             region: Some(edited.region),
             page_status: Some(edited.page_status),
@@ -792,13 +816,17 @@ fn overlap(a: Rect, b: Rect) -> u64 {
 /// read-modify-write of a manifest in this crate: the file is rewritten whole,
 /// and an edit that interleaved with a run's flush would lose one of them
 /// entirely.
+///
+/// Everything here renders on this machine. The cloud is reached only through
+/// a grant, before a plan is made, so `Engine::Cloud` is refused, and
+/// `Engine::Flux` is the local helper whichever cloud endpoint is selected: the
+/// interface names the cloud as its own engine. What must not run here, a
+/// cloud patch re-run as itself, [`rerun_needs_cloud`] stops before this.
 fn edit(app: &tauri::AppHandle, located: &Located, plan: Plan) -> Result<Outcome, String> {
-    // Saved remote FLUX selection must never silently use the local sidecar.
-    if plan.choice == Choice::Exact(Engine::Flux)
-        && !crate::inference::config::read_inference_config(app)?.selected_target.is_local()
-    {
+    if plan.choice == Choice::Exact(Engine::Cloud) {
         return Ok(Outcome::Refused("decline.reason.rungUnavailable"));
     }
+
     let mut bench = Bench::open(app);
     let stored = crate::settings::read(app)
         .ok()
@@ -1676,7 +1704,7 @@ fn page_size(job: &Job, source_idx: usize) -> Option<(u32, u32)> {
 /// engines already take.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct PaintedStroke {
-    /// The path the pointer took, in page percent (0–100 on both axes).
+    /// The path the pointer took, in page percent (0 to 100 on both axes).
     points: Vec<StrokePoint>,
     /// Half the brush's `size` parameter, in **page pixels**.
     radius: f64,
@@ -1721,7 +1749,7 @@ fn stroke_mask(stroke: &PaintedStroke, width: u32, height: u32) -> Option<Mask> 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 struct PaintedShape {
     kind: ShapeKind,
-    /// The outline, in page percent (0–100 on both axes). Closed here: the
+    /// The outline, in page percent (0 to 100 on both axes). Closed here: the
     /// last vertex joins the first.
     points: Vec<StrokePoint>,
     /// How far the mask grows past the outline, in **page pixels**.
@@ -2237,6 +2265,15 @@ fn named_rung(engine: Option<&str>) -> Option<Engine> {
     run::parse_rung(engine?)
 }
 
+/// Whether a re-run with no grant would have to go to the cloud: the cloud
+/// named outright, or a cloud patch run again as what it was. Rendering either
+/// on this machine is a swap the user never chose. A cloud patch re-run with a
+/// local engine named (`named`, even FLUX, the engine it recorded), or stepped
+/// or cycled to another one, is that choice, and runs here.
+fn rerun_needs_cloud(target: Engine, current: Engine, is_cloud_provenance: bool, named: bool) -> bool {
+    target == Engine::Cloud || (is_cloud_provenance && target == current && !named)
+}
+
 /* ------------------------------------------------------------------ */
 /* Answering                                                           */
 /* ------------------------------------------------------------------ */
@@ -2264,6 +2301,110 @@ fn explicit_remote_or_invalid_target(params: &serde_json::Value) -> bool {
         })
 }
 
+/// The grant a cloud request carries, if it carries one.
+fn grant_nonce_in(params: &serde_json::Value) -> Option<String> {
+    params
+        .get("grantNonce")
+        .or_else(|| params.get("grant_nonce"))
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+}
+
+/// Refuse a cloud request because the permission switch is off.
+fn cloud_blocked() {
+    crate::events::notice("notice.cloud.blocked", serde_json::json!({}), "warn");
+}
+
+/// Where a cloud render left its region.
+enum CloudRender {
+    /// Committed: the region as the manifest now holds it, and its page's
+    /// status. Boxed: a region is large, and `Stopped` is two words.
+    Committed(Box<ApiRegion>, String),
+    /// Not committed: `failed`, `cancelled` or `unknown`, and the code the
+    /// render's last `cloud://attempt` event carried as well.
+    Stopped(&'static str, &'static str),
+}
+
+/// Render one stored region in the cloud with the grant `params` carries.
+///
+/// The caller has checked the permission switch and found the region; the
+/// grant, the target and the region's bytes are checked again below this, by
+/// the service, against what consent bound. Every way this ends reaches the
+/// interface as a `cloud://attempt` event, including the refusals that come
+/// before the service is asked, so a render the interface is waiting on never
+/// goes quiet.
+fn render_in_cloud(
+    app: &tauri::AppHandle,
+    located: &Located,
+    region_id: &str,
+    params: &serde_json::Value,
+    grant_nonce: &str,
+) -> CloudRender {
+    let refuse_with = |code: &'static str| {
+        let sink = crate::inference::commands::cloud_attempt_sink(app);
+        sink(&CloudAttemptProgress {
+            attempt_id: attempt_id_for_nonce(grant_nonce),
+            region_id: region_id.to_owned(),
+            chapter_id: located.chapter_id.clone(),
+            page_index: located.page_index as u32,
+            phase: RenderPhase::Failed,
+            elapsed_ms: 0,
+            error_code: Some(code),
+        });
+        CloudRender::Stopped("failed", code)
+    };
+
+    let field = |key: &str| params.get(key).cloned();
+    let (Some(target), Some(recipe), Some(intent)) = (
+        field("executionTarget").and_then(|v| serde_json::from_value::<ExecutionTarget>(v).ok()),
+        field("recipe").and_then(|v| serde_json::from_value::<RenderRecipe>(v).ok()),
+        field("intent").and_then(|v| serde_json::from_value::<OperationIntent>(v).ok()),
+    ) else {
+        return refuse_with("invalid_request");
+    };
+    let Ok(config) = crate::inference::config::read_inference_config(app) else {
+        return refuse_with("config_unreadable");
+    };
+    // The grant was minted for the target selected then. One that has moved
+    // since is a different destination, and consent is asked for again.
+    if target.is_local() || target != config.selected_target {
+        return refuse_with("target_changed");
+    }
+    let Ok(service) = crate::inference::commands::app_inference_service(app) else {
+        return refuse_with("journal_error");
+    };
+
+    match service.execute_cloud_render(
+        grant_nonce,
+        &located.job_path,
+        located.page_index as u32,
+        region_id,
+        &target,
+        &recipe,
+        &intent,
+        &config,
+        crate::inference::cloud_allowed(app),
+        &PollOptions::interactive(),
+    ) {
+        Ok(region) => {
+            let page_status = current_region(located, region_id)
+                .ok()
+                .flatten()
+                .map(|(_, page_status)| page_status)
+                .unwrap_or_else(|| "reviewed".to_owned());
+            CloudRender::Committed(Box::new(region), page_status)
+        }
+        Err(err) => CloudRender::Stopped(
+            match err.phase() {
+                RenderPhase::Cancelled => "cancelled",
+                RenderPhase::Unknown => "unknown",
+                _ => "failed",
+            },
+            err.code(),
+        ),
+    }
+}
+
 /// `applyTool`.
 #[tauri::command]
 pub async fn apply_tool(
@@ -2281,18 +2422,41 @@ pub async fn apply_tool(
         };
 
         let has_cloud_target = explicit_remote_or_invalid_target(&params);
+        let grant_nonce = grant_nonce_in(&params);
 
+        if (has_cloud_target || grant_nonce.is_some()) && !crate::inference::cloud_allowed(&app) {
+            cloud_blocked();
+            return Ok(ApplyResult {
+                error_code: Some("cloud_disabled"),
+                ..ApplyResult::of("blocked")
+            });
+        }
+
+        if let Some(grant_nonce) = grant_nonce {
+            let Some(region_id) = region_id else { return Ok(ApplyResult::of("not-found")) };
+            let library = Library::for_app(&app)?;
+            let Some(located) = locate_region(&library, &region_id)? else {
+                return Ok(ApplyResult::of("not-found"));
+            };
+            return Ok(match render_in_cloud(&app, &located, &region_id, &params, &grant_nonce) {
+                CloudRender::Committed(region, page_status) => ApplyResult {
+                    mask: region.mask.clone(),
+                    region: Some(*region),
+                    page_status: Some(page_status),
+                    ..ApplyResult::of("applied")
+                },
+                CloudRender::Stopped(status, code) => ApplyResult {
+                    error_code: Some(code),
+                    ..ApplyResult::of(status)
+                },
+            });
+        }
+
+        // A cloud engine with no grant: nothing is sent until the user has
+        // seen what will be and said yes, which is the interface's consent
+        // step, and this is the answer that asks for it.
         if has_cloud_target {
-            let blocked = crate::settings::read(&app)
-                .ok()
-                .and_then(|s| s.get("cloudEngines").and_then(|v| v.as_str()).map(str::to_owned))
-                .is_some_and(|value| value != "allowed");
-            crate::events::notice(
-                if blocked { "notice.cloud.blocked" } else { "notice.cloud.unavailable" },
-                serde_json::json!({}),
-                "warn",
-            );
-            return Ok(ApplyResult::of("blocked"));
+            return Ok(ApplyResult::of("needs-confirmation"));
         }
 
         // Auto clean is a run trigger and not a per-region tool: it answers
@@ -2321,10 +2485,6 @@ pub async fn apply_tool(
                 ..ApplyResult::of("run-started")
             });
         }
-
-        // The cloud rung has no client in this build. Refused here rather than
-        // one layer down, so the sentence the user reads is the true one:
-        // nothing was sent.
 
         let Some(region_id) = region_id else { return Ok(ApplyResult::of("not-found")) };
         let library = Library::for_app(&app)?;
@@ -2474,6 +2634,13 @@ fn untouched_fallback_pick(reason: Option<&str>) -> EnginePick {
 }
 
 /// `createRegion` - a region drawn where the detector found nothing.
+///
+/// **Always rendered locally.** Consent binds a cloud grant to a stored
+/// region's crop and mask, and this region is not stored until this command
+/// writes it. So a cloud engine here is refused only when cloud is off
+/// (`notice.cloud.blocked`); otherwise the region is created with the local
+/// default for its fill mode, exactly as if no engine had been named, and the
+/// interface asks for consent and calls `applyTool` on the new region.
 #[tauri::command]
 pub async fn create_region(
     app: tauri::AppHandle,
@@ -2487,18 +2654,9 @@ pub async fn create_region(
         let params = params.unwrap_or(serde_json::Value::Null);
         let string = |key: &str| params.get(key).and_then(|v| v.as_str()).map(str::to_owned);
 
-        let has_cloud_target = explicit_remote_or_invalid_target(&params);
-
-        if has_cloud_target {
-            let blocked = crate::settings::read(&app)
-                .ok()
-                .and_then(|s| s.get("cloudEngines").and_then(|v| v.as_str()).map(str::to_owned))
-                .is_some_and(|value| value != "allowed");
-            crate::events::notice(
-                if blocked { "notice.cloud.blocked" } else { "notice.cloud.unavailable" },
-                serde_json::json!({}),
-                "warn",
-            );
+        let wants_cloud = explicit_remote_or_invalid_target(&params);
+        if wants_cloud && !crate::inference::cloud_allowed(&app) {
+            cloud_blocked();
             return Ok(None);
         }
 
@@ -2540,7 +2698,9 @@ pub async fn create_region(
         };
 
         let fill_mode = string("fillMode").unwrap_or_else(|| "match-surround".to_owned());
-        let choice = match named_rung(string("engine").as_deref()) {
+        // A cloud engine names no local rung: the local default it is.
+        let engine = string("engine").filter(|_| !wants_cloud);
+        let choice = match named_rung(engine.as_deref()) {
             Some(engine) => Choice::Exact(engine),
             None => Choice::Ladder(Some(match engine_for_fill_mode(&fill_mode) {
                 Engine::Fill => EnginePick::Fill,
@@ -2595,17 +2755,39 @@ fn mint_hand_id(job: &Job, page_id: &str) -> String {
 }
 
 /// `rerunMask`.
+///
+/// `params` carries a cloud grant and nothing else: with one, the region is
+/// rendered in the cloud (see the module docs) and a render that does not
+/// commit answers `null`, its code on the `cloud://attempt` event.
 #[tauri::command]
 pub async fn rerun_mask(
     app: tauri::AppHandle,
     mask_id: String,
     kind: String,
     engine: Option<String>,
+    params: Option<serde_json::Value>,
 ) -> Result<Option<RerunResult>, String> {
     crate::library::blocking(move || {
+        let params = params.unwrap_or(serde_json::Value::Null);
         let region_id = crate::library::region_of_mask(&mask_id).to_owned();
         let library = Library::for_app(&app)?;
         let Some(located) = locate_region(&library, &region_id)? else { return Ok(None) };
+
+        if let Some(grant_nonce) = grant_nonce_in(&params) {
+            if !crate::inference::cloud_allowed(&app) {
+                cloud_blocked();
+                return Ok(None);
+            }
+            return Ok(match render_in_cloud(&app, &located, &region_id, &params, &grant_nonce) {
+                CloudRender::Committed(region, page_status) => Some(RerunResult {
+                    mask: region.mask.clone(),
+                    region: *region,
+                    reopen_tool: None,
+                    page_status,
+                }),
+                CloudRender::Stopped(..) => None,
+            });
+        }
 
         // What the mask currently is. A re-run of a region with no patch is a
         // re-run of nothing - the same `null` the seam gives for an id it
@@ -2671,17 +2853,14 @@ pub async fn rerun_mask(
             _ => (current, if current_fill == "solid" { Some("solid") } else { None }),
         };
 
-        // Remote-provenance rerun must NOT silently rerun local.
-        if target == Engine::Cloud || (is_cloud_provenance && kind != "engine") {
-            let blocked = crate::settings::read(&app)
-                .ok()
-                .and_then(|s| s.get("cloudEngines").and_then(|v| v.as_str()).map(str::to_owned))
-                .is_some_and(|value| value != "allowed");
-            crate::events::notice(
-                if blocked { "notice.cloud.blocked" } else { "notice.cloud.unavailable" },
-                serde_json::json!({}),
-                "warn",
-            );
+        // Remote-provenance rerun must NOT silently rerun local. A grant took
+        // it to the cloud above; without one it goes nowhere.
+        if rerun_needs_cloud(target, current, is_cloud_provenance, kind == "engine") {
+            if crate::inference::cloud_allowed(&app) {
+                refuse("decline.reason.rungUnavailable");
+            } else {
+                cloud_blocked();
+            }
             return Ok(None);
         }
 
@@ -2826,31 +3005,43 @@ fn current_region(
 /// else: the ladder escalates past it exactly as a run's would, and it is
 /// capped at [`crate::run::HIGHEST_AUTOMATIC`] unless the caller names rung 3a
 /// outright.
+///
+/// `params` carries a cloud grant, as for `rerunMask`. Consent binds a grant
+/// to a stored region, so the cloud can render a region only once it has a
+/// patch: a region the gate held back is cleaned here locally first, and
+/// rendered in the cloud by the edit after that.
 #[tauri::command]
 pub async fn clean_anyway(
     app: tauri::AppHandle,
     region_id: String,
     engine: Option<String>,
+    params: Option<serde_json::Value>,
 ) -> Result<Option<CleanedRegion>, String> {
     crate::library::blocking(move || {
+        let params = params.unwrap_or(serde_json::Value::Null);
+        let grant_nonce = grant_nonce_in(&params);
         let has_cloud_target = engine.as_deref() == Some("cloud")
-            || named_rung(engine.as_deref()) == Some(Engine::Cloud);
+            || named_rung(engine.as_deref()) == Some(Engine::Cloud)
+            || grant_nonce.is_some();
 
-        if has_cloud_target {
-            let blocked = crate::settings::read(&app)
-                .ok()
-                .and_then(|s| s.get("cloudEngines").and_then(|v| v.as_str()).map(str::to_owned))
-                .is_some_and(|value| value != "allowed");
-            crate::events::notice(
-                if blocked { "notice.cloud.blocked" } else { "notice.cloud.unavailable" },
-                serde_json::json!({}),
-                "warn",
-            );
+        if has_cloud_target && !crate::inference::cloud_allowed(&app) {
+            cloud_blocked();
             return Ok(None);
         }
 
         let library = Library::for_app(&app)?;
         let Some(located) = locate_region(&library, &region_id)? else { return Ok(None) };
+
+        if let Some(grant_nonce) = grant_nonce {
+            return Ok(match render_in_cloud(&app, &located, &region_id, &params, &grant_nonce) {
+                CloudRender::Committed(region, page_status) => Some(CleanedRegion {
+                    mask: region.mask.clone(),
+                    region: *region,
+                    page_status,
+                }),
+                CloudRender::Stopped(..) => None,
+            });
+        }
 
         let geometry = existing_geometry(&located, &region_id)?;
         let reason = untouched_reason(&located, &region_id)?;
@@ -4121,10 +4312,29 @@ mod tests {
     }
 
     #[test]
+    fn a_cloud_patch_goes_local_only_when_a_local_engine_is_chosen() {
+        // Run again as itself, by Try again or a step that lands on the same
+        // rung: FLUX recorded with cloud provenance, or the legacy engine.
+        assert!(rerun_needs_cloud(Engine::Flux, Engine::Flux, true, false));
+        assert!(rerun_needs_cloud(Engine::Cloud, Engine::Cloud, true, false));
+        // The cloud named outright, whatever ran before.
+        assert!(rerun_needs_cloud(Engine::Cloud, Engine::Lama, false, true));
+        assert!(rerun_needs_cloud(Engine::Cloud, Engine::Flux, true, true));
+        // A local engine chosen for a cloud patch, FLUX included.
+        assert!(!rerun_needs_cloud(Engine::Lama, Engine::Flux, true, true));
+        assert!(!rerun_needs_cloud(Engine::Flux, Engine::Flux, true, true));
+        // Stepped down to another rung.
+        assert!(!rerun_needs_cloud(Engine::Lama, Engine::Flux, true, false));
+        // Local FLUX re-run as itself stays local.
+        assert!(!rerun_needs_cloud(Engine::Flux, Engine::Flux, false, false));
+    }
+
+    #[test]
     fn step_on_cloud_engine_returns_cloud_engine() {
         assert_eq!(step(Engine::Cloud, true), Engine::Cloud);
         assert_eq!(step(Engine::Cloud, false), Engine::Cloud);
     }
+
     #[test]
     fn explicit_remote_and_malformed_targets_fail_closed() {
         for value in [serde_json::json!({"type":"beam","profile_id":"p"}), serde_json::json!(null), serde_json::json!({"type":"local","extra":true})] {
@@ -4134,4 +4344,24 @@ mod tests {
         assert!(!explicit_remote_or_invalid_target(&serde_json::json!({"engine":"lama"})));
     }
 
+    #[test]
+    fn automatic_runs_never_reach_cloud_engine() {
+        assert!(!run::reachable_automatically(Engine::Cloud));
+        assert!(!run::reachable_automatically(Engine::Flux));
+        assert_eq!(run::HIGHEST_AUTOMATIC, Engine::Lama);
+        assert_eq!(run::effective_ceiling(None, Some(Engine::Cloud.rung_key())), run::HIGHEST_LOCAL);
+    }
+
+    #[test]
+    fn is_remote_target_detects_beam_and_modal() {
+        let beam_params = serde_json::json!({"executionTarget": {"type": "beam", "profile_id": "test-beam"}});
+        let modal_params = serde_json::json!({"executionTarget": {"type": "modal", "profile_id": "test-modal"}});
+        let local_params = serde_json::json!({"executionTarget": {"type": "local"}});
+        let empty_params = serde_json::json!({});
+
+        assert!(explicit_remote_or_invalid_target(&beam_params));
+        assert!(explicit_remote_or_invalid_target(&modal_params));
+        assert!(!explicit_remote_or_invalid_target(&local_params));
+        assert!(!explicit_remote_or_invalid_target(&empty_params));
+    }
 }

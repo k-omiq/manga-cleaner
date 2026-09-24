@@ -34,3 +34,20 @@ pub use secrets::{
     SecretSummary, SecretValue, StorageBackendKind, KEYRING_SERVICE,
 };
 pub use service::{InferenceService, InferenceServiceError, PollOptions};
+
+/// The user's cloud permission switch: `cloudEngines` in the settings file.
+///
+/// Anything but an explicit `"allowed"` is off, including a key that was never
+/// written and a settings file that cannot be read, so paid work fails closed.
+/// Every command that can spend reads the switch through this one function.
+pub fn cloud_allowed(app: &tauri::AppHandle) -> bool {
+    crate::settings::read(app)
+        .ok()
+        .and_then(|settings| {
+            settings
+                .get("cloudEngines")
+                .and_then(|value| value.as_str())
+                .map(|value| value == "allowed")
+        })
+        .unwrap_or(false)
+}

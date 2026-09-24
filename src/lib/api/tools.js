@@ -1,5 +1,5 @@
 /**
- * What each tool, re-run and cloud request does to a region.
+ * What each tool and re-run does to a region, in the browser mock.
  *
  * Every function here mutates the region in place and returns the notices the
  * adapter should put on the event channel. Notices are i18n keys plus
@@ -7,23 +7,22 @@
  *
  * A mask made by hand and a mask made by the automatic pass are identical in
  * kind, so all of these produce the same `Mask` shape.
+ *
+ * Nothing here renders in the cloud. A cloud render needs a grant, and the
+ * mock runs it where the grant is checked (`mock.js#renderWithGrant`), the way
+ * `region.rs` hands one to the inference service; a request that names the
+ * cloud without a grant never reaches this module.
  */
 
 import { RUNGS, simpler, stronger } from '../model/ladder.js'
-import { fillModeLabel, nextFillMode, ROW_ENGINES } from '../model/masks.js'
-import {
-  capRung,
-  CLOUD_REJECTION_CAUSES,
-  commitMask,
-  ENGINE_INFO,
-} from './provenance.js'
-import { hashString } from './rng.js'
+import { CLOUD_ENGINE, fillModeLabel, isCloudMask, nextFillMode, ROW_ENGINES } from '../model/masks.js'
+import { capRung, commitMask, ENGINE_INFO } from './provenance.js'
 
 /** @typedef {{ key: string, params: Object, tone: 'info'|'warn' }} NoticeSpec */
 
 /**
  * A `CommitContext` (provenance.js) whose timestamps come from the mock's
- * injected clock, plus the settings that gate the cloud rung. Sharing the
+ * injected clock, plus the settings that cap a run's engine. Sharing the
  * shape with `pagebuilder.js`'s `BuildContext` is what lets both commit a
  * mask through one function.
  *
@@ -43,21 +42,6 @@ export const TOOLS = Object.freeze({
   },
   cloneHeal: { labelKey: 'tools.name.cloneHeal', engine: 'clone', fillMode: 'match-surround' },
 })
-
-/**
- * Whether a cloud request for this region comes back accepted or rejected,
- * and by which of the five causes. Deterministic in
- * the region id, so a region's cloud behaviour is stable across launches and
- * a re-run is a re-run rather than a dice roll.
- *
- * @param {string} regionId
- * @returns {import('../model/types.js').CloudOutcome}
- */
-export function cloudOutcomeFor(regionId) {
-  const hash = hashString(`cloud:${regionId}`)
-  if (hash % 4 !== 3) return { accepted: true, rejectionCause: null }
-  return { accepted: false, rejectionCause: CLOUD_REJECTION_CAUSES[(hash >>> 3) % 5] }
-}
 
 /**
  * Whether an automatic run may pick this region up. A region the detector
@@ -121,24 +105,6 @@ export function cleanRegionAutomatically(region, page, ctx, options = {}) {
       : (options.outsideEngine ?? 'lama')
   const started = pick === 'redraw' ? 'lama' : RUNGS.includes(pick) ? pick : 'fill'
   const engine = capRung(started, ceiling)
-  if (engine === 'cloud') {
-    const outcome = cloudOutcomeFor(region.id)
-    return outcome.accepted
-      ? commitMask(region, ctx, {
-          engine: 'cloud',
-          cloudBilled: true,
-          cloudOutcome: outcome,
-          fillMode: 'reconstruct',
-        })
-      : // The fallback to rung 2 does not set `fittingReconstructed`: that is
-        // checked first in `review.js` and would hide the rejection cause,
-        // which is the more actionable thing to show.
-        commitMask(region, ctx, {
-          engine: 'lama',
-          cloudOutcome: outcome,
-          fillMode: 'reconstruct',
-        })
-  }
   return commitMask(region, ctx, {
     engine,
     fittingReconstructed: engine === 'lama',
@@ -283,60 +249,6 @@ export function createHandRegion(page, ctx, options) {
 }
 
 /**
- * A cloud request for one region, after the user has confirmed the spend.
- * Rejected requests fall back to rung 2 and are not billed.
- *
- * @param {import('../model/types.js').Region} region
- * @param {import('../model/types.js').Page} page
- * @param {ToolContext} ctx
- * @returns {{ mask: import('../model/types.js').Mask, outcome: import('../model/types.js').CloudOutcome, notices: NoticeSpec[] }}
- */
-export function applyCloudToRegion(region, page, ctx) {
-  const outcome = cloudOutcomeFor(region.id)
-  const notices = []
-  let mask
-  if (outcome.accepted) {
-    mask = commitMask(region, ctx, {
-      engine: 'cloud',
-      fillMode: 'reconstruct',
-      cloudBilled: true,
-      cloudOutcome: outcome,
-    })
-    notices.push({
-      key: 'notice.cloud.returned',
-      params: { seconds: Math.round(mask.elapsedMs / 100) / 10, cost: mask.provenance.cloud.cost },
-      tone: 'info',
-    })
-  } else {
-    mask = commitMask(region, ctx, {
-      engine: 'lama',
-      fillMode: 'reconstruct',
-      cloudOutcome: outcome,
-    })
-    notices.push({
-      key: 'notice.cloud.rejected',
-      params: { causeKey: `review.reason.cloudRejected${causeSuffix(outcome.rejectionCause)}` },
-      tone: 'warn',
-    })
-  }
-  region.source = 'hand'
-  region.tool = 'contentAwareFill'
-  if (page.status === 'unclean') page.status = 'cleaned'
-  return { mask, outcome, notices }
-}
-
-/**
- * @param {string} cause
- * @returns {string} the cause in PascalCase, matching `review.js`'s key names
- */
-function causeSuffix(cause) {
-  return cause
-    .split('-')
-    .map((part) => part[0].toUpperCase() + part.slice(1))
-    .join('')
-}
-
-/**
  * Deletes a region's mask, restoring the original text under it.
  *
  * The mask only. Taking the region off the page is the caller's half - see
@@ -362,9 +274,11 @@ export function deleteRegionMask(region) {
  * `'retry'` and `'engine'` are what the Layers panel's row controls send -
  * "run this again" and "run this with that engine". They join the ladder pair
  * at the tail below rather than getting a branch of their own, because the only
- * thing that separates the four is how the target rung is chosen; everything
- * after that - the cloud gate, the rejection fallback, the commit - has to be
- * identical or a row control would produce a mask an escalation could not.
+ * thing that separates the four is how the target rung is chosen; the commit
+ * after that has to be identical or a row control would produce a mask an
+ * escalation could not. Every target is local: a re-run that would need the
+ * cloud (`rerunNeedsCloud`) is answered by `mock.js#rerunMask` before it gets
+ * here.
  *
  * @param {import('../model/types.js').Region} region
  * @param {ToolContext} ctx
@@ -400,8 +314,6 @@ export function rerunRegionMask(region, ctx, options) {
       engine,
       fillMode: next,
       fittingReconstructed: current.fittingReconstructed,
-      cloudOutcome: current.cloudOutcome,
-      cloudBilled: !!current.provenance.cloud,
     })
     return {
       mask,
@@ -416,20 +328,10 @@ export function rerunRegionMask(region, ctx, options) {
   // rather than to a guess: the request was "run it with that", and if the app
   // does not have "that", running it again unchanged is the honest answer.
   const target = TARGET_RUNG[options.kind](engine, options.engine)
-  if (target === 'cloud' && ctx.settings.cloudEngines !== 'allowed') {
-    return {
-      mask: current,
-      reopenTool: null,
-      notices: [{ key: 'notice.cloud.blocked', params: {}, tone: 'warn' }],
-    }
-  }
-  const cloudOutcome = target === 'cloud' ? cloudOutcomeFor(region.id) : null
   const mask = commitMask(region, ctx, {
-    engine: target === 'cloud' && !cloudOutcome.accepted ? 'lama' : target,
+    engine: target,
     fillMode: ENGINE_INFO[target].fillMode,
     fittingReconstructed: target === 'lama',
-    cloudOutcome,
-    cloudBilled: target === 'cloud' && cloudOutcome.accepted,
   })
   return {
     mask,
@@ -457,6 +359,33 @@ const TARGET_RUNG = Object.freeze({
       ? /** @type {string} */ (wanted)
       : current,
 })
+
+/**
+ * Whether a re-run with no grant would have to go to the cloud, as
+ * `region.rs#rerun_needs_cloud` decides it: the cloud named outright, or a
+ * patch the cloud rendered run again as what it was - Try again, or a step
+ * that lands on the rung it already used. A cloud patch re-run with a local
+ * engine named, stepped or cycled to runs on this machine, and naming FLUX,
+ * the rung a cloud patch records, is naming the local helper.
+ *
+ * `cycleFill` moves to the rung the next fill mode implies
+ * (`region.rs#engine_for_fill_mode`), LaMa or planar fill, never the FLUX or
+ * cloud rung a cloud patch records; `reopenInTool` runs nothing.
+ *
+ * @param {import('../model/types.js').Mask|null|undefined} mask
+ * @param {string} kind
+ * @param {string} [engine] - the rung `kind: 'engine'` names
+ * @returns {boolean}
+ */
+export function rerunNeedsCloud(mask, kind, engine) {
+  if (!mask?.provenance || kind === 'reopenInTool' || kind === 'cycleFill') return false
+  const current = mask.provenance.engine
+  const target =
+    kind === 'engine' && engine === CLOUD_ENGINE
+      ? CLOUD_ENGINE
+      : (TARGET_RUNG[/** @type {keyof typeof TARGET_RUNG} */ (kind)] ?? TARGET_RUNG.retry)(current, engine)
+  return target === CLOUD_ENGINE || (isCloudMask(mask) && target === current && kind !== 'engine')
+}
 
 /** What each of them says when it lands. */
 const RERUN_NOTICE = Object.freeze({
