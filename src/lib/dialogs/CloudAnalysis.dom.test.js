@@ -101,7 +101,7 @@ it('shows exactly what would be sent and sends nothing until both statements are
   expect(text).toContain('1 page as 2 tiles: 3,840,000 pixels, 2,621,440 bytes encoded (2.5 MB).')
   expect(text).toContain('The surrounding art is included, not only the lettering.')
   expect(text).toContain('Studio A100, your endpoint on Modal')
-  expect(text).toContain(`SAM text mask, revision ${'c'.repeat(12)}…`)
+  expect(text).toContain(`☁ SAM-TS-L, revision ${'c'.repeat(12)}…`)
   expect(text).toContain(`Graph SHA-256 ${'a'.repeat(12)}…, ${'b'.repeat(12)}…`)
   expect(text).toContain('a'.repeat(64))
   expect(text).toContain('Estimated cost unknown')
@@ -251,7 +251,7 @@ it('names a model the endpoint does not offer and sends nothing', async () => {
   expect(screen.getByText('This cloud GPU does not offer the selected analysis model. Nothing was sent.')).toBeTruthy()
   expect(api.proposeRemoteAnalysis).not.toHaveBeenCalled()
   expect(api.confirmRemoteAnalysis).not.toHaveBeenCalled()
-  expect(screen.getByRole('option', { name: 'SAM text mask, not offered' })).toBeTruthy()
+  expect(screen.getByRole('option', { name: '☁ SAM-TS-L, not offered' })).toBeTruthy()
 
   // The offered model still proposes.
   await fireEvent.change(screen.getByLabelText('Cloud model'), { target: { value: RT } })

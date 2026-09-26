@@ -115,6 +115,13 @@
     setOcrRescue,
     setTheme,
   } from '../state/session.svelte.js'
+  const ACCEL_STATE_KEYS = {
+    verified: 'settings.accel.state.verified',
+    available: 'settings.accel.state.available',
+    installed: 'settings.accel.state.installed',
+    supported: 'settings.accel.state.supported',
+    unsupported: 'settings.accel.state.unsupported',
+  }
   import {
     ALL_TEXT_POLICY,
     CAPABILITIES,
@@ -2833,7 +2840,7 @@
                     <span class="row-meta">{row.backendStatus.map((status) => {
                       const name = accelerators.providers.find((provider) => provider.id === status.id)?.labelKey
                       const level = status.verified ? 'verified' : status.available ? 'available' : status.installed ? 'installed' : status.supported ? 'supported' : 'unsupported'
-                      return `${name ? t(name) : status.id}: ${t(`settings.accel.state.${level}`)}`
+                      return `${name ? t(name) : status.id}: ${t(ACCEL_STATE_KEYS[level])}`
                     }).join(' · ')}</span>
                   {/if}
                 </div>
