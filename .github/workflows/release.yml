@@ -257,10 +257,14 @@ jobs:
           if (-not $sevenZip) { $sevenZip = Join-Path $env:ProgramFiles '7-Zip/7z.exe' }
           if (-not (Test-Path $sevenZip)) { throw '7-Zip is required to inspect the NSIS installer' }
           $listing = & $sevenZip l -slt $installer.FullName
-          if ($LASTEXITCODE -ne 0 -or -not ($listing | Select-String -Quiet 'Path = .*manga-cleaner-provisioner\.exe$') -or -not ($listing | Select-String -Quiet 'Path = .*manga-cleaner-uv\.exe$')) {
-            throw 'The Windows installer does not contain both setup helpers'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the NSIS installer' }
+          foreach ($name in @('manga-cleaner-provisioner.exe', 'manga-cleaner-uv.exe', 'msvcp140.dll', 'msvcp140_1.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'bootstrap.py', 'export_mask.py', 'environment.txt')) {
+            if (-not ($listing | Select-String -SimpleMatch -Quiet $name)) {
+              throw "The Windows installer is missing $name"
+            }
           }
-      - name: Verify cloud helper inside Linux package
+          if (-not (Test-Path "$($installer.FullName).sig")) { throw 'NSIS updater signature is missing' }
+      - name: Verify Linux packages and bundled setup helpers
         if: startsWith(matrix.platform, 'linux-')
         shell: bash
         run: |
@@ -270,9 +274,27 @@ jobs:
           "$HELPER" --self-check | python3 -c 'import json,sys; assert json.load(sys.stdin)["ok"] is True'
           DEB=$(find "target/${{ matrix.target }}/release/bundle/deb" -maxdepth 1 -name '*.deb' -print -quit)
           test -n "$DEB"
-          DEB_CONTENTS=$(dpkg-deb --contents "$DEB")
-          grep -q '/manga-cleaner-provisioner$' <<< "$DEB_CONTENTS"
-          grep -q '/manga-cleaner-uv$' <<< "$DEB_CONTENTS"
+          APPIMAGE=$(find "target/${{ matrix.target }}/release/bundle/appimage" -maxdepth 1 -name '*.AppImage' -print -quit)
+          test -n "$APPIMAGE"
+          test -s "$APPIMAGE.sig"
+          APPIMAGE=$(realpath "$APPIMAGE")
+          VERIFY_DIR=$(mktemp -d)
+          trap 'rm -rf "$VERIFY_DIR"' EXIT
+          dpkg-deb -x "$DEB" "$VERIFY_DIR/deb"
+          (cd "$VERIFY_DIR" && "$APPIMAGE" --appimage-extract >/dev/null)
+          for package in "$VERIFY_DIR/deb" "$VERIFY_DIR/squashfs-root"; do
+            for helper in manga-cleaner-provisioner manga-cleaner-uv; do
+              test -n "$(find "$package" -type f -name "$helper" -perm /111 -print -quit)" || {
+                echo "$package: $helper missing or not executable" >&2; exit 1;
+              }
+            done
+            for resource in 'sidecar/bootstrap.py' 'sidecar/pyproject.toml' 'sam-bootstrap/bootstrap.py' 'sam-bootstrap/export_mask.py' 'sam-bootstrap/environment.txt'; do
+              test -n "$(find "$package" -type f -path "*/$resource" -print -quit)" || {
+                echo "$package: $resource missing" >&2; exit 1;
+              }
+            done
+          done
+          dpkg-deb --field "$DEB" Depends
       - name: Collect updater artifacts
         shell: bash
         # Renamed to MangaCleaner_<version>_<platform>.<ext>: the platform tag keeps

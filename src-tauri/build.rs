@@ -10,12 +10,19 @@ fn main() {
         .expect("parse Tauri config");
         let bundled = config["bundle"]["externalBin"]
             .as_array()
-            .is_some_and(|bins| bins.iter().any(|bin| bin == "binaries/manga-cleaner-provisioner"));
+            .is_some_and(|bins| {
+                bins.iter()
+                    .any(|bin| bin == "binaries/manga-cleaner-provisioner")
+            });
         assert!(
             bundled,
             "release build is missing bundle.externalBin for the cloud helper; run .github/scripts/build-cloud-provisioner.py first"
         );
-        let suffix = if target.contains("windows") { ".exe" } else { "" };
+        let suffix = if target.contains("windows") {
+            ".exe"
+        } else {
+            ""
+        };
         let helper = manifest
             .join("binaries")
             .join(format!("manga-cleaner-provisioner-{target}{suffix}"));
@@ -24,7 +31,23 @@ fn main() {
             "release build is missing {}. Freeze the cloud helper for this target first",
             helper.display()
         );
+        let uv_configured = config["bundle"]["externalBin"]
+            .as_array()
+            .is_some_and(|bins| bins.iter().any(|bin| bin == "binaries/manga-cleaner-uv"));
+        assert!(
+            uv_configured,
+            "release build is missing bundle.externalBin for managed Python; run .github/scripts/stage-flux-python.py first"
+        );
+        let uv = manifest
+            .join("binaries")
+            .join(format!("manga-cleaner-uv-{target}{suffix}"));
+        assert!(
+            uv.is_file(),
+            "release build is missing {}. Stage uv for this target first",
+            uv.display()
+        );
         println!("cargo:rerun-if-changed={}", helper.display());
+        println!("cargo:rerun-if-changed={}", uv.display());
         println!("cargo:rerun-if-changed=tauri.conf.json");
     }
     // `crate::provision` looks for the development sidecar under the name the
@@ -33,8 +56,8 @@ fn main() {
         "cargo:rustc-env=MC_TARGET_TRIPLE={}",
         std::env::var("TARGET").expect("cargo sets TARGET for build scripts")
     );
-    let attributes = tauri_build::Attributes::new().app_manifest(
-        tauri_build::AppManifest::new().commands(&[
+    let attributes =
+        tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands(&[
             "diagnostics",
             "about",
             "read_settings",
@@ -98,7 +121,6 @@ fn main() {
             "run_clean",
             "cancel_run",
             "resume_job",
-        ]),
-    );
+        ]));
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
 }
