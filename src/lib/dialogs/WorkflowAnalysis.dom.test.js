@@ -127,8 +127,8 @@ it('uses the selected RT model matrix to disable an incompatible explicit backen
         available: true, selectable: true, note: 'Candidate provider' }],
     }),
     listAccelerators: async () => ({ models: [
-      { id: 'rtFull', backendStatus: [{ id: 'ort-webgpu', supported: false, available: false }] },
-      { id: 'rtSmall', backendStatus: [{ id: 'ort-webgpu', supported: true, available: true }] },
+      { id: 'rtFull', backendStatus: [{ id: 'webgpu', supported: false, available: false }] },
+      { id: 'rtSmall', backendStatus: [{ id: 'webgpu', supported: true, available: true }] },
     ] }),
   }))
   const screen = render(WorkflowAnalysis)

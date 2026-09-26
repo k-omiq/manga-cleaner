@@ -818,7 +818,8 @@
 
   function rtBackendSelectable(id) {
     const modelId = rtProfile === 'small-whole' ? 'rtSmall' : 'rtFull'
-    const status = modelBackendRows?.find((row) => row.id === modelId)?.backendStatus?.find((entry) => entry.id === id)
+    const providerId = id.startsWith('ort-') ? id.slice(4) : id
+    const status = modelBackendRows?.find((row) => row.id === modelId)?.backendStatus?.find((entry) => entry.id === providerId)
     if (status) return status.supported && status.available
     // Older native builds may lack the per-model matrix. Neither shipped RT
     // graph has a strict WebGPU session, so do not invite that selection.
