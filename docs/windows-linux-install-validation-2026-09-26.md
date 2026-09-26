@@ -4,7 +4,7 @@
 
 The development host was a Mac17,3 MacBook Air with an Apple M5, 32 GiB RAM, macOS 27.0 (26A428), arm64, Rust 1.96.0, Node 26.3.0 and npm 11.16.0. Its graphics device reported Metal 4. Colima ran an Ubuntu 22.04.5 LTS `linux/amd64` container under QEMU emulation. The container reported `x86_64`/`amd64`, with neither `/dev/dri` nor `/dev/nvidia0`. No Windows machine, Windows VM, Linux desktop, or Linux GPU was available. The container was **not** an installed Linux desktop test.
 
-No current-branch NSIS, AppImage or Debian package was produced on this host. The Windows and Linux release workflow builds on native GitHub runners, but that workflow was not dispatched because its next job publishes a release. The new package checks below are therefore committed gates awaiting a build; they are not reported as passing runs.
+No current-branch NSIS, AppImage or Debian package was produced on this host. The Windows and Linux release workflow builds on native GitHub runners. A manual run can now set `validate_only` to build and inspect artifacts while skipping the publish job. That run was not dispatched from this local branch, so the new package checks are committed gates awaiting a build; they are not reported as passing runs.
 
 ## Confirmed defect and fixes
 
@@ -31,4 +31,4 @@ The local `scripts/release.sh` path used a nonexistent `npm run tauri build` com
 | Interrupted downloads, retry, offline errors, insufficient disk | Unverified on Windows/Linux: these need installation and controlled network/storage tests. |
 | Windows DirectML/CUDA and Linux CUDA/WebGPU inference | Unverified: no corresponding OS and GPU device; the Linux container exposed no GPU. |
 
-The release workflow's artifact checks should be run on a build-only job before using these packages as installation evidence. A physical Windows and Linux desktop pass remains necessary for clean-install, launch, model setup, GPU and update claims.
+The release workflow's `validate_only` path should be run before using these packages as installation evidence. A physical Windows and Linux desktop pass remains necessary for clean-install, launch, model setup, GPU and update claims.

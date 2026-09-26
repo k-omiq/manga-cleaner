@@ -7,7 +7,9 @@ name: Release
 # Installed apps poll that URL and offer the update in-app.
 #
 # Trigger: push a tag like v0.1.0 (tag message becomes the release notes),
-# or run manually with workflow_dispatch and type the notes. Prerelease tags
+# or run manually with workflow_dispatch and type the notes. Manual runs can
+# set validate_only to build and inspect artifacts without publishing them.
+# Prerelease tags
 # such as v1.0.0-beta.1 are ordinary tags here; scripts/ship.sh knows how to
 # order them.
 #
@@ -93,6 +95,11 @@ on:
         description: "Release notes shown in the in-app update dialog"
         required: false
         default: ""
+      validate_only:
+        description: "Build and inspect installers without publishing to R2"
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: release-${{ github.ref }}
@@ -349,6 +356,7 @@ jobs:
   publish:
     name: Publish to R2
     needs: build
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.validate_only != true }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
