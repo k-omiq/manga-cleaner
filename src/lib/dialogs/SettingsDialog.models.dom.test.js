@@ -658,4 +658,13 @@ describe('the two pipelines', () => {
     await waitFor(() => expect(writeSettings).toHaveBeenCalledTimes(1))
     expect(writeSettings).toHaveBeenCalledWith(expect.objectContaining({ sidecarPath: '/opt/flux' }))
   })
+
+  it('keeps MLX visible with its platform requirement and disables Metal setup on Windows', async () => {
+    const cleaning = await open(() => view({ runtime: { platform: 'windows-x64' } }))
+    const mlx = /** @type {HTMLButtonElement} */ (cleaning.getByRole('radio', { name: t('settings.fluxBackend.mfluxUnsupported') }))
+    expect(mlx.disabled).toBe(true)
+    expect(mlx.title).toBe(t('settings.fluxBackend.mfluxReason'))
+    const accelerator = /** @type {HTMLSelectElement} */ (cleaning.getByLabelText(t('settings.sidecar.accelerator')))
+    expect(accelerator.querySelector('option[value="mps"]')?.disabled).toBe(true)
+  })
 })

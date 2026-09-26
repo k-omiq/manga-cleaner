@@ -1657,7 +1657,7 @@
           if (['environment', 'dependencies', 'weights', 'ready'].includes(step)) fluxInstallStage = step
         })
       }
-      await getBackend().installFluxHelper({ backend: session.fluxBackend, accelerator: fluxAccelerator })
+      await getBackend().installFluxHelper({ backend: session.fluxBackend, accelerator: fluxUsesMlx ? 'auto' : fluxAccelerator })
       setFluxModel('flux2-klein-4b')
       await getBackend().writeSettings(backendSettingsPatch())
       await loadCapabilities()
@@ -1726,17 +1726,28 @@
    * runtime is better on a given machine is a question about that machine, the
    * core answers it per platform (`mflux` on Apple Silicon, `sdnq` elsewhere),
    * and hiding that behind a two-way switch would make every Mac user choose
-   * between two things they have no way to compare. The two named values are
-   * shown on **every** platform rather than filtered by `capabilities`: a
-   * control that silently drops the option a user is looking for reads as a
-   * missing feature, and an impossible choice is refused with a reason
-   * (`decline.reason.sidecarPlatform`) at the moment it is used.
+   * between two things they have no way to compare. MLX stays visible but
+   * disabled outside Apple Silicon, with its platform requirement on screen.
    */
-  const fluxBackends = [
+  const fluxPlatform = $derived(catalogue?.runtime?.platform ?? null)
+  const fluxUsesMlx = $derived(session.fluxBackend === 'mflux' || (session.fluxBackend === 'auto' && fluxPlatform === 'macos-arm64'))
+  const fluxBackends = $derived([
     { value: 'auto', label: t('settings.fluxBackend.auto') },
-    { value: 'mflux', label: t('settings.fluxBackend.mflux') },
+    {
+      value: 'mflux',
+      label: fluxPlatform === 'macos-arm64' ? t('settings.fluxBackend.mflux') : t('settings.fluxBackend.mfluxUnsupported'),
+      disabled: fluxPlatform !== 'macos-arm64',
+      title: t('settings.fluxBackend.mfluxReason'),
+    },
     { value: 'sdnq', label: t('settings.fluxBackend.sdnq') },
-  ]
+  ])
+  const fluxAcceleratorChoices = $derived([
+    { value: 'auto', label: t('settings.sidecar.acceleratorAuto') },
+    { value: 'cuda', label: 'NVIDIA CUDA', disabled: fluxPlatform?.startsWith('macos-') === true },
+    { value: 'xpu', label: 'Intel XPU', disabled: fluxPlatform?.startsWith('macos-') === true },
+    { value: 'mps', label: 'Apple Metal', disabled: fluxPlatform?.startsWith('macos-') !== true },
+  ])
+  const fluxAcceleratorAllowed = $derived(fluxUsesMlx || fluxAcceleratorChoices.some((entry) => entry.value === fluxAccelerator && !entry.disabled))
 
   /**
    * The catalogues that exist, not a wish list. One entry today; the row ships
@@ -2470,6 +2481,7 @@
         </fieldset>
 
         <p class="line">{t('settings.detection.selectedModels', { models: session.detectorModels.map((id) => pipelineModel(id)?.product).filter(Boolean).join(' + ') })}</p>
+        <p class="line">{t('settings.accel.cloudReview')}</p>
 
         <!-- Whether the selected workflow can run with what is here, from the
              same needs the downloads follow. -->
@@ -2598,25 +2610,24 @@
               />
             {/snippet}
         </Field>
+        {#if session.fluxBackend === 'mflux' && fluxPlatform !== 'macos-arm64'}
+          <p class="line">{t('settings.fluxBackend.mfluxReason')}</p>
+        {/if}
 
         <Field label={t('settings.sidecar.accelerator')} layout="row" controlId="settings-flux-accelerator">
           {#snippet children()}
             <Select
               id="settings-flux-accelerator"
-              options={[
-                { value: 'auto', label: t('settings.sidecar.acceleratorAuto') },
-                { value: 'cuda', label: 'NVIDIA CUDA' },
-                { value: 'xpu', label: 'Intel XPU' },
-                { value: 'mps', label: 'Apple Metal' },
-              ]}
-              value={fluxAccelerator}
-              disabled={installingFlux}
+              options={fluxAcceleratorChoices}
+              value={fluxUsesMlx ? 'auto' : fluxAccelerator}
+              disabled={installingFlux || fluxUsesMlx}
               onchange={(value) => (fluxAccelerator = value)}
             />
           {/snippet}
         </Field>
+        {#if fluxUsesMlx}<p class="line">{t('settings.sidecar.mlxAutomatic')}</p>{/if}
         <div class="inline">
-          <Button onclick={installFlux} disabled={installingFlux}>
+          <Button onclick={installFlux} disabled={installingFlux || !fluxAcceleratorAllowed || (session.fluxBackend === 'mflux' && fluxPlatform !== 'macos-arm64')}>
             {installingFlux ? t('settings.sidecar.installing') : t('settings.sidecar.install')}
           </Button>
           {#if installingFlux}<span role="status">{t(fluxStageKey)}</span>{/if}

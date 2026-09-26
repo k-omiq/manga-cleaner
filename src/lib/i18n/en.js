@@ -349,6 +349,7 @@ export const en = {
       installFailed: 'FLUX setup failed: {detail}',
       accelerator: 'GPU runtime for installation',
       acceleratorAuto: 'Automatic',
+      mlxAutomatic: 'MLX uses the Apple GPU automatically.',
       stage: {
         environment: 'Creating the helper environment…',
         dependencies: 'Installing the model runtime…',
@@ -360,7 +361,9 @@ export const en = {
       label: 'Backend',
       auto: 'Automatic',
       mflux: 'MLX (Apple)',
-      sdnq: 'SDNQ (any GPU)',
+      mfluxUnsupported: 'MLX (Apple Silicon only)',
+      mfluxReason: 'MLX requires an Apple Silicon Mac. Choose Automatic or SDNQ here.',
+      sdnq: 'SDNQ (CUDA, Intel XPU, or Apple Metal)',
     },
     sidecarModel: {
       label: 'Model',
@@ -628,7 +631,7 @@ export const en = {
       modelLabel: 'Local backend for {model}',
       predicted: 'Next session: {backend}',
       unavailableForModel: '{model} cannot use {backend}: {reason}. Choose a supported backend in Performance.',
-      cloudReview: '☁ Cloud GPU is available through explicit Review analysis only. Auto clean stays local.',
+      cloudReview: '☁ Cloud GPU: SAM-TS-L and RT-DETR v2 full can analyze pages from the editor’s Review screen. Cloud analysis is review only; Auto clean stays local.',
       saveFailed: 'Could not save the model backend. Try again.',
       state: {
         supported: 'supported; install the runtime or dependency',
@@ -2130,6 +2133,7 @@ export const en = {
       nothingInScope: 'Nothing to clean in this scope.',
       allLanguagesSkipped: 'All source languages are skipped. Select a language to clean.',
       ocrRescueUnavailable: 'Japanese OCR rescue is off for this run: {reason}',
+      accelFallback: '{model} switched from {requested} to {effective}: {reason}',
       // The run could not start because the weights are not on this machine.
       // A notice rather than an error now that there is somewhere to send the
       // reader: before Settings › Models existed, this was a rejected promise
@@ -2761,8 +2765,8 @@ export const en = {
       cancelled: 'Cloud analysis cancelled. Remaining tiles were not sent.',
       capability: {
         label: 'Cloud model',
-        sam: 'SAM text mask',
-        rt: 'RT text regions',
+        sam: '☁ SAM-TS-L',
+        rt: '☁ RT-DETR v2 full',
         notOffered: '{name}, not offered',
         invalid: 'This cloud GPU’s model list could not be read. Nothing was sent. Update the cloud worker, then try again.',
         notConfigured: 'This cloud GPU has no analysis models set up. Nothing was sent.',

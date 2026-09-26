@@ -52,7 +52,7 @@ it('shows the native model capability matrix and persists a backend choice for t
   const cuda = /** @type {HTMLOptionElement} */ (picker.querySelector('option[value="cuda"]'))
   expect(cuda.disabled).toBe(true)
   expect(picker.textContent).toContain('WebGPU · available; execution has not been verified')
-  expect(rendered.getByText(/Cloud GPU is available through explicit Review analysis only/)).not.toBeNull()
+  expect(rendered.getAllByText(/Cloud analysis is review only; Auto clean stays local/).length).toBeGreaterThan(0)
 
   await fireEvent.change(picker, { target: { value: 'webgpu' } })
   await waitFor(() => expect(writeSettings).toHaveBeenCalledWith(expect.objectContaining({
