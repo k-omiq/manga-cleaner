@@ -24,6 +24,7 @@ _SHIPPED_FILES: Tuple[str, ...] = (
     "cloud/__init__.py",
     "cloud/beam/__init__.py",
     "cloud/beam/backend.py",
+    "cloud/beam/routes.py",
     "cloud/beam/settings.py",
 )
 _SHIPPED_PACKAGES: Tuple[str, ...] = ("cloud/common",)

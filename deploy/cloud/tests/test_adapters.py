@@ -160,6 +160,7 @@ class BeamStagingTest(unittest.TestCase):
                     "deploy/cloud/__init__.py",
                     "deploy/cloud/beam/__init__.py",
                     "deploy/cloud/beam/backend.py",
+                    "deploy/cloud/beam/routes.py",
                     "deploy/cloud/beam/settings.py",
                 ]
                 + common

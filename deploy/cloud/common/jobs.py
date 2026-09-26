@@ -34,6 +34,11 @@ from deploy.cloud.common.redact import redact_text
 
 logger = logging.getLogger("deploy.cloud.jobs")
 
+
+def execute_analysis_job(worker: Any, metadata: Dict[str, Any], tile_png: bytes) -> Dict[str, Any]:
+    """Dispatch one explicitly submitted analysis tile without FLUX job state."""
+    return worker.analyze(metadata, tile_png)
+
 TERMINAL_STATUSES = (
     JobExecutionStatus.COMPLETED,
     JobExecutionStatus.FAILED,

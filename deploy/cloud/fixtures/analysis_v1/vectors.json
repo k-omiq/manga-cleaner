@@ -1,0 +1,156 @@
+{
+  "valid": [
+    {
+      "request": {
+        "protocol_version": "1.0.0",
+        "capability": "text_mask_sam_ts@1",
+        "graph_sha256s": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ],
+        "model_revision": "cccccccccccccccccccccccccccccccccccccccc",
+        "tile_id": "tile_01",
+        "tile_rect": {
+          "x": 1,
+          "y": 23,
+          "width": 16,
+          "height": 16
+        },
+        "tile_png_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "source_page_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_digest": "1dffe149aed278e23eff1a782d51f896a3a1a658e78732f6173a1eb305e74255"
+      },
+      "canonical": "[\"MC-ANA-V1\",\"1.0.0\",\"text_mask_sam_ts@1\",[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"],\"cccccccccccccccccccccccccccccccccccccccc\",\"tile_01\",1,23,16,16,\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"]",
+      "digest": "1dffe149aed278e23eff1a782d51f896a3a1a658e78732f6173a1eb305e74255"
+    },
+    {
+      "request": {
+        "protocol_version": "1.0.0",
+        "capability": "text_mask_sam_ts@1",
+        "graph_sha256s": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ],
+        "model_revision": "cccccccccccccccccccccccccccccccccccccccc",
+        "tile_id": "tile_01",
+        "tile_rect": {
+          "x": 12,
+          "y": 3,
+          "width": 16,
+          "height": 16
+        },
+        "tile_png_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "source_page_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_digest": "097ada521037a847656f69a99e1a0466a72e8c00297a5b0da222907b1f114400"
+      },
+      "canonical": "[\"MC-ANA-V1\",\"1.0.0\",\"text_mask_sam_ts@1\",[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"],\"cccccccccccccccccccccccccccccccccccccccc\",\"tile_01\",12,3,16,16,\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"]",
+      "digest": "097ada521037a847656f69a99e1a0466a72e8c00297a5b0da222907b1f114400"
+    },
+    {
+      "request": {
+        "protocol_version": "1.0.0",
+        "capability": "text_regions_rt@1",
+        "graph_sha256s": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ],
+        "model_revision": "cccccccccccccccccccccccccccccccccccccccc",
+        "tile_id": "tile_01",
+        "tile_rect": {
+          "x": 1,
+          "y": 23,
+          "width": 16,
+          "height": 16
+        },
+        "tile_png_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "source_page_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_digest": "c060679a31c1e9b4d0e86fcb4bda311861919ce5fcf2c2e0bbbde865adbc1b62"
+      },
+      "canonical": "[\"MC-ANA-V1\",\"1.0.0\",\"text_regions_rt@1\",[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"],\"cccccccccccccccccccccccccccccccccccccccc\",\"tile_01\",1,23,16,16,\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"]",
+      "digest": "c060679a31c1e9b4d0e86fcb4bda311861919ce5fcf2c2e0bbbde865adbc1b62"
+    }
+  ],
+  "invalid": [
+    {
+      "protocol_version": "1.0.0",
+      "capability": "coo@1",
+      "graph_sha256s": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "model_revision": "cccccccccccccccccccccccccccccccccccccccc",
+      "tile_id": "tile_01",
+      "tile_rect": {
+        "x": 1,
+        "y": 23,
+        "width": 16,
+        "height": 16
+      },
+      "tile_png_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "source_page_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "request_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "protocol_version": "1.0.0",
+      "capability": "text_mask_sam_ts@1",
+      "graph_sha256s": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "model_revision": "cccccccccccccccccccccccccccccccccccccccc",
+      "tile_id": "tile_01",
+      "tile_rect": {
+        "x": 1,
+        "y": 23,
+        "width": 16,
+        "height": 16
+      },
+      "tile_png_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "source_page_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "extra": 42,
+      "request_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "protocol_version": "1.0.0",
+      "capability": "text_mask_sam_ts@1",
+      "graph_sha256s": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "model_revision": "main",
+      "tile_id": "tile_01",
+      "tile_rect": {
+        "x": 1,
+        "y": 23,
+        "width": 16,
+        "height": 16
+      },
+      "tile_png_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "source_page_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "request_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "protocol_version": "1.0.0",
+      "capability": "text_mask_sam_ts@1",
+      "graph_sha256s": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "model_revision": "cccccccccccccccccccccccccccccccccccccccc",
+      "tile_id": "tile_01",
+      "tile_rect": {
+        "x": 0,
+        "y": 0,
+        "width": 1025,
+        "height": 1
+      },
+      "tile_png_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "source_page_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "request_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "valid_response": {
+    "file": "sam_response.json",
+    "request_digest": "1dffe149aed278e23eff1a782d51f896a3a1a658e78732f6173a1eb305e74255",
+    "mask_png_sha256": "565bb6ae9b189dc8d7f8bd6c85be23f65373594d8df0c495f45d1f6301867062"
+  }
+}

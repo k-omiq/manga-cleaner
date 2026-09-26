@@ -225,6 +225,8 @@
   const actionLabel = $derived(
     running
       ? t('editor.action.cancelRun')
+      : session.textPolicy === 'all_text'
+        ? t('editor.action.reviewText')
       : values.scope === 'project'
         ? t('editor.action.runOnProject')
         : t('editor.action.runOnPage'),
@@ -264,6 +266,7 @@
    */
   const blockedKey = $derived.by(() => {
     if (!spec.runnable) return null
+    if (session.textPolicy === 'all_text') return null
     if (!capabilities.runtime) return 'editor.state.runtimeMissing'
     return capabilities.autoClean ? null : 'editor.state.modelsMissing'
   })
@@ -385,6 +388,7 @@
   </span>
 
   {#key spec.id}
+    {#if session.textPolicy !== 'all_text'}
     {#each layout.groups as group, index (group.key ?? index)}
       <span class="rule" role="separator" aria-orientation="vertical"></span>
       <div class="group">
@@ -494,6 +498,7 @@
           {/each}
         </div>
       </Popover>
+    {/if}
     {/if}
 
     {#if spec.runnable}

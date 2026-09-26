@@ -439,7 +439,10 @@ export const TOOL_SPECS = [
       // to, no confidence to show and nothing to fall back from. A control
       // that cannot change what happens is worse than no control.
       ...section('engines', [
-        choice('engine', 'tools.param.cleanWith', MASK_ENGINES, 'tools.short.cleanWith'),
+        choice('engine', 'tools.param.cleanWith', [
+          ...MASK_ENGINES,
+          { value: 'cloud', labelKey: 'tools.option.engineCloud', cloud: true },
+        ], 'tools.short.cleanWith'),
       ]),
       ...section('brush', [range('size', 'tools.param.size', 8, 160, 4, 'px')]),
     ],

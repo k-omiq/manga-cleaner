@@ -92,6 +92,7 @@ class WorkerRuntime:
         marker_attempts: int = 1,
         marker_delay_seconds: float = 0.0,
         sleep: Callable[[float], Any] = time.sleep,
+        analysis_worker: Optional[Any] = None,
     ):
         self.weights_root = weights_root
         self.reload = reload
@@ -101,6 +102,7 @@ class WorkerRuntime:
         self.marker_delay_seconds = marker_delay_seconds
         self.sleep = sleep
         self.runner: Any = None
+        self.analysis_worker = analysis_worker
         self.load_error: Optional[Tuple[str, str]] = None
 
     def load(self) -> bool:
@@ -147,3 +149,8 @@ class WorkerRuntime:
             logger.error("Unexpected render failure: %s", redact_text(str(exc)))
             return failure("inference_failed", f"Unexpected render failure: {exc}")
         return {"ok": True, "png": rendered.png, "digest": rendered.digest}
+
+    def analyze(self, metadata: Dict[str, Any], tile_png: bytes) -> Dict[str, Any]:
+        if self.analysis_worker is None:
+            raise ContractValidationError("analysis capability unavailable")
+        return self.analysis_worker.analyze(metadata, tile_png)

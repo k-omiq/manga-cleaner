@@ -31,7 +31,9 @@ Download the installer from [cleaner.komiq.cc](https://cleaner.komiq.cc): a `.dm
 
 Windows needs 10 version 1803 x64 or later, which is what WebView2, the Visual C++ 2015-2022 runtime and ONNX Runtime 1.28 each require on their own. The Visual C++ runtime is not something to install: the four libraries the ONNX Runtime imports outright ship beside the executable, where the loader finds them first.
 
-Model weights and the runtime are not bundled, which keeps the installer small and respects weight provenance. The first-launch setup walks through the downloads (the ONNX Runtime, about 32 MB on macOS, about 200 MB on Windows, plus the five required model weights, about 317 MB in total), the defaults, an optional cloud GPU and app behavior. Anything declined or missed can be fetched later from **Settings › Models**. An optional Japanese text reader (about 460 MB, three files) can be added from the same panel: it recovers roughly 5% of speech balloons that the script gate cannot read and would otherwise go to review uncleaned, and nothing else depends on it. For offline setups, place the verified files in the application's `models/` directory instead.
+Model weights and the runtime are not bundled, which keeps the installer small and respects weight provenance. The first-launch setup walks through the downloads (the ONNX Runtime, about 32 MB on macOS, about 200 MB on Windows, plus the five required model weights, about 317 MB in total), the defaults, an optional cloud GPU and app behavior. Anything declined or missed can be fetched later from **Settings › Models**. An optional Japanese text reader (about 460 MB, three files) can be added from the same panel and selected for a legacy run's OCR rescue; merely installing it does not switch the run. For offline setups, place the verified files in the application's `models/` directory instead.
+
+The optional **Text-shaped review** analyzes a selected chapter page with RT-DETR and the exact Koharu SAM-TS-L model. Its all-text policy does not need script recognition or OCR. You review lettering components, source-pixel padding and corrections against the tinted write-support preview before applying any patch. Supervised writes are currently restricted to PNG pages on the measured Apple M5/WebGPU configuration; other sources and providers stay in review. The legacy workflow remains the default. See [local release evidence and known failures](docs/local-text-shape-release.md) for current limits and rollback behavior, and the [model workflow decisions and benchmarks](docs/model-workflow-benchmarks.md) for the earlier CPU, GPU and chapter measurements.
 
 Intel Macs (`x86_64`) are unsupported: ONNX Runtime 1.28.0 publishes no `osx-x86_64` archive. Linux `x86_64` has a GPU path (the WebGPU plugin, with CUDA flavours for NVIDIA) that has not been executed on real hardware; Linux `aarch64` is best effort and CPU only. Neither is part of the release workflow.
 
@@ -100,11 +102,18 @@ cargo test --workspace --exclude spike-strip-memory -- --test-threads=1
 # 5. Run the application in development mode
 npx tauri dev
 
-# 6. Build the release bundle
-npx tauri build
+# 6. Freeze and smoke test the cloud setup helper for this machine's release target
+# On Windows, use x86_64-pc-windows-msvc instead.
+RELEASE_TARGET=aarch64-apple-darwin
+python -m pip install --require-hashes -r provisioner/requirements.lock
+python .github/scripts/build-cloud-provisioner.py "$RELEASE_TARGET"
+
+# 7. Build the release bundle (aarch64-apple-darwin or x86_64-pc-windows-msvc)
+npx tauri build --target "$RELEASE_TARGET"
 ```
 
 `--test-threads=1` is required because concurrent WebGPU session initialisation on macOS can abort the test binary.
+Release builds fail if the target's cloud helper is missing from `bundle.externalBin`. The release workflow builds and checks the macOS app and Windows installer separately.
 
 ## Documentation
 

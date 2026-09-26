@@ -28,7 +28,9 @@ import {
   setCloudAllowed,
   setDetection,
   setFluxModel,
+  setOcrRescue,
   setSidecarPath,
+  setTextPolicy,
   setTheme,
 } from '../state/session.svelte.js'
 import FirstLaunchDialog from './FirstLaunchDialog.svelte'
@@ -162,6 +164,7 @@ function makeBackend() {
     writeSettings: vi.fn(async () => ({})),
     downloadRuntime: vi.fn(async () => 'started'),
     downloadModel: vi.fn(async () => 'started'),
+    downloadModelGroup: vi.fn(async () => 'started'),
     cancelDownload: vi.fn(async () => true),
     listAccelerators: vi.fn(async () => accelerators('auto')),
     listSidecarModels: vi.fn(async () => []),
@@ -183,6 +186,8 @@ beforeEach(() => {
   setFluxModel('')
   setSidecarPath('')
   for (const language of ['ja', 'zh', 'ko']) setDetection(language, 'ctd-rtdetr')
+  setOcrRescue(false)
+  setTextPolicy('legacy_gate')
   session.firstLaunchOffered = false
   capabilities.sidecar = false
 })
@@ -223,6 +228,11 @@ async function press(rendered, name) {
  */
 function finish(id, error = null) {
   backend.emit({ type: 'model-progress', id, downloaded: 1, total: 1, done: true, error })
+}
+
+/** @param {string} id @param {string|null} [error] */
+function finishGroup(id, error = null) {
+  backend.emit({ type: 'model-progress', id, downloaded: 0, total: null, done: true, error })
 }
 
 describe('the nine steps', () => {
@@ -353,7 +363,7 @@ describe('the setting steps', () => {
 describe('the pipelines', () => {
   it('drop a skipped language, and every detection file once all three are skipped', async () => {
     const rendered = open('detection')
-    expect(rendered.getByText('RT-DETR v2 + COO + SAM-TS')).toBeTruthy()
+    expect(rendered.queryByText('RT-DETR v2 + COO + SAM-TS')).toBeNull()
     for (const language of ['Japanese', 'Chinese', 'Korean']) {
       await fireEvent.change(rendered.getByLabelText(t('pipelines.detectorFor', { language })), { target: { value: '' } })
     }
@@ -364,12 +374,58 @@ describe('the pipelines', () => {
     )
   })
 
-  it('add the Japanese reader only for Japanese', async () => {
+  it('offer the Japanese OCR rescue as an opt-in switch, not a detector, and fetch it only when ticked', async () => {
     const rendered = open('detection')
-    const japanese = /** @type {HTMLSelectElement} */ (rendered.getByLabelText(t('pipelines.detectorFor', { language: 'Japanese' })))
-    const korean = /** @type {HTMLSelectElement} */ (rendered.getByLabelText(t('pipelines.detectorFor', { language: 'Korean' })))
-    expect([...japanese.options].map((option) => option.value)).toContain('ctd-rtdetr-ocr')
-    expect([...korean.options].map((option) => option.value)).not.toContain('ctd-rtdetr-ocr')
+    for (const language of ['Japanese', 'Chinese', 'Korean']) {
+      const select = /** @type {HTMLSelectElement} */ (rendered.getByLabelText(t('pipelines.detectorFor', { language })))
+      expect([...select.options].map((option) => option.value)).toEqual(['ctd-rtdetr', ''])
+    }
+    const rescue = /** @type {HTMLInputElement} */ (rendered.getByRole('checkbox', { name: t('pipelines.workflow.ocrRescue') }))
+    expect(rescue.checked).toBe(false)
+    // The cost is said before the box is ticked, and read with it.
+    const cost = t('settings.detection.rescue.size', { bytes: 343 + 117 + 1 })
+    expect(rendered.getByText(cost)).toBeTruthy()
+    expect(rescue.getAttribute('aria-describedby')?.split(' ').map((id) => document.getElementById(id)?.textContent))
+      .toEqual([t('pipelines.workflow.ocrRescueDescription'), cost])
+
+    await fireEvent.click(rescue)
+    expect(session.ocrRescue).toBe(true)
+    setFirstLaunchStep('dependencies')
+    await waitFor(() =>
+      expect(rendered.getByText(t('onboarding.dependencies.total', { count: 9, bytes: PRICE + 343 + 117 + 1 }))).toBeTruthy(),
+    )
+  })
+
+  it('say the rescue has nothing to read once Japanese is skipped, and fetch no OCR file', async () => {
+    setOcrRescue(true)
+    const rendered = open('detection')
+    await fireEvent.change(rendered.getByLabelText(t('pipelines.detectorFor', { language: 'Japanese' })), { target: { value: '' } })
+    expect(rendered.getByText(t('settings.detection.rescue.skipped'))).toBeTruthy()
+    setFirstLaunchStep('dependencies')
+    // Chinese and Korean still need the detector pair and the script gate.
+    await waitFor(() => expect(rendered.getByText(t('onboarding.dependencies.total', { count: 6, bytes: PRICE }))).toBeTruthy())
+  })
+
+  it('fetch neither the script gate nor any OCR file when a replay finds all-text review chosen', async () => {
+    setTextPolicy('all_text')
+    setOcrRescue(true)
+    const rendered = open('detection')
+    expect(rendered.getByText(t('settings.detection.setupAllText'))).toBeTruthy()
+    setFirstLaunchStep('dependencies')
+    // The runtime, the speech bubble finder and the redraw model.
+    await waitFor(() =>
+      expect(rendered.getByText(t('onboarding.dependencies.total', { count: 3, bytes: RUNTIME_BYTES + 11 + REDRAW_BYTES }))).toBeTruthy(),
+    )
+  })
+
+  it('say where the text-shaped review is set up, and that the stars are provisional', async () => {
+    const rendered = open('detection')
+    expect(rendered.getByText(t('settings.detection.setupReview'))).toBeTruthy()
+    expect(rendered.queryByText(t('settings.detection.setupAllText'))).toBeNull()
+    expect(rendered.getByText(t('pipelines.workflow.ratingsNote'))).toBeTruthy()
+    setFirstLaunchStep('cleaning')
+    await waitFor(() => expect(rendered.getByRole('heading', { level: 1 }).textContent).toBe(t('onboarding.cleaning.heading')))
+    expect(rendered.getByText(t('pipelines.workflow.ratingsNote'))).toBeTruthy()
   })
 
   it('draw cleaners that cannot be fetched as disabled, and FLUX as the helper\'s', async () => {
@@ -435,10 +491,14 @@ describe('the downloads', () => {
     finish('textDetector')
     await waitFor(() => expect(backend.downloadRuntime).toHaveBeenCalledTimes(2))
     finish(RUNTIME_ID)
-    for (const id of ['balloonDetector', 'scriptGate', 'scriptGateLabels', 'inpainter']) {
-      await waitFor(() => expect(backend.downloadModel).toHaveBeenCalledWith({ id }))
-      finish(id)
-    }
+    await waitFor(() => expect(backend.downloadModel).toHaveBeenCalledWith({ id: 'balloonDetector' }))
+    finish('balloonDetector')
+    await waitFor(() => expect(backend.downloadModelGroup).toHaveBeenCalledWith({ id: 'scriptGate' }))
+    finish('scriptGate')
+    finish('scriptGateLabels')
+    finishGroup('scriptGate')
+    await waitFor(() => expect(backend.downloadModel).toHaveBeenCalledWith({ id: 'inpainter' }))
+    finish('inpainter')
     await waitFor(() => expect(firstLaunch.running).toBe(false))
     expect(Object.values(firstLaunch.status).every((status) => status === 'done')).toBe(true)
 
@@ -459,6 +519,38 @@ describe('the downloads', () => {
     await fireEvent.click(rendered.getByRole('button', { name: t('onboarding.downloads.retry', { name: t('settings.models.runtime.label') }) }))
     expect(firstLaunch.status[RUNTIME_ID]).toBe('waiting')
     expect(firstLaunch.errors[RUNTIME_ID]).toBeUndefined()
+  })
+
+  it('installs the script gate as one atomic group and pauses/resumes both files together', async () => {
+    open('dependencies')
+    startFirstLaunchDownloads()
+    await waitFor(() => expect(backend.downloadRuntime).toHaveBeenCalledTimes(1))
+    finish(RUNTIME_ID)
+    await waitFor(() => expect(backend.downloadModel).toHaveBeenCalledWith({ id: 'textDetector' }))
+    finish('textDetector')
+    await waitFor(() => expect(backend.downloadModel).toHaveBeenCalledWith({ id: 'balloonDetector' }))
+    finish('balloonDetector')
+    await waitFor(() => expect(backend.downloadModelGroup).toHaveBeenCalledWith({ id: 'scriptGate' }))
+    expect(backend.downloadModel).not.toHaveBeenCalledWith({ id: 'scriptGate' })
+    expect(firstLaunch.status.scriptGate).toBe('active')
+    expect(firstLaunch.status.scriptGateLabels).toBe('active')
+
+    await pauseFile('scriptGateLabels')
+    expect(backend.cancelDownload).toHaveBeenCalledWith({ id: 'scriptGate' })
+    expect(firstLaunch.status.scriptGate).toBe('paused')
+    expect(firstLaunch.status.scriptGateLabels).toBe('paused')
+    finishGroup('scriptGate', 'cancelled')
+    await waitFor(() => expect(backend.downloadModel).toHaveBeenCalledWith({ id: 'inpainter' }))
+    finish('inpainter')
+    await waitFor(() => expect(firstLaunch.running).toBe(false))
+
+    resumeFile('scriptGateLabels')
+    await waitFor(() => expect(backend.downloadModelGroup).toHaveBeenCalledTimes(2))
+    finish('scriptGate')
+    finish('scriptGateLabels')
+    finishGroup('scriptGate')
+    await waitFor(() => expect(firstLaunch.status.scriptGate).toBe('done'))
+    expect(firstLaunch.status.scriptGateLabels).toBe('done')
   })
 
   it('pause everything, then resume everything', async () => {

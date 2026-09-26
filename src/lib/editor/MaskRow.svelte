@@ -1,11 +1,11 @@
 <script>
-  import { isHighlighted, hover, select } from '../state/editor.svelte.js'
+  import { isHighlighted, hover, select, undo, undoAvailable, undoLabelKey } from '../state/editor.svelte.js'
   import { rowEngines, engineChoiceLabel } from '../model/masks.js'
   import { capabilities } from '../state/capabilities.svelte.js'
   import { cloudUsable } from '../state/cloud.svelte.js'
   import { actionHint } from './maskrows.js'
   import { menuPoint } from './gesture.js'
-  import { deleteRow, rerunMask, runMaskAction } from './maskactions.svelte.js'
+  import { deleteRow, keepDependencyResult, rerunMask, runMaskAction } from './maskactions.svelte.js'
   import { Button, Disclosure, IconButton, Select } from '../ui/index.js'
   import { t } from '../i18n/index.js'
   import MaskFacts from './MaskFacts.svelte'
@@ -28,6 +28,11 @@
    * ladder in their head to press any of them. The picker says the same thing
    * - *what should this layer be cleaned with* - as a list of names, and Try
    * again covers the case where the answer is "the same thing, again".
+   *
+   * **Try again replaces; a new stroke refines.** Both Try again and the
+   * picker redo this layer from the layers below it and swap its result; a new
+   * stroke reads the page as shown. The expanded row says so in one line, and
+   * a paint or clone row keeps Try again visible but off, with the reason.
    *
    * **Delete is on every row, warnings included.** For a mask it deletes the
    * mask and the original text comes back; for a region with no mask it is the
@@ -52,6 +57,17 @@
   const pickerId = $props.id()
 
   const highlighted = $derived(isHighlighted(row.id))
+
+  // Try again replaces this layer from the layers below it; a paint or clone
+  // stroke has no cleaning to redo, so its row keeps the control in place,
+  // dimmed, and says why rather than dropping it without a word. Other masks
+  // `reRunnable` refuses (an approved text-shape component) keep Delete alone.
+  const retryBlocked = $derived(!row.reRunnable && (row.engine === 'paint' || row.engine === 'clone'))
+
+  // Undo here is the editor's global undo, not an undo of the change that put
+  // this layer in review, so its tooltip names what it would reverse.
+  const undoKey = $derived(undoLabelKey())
+  const undoHint = $derived(undoKey ? t('editor.action.undoCommand', { commandKey: undoKey }) : undefined)
   const title = $derived(t(row.titleKey))
   const sub = $derived(row.sub.map((part) => t(part.key, part.params)).join(' · '))
 
@@ -180,6 +196,19 @@
           iconSize={13}
           onclick={() => rerunMask(region, 'retry')}
         />
+      {:else if retryBlocked}
+        <!-- aria-disabled rather than disabled: a disabled button leaves the
+             tab order and WebKit shows no tooltip over it, and then nothing
+             says why Try again is off. -->
+        <IconButton
+          icon="refresh"
+          label={t('masks.action.retry')}
+          title={t('masks.action.retryBlocked')}
+          aria-disabled="true"
+          data-retry-blocked
+          size={21}
+          iconSize={13}
+        />
       {/if}
       <IconButton
         icon="trash"
@@ -192,6 +221,24 @@
     {/snippet}
 
     <MaskFacts facts={row.facts} />
+
+    {#if region.mask?.dependencyReview}
+      <!-- The facts above end with why ("Flagged"); these are the three
+           answers to it. Rebuild is Try again, so it says what Try again says. -->
+      <div class="acts" role="group" aria-label={t('masks.status.needsReview')} data-dependency-review>
+        <Button size="sm" title={t('masks.dependency.keepHint')} onclick={() => keepDependencyResult(region)}>
+          {t('masks.dependency.keep')}
+        </Button>
+        {#if row.reRunnable}
+          <Button size="sm" title={t('masks.action.retryHint')} onclick={() => rerunMask(region, 'retry')}>
+            {t('masks.dependency.rebuild')}
+          </Button>
+        {/if}
+        {#if undoAvailable()}
+          <Button size="sm" title={undoHint} onclick={() => undo()}>{t('masks.dependency.undoLast')}</Button>
+        {/if}
+      </div>
+    {/if}
 
     {#if row.reRunnable}
       <!-- The kit's picker at the row's own size, not a `<select>` of this
@@ -210,6 +257,9 @@
           />
         </div>
       </div>
+      <p class="note">{t('masks.action.rerunNote')}</p>
+    {:else if retryBlocked}
+      <p class="note">{t('masks.action.retryBlocked')}</p>
     {/if}
 
     {#if row.actions.length > 0}
@@ -294,11 +344,30 @@
     min-width: 0;
   }
 
+  /* What Try again means next to a new stroke, or why it is off. Muted and
+     small: it is a reminder under the controls, not another fact. */
+  .note {
+    margin: 6px 0 0;
+    font-size: 10.5px;
+    line-height: 1.45;
+    color: var(--t3);
+  }
+
   .acts {
     display: flex;
     flex-wrap: wrap;
     gap: 5px;
     margin-top: 9px;
+  }
+
+  /* The kit's IconButton dims only a native `disabled`; this one stays
+     focusable so its reason can be read. The glyph is dimmed rather than the
+     button, so the focus ring keeps its full contrast. */
+  .row :global(.ibtn[aria-disabled='true']) { cursor: default }
+  .row :global(.ibtn[aria-disabled='true'] > *) { opacity: .35 }
+  .row :global(.ibtn[aria-disabled='true']:hover) {
+    background: transparent;
+    color: var(--t2);
   }
 
   /* Visually hidden, still read aloud: the glyph's meaning in words. */

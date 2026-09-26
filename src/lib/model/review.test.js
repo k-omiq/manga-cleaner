@@ -88,6 +88,27 @@ describe('needsReview / reviewReason', () => {
     expect(reviewReason(r)).toBe('review.reason.gateSkippedNotJapanese')
   })
 
+  it.each([
+    ['language-skipped', 'review.reason.languageSkipped'],
+    ['outside-language-unverified', 'review.reason.outsideLanguageUnverified'],
+  ])('keeps %s candidates held for review', (cause, expectedKey) => {
+    const r = region({ outcome: 'gate-skipped', gateSkipCause: cause, mask: null })
+    expect(needsReview(r)).toBe(true)
+    expect(reviewReason(r)).toBe(expectedKey)
+  })
+
+  it('keeps a saved text-shaped mask correction state in review', () => {
+    const r = region({ mask: mask({ maskQualityState: 'emptySupport' }) })
+    expect(needsReview(r)).toBe(true)
+    expect(reviewReason(r)).toBe('review.reason.maskNeedsCorrection')
+  })
+
+  it('keeps an unpatched declined candidate that needs correction visible', () => {
+    const r = region({ outcome: 'declined', declineReason: 'review.reason.maskNeedsCorrection', mask: null })
+    expect(needsReview(r)).toBe(true)
+    expect(reviewReason(r)).toBe('review.reason.maskNeedsCorrection')
+  })
+
   it('an unrecognised gate cause still flags the region rather than hiding it', () => {
     const r = region({ outcome: 'gate-skipped', gateSkipCause: null, mask: null })
     expect(needsReview(r)).toBe(true)

@@ -86,6 +86,8 @@ pub enum PaintError {
 pub struct Painted {
     pub mask: Mask,
     pub pixels: Raster,
+    /// The composited page rectangle sampled to render this stroke.
+    pub read_window: Rect,
     /// How many dabs the planner emitted. Provenance, not geometry - it is the
     /// one number that says how much of the stroke the commit actually walked.
     pub dabs: usize,
@@ -357,7 +359,7 @@ fn finish(
         }
     }
 
-    Ok(Painted { mask, pixels, dabs })
+    Ok(Painted { mask, pixels, read_window: window, dabs })
 }
 
 /// A raster in one of Phase 1's four modes, as tightly packed RGBA8 - the only

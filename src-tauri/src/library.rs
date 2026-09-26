@@ -115,9 +115,9 @@
 //!   needs the file to still be there.
 //!
 //! The cost is a second copy of every page under the library root, which for a
-//! 200-page colour chapter is on the order of a gigabyte. There is no
-//! free-space preflight in front of it yet; a write that fails lists the page
-//! as `input.skipReason.importFailed` rather than failing the chapter.
+//! 200-page colour chapter is on the order of a gigabyte. Import estimates
+//! that copy and checks available space on the destination volume before it
+//! writes the first page.
 //!
 //! ## When a job is missing or unreadable
 //!
@@ -162,7 +162,7 @@ use cleaner_core::ingest;
 use cleaner_core::mask::Rect;
 use cleaner_core::patch::{CloudRecord, Engine};
 use cleaner_core::project::{
-    Job, PatchRecord, Project, RegionUntouched, StoreError, StripMode, buffers, sidecar_dir,
+    buffers, sidecar_dir, Job, PatchRecord, Project, RegionUntouched, StoreError, StripMode,
 };
 
 /// The library's own directory under the app's data directory, and the index
@@ -202,6 +202,8 @@ pub enum LibraryError {
     NoJob { chapter_id: String },
     /// The job is on disk and could not be opened.
     Manifest { path: PathBuf, detail: String },
+    InsufficientSpace { required: u64, available: u64 },
+    FreeSpaceUnavailable { path: PathBuf },
 }
 
 impl LibraryError {
@@ -223,6 +225,8 @@ impl LibraryError {
             LibraryError::Unknown { .. } => "notice.library.changeFailed",
             LibraryError::NoJob { .. } => "notice.library.changeFailed",
             LibraryError::Manifest { .. } => "notice.library.changeFailed",
+            LibraryError::InsufficientSpace { .. } => "notice.library.ingestInsufficientSpace",
+            LibraryError::FreeSpaceUnavailable { .. } => "notice.library.ingestSpaceUnknown",
         }
     }
 }
@@ -236,6 +240,8 @@ impl std::fmt::Display for LibraryError {
                 write!(f, "chapter {chapter_id} has no job on disk yet")
             }
             LibraryError::Manifest { path, detail } => write!(f, "{}: {detail}", path.display()),
+            LibraryError::InsufficientSpace { required, available } => write!(f, "chapter import needs {required} bytes, but only {available} bytes are available"),
+            LibraryError::FreeSpaceUnavailable { path } => write!(f, "could not check free space for chapter import at {}", path.display()),
         }
     }
 }
@@ -316,7 +322,11 @@ pub struct Index {
 
 impl Default for Index {
     fn default() -> Self {
-        Index { version: INDEX_VERSION, next_id: 1, projects: Vec::new() }
+        Index {
+            version: INDEX_VERSION,
+            next_id: 1,
+            projects: Vec::new(),
+        }
     }
 }
 
@@ -370,7 +380,10 @@ pub fn sanitize_identifier(raw: &str) -> Option<String> {
     if raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return None;
     }
-    if !raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' || c == '/') {
+    if !raw
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' || c == '/')
+    {
         return None;
     }
     if raw.contains("//") || raw.starts_with('/') || raw.ends_with('/') {
@@ -392,7 +405,10 @@ pub fn sanitize_cloud_record(cloud: &CloudRecord) -> CloudRecord {
         attempt_id: cloud.attempt_id.as_deref().and_then(sanitize_identifier),
         recipe_id: cloud.recipe_id.as_deref().and_then(sanitize_identifier),
         model: sanitize_identifier(&cloud.model).unwrap_or_else(|| "unknown".to_string()),
-        model_revision: cloud.model_revision.as_deref().and_then(sanitize_identifier),
+        model_revision: cloud
+            .model_revision
+            .as_deref()
+            .and_then(sanitize_identifier),
         tier: cloud.tier.as_deref().and_then(sanitize_identifier),
         cost: cloud.cost,
         duration_ms: cloud.duration_ms,
@@ -443,11 +459,25 @@ pub struct ApiMask {
     /// `<region id>-m<n>`. The shape is load-bearing: the seam addresses masks
     /// by id (`deleteMask`, `rerunMask`) and the region is recovered from it.
     pub id: String,
+    /// Explicit geometry policy. Old manifest rows deserialize as legacy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geometry_policy: Option<cleaner_core::text_shape::GeometryPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_shape_plan_identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_shape_patch_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_patch_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mask_quality_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_support_sha256: Option<String>,
     pub region_id: String,
     pub sequence: u32,
     pub fill_mode: &'static str,
     pub elapsed_ms: u64,
     pub fitting_reconstructed: bool,
+    pub dependency_review: Option<&'static str>,
     pub cloud_outcome: Option<CloudOutcome>,
     pub provenance: ApiProvenance,
 }
@@ -476,6 +506,8 @@ pub struct ApiPage {
     pub id: String,
     pub chapter_id: String,
     pub index: u32,
+    /// Stable source slot, used to bind an in-flight hand gesture to this scan.
+    pub source_index: usize,
     pub number: u32,
     pub file: String,
     pub source_sha: String,
@@ -580,7 +612,9 @@ pub enum NewChapter {
     /// corrected afterwards: the seam has no `setChapterSource` and no
     /// `deleteChapter`, so a chapter created over the wrong folder is a chapter
     /// the user is stuck with.
-    SourceTaken { chapter: String },
+    SourceTaken {
+        chapter: String,
+    },
 }
 
 /// What became of a chapter's **source scans** when the chapter was deleted.
@@ -612,7 +646,10 @@ pub enum Scans {
 pub enum ChapterDeleted {
     /// No project or no chapter in the library has that id.
     NoChapter,
-    Deleted { number: u32, scans: Scans },
+    Deleted {
+        number: u32,
+        scans: Scans,
+    },
 }
 
 impl NewChapter {
@@ -687,16 +724,30 @@ pub fn relative_time(now: u64, then: u64) -> RelativeTime {
     let count = |n: u64| serde_json::json!({ "count": n });
     let none = || serde_json::json!({});
     match elapsed {
-        s if s < 3_600 => RelativeTime { key: "time.relative.justNow", params: none() },
-        s if s < 86_400 => {
-            RelativeTime { key: "time.relative.hoursAgo", params: count(s / 3_600) }
-        }
-        s if s < 172_800 => RelativeTime { key: "time.relative.yesterday", params: none() },
-        s if s < 604_800 => {
-            RelativeTime { key: "time.relative.daysAgo", params: count(s / 86_400) }
-        }
-        s if s < 1_209_600 => RelativeTime { key: "time.relative.lastWeek", params: none() },
-        s => RelativeTime { key: "time.relative.weeksAgo", params: count(s / 604_800) },
+        s if s < 3_600 => RelativeTime {
+            key: "time.relative.justNow",
+            params: none(),
+        },
+        s if s < 86_400 => RelativeTime {
+            key: "time.relative.hoursAgo",
+            params: count(s / 3_600),
+        },
+        s if s < 172_800 => RelativeTime {
+            key: "time.relative.yesterday",
+            params: none(),
+        },
+        s if s < 604_800 => RelativeTime {
+            key: "time.relative.daysAgo",
+            params: count(s / 86_400),
+        },
+        s if s < 1_209_600 => RelativeTime {
+            key: "time.relative.lastWeek",
+            params: none(),
+        },
+        s => RelativeTime {
+            key: "time.relative.weeksAgo",
+            params: count(s / 604_800),
+        },
     }
 }
 
@@ -719,7 +770,13 @@ fn now() -> u64 {
 /// width has no percentage to give, so it collapses to the origin rather than
 /// dividing by it.
 pub fn percent_of(rect: Rect, width: u32, height: u32) -> Bbox {
-    let span = |value: f64, total: u32| if total == 0 { 0.0 } else { value * 100.0 / total as f64 };
+    let span = |value: f64, total: u32| {
+        if total == 0 {
+            0.0
+        } else {
+            value * 100.0 / total as f64
+        }
+    };
     Bbox {
         x: span(rect.x as f64, width),
         y: span(rect.y as f64, height),
@@ -745,12 +802,17 @@ struct ReviewFlags {
     fitting_reconstructed: bool,
     unusually_large: bool,
     cloud_outcome: Option<(bool, Option<&'static str>)>,
+    dependency_review: Option<&'static str>,
 }
 
 fn review_flags(review_state: Option<&str>) -> ReviewFlags {
     let mut flags = ReviewFlags::default();
-    let Some(key) = review_state else { return flags };
+    let Some(key) = review_state else {
+        return flags;
+    };
     match key {
+        "review.reason.inputChanged" => flags.dependency_review = Some("changed"),
+        "review.reason.inputUnknown" => flags.dependency_review = Some("unknown"),
         "review.reason.fittingReconstructed" => flags.fitting_reconstructed = true,
         "review.reason.unusuallyLarge" => flags.unusually_large = true,
         "review.reason.cloudAccepted" => flags.cloud_outcome = Some((true, None)),
@@ -829,7 +891,12 @@ fn region_of_deleted_patch(record: &PatchRecord, page: &ApiPage) -> ApiRegion {
         page_id: page.id.clone(),
         source_sha: page.source_sha.clone(),
         bbox: percent_of(record.bbox, page.width, page.height),
-        source: match record.provenance.params_snapshot.get("source").and_then(|v| v.as_str()) {
+        source: match record
+            .provenance
+            .params_snapshot
+            .get("source")
+            .and_then(|v| v.as_str())
+        {
             Some("hand") => "hand",
             _ => "auto",
         },
@@ -867,18 +934,32 @@ pub(crate) fn region_of_patch(record: &PatchRecord, page: &ApiPage) -> ApiRegion
         unusually_large: flags.unusually_large,
         mask: Some(ApiMask {
             id: format!("{}-m1", record.id),
+            geometry_policy: (record.geometry_policy == cleaner_core::text_shape::GeometryPolicy::TextShape)
+                .then_some(record.geometry_policy),
+            text_shape_plan_identity: record.text_shape_plan_identity.clone(),
+            text_shape_patch_revision: record.text_shape_revision_id(),
+            legacy_patch_revision: record.legacy_revision_id(),
+            mask_quality_state: None,
+            write_support_sha256: params.get("write_support_sha256")
+                .and_then(|value| value.as_str()).map(str::to_owned),
             region_id: record.id.clone(),
             // The manifest keeps one record per region id - a re-run replaces
             // it rather than appending - so a reopened job has exactly one
             // revision and it is the first one the session sees.
             sequence: 1,
             fill_mode: fill_mode(record.provenance.engine, params),
-            elapsed_ms: params.get("elapsed_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+            elapsed_ms: params
+                .get("elapsed_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
             fitting_reconstructed: flags.fitting_reconstructed,
-            cloud_outcome: flags.cloud_outcome.map(|(accepted, rejection_cause)| CloudOutcome {
-                accepted,
-                rejection_cause,
-            }),
+            dependency_review: flags.dependency_review,
+            cloud_outcome: flags
+                .cloud_outcome
+                .map(|(accepted, rejection_cause)| CloudOutcome {
+                    accepted,
+                    rejection_cause,
+                }),
             provenance: ApiProvenance::of(&record.provenance),
         }),
     }
@@ -889,6 +970,8 @@ pub(crate) fn region_of_untouched(record: &RegionUntouched, page: &ApiPage) -> A
         "review.reason.gateSkippedLowConfidence" => ("gate-skipped", Some("low-confidence"), None),
         "review.reason.gateSkippedOutsideBubble" => ("gate-skipped", Some("outside-bubble"), None),
         "review.reason.gateSkippedNotJapanese" => ("gate-skipped", Some("not-japanese"), None),
+        "review.reason.languageSkipped" => ("gate-skipped", Some("language-skipped"), None),
+        "review.reason.outsideLanguageUnverified" => ("gate-skipped", Some("outside-language-unverified"), None),
         "review.reason.declined" => ("declined", None, None),
         // Anything else - a `decline.reason.*` key, or a key added after this
         // build - leaves the region flagged rather than dropping it out of
@@ -939,7 +1022,9 @@ fn manifest_cache() -> &'static Mutex<HashMap<PathBuf, ManifestCacheEntry>> {
 }
 
 pub(crate) fn invalidate_manifest_cache(path: &Path) {
-    let mut cache = manifest_cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut cache = manifest_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.remove(path);
 }
 
@@ -996,7 +1081,9 @@ impl Library {
     /// Where a chapter's job lives. Derived from the ids rather than stored, so
     /// the whole library is one relocatable directory.
     pub fn job_path(&self, project_id: &str, chapter_id: &str) -> PathBuf {
-        self.root.join(project_id).join(format!("{chapter_id}.{}", cleaner_core::project::EXTENSION))
+        self.root
+            .join(project_id)
+            .join(format!("{chapter_id}.{}", cleaner_core::project::EXTENSION))
     }
 
     /// Read a chapter's project manifest from disk, returning a cached [`Project`]
@@ -1013,7 +1100,9 @@ impl Library {
         let len = metadata.len();
 
         {
-            let cache = manifest_cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let cache = manifest_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(entry) = cache.get(path) {
                 if entry.mtime == mtime && entry.len == len {
                     return Ok(entry.project.clone());
@@ -1034,8 +1123,17 @@ impl Library {
         let project = Arc::new(job.project);
 
         {
-            let mut cache = manifest_cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.insert(path.to_path_buf(), ManifestCacheEntry { mtime, len, project: project.clone() });
+            let mut cache = manifest_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.insert(
+                path.to_path_buf(),
+                ManifestCacheEntry {
+                    mtime,
+                    len,
+                    project: project.clone(),
+                },
+            );
         }
 
         Ok(project)
@@ -1058,11 +1156,18 @@ impl Library {
         let path = self.index_path();
         let bytes = match std::fs::read(&path) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Index::default()),
-            Err(err) => return Err(LibraryError::Index { path, detail: err.to_string() }),
+            Err(err) => {
+                return Err(LibraryError::Index {
+                    path,
+                    detail: err.to_string(),
+                })
+            }
             Ok(bytes) => bytes,
         };
-        let index: Index = serde_json::from_slice(&bytes)
-            .map_err(|e| LibraryError::Index { path: path.clone(), detail: e.to_string() })?;
+        let index: Index = serde_json::from_slice(&bytes).map_err(|e| LibraryError::Index {
+            path: path.clone(),
+            detail: e.to_string(),
+        })?;
         if index.version != INDEX_VERSION {
             return Err(LibraryError::Index {
                 path,
@@ -1079,12 +1184,18 @@ impl Library {
     /// atomically: a truncated index is every project gone.
     fn save(&self, index: &Index) -> Result<(), LibraryError> {
         let path = self.index_path();
-        std::fs::create_dir_all(&self.root)
-            .map_err(|e| LibraryError::Index { path: self.root.clone(), detail: e.to_string() })?;
-        let bytes = serde_json::to_vec_pretty(index)
-            .map_err(|e| LibraryError::Index { path: path.clone(), detail: e.to_string() })?;
-        buffers::write_atomic(&path, &bytes)
-            .map_err(|e| LibraryError::Index { path, detail: e.to_string() })
+        std::fs::create_dir_all(&self.root).map_err(|e| LibraryError::Index {
+            path: self.root.clone(),
+            detail: e.to_string(),
+        })?;
+        let bytes = serde_json::to_vec_pretty(index).map_err(|e| LibraryError::Index {
+            path: path.clone(),
+            detail: e.to_string(),
+        })?;
+        buffers::write_atomic(&path, &bytes).map_err(|e| LibraryError::Index {
+            path,
+            detail: e.to_string(),
+        })
     }
 
     /* ---------- reads ---------- */
@@ -1092,7 +1203,11 @@ impl Library {
     pub fn list_projects(&self) -> Result<Vec<ApiProject>, LibraryError> {
         let index = self.index()?;
         let at = now();
-        Ok(index.projects.iter().map(|project| self.build_project(project, at)).collect())
+        Ok(index
+            .projects
+            .iter()
+            .map(|project| self.build_project(project, at))
+            .collect())
     }
 
     /// Resolve a chapter id to its `.mtclean` job path.
@@ -1104,16 +1219,24 @@ impl Library {
     pub fn resolve_chapter(&self, chapter_id: &str) -> Result<PathBuf, LibraryError> {
         let index = self.index()?;
         for project in &index.projects {
-            if project.chapters.iter().any(|chapter| chapter.id == chapter_id) {
+            if project
+                .chapters
+                .iter()
+                .any(|chapter| chapter.id == chapter_id)
+            {
                 let path = self.job_path(&project.id, chapter_id);
                 return if path.exists() {
                     Ok(path)
                 } else {
-                    Err(LibraryError::NoJob { chapter_id: chapter_id.to_owned() })
+                    Err(LibraryError::NoJob {
+                        chapter_id: chapter_id.to_owned(),
+                    })
                 };
             }
         }
-        Err(LibraryError::Unknown { id: chapter_id.to_owned() })
+        Err(LibraryError::Unknown {
+            id: chapter_id.to_owned(),
+        })
     }
 
     /// The source index a page index addresses.
@@ -1163,7 +1286,11 @@ impl Library {
             },
         );
         self.save(&index)?;
-        let project = index.projects.iter().find(|p| p.id == id).expect("just inserted");
+        let project = index
+            .projects
+            .iter()
+            .find(|p| p.id == id)
+            .expect("just inserted");
         Ok(self.build_project(project, at))
     }
 
@@ -1202,9 +1329,9 @@ impl Library {
             // The number the user chose, stored verbatim. `max + 1` is the
             // fallback for a caller that names none, and is what the dialog
             // starts its field at.
-            let number = number
-                .filter(|given| *given >= 1)
-                .unwrap_or_else(|| project.chapters.iter().map(|c| c.number).max().unwrap_or(0) + 1);
+            let number = number.filter(|given| *given >= 1).unwrap_or_else(|| {
+                project.chapters.iter().map(|c| c.number).max().unwrap_or(0) + 1
+            });
             let resolved = match source_path {
                 Some(given) => Some(given),
                 None => match self.inferred_source_dir(project, name) {
@@ -1247,7 +1374,8 @@ impl Library {
                 // page, so a resident window would build nothing; the editor
                 // asks for one when it opens the chapter.
                 NewChapter::Created(Box::new(
-                    self.build_chapter(project, chapter, order as u32, at, &[]).0,
+                    self.build_chapter(project, chapter, order as u32, at, &[])
+                        .0,
                 ))
             })
             .unwrap_or(NewChapter::NoProject))
@@ -1271,7 +1399,9 @@ impl Library {
         project: &IndexProject,
         name: &str,
     ) -> Result<Option<PathBuf>, String> {
-        let Some(root) = project.source_path.as_deref() else { return Ok(None) };
+        let Some(root) = project.source_path.as_deref() else {
+            return Ok(None);
+        };
         let named = root.join(name);
         let candidate = if named.is_dir() {
             named
@@ -1282,7 +1412,10 @@ impl Library {
         };
         for chapter in &project.chapters {
             let taken = self.chapter_source(project, chapter);
-            if taken.as_deref().is_some_and(|dir| same_dir(dir, &candidate)) {
+            if taken
+                .as_deref()
+                .is_some_and(|dir| same_dir(dir, &candidate))
+            {
                 return Err(chapter.name.clone());
             }
         }
@@ -1336,8 +1469,10 @@ impl Library {
         let Some(position) = index.projects.iter().position(|p| p.id == project_id) else {
             return Ok(None);
         };
-        let Some(chapter_position) =
-            index.projects[position].chapters.iter().position(|c| c.id == chapter_id)
+        let Some(chapter_position) = index.projects[position]
+            .chapters
+            .iter()
+            .position(|c| c.id == chapter_id)
         else {
             return Ok(None);
         };
@@ -1354,7 +1489,9 @@ impl Library {
         // plus its review index and `loadPages` fills the window in one further
         // call.
         Ok(Some(OpenedChapter {
-            chapter: self.build_chapter(project, chapter, chapter_position as u32, at, &[]).0,
+            chapter: self
+                .build_chapter(project, chapter, chapter_position as u32, at, &[])
+                .0,
             project: self.build_project(project, at),
             pending_conversion: None,
         }))
@@ -1373,7 +1510,10 @@ impl Library {
     ) -> Result<Vec<ApiPage>, LibraryError> {
         let path = self.resolve_chapter(chapter_id)?;
         let project = self.read_manifest(&path)?;
-        Ok(indices.iter().filter_map(|index| page_of(chapter_id, &project, *index)).collect())
+        Ok(indices
+            .iter()
+            .filter_map(|index| page_of(chapter_id, &project, *index))
+            .collect())
     }
 
     /// Rename the library's label for a project. The folder on disk keeps its
@@ -1469,7 +1609,10 @@ impl Library {
             (false, _) => Scans::Kept,
             (true, None) => Scans::KeptUnknown,
             (true, Some(dir)) => {
-                if project_root.as_ref().is_some_and(|root| same_dir(root, &dir)) {
+                if project_root
+                    .as_ref()
+                    .is_some_and(|root| same_dir(root, &dir))
+                {
                     Scans::KeptProjectFolder
                 } else {
                     std::fs::remove_dir_all(&dir).map_err(|e| LibraryError::Index {
@@ -1504,7 +1647,9 @@ impl Library {
         visible: bool,
     ) -> Result<Option<(ApiRegion, String)>, LibraryError> {
         let index = self.index()?;
-        let Some(chapter_id) = chapter_holding(&index, region_id) else { return Ok(None) };
+        let Some(chapter_id) = chapter_holding(&index, region_id) else {
+            return Ok(None);
+        };
         let path = self.resolve_chapter(&chapter_id)?;
 
         // Under the job's own lock, like every other write to a manifest in
@@ -1523,7 +1668,12 @@ impl Library {
             // Already there. Still answered, not refused: the seam's undo is
             // free to ask twice, and "it is as you asked" is the truth.
             let source_idx = record.source_idx;
-            return Ok(region_and_status(&chapter_id, &job.project, source_idx, region_id));
+            return Ok(region_and_status(
+                &chapter_id,
+                &job.project,
+                source_idx,
+                region_id,
+            ));
         }
         record.visible = visible;
         let source_idx = record.source_idx;
@@ -1531,8 +1681,134 @@ impl Library {
             path: path.clone(),
             detail: e.to_string(),
         })?;
+        crate::underlay::refresh_dependencies(&mut job, region_id).map_err(|detail| {
+            LibraryError::Manifest {
+                path: path.clone(),
+                detail,
+            }
+        })?;
+        invalidate_manifest_cache(&path);
+        Ok(region_and_status(
+            &chapter_id,
+            &job.project,
+            source_idx,
+            region_id,
+        ))
+    }
+
+    /// Restore the exact committed text-shaped revision named by an undo
+    /// snapshot. Its immutable patch and plan artifacts are checked by the
+    /// store before the current row changes. Never turn on the latest patch
+    /// when the requested historical revision has gone missing.
+    pub fn restore_text_shape_mask(
+        &self,
+        region_id: &str,
+        revision: &str,
+    ) -> Result<Option<(ApiRegion, String)>, LibraryError> {
+        let index = self.index()?;
+        let Some(chapter_id) = chapter_holding(&index, region_id) else { return Ok(None) };
+        let path = self.resolve_chapter(&chapter_id)?;
+        let _lock = crate::run::lock_job(&path);
+        let mut job = Job::open(&path).map_err(|e| LibraryError::Manifest {
+            path: path.clone(), detail: e.to_string(),
+        })?;
+        if !job.restore_text_shape_revision(region_id, revision).map_err(|e| LibraryError::Manifest {
+            path: path.clone(), detail: e.to_string(),
+        })? {
+            return Ok(None);
+        }
+        let Some(record) = job.project.patches.iter_mut().find(|record| record.id == region_id) else {
+            return Ok(None);
+        };
+        record.visible = true;
+        let source_idx = record.source_idx;
+        job.flush().map_err(|e| LibraryError::Manifest { path: path.clone(), detail: e.to_string() })?;
+        crate::underlay::refresh_dependencies(&mut job, region_id).map_err(|detail| LibraryError::Manifest {
+            path: path.clone(), detail,
+        })?;
         invalidate_manifest_cache(&path);
         Ok(region_and_status(&chapter_id, &job.project, source_idx, region_id))
+    }
+
+    pub fn restore_legacy_mask(
+        &self,
+        region_id: &str,
+        revision: &str,
+    ) -> Result<Option<(ApiRegion, String)>, LibraryError> {
+        let index = self.index()?;
+        let Some(chapter_id) = chapter_holding(&index, region_id) else { return Ok(None) };
+        let path = self.resolve_chapter(&chapter_id)?;
+        let _lock = crate::run::lock_job(&path);
+        let mut job = Job::open(&path).map_err(|error| LibraryError::Manifest {
+            path: path.clone(), detail: error.to_string(),
+        })?;
+        if !job.restore_legacy_revision(region_id, revision).map_err(|error| LibraryError::Manifest {
+            path: path.clone(), detail: error.to_string(),
+        })? {
+            return Ok(None);
+        }
+        let Some(record) = job.project.patches.iter_mut().find(|row| row.id == region_id) else {
+            return Ok(None);
+        };
+        record.visible = true;
+        let source_idx = record.source_idx;
+        job.flush().map_err(|error| LibraryError::Manifest {
+            path: path.clone(), detail: error.to_string(),
+        })?;
+        crate::underlay::refresh_dependencies(&mut job, region_id).map_err(|detail| LibraryError::Manifest {
+            path: path.clone(), detail,
+        })?;
+        invalidate_manifest_cache(&path);
+        Ok(region_and_status(&chapter_id, &job.project, source_idx, region_id))
+    }
+
+    pub fn keep_dependency_result(
+        &self,
+        region_id: &str,
+    ) -> Result<Option<ApiRegion>, LibraryError> {
+        let index = self.index()?;
+        let Some(chapter_id) = chapter_holding(&index, region_id) else {
+            return Ok(None);
+        };
+        let path = self.resolve_chapter(&chapter_id)?;
+        let _lock = crate::run::lock_job(&path);
+        let mut job = Job::open(&path).map_err(|e| LibraryError::Manifest {
+            path: path.clone(),
+            detail: e.to_string(),
+        })?;
+        let Some(record) = job
+            .project
+            .patches
+            .iter_mut()
+            .find(|r| r.id == region_id && r.visible)
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            record.review_state.as_deref(),
+            Some("review.reason.inputChanged" | "review.reason.inputUnknown")
+        ) {
+            return Ok(None);
+        }
+        let source_idx = record.source_idx;
+        record.review_state = record
+            .provenance
+            .params_snapshot
+            .get("review_before_input_change")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned);
+        if let Some(snapshot) = record.provenance.params_snapshot.as_object_mut() {
+            snapshot.remove("review_before_input_change");
+        }
+        job.flush().map_err(|e| LibraryError::Manifest {
+            path: path.clone(),
+            detail: e.to_string(),
+        })?;
+        invalidate_manifest_cache(&path);
+        Ok(
+            region_and_status(&chapter_id, &job.project, source_idx, region_id)
+                .map(|(region, _)| region),
+        )
     }
 
     /// Remove one region record entirely (manifest record + buffer files) -
@@ -1545,7 +1821,9 @@ impl Library {
         region_id: &str,
     ) -> Result<Option<(ApiRegion, String)>, LibraryError> {
         let index = self.index()?;
-        let Some(chapter_id) = chapter_holding(&index, region_id) else { return Ok(None) };
+        let Some(chapter_id) = chapter_holding(&index, region_id) else {
+            return Ok(None);
+        };
         let path = self.resolve_chapter(&chapter_id)?;
 
         let _lock = crate::run::lock_job(&path);
@@ -1555,13 +1833,36 @@ impl Library {
         })?;
 
         let mut source_idx = None;
+        let mut removed_artifacts = Vec::<String>::new();
         if let Some(pos) = job.project.patches.iter().position(|r| r.id == region_id) {
             let record = job.project.patches.remove(pos);
             source_idx = Some(record.source_idx);
-            let _ = std::fs::remove_file(job.sidecar().join(&record.mask_ref));
-            let _ = std::fs::remove_file(job.sidecar().join(record.ink_ref()));
-            let _ = std::fs::remove_file(job.sidecar().join(&record.buffer_ref));
+            removed_artifacts.extend([record.mask_ref.clone(), record.ink_ref(), record.buffer_ref.clone()]);
+            if record.geometry_policy == cleaner_core::text_shape::GeometryPolicy::Legacy {
+                removed_artifacts.push(format!("{region_id}.ink"));
+            }
         }
+        job.project.text_shape_patch_revisions.retain(|record| {
+            if record.id != region_id { return true; }
+            removed_artifacts.extend([record.mask_ref.clone(), record.ink_ref(), record.buffer_ref.clone()]);
+            false
+        });
+        job.project.legacy_patch_revisions.retain(|record| {
+            if record.id != region_id { return true; }
+            removed_artifacts.extend([record.mask_ref.clone(), record.ink_ref(), record.buffer_ref.clone()]);
+            removed_artifacts.push(format!("{region_id}.ink"));
+            false
+        });
+        job.project.text_shape_plans.retain(|plan| {
+            if plan.region_id != region_id { return true; }
+            removed_artifacts.extend([
+                plan.base_mask_ref.clone(), plan.additions_ref.clone(), plan.removals_ref.clone(),
+                plan.write_support_ref.clone(), plan.model_hole_ref.clone(),
+            ]);
+            if let Some(alpha) = &plan.blend_alpha_ref { removed_artifacts.push(alpha.clone()); }
+            false
+        });
+        job.project.text_shape_corrections.retain(|entry| entry.region_id != region_id);
 
         let prefix_idx = region_id.rfind("-u");
         if let Some(at) = prefix_idx {
@@ -1574,7 +1875,7 @@ impl Library {
                 );
                 if id == region_id {
                     source_idx = Some(record.source_idx);
-                    if record.reason.contains("gateSkipped") {
+                    if crate::run::is_gate_skip(&record.reason) {
                         gate_dropped += 1;
                     } else {
                         declined += 1;
@@ -1593,16 +1894,31 @@ impl Library {
             path: path.clone(),
             detail: e.to_string(),
         })?;
+        removed_artifacts.sort();
+        removed_artifacts.dedup();
+        for reference in removed_artifacts {
+            let _ = std::fs::remove_file(job.sidecar().join(reference));
+        }
         invalidate_manifest_cache(&path);
         Ok(source_idx.and_then(|idx| {
-            let page_index = job.project.strip.order.iter().position(|index| *index == idx)?;
+            let page_index = job
+                .project
+                .strip
+                .order
+                .iter()
+                .position(|index| *index == idx)?;
             let page = page_of(&chapter_id, &job.project, page_index)?;
             Some((
                 ApiRegion {
                     id: region_id.to_owned(),
                     page_id: page.id.clone(),
                     source_sha: page.source_sha.clone(),
-                    bbox: Bbox { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+                    bbox: Bbox {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 0.0,
+                        h: 0.0,
+                    },
                     source: "hand",
                     detected: false,
                     outcome: "pending",
@@ -1624,6 +1940,16 @@ impl Library {
         source_dir: &Path,
         mode: StripMode,
     ) -> Result<(), LibraryError> {
+        self.write_job_with_space(manifest, source_dir, mode, crate::weights::free_space)
+    }
+
+    fn write_job_with_space(
+        &self,
+        manifest: &Path,
+        source_dir: &Path,
+        mode: StripMode,
+        free_space: impl Fn(&Path) -> Option<u64>,
+    ) -> Result<(), LibraryError> {
         // Paths, not bytes. `ingest_paths_importing` opens one file at a time
         // and lets its buffer go before the next - a 200-page chapter is 200
         // headers in memory, never 200 pages.
@@ -1637,7 +1963,7 @@ impl Library {
         // one place in the application that reads a format it cannot write, and
         // writing those formats back out is still not offered.
         //
-        // What the user's folder is needed for afterwards is one question  - 
+        // What the user's folder is needed for afterwards is one question  -
         // where an export goes by default, and which files must never be
         // written over - and `converted_from` answers it without opening
         // anything.
@@ -1646,23 +1972,35 @@ impl Library {
         // the import makes, and it is why the remove-project copy had to
         // change: after an import the library's copy can be the only one left.
         let pages = sidecar_dir(manifest).join(PAGES_DIR);
-        let report = ingest::ingest_paths_importing(read_directory(source_dir), &pages);
+        let inputs = read_directory(source_dir);
+        let required = estimate_import_bytes(&inputs);
+        if required > 0 {
+            let available = free_space(&pages).ok_or_else(|| LibraryError::FreeSpaceUnavailable {
+                path: pages.clone(),
+            })?;
+            if available < required {
+                return Err(LibraryError::InsufficientSpace { required, available });
+            }
+        }
+        let report = ingest::ingest_paths_importing(inputs, &pages);
         let parent = manifest.parent().unwrap_or(&self.root);
         std::fs::create_dir_all(parent).map_err(|e| LibraryError::Manifest {
             path: parent.to_path_buf(),
             detail: e.to_string(),
         })?;
-        let project =
-            Project::from_ingest(parent, env!("CARGO_PKG_VERSION"), mode, &report);
+        let project = Project::from_ingest(parent, env!("CARGO_PKG_VERSION"), mode, &report);
         // Under the job's own lock like every other write to a manifest in this
         // crate ([`crate::run::lock_job`]). A new chapter's job cannot be one a
         // run is inside - the id has just been minted - but the rule is "one
         // writer per job", and a rule with an exception in it is a rule
         // somebody has to remember.
         let _lock = crate::run::lock_job(manifest);
-        Job::create(manifest, project).map(|_| ()).map_err(|e: StoreError| {
-            LibraryError::Manifest { path: manifest.to_path_buf(), detail: e.to_string() }
-        })?;
+        Job::create(manifest, project)
+            .map(|_| ())
+            .map_err(|e: StoreError| LibraryError::Manifest {
+                path: manifest.to_path_buf(),
+                detail: e.to_string(),
+            })?;
         invalidate_manifest_cache(manifest);
         Ok(())
     }
@@ -1676,12 +2014,13 @@ impl Library {
             // header or by the review index - before this parameter existed,
             // opening the app built every region of every chapter of every
             // project.
-            let (api, interrupted_at) =
-                self.build_chapter(project, chapter, order as u32, at, &[]);
+            let (api, interrupted_at) = self.build_chapter(project, chapter, order as u32, at, &[]);
             if interrupted.is_none() {
                 if let Some(page_index) = interrupted_at {
-                    interrupted =
-                        Some(InterruptedJob { chapter_id: chapter.id.clone(), page_index });
+                    interrupted = Some(InterruptedJob {
+                        chapter_id: chapter.id.clone(),
+                        page_index,
+                    });
                 }
             }
             chapters.push(api);
@@ -1773,7 +2112,11 @@ impl Library {
 /// left alone, so it is not an empty result.
 fn no_text_detected(project: &Project) -> bool {
     !project.strip.order.is_empty()
-        && project.strip.order.iter().all(|idx| project.examined.contains(idx))
+        && project
+            .strip
+            .order
+            .iter()
+            .all(|idx| project.examined.contains(idx))
         && project.patches.is_empty()
         && project.regions_untouched.is_empty()
 }
@@ -1830,7 +2173,10 @@ fn input_reports(project: &Project) -> Vec<NoticeSpec> {
     // same reason: a handful of reasons, and the order is the point.
     let mut by_reason: Vec<(&str, &str, usize)> = Vec::new();
     for entry in &report.skipped {
-        match by_reason.iter_mut().find(|(reason, _, _)| *reason == entry.reason) {
+        match by_reason
+            .iter_mut()
+            .find(|(reason, _, _)| *reason == entry.reason)
+        {
             Some((_, _, count)) => *count += 1,
             None => by_reason.push((&entry.reason, &entry.file, 1)),
         }
@@ -1867,7 +2213,9 @@ fn pages_and_review(
     let mut pages = Vec::with_capacity(project.strip.order.len());
     let mut refs = Vec::new();
     for index in 0..project.strip.order.len() {
-        let Some(page) = page_of(chapter_id, project, index) else { continue };
+        let Some(page) = page_of(chapter_id, project, index) else {
+            continue;
+        };
         for region in &page.regions {
             if let Some(reason_key) = review_reason(region) {
                 refs.push(ReviewRef {
@@ -1878,7 +2226,11 @@ fn pages_and_review(
                 });
             }
         }
-        pages.push(if resident.contains(&index) { page } else { shed_regions(page) });
+        pages.push(if resident.contains(&index) {
+            page
+        } else {
+            shed_regions(page)
+        });
     }
     (pages, refs)
 }
@@ -1916,11 +2268,27 @@ pub struct ReviewRef {
 /// can match more than one, and a fit failure is more actionable than a size
 /// heuristic.
 fn review_reason(region: &ApiRegion) -> Option<&'static str> {
-    if region.mask.as_ref().is_some_and(|mask| mask.fitting_reconstructed) {
+    if let Some(kind) = region.mask.as_ref().and_then(|mask| mask.dependency_review) {
+        return Some(if kind == "changed" {
+            "review.reason.inputChanged"
+        } else {
+            "review.reason.inputUnknown"
+        });
+    }
+    if region
+        .mask
+        .as_ref()
+        .is_some_and(|mask| mask.fitting_reconstructed)
+    {
         return Some("review.reason.fittingReconstructed");
     }
     if region.unusually_large {
         return Some("review.reason.unusuallyLarge");
+    }
+    if region.mask.as_ref().is_some_and(|mask| mask.mask_quality_state.is_some())
+        || region.decline_reason.as_deref() == Some("review.reason.maskNeedsCorrection")
+    {
+        return Some("review.reason.maskNeedsCorrection");
     }
     if region.outcome == "declined" {
         return Some("review.reason.declined");
@@ -1932,6 +2300,8 @@ fn review_reason(region: &ApiRegion) -> Option<&'static str> {
         return Some(match region.gate_skip_cause {
             Some("outside-bubble") => "review.reason.gateSkippedOutsideBubble",
             Some("not-japanese") => "review.reason.gateSkippedNotJapanese",
+            Some("language-skipped") => "review.reason.languageSkipped",
+            Some("outside-language-unverified") => "review.reason.outsideLanguageUnverified",
             _ => "review.reason.gateSkippedLowConfidence",
         });
     }
@@ -1988,7 +2358,11 @@ pub(crate) fn page_of(chapter_id: &str, project: &Project, index: usize) -> Opti
     page.resident = true;
     let mut applied = 0usize;
     let mut deleted = 0usize;
-    for record in project.patches.iter().filter(|r| r.source_idx == source_idx) {
+    for record in project
+        .patches
+        .iter()
+        .filter(|r| r.source_idx == source_idx)
+    {
         // **A deleted mask is not one of the page's regions.** The row is still
         // on disk so the delete can be undone, but a listing that emitted it
         // put a maskless row back in the Layers panel and a box back on the
@@ -1999,7 +2373,15 @@ pub(crate) fn page_of(chapter_id: &str, project: &Project, index: usize) -> Opti
             continue;
         }
         applied += 1;
-        page.regions.push(region_of_patch(record, &page));
+        let mut region = region_of_patch(record, &page);
+        if let Some(correction) = project.text_shape_corrections.iter()
+            .find(|entry| entry.region_id == record.id && entry.source_idx == source_idx)
+        {
+            if let Some(mask) = region.mask.as_mut() {
+                mask.mask_quality_state = Some(correction.reason.clone());
+            }
+        }
+        page.regions.push(region);
     }
     // A page the run examined is finished with, whatever it found. Without the
     // second clause a page with no text on it would read `unclean` for ever and
@@ -2015,8 +2397,30 @@ pub(crate) fn page_of(chapter_id: &str, project: &Project, index: usize) -> Opti
     if applied > 0 || (project.examined.contains(&source_idx) && deleted == 0) {
         page.status = "cleaned";
     }
-    for record in project.regions_untouched.iter().filter(|r| r.source_idx == source_idx) {
+    for record in project
+        .regions_untouched
+        .iter()
+        .filter(|r| r.source_idx == source_idx)
+    {
         page.regions.push(region_of_untouched(record, &page));
+    }
+    for correction in project.text_shape_corrections.iter()
+        .filter(|entry| entry.source_idx == source_idx)
+    {
+        if page.regions.iter().any(|region| region.id == correction.region_id) { continue; }
+        page.regions.push(ApiRegion {
+            id: correction.region_id.clone(),
+            page_id: page.id.clone(),
+            source_sha: page.source_sha.clone(),
+            bbox: percent_of(correction.candidate_bounds, page.width, page.height),
+            source: "hand",
+            detected: true,
+            outcome: "declined",
+            gate_skip_cause: None,
+            decline_reason: Some("review.reason.maskNeedsCorrection".into()),
+            unusually_large: false,
+            mask: None,
+        });
     }
     count_page(&mut page);
     Some(page)
@@ -2040,8 +2444,11 @@ fn count_page(page: &mut ApiPage) {
         .iter()
         .filter(|region| region.mask.is_some() && review_reason(region).is_none())
         .count() as u32;
-    page.review_count =
-        page.regions.iter().filter(|region| review_reason(region).is_some()).count() as u32;
+    page.review_count = page
+        .regions
+        .iter()
+        .filter(|region| review_reason(region).is_some())
+        .count() as u32;
 }
 
 /// The header every page carries, before anything has counted its regions.
@@ -2052,6 +2459,7 @@ fn blank_page(chapter_id: &str, project: &Project, index: usize) -> Option<ApiPa
         id: page_id(chapter_id, index),
         chapter_id: chapter_id.to_owned(),
         index: index as u32,
+        source_index: source_idx,
         number: index as u32 + 1,
         file: source
             .rel_path
@@ -2095,7 +2503,10 @@ pub(crate) fn chapter_holding(index: &Index, region_id: &str) -> Option<String> 
             if !region_id.starts_with(&format!("{}-p", chapter.id)) {
                 continue;
             }
-            if best.map(|current| chapter.id.len() > current.len()).unwrap_or(true) {
+            if best
+                .map(|current| chapter.id.len() > current.len())
+                .unwrap_or(true)
+            {
                 best = Some(&chapter.id);
             }
         }
@@ -2117,7 +2528,11 @@ pub(crate) fn region_and_status(
 ) -> Option<(ApiRegion, String)> {
     // `page_of` takes a position in `strip.order`, never a source index -
     // `Library::resolve_page` is the rule, and this is it read backwards.
-    let page_index = project.strip.order.iter().position(|index| *index == source_idx)?;
+    let page_index = project
+        .strip
+        .order
+        .iter()
+        .position(|index| *index == source_idx)?;
     let page = page_of(chapter_id, project, page_index)?;
     if let Some(region) = page.regions.iter().find(|region| region.id == region_id) {
         return Some((region.clone(), page.status.to_owned()));
@@ -2127,8 +2542,14 @@ pub(crate) fn region_and_status(
     // record directly. Only for a record that is *there and invisible*: an id
     // nothing names is still `None`, which is the answer the seam gives for a
     // region it cannot find.
-    let record = project.patches.iter().find(|r| r.id == region_id && !r.visible)?;
-    Some((region_of_deleted_patch(record, &page), page.status.to_owned()))
+    let record = project
+        .patches
+        .iter()
+        .find(|r| r.id == region_id && !r.visible)?;
+    Some((
+        region_of_deleted_patch(record, &page),
+        page.status.to_owned(),
+    ))
 }
 
 /// The folder a job's sources sit in, read out of the manifest.
@@ -2178,9 +2599,44 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 /// to avoid; `ingest_paths` does the reading, one file at a time. A file that
 /// cannot be opened is now listed as a refusal by ingest rather than dropped
 /// here without a word.
+fn estimate_import_bytes(paths: &[PathBuf]) -> u64 {
+    let mut bytes = 0u64;
+    for path in paths {
+        if ingest::is_junk(path) {
+            continue;
+        }
+        let Ok(source) = std::fs::read(path) else { continue };
+        if cleaner_core::image::Format::sniff(&source).is_some() {
+            if ingest::source_ref(path, &source).is_ok() {
+                bytes = bytes.saturating_add(source.len() as u64);
+            }
+        } else if let Ok(raster) = cleaner_core::image::foreign::decode(&source) {
+            // Measure the same PNG or TIFF the importer writes, so compressed
+            // scans do not inherit a 16-bit RGBA estimate.
+            if let Some(expanded) = estimate_converted_bytes(&raster) {
+                bytes = bytes.saturating_add(expanded);
+            }
+        }
+    }
+    if bytes == 0 { 0 } else { bytes.saturating_add(1_048_576) }
+}
+
+fn estimate_converted_bytes(raster: &cleaner_core::image::Raster) -> Option<u64> {
+    let target = cleaner_core::image::lossless_format_for(raster);
+    cleaner_core::image::encode(raster, target)
+        .ok()
+        .map(|encoded| (encoded.len() as u64).saturating_add(1_048_576))
+}
+
 fn read_directory(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
-    entries.flatten().map(|entry| entry.path()).filter(|path| path.is_file()).collect()
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect()
 }
 
 fn take_id(index: &mut Index) -> u64 {
@@ -2311,9 +2767,17 @@ pub async fn create_chapter(
             &name,
             number,
             source_path.map(PathBuf::from),
-        )?)
+        ))
     })
     .await?;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error @ (LibraryError::InsufficientSpace { .. } | LibraryError::FreeSpaceUnavailable { .. })) => {
+            crate::events::notice(error.reason_key(), serde_json::json!({}), "warn");
+            return Ok(None);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     match outcome {
         NewChapter::NoProject => Ok(None),
         NewChapter::SourceTaken { chapter } => {
@@ -2329,7 +2793,11 @@ pub async fn create_chapter(
                 .and_then(|library| library.index())
                 .ok()
                 .and_then(|index| {
-                    index.projects.iter().find(|p| p.id == project_id).map(|p| p.name.clone())
+                    index
+                        .projects
+                        .iter()
+                        .find(|p| p.id == project_id)
+                        .map(|p| p.name.clone())
                 })
                 .unwrap_or_default();
             crate::events::notice(
@@ -2421,10 +2889,16 @@ pub async fn delete_project(app: tauri::AppHandle, project_id: String) -> Result
     let name = Library::for_app(&app)
         .and_then(|library| library.index())
         .ok()
-        .and_then(|index| index.projects.iter().find(|p| p.id == id).map(|p| p.name.clone()))
+        .and_then(|index| {
+            index
+                .projects
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.name.clone())
+        })
         .unwrap_or_default();
-    let deleted = blocking(move || Ok(Library::for_app(&handle)?.delete_project(&project_id)?))
-        .await?;
+    let deleted =
+        blocking(move || Ok(Library::for_app(&handle)?.delete_project(&project_id)?)).await?;
     if deleted {
         crate::events::notice(
             "notice.project.deleted",
@@ -2513,7 +2987,10 @@ pub async fn delete_mask(
     if edited.is_some() {
         crate::events::notice("notice.mask.deleted", serde_json::json!({}), "info");
     }
-    Ok(edited.map(|(_, page_status)| DeletedMask { region: None, page_status }))
+    Ok(edited.map(|(_, page_status)| DeletedMask {
+        region: None,
+        page_status,
+    }))
 }
 
 /// Put a region back as the caller last saw it - the undo half of every
@@ -2535,9 +3012,26 @@ pub async fn restore_region(
     region: Option<serde_json::Value>,
 ) -> Result<Option<ApiRegion>, String> {
     let wanted = !matches!(region, None | Some(serde_json::Value::Null));
+    let revision = region.as_ref().and_then(|snapshot| {
+        snapshot.pointer("/mask/textShapePatchRevision")
+            .or_else(|| snapshot.pointer("/mask/textShapePlanIdentity"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    });
+    let legacy_revision = region.as_ref().and_then(|snapshot| {
+        snapshot.pointer("/mask/legacyPatchRevision")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    });
     let edited = blocking(move || {
         let library = Library::for_app(&app)?;
         if wanted {
+            if let Some(revision) = revision {
+                return Ok(library.restore_text_shape_mask(&region_id, &revision)?);
+            }
+            if let Some(revision) = legacy_revision {
+                return Ok(library.restore_legacy_mask(&region_id, &revision)?);
+            }
             return Ok(library.set_mask_visible(&region_id, true)?);
         }
         // **"It was not there" is the soft delete, when there is a patch to
@@ -2557,7 +3051,19 @@ pub async fn restore_region(
     .await?;
     // A removal answers with nothing, as the seam says: there is no region to
     // hand back, and the caller's own snapshot is what it applies.
-    Ok(if wanted { edited.map(|(region, _)| region) } else { None })
+    Ok(if wanted {
+        edited.map(|(region, _)| region)
+    } else {
+        None
+    })
+}
+
+#[tauri::command]
+pub async fn keep_dependency_result(
+    app: tauri::AppHandle,
+    region_id: String,
+) -> Result<Option<ApiRegion>, String> {
+    blocking(move || Ok(Library::for_app(&app)?.keep_dependency_result(&region_id)?)).await
 }
 
 impl From<LibraryError> for String {
@@ -2569,7 +3075,7 @@ impl From<LibraryError> for String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cleaner_core::image::{Format, encode, fixtures};
+    use cleaner_core::image::{encode, fixtures, Format};
     use cleaner_core::mask::Mask;
     use cleaner_core::patch::{Patch, Provenance};
 
@@ -2620,7 +3126,10 @@ mod tests {
             let buffer = image::RgbImage::from_raw(raster.width, raster.height, samples).unwrap();
             let mut bytes = Vec::new();
             image::DynamicImage::ImageRgb8(buffer)
-                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Jpeg)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Jpeg,
+                )
                 .unwrap();
             std::fs::write(dir.join(format!("{n:03}.jpg")), bytes).unwrap();
         }
@@ -2658,6 +3167,28 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn unsafe_text_shape_plan_stays_in_review_after_reopen() {
+        let scratch = Scratch::new("shape-correction-reopen");
+        let library = library(&scratch);
+        let project = a_project(&library, &scratch, 1);
+        let chapter = library.create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap().created().unwrap();
+        let path = library.resolve_chapter(&chapter.id).unwrap();
+        let mut job = Job::open(&path).unwrap();
+        job.record_text_shape_correction(
+            0, "shape-draft", 3, Rect::new(2, 3, 4, 5), "empty base mask",
+        ).unwrap();
+        drop(job);
+        let reopened = Job::open(&path).unwrap();
+        let page = page_of(&chapter.id, &reopened.project, 0).unwrap();
+        let region = page.regions.iter().find(|region| region.id == "shape-draft").unwrap();
+        assert_eq!(region.outcome, "declined");
+        assert_eq!(region.decline_reason.as_deref(), Some("review.reason.maskNeedsCorrection"));
+        assert_eq!(region.bbox, percent_of(Rect::new(2, 3, 4, 5), page.width, page.height));
+        assert_eq!(page.review_count, 1);
+    }
+
     fn provenance(engine: Engine) -> Provenance {
         Provenance {
             engine,
@@ -2688,6 +3219,125 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chapter_import_refuses_full_volume_before_writing() {
+        let scratch = Scratch::new("ingest-full-volume");
+        let library = library(&scratch);
+        let source = scans(&scratch.join("scans"), 2);
+        let manifest = scratch.join("library/chapter.mtclean");
+        let error = library.write_job_with_space(&manifest, &source, StripMode::Single, |_| Some(0))
+            .unwrap_err();
+        assert!(matches!(error, LibraryError::InsufficientSpace { required: 1.., available: 0 }));
+        assert_eq!(error.reason_key(), "notice.library.ingestInsufficientSpace");
+        assert!(!manifest.exists());
+        assert!(!sidecar_dir(&manifest).exists());
+    }
+
+    #[test]
+    fn dependency_keep_preserves_pixels_and_unrelated_edits_leave_b_alone() {
+        let scratch = Scratch::new("dependency-keep");
+        let library = library(&scratch);
+        let project = a_project(&library, &scratch, 1);
+        let chapter = library.create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap().created().unwrap();
+        let path = library.resolve_chapter(&chapter.id).unwrap();
+        let a_id = format!("{}-r1", page_id(&chapter.id, 0));
+        let b_id = format!("{}-r2", page_id(&chapter.id, 0));
+        let mut job = Job::open(&path).unwrap();
+        let a = a_patch(&a_id, Rect::new(0, 0, 4, 4), Engine::Fill);
+        job.complete_region(0, &a, None).unwrap();
+        let mut b = a_patch(&b_id, Rect::new(40, 30, 4, 4), Engine::Fill);
+        b.order = 1;
+        b.provenance.params_snapshot["input_provenance"] = serde_json::json!({
+            "read_footprint": Rect::new(35, 25, 12, 12),
+            "input_sha256": "unrelated-digest"
+        });
+        job.complete_region(0, &b, None).unwrap();
+        crate::underlay::refresh_dependencies(&mut job, &a_id).unwrap();
+        assert_eq!(job.project.patches[1].review_state, None);
+
+        job.project.patches[1].review_state = Some("review.reason.inputChanged".into());
+        job.project.patches[1].provenance.params_snapshot["review_before_input_change"] =
+            serde_json::Value::Null;
+        job.flush().unwrap();
+        let before = job.load_patch(&job.project.patches[1]).unwrap().pixels.data;
+        drop(job);
+        let kept = library.keep_dependency_result(&b_id).unwrap().unwrap();
+        assert_eq!(kept.mask.unwrap().dependency_review, None);
+        let reopened = Job::open(&path).unwrap();
+        assert_eq!(reopened.project.patches[1].review_state, None);
+        assert_eq!(reopened.load_patch(&reopened.project.patches[1]).unwrap().pixels.data, before);
+    }
+
+    #[test]
+    fn legacy_restore_selects_old_and_new_pixels_after_reopen() {
+        let scratch = Scratch::new("legacy-restore-reopen");
+        let library = library(&scratch);
+        let project = a_project(&library, &scratch, 1);
+        let chapter = library.create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap().created().unwrap();
+        let path = library.resolve_chapter(&chapter.id).unwrap();
+        let region_id = format!("{}-r1", page_id(&chapter.id, 0));
+        let mut job = Job::open(&path).unwrap();
+        let mut patch = a_patch(&region_id, Rect::new(10, 10, 4, 4), Engine::Fill);
+        patch.pixels.data.fill(17);
+        job.complete_region(0, &patch, None).unwrap();
+        let old = job.project.patches[0].legacy_revision_id().unwrap();
+        patch.pixels.data.fill(201);
+        job.complete_region(0, &patch, None).unwrap();
+        let new = job.project.patches[0].legacy_revision_id().unwrap();
+        drop(job);
+
+        library.restore_legacy_mask(&region_id, &old).unwrap().unwrap();
+        let reopened = Job::open(&path).unwrap();
+        assert!(reopened.load_patch(&reopened.project.patches[0]).unwrap().pixels.data.iter().all(|&p| p == 17));
+        drop(reopened);
+        library.restore_legacy_mask(&region_id, &new).unwrap().unwrap();
+        let reopened = Job::open(&path).unwrap();
+        assert!(reopened.load_patch(&reopened.project.patches[0]).unwrap().pixels.data.iter().all(|&p| p == 201));
+    }
+
+    #[test]
+    fn hard_remove_deletes_legacy_rerun_sidecars_but_keeps_other_regions() {
+        let scratch = Scratch::new("legacy-hard-remove");
+        let library = library(&scratch);
+        let project = a_project(&library, &scratch, 1);
+        let chapter = library.create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap().created().unwrap();
+        let path = library.resolve_chapter(&chapter.id).unwrap();
+        let region_id = format!("{}-r1", page_id(&chapter.id, 0));
+        let other_id = format!("{}-r2", page_id(&chapter.id, 0));
+        let mut job = Job::open(&path).unwrap();
+        let mut patch = a_patch(&region_id, Rect::new(10, 10, 4, 4), Engine::Fill);
+        for value in [17, 91, 201] {
+            patch.pixels.data.fill(value);
+            job.complete_region(0, &patch, None).unwrap();
+        }
+        job.complete_region(0, &a_patch(&other_id, Rect::new(30, 30, 4, 4), Engine::Fill), None)
+            .unwrap();
+        assert_eq!(job.project.legacy_patch_revisions.iter().filter(|row| row.id == region_id).count(), 3);
+        let mut removed_files: Vec<_> = job.project.patches.iter()
+            .chain(job.project.legacy_patch_revisions.iter())
+            .filter(|row| row.id == region_id)
+            .flat_map(|row| [row.mask_ref.clone(), row.ink_ref(), row.buffer_ref.clone()])
+            .collect();
+        removed_files.push(format!("{region_id}.ink"));
+        let other = job.project.patches.iter().find(|row| row.id == other_id).unwrap();
+        let other_files = [other.mask_ref.clone(), other.ink_ref(), other.buffer_ref.clone()];
+        assert!(removed_files.iter().all(|name| job.sidecar().join(name).exists()));
+        assert!(other_files.iter().all(|name| job.sidecar().join(name).exists()));
+        let sidecar = job.sidecar().to_path_buf();
+        drop(job);
+
+        assert!(library.remove_region(&region_id).unwrap().is_some());
+        let reopened = Job::open(&path).unwrap();
+        assert!(!reopened.project.patches.iter().any(|row| row.id == region_id));
+        assert!(!reopened.project.legacy_patch_revisions.iter().any(|row| row.id == region_id));
+        assert!(removed_files.iter().all(|name| !sidecar.join(name).exists()));
+        assert!(reopened.project.patches.iter().any(|row| row.id == other_id));
+        assert!(other_files.iter().all(|name| sidecar.join(name).exists()));
+    }
+
     /* ---------- the index ---------- */
 
     #[test]
@@ -2695,7 +3345,10 @@ mod tests {
         let scratch = Scratch::new("first-launch");
         let library = library(&scratch);
         assert!(library.list_projects().unwrap().is_empty());
-        assert!(!library.index_path().exists(), "reading the library created it");
+        assert!(
+            !library.index_path().exists(),
+            "reading the library created it"
+        );
     }
 
     /// `version` is written on every save, so it has to be read on every load.
@@ -2719,9 +3372,15 @@ mod tests {
         // And nothing writes over it on the way past: a refused read is a
         // library left exactly as the newer build wrote it.
         assert!(library.rename_project(&project.id, "Renamed").is_err());
-        assert!(library.create_project("New", StripMode::Single, None, None).is_err());
+        assert!(library
+            .create_project("New", StripMode::Single, None, None)
+            .is_err());
         assert!(library.delete_project(&project.id).is_err());
-        assert_eq!(std::fs::read(library.index_path()).unwrap(), on_disk, "the index was rewritten");
+        assert_eq!(
+            std::fs::read(library.index_path()).unwrap(),
+            on_disk,
+            "the index was rewritten"
+        );
     }
 
     /// Whatever a refused index costs the user, it is reported under a key the
@@ -2740,7 +3399,12 @@ mod tests {
         let scratch = Scratch::new("round-trip");
         let library = library(&scratch);
         let created = library
-            .create_project("Nine Skies", StripMode::Longstrip, None, Some(ReadingDirection::Ltr))
+            .create_project(
+                "Nine Skies",
+                StripMode::Longstrip,
+                None,
+                Some(ReadingDirection::Ltr),
+            )
             .unwrap();
 
         let listed = library.list_projects().unwrap();
@@ -2749,14 +3413,19 @@ mod tests {
         assert_eq!(listed[0].name, "Nine Skies");
         assert_eq!(listed[0].mode, StripMode::Longstrip);
         assert_eq!(listed[0].reading_direction, ReadingDirection::Ltr);
-        assert!(listed[0].chapters.is_empty(), "a new project invented a chapter");
+        assert!(
+            listed[0].chapters.is_empty(),
+            "a new project invented a chapter"
+        );
     }
 
     #[test]
     fn reading_direction_defaults_to_right_to_left() {
         let scratch = Scratch::new("rtl");
         let library = library(&scratch);
-        let project = library.create_project("Tsuki", StripMode::Single, None, None).unwrap();
+        let project = library
+            .create_project("Tsuki", StripMode::Single, None, None)
+            .unwrap();
         assert_eq!(project.reading_direction, ReadingDirection::Rtl);
     }
 
@@ -2765,11 +3434,16 @@ mod tests {
     fn chapters_are_numbered_above_the_highest_and_a_gap_stays_a_gap() {
         let scratch = Scratch::new("numbering");
         let library = library(&scratch);
-        let project = library.create_project("Emberfall", StripMode::Single, None, None).unwrap();
+        let project = library
+            .create_project("Emberfall", StripMode::Single, None, None)
+            .unwrap();
 
         for expected in 1..=3 {
-            let chapter =
-                library.create_chapter(&project.id, &format!("Ch {expected}"), None, None).unwrap().created().unwrap();
+            let chapter = library
+                .create_chapter(&project.id, &format!("Ch {expected}"), None, None)
+                .unwrap()
+                .created()
+                .unwrap();
             assert_eq!(chapter.number, expected);
         }
 
@@ -2777,11 +3451,20 @@ mod tests {
         // property under test is that numbering reads the maximum rather than
         // the count.
         let mut index = library.index().unwrap();
-        index.projects[0].chapters.retain(|chapter| chapter.number != 2);
+        index.projects[0]
+            .chapters
+            .retain(|chapter| chapter.number != 2);
         library.save(&index).unwrap();
 
-        let next = library.create_chapter(&project.id, "Ch 4", None, None).unwrap().created().unwrap();
-        assert_eq!(next.number, 4, "a removed chapter's number was handed out again");
+        let next = library
+            .create_chapter(&project.id, "Ch 4", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
+        assert_eq!(
+            next.number, 4,
+            "a removed chapter's number was handed out again"
+        );
     }
 
     /// The number the New chapter dialog sends is the number the chapter gets,
@@ -2792,10 +3475,15 @@ mod tests {
     fn a_given_number_is_stored_verbatim() {
         let scratch = Scratch::new("given-number");
         let library = library(&scratch);
-        let project = library.create_project("Emberfall", StripMode::Single, None, None).unwrap();
+        let project = library
+            .create_project("Emberfall", StripMode::Single, None, None)
+            .unwrap();
 
-        let first =
-            library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let first = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
         assert_eq!(first.number, 1);
 
         let jump = library
@@ -2830,7 +3518,9 @@ mod tests {
         let scratch = Scratch::new("delete-chapter");
         let library = library(&scratch);
         let scans = scans(&scratch.join("ch1"), 2);
-        let project = library.create_project("Emberfall", StripMode::Single, None, None).unwrap();
+        let project = library
+            .create_project("Emberfall", StripMode::Single, None, None)
+            .unwrap();
         let chapter = library
             .create_chapter(&project.id, "Ch 1", None, Some(scans.clone()))
             .unwrap()
@@ -2841,12 +3531,26 @@ mod tests {
         let sidecar = cleaner_core::project::sidecar_dir(&manifest);
         assert!(manifest.exists(), "the chapter was never written");
 
-        let outcome = library.delete_chapter(&project.id, &chapter.id, false).unwrap();
-        assert!(matches!(outcome, ChapterDeleted::Deleted { number: 1, scans: Scans::Kept }));
+        let outcome = library
+            .delete_chapter(&project.id, &chapter.id, false)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ChapterDeleted::Deleted {
+                number: 1,
+                scans: Scans::Kept
+            }
+        ));
 
         assert!(!manifest.exists(), "the manifest outlived the chapter");
-        assert!(!sidecar.exists(), "the sidecar directory outlived the chapter");
-        assert!(scans.exists(), "the scans were removed without being asked for");
+        assert!(
+            !sidecar.exists(),
+            "the sidecar directory outlived the chapter"
+        );
+        assert!(
+            scans.exists(),
+            "the scans were removed without being asked for"
+        );
         assert!(library.index().unwrap().projects[0].chapters.is_empty());
     }
 
@@ -2854,18 +3558,49 @@ mod tests {
     /// page, and every answer about *where the chapter came from* still names
     /// the user's folder rather than the library directory the PNGs went into.
     #[test]
+    fn jpeg_import_estimate_bounds_png_without_assuming_rgba16() {
+        let scratch = Scratch::new("jpeg-estimate");
+        let raws = jpeg_scans(&scratch.join("raws"), 1);
+        let path = raws.join("001.jpg");
+        let source = std::fs::read(&path).unwrap();
+        let raster = cleaner_core::image::foreign::decode(&source).unwrap();
+        let converted = encode(&raster, Format::Png).unwrap();
+        let estimate = estimate_import_bytes(&[path]);
+
+        assert!(estimate >= converted.len() as u64 + 1_048_576);
+        assert!(estimate - 2 * 1_048_576 < u64::from(raster.width) * u64::from(raster.height) * 8);
+    }
+
+    #[test]
+    fn cmyk_import_estimate_uses_tiff_output_size() {
+        let raster = fixtures::by_name("cmyk8").raster;
+        let tiff = encode(&raster, Format::Tiff).unwrap();
+        assert_eq!(
+            estimate_converted_bytes(&raster),
+            Some(tiff.len() as u64 + 1_048_576)
+        );
+    }
+
+    #[test]
     fn a_folder_of_jpegs_becomes_a_chapter_of_pngs() {
         let scratch = Scratch::new("convert-chapter");
         let library = library(&scratch);
         let raws = jpeg_scans(&scratch.join("raws"), 2);
-        let project = library.create_project("Neon Alley", StripMode::Single, None, None).unwrap();
+        let project = library
+            .create_project("Neon Alley", StripMode::Single, None, None)
+            .unwrap();
         let chapter = library
             .create_chapter(&project.id, "Ch 1", None, Some(raws.clone()))
             .unwrap()
             .created()
             .unwrap();
 
-        assert_eq!(chapter.pages.len(), 2, "the JPEGs were refused: {:?}", chapter.input_reports);
+        assert_eq!(
+            chapter.pages.len(),
+            2,
+            "the JPEGs were refused: {:?}",
+            chapter.input_reports
+        );
         assert_eq!(chapter.source_path, raws.to_string_lossy());
 
         let manifest_path = library.job_path(&project.id, &chapter.id);
@@ -2877,7 +3612,10 @@ mod tests {
             let png = manifest_path.parent().unwrap().join(&source.rel_path);
             assert_eq!(png.extension().unwrap(), "png");
             assert!(png.starts_with(&converted));
-            let original = source.converted_from.as_ref().expect("the JPEG it came from");
+            let original = source
+                .converted_from
+                .as_ref()
+                .expect("the JPEG it came from");
             assert!(manifest_path.parent().unwrap().join(original).exists());
         }
 
@@ -2902,14 +3640,20 @@ mod tests {
         let scratch = Scratch::new("import-chapter");
         let library = library(&scratch);
         let raws = scans(&scratch.join("raws"), 2);
-        let project =
-            library.create_project("Wandering Moon", StripMode::Single, None, None).unwrap();
+        let project = library
+            .create_project("Wandering Moon", StripMode::Single, None, None)
+            .unwrap();
         let chapter = library
             .create_chapter(&project.id, "Ch 1", None, Some(raws.clone()))
             .unwrap()
             .created()
             .unwrap();
-        assert_eq!(chapter.pages.len(), 2, "the PNGs were refused: {:?}", chapter.input_reports);
+        assert_eq!(
+            chapter.pages.len(),
+            2,
+            "the PNGs were refused: {:?}",
+            chapter.input_reports
+        );
 
         let manifest_path = library.job_path(&project.id, &chapter.id);
         let pages = cleaner_core::project::sidecar_dir(&manifest_path).join(PAGES_DIR);
@@ -2917,7 +3661,10 @@ mod tests {
 
         // Nothing was converted, so the chapter must not say anything was.
         assert!(
-            !chapter.input_reports.iter().any(|notice| notice.key == "notice.input.converted"),
+            !chapter
+                .input_reports
+                .iter()
+                .any(|notice| notice.key == "notice.input.converted"),
             "a copy was reported as a conversion"
         );
 
@@ -2926,7 +3673,10 @@ mod tests {
         // in it any more.
         let job = Job::open(&manifest_path).expect("the job opens");
         assert!(job.output_refusal(&raws).is_some());
-        assert_eq!(job.origin_path(0).unwrap().parent().unwrap().file_name(), raws.file_name());
+        assert_eq!(
+            job.origin_path(0).unwrap().parent().unwrap().file_name(),
+            raws.file_name()
+        );
         drop(job);
 
         // The user's folder goes, and with it every path the manifest used to
@@ -2937,19 +3687,21 @@ mod tests {
         let job = Job::open(&manifest_path).expect("the job still opens");
         for index in 0..manifest.sources.len() {
             let page = job.source_path(index).expect("a page path");
-            assert!(page.starts_with(&pages), "{page:?} is not the library's own file");
+            assert!(
+                page.starts_with(&pages),
+                "{page:?} is not the library's own file"
+            );
             assert!(page.exists(), "{page:?} did not survive the scan folder");
         }
         // Every source verifies against the library's own copy, so a resume
         // finds nothing stale and drops no patches.
-        assert!(
-            job.verify_sources()
-                .iter()
-                .all(|state| *state == cleaner_core::project::SourceState::Unchanged)
-        );
+        assert!(job
+            .verify_sources()
+            .iter()
+            .all(|state| *state == cleaner_core::project::SourceState::Unchanged));
 
         // And the origin is still the folder the user chose, so the export's
-        // default destination is still theirs and not one inside the library  - 
+        // default destination is still theirs and not one inside the library  -
         // a directory the exporter creates, rather than a path it cannot form.
         // (Lexically, since `rel_path` climbs out of the library with `..` and
         // neither end canonicalises once the folder is gone.)
@@ -2965,7 +3717,9 @@ mod tests {
         let scratch = Scratch::new("convert-export-dir");
         let library = library(&scratch);
         let raws = jpeg_scans(&scratch.join("raws"), 1);
-        let project = library.create_project("Neon Alley", StripMode::Single, None, None).unwrap();
+        let project = library
+            .create_project("Neon Alley", StripMode::Single, None, None)
+            .unwrap();
         let chapter = library
             .create_chapter(&project.id, "Ch 1", None, Some(raws.clone()))
             .unwrap()
@@ -2977,10 +3731,7 @@ mod tests {
         // join back out of the library is a `../..` chain - true, and not a
         // path to compare textually.
         let origin = job.origin_path(0).unwrap().canonicalize().unwrap();
-        assert_eq!(
-            origin.parent().unwrap(),
-            raws.canonicalize().unwrap(),
-        );
+        assert_eq!(origin.parent().unwrap(), raws.canonicalize().unwrap(),);
         // And "output never overwrites input" covers the JPEG too.
         assert!(job.output_refusal(&raws).is_some());
     }
@@ -2990,16 +3741,29 @@ mod tests {
         let scratch = Scratch::new("delete-chapter-scans");
         let library = library(&scratch);
         let scans = scans(&scratch.join("ch1"), 2);
-        let project = library.create_project("Emberfall", StripMode::Single, None, None).unwrap();
+        let project = library
+            .create_project("Emberfall", StripMode::Single, None, None)
+            .unwrap();
         let chapter = library
             .create_chapter(&project.id, "Ch 1", None, Some(scans.clone()))
             .unwrap()
             .created()
             .unwrap();
 
-        let outcome = library.delete_chapter(&project.id, &chapter.id, true).unwrap();
-        assert!(matches!(outcome, ChapterDeleted::Deleted { scans: Scans::Removed, .. }));
-        assert!(!scans.exists(), "the scans were kept after the user asked for them to go");
+        let outcome = library
+            .delete_chapter(&project.id, &chapter.id, true)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ChapterDeleted::Deleted {
+                scans: Scans::Removed,
+                ..
+            }
+        ));
+        assert!(
+            !scans.exists(),
+            "the scans were kept after the user asked for them to go"
+        );
     }
 
     /// The one refusal: a chapter reading the project's own folder is every
@@ -3012,11 +3776,22 @@ mod tests {
         let project = library
             .create_project("Emberfall", StripMode::Single, Some(root.clone()), None)
             .unwrap();
-        let chapter =
-            library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
-        let outcome = library.delete_chapter(&project.id, &chapter.id, true).unwrap();
-        assert!(matches!(outcome, ChapterDeleted::Deleted { scans: Scans::KeptProjectFolder, .. }));
+        let outcome = library
+            .delete_chapter(&project.id, &chapter.id, true)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ChapterDeleted::Deleted {
+                scans: Scans::KeptProjectFolder,
+                ..
+            }
+        ));
         assert!(root.exists(), "deleting one chapter emptied the project");
     }
 
@@ -3024,7 +3799,9 @@ mod tests {
     fn deleting_a_chapter_that_is_not_there_is_no_chapter_rather_than_an_error() {
         let scratch = Scratch::new("delete-chapter-missing");
         let library = library(&scratch);
-        let project = library.create_project("Emberfall", StripMode::Single, None, None).unwrap();
+        let project = library
+            .create_project("Emberfall", StripMode::Single, None, None)
+            .unwrap();
         assert!(matches!(
             library.delete_chapter(&project.id, "c404", false).unwrap(),
             ChapterDeleted::NoChapter
@@ -3045,7 +3822,10 @@ mod tests {
         ));
         assert!(library.rename_project("p404", "x").unwrap().is_none());
         assert!(!library.delete_project("p404").unwrap());
-        assert!(library.open_chapter("p404", "c404", false).unwrap().is_none());
+        assert!(library
+            .open_chapter("p404", "c404", false)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -3053,7 +3833,10 @@ mod tests {
         let scratch = Scratch::new("rename");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 2);
-        let renamed = library.rename_project(&project.id, "Wandering Moon (v2)").unwrap().unwrap();
+        let renamed = library
+            .rename_project(&project.id, "Wandering Moon (v2)")
+            .unwrap()
+            .unwrap();
         assert_eq!(renamed.name, "Wandering Moon (v2)");
         assert_eq!(renamed.source_path, project.source_path);
         assert_eq!(renamed.mode, project.mode);
@@ -3067,13 +3850,20 @@ mod tests {
         let scratch = Scratch::new("delete");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 3);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
         let job = library.job_path(&project.id, &chapter.id);
         assert!(job.exists());
 
         assert!(library.delete_project(&project.id).unwrap());
         assert!(library.list_projects().unwrap().is_empty());
-        assert!(job.exists(), "the job manifest was deleted with the library entry");
+        assert!(
+            job.exists(),
+            "the job manifest was deleted with the library entry"
+        );
         assert_eq!(std::fs::read_dir(scratch.join("raws")).unwrap().count(), 3);
     }
 
@@ -3084,7 +3874,10 @@ mod tests {
         let scratch = Scratch::new("pages");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 4);
-        library.create_chapter(&project.id, "Vault of Ash", None, None).unwrap().created();
+        library
+            .create_chapter(&project.id, "Vault of Ash", None, None)
+            .unwrap()
+            .created();
 
         let listed = library.list_projects().unwrap();
         let chapter = &listed[0].chapters[0];
@@ -3095,7 +3888,10 @@ mod tests {
         assert_eq!(chapter.pages[0].number, 1);
         assert_eq!(chapter.pages[3].file, "004.png");
         assert!(chapter.pages.iter().all(|page| page.status == "unclean"));
-        assert!(chapter.pages.iter().all(|page| page.width > 0 && page.height > 0));
+        assert!(chapter
+            .pages
+            .iter()
+            .all(|page| page.width > 0 && page.height > 0));
     }
 
     #[test]
@@ -3105,12 +3901,20 @@ mod tests {
         let root = scratch.join("raws");
         scans(&root, 2);
         scans(&root.join("Ch 12"), 5);
-        let project =
-            library.create_project("WM", StripMode::Single, Some(root), None).unwrap();
+        let project = library
+            .create_project("WM", StripMode::Single, Some(root), None)
+            .unwrap();
 
-        library.create_chapter(&project.id, "Ch 12", None, None).unwrap().created();
+        library
+            .create_chapter(&project.id, "Ch 12", None, None)
+            .unwrap()
+            .created();
         let listed = library.list_projects().unwrap();
-        assert_eq!(listed[0].chapters[0].pages.len(), 5, "the subfolder was not preferred");
+        assert_eq!(
+            listed[0].chapters[0].pages.len(),
+            5,
+            "the subfolder was not preferred"
+        );
     }
 
     /* ---------- where a chapter's pages come from ---------- */
@@ -3128,26 +3932,40 @@ mod tests {
         // - ingest is per chapter - and the test would pass without proving it.
         let east = tagged_scans(&scratch.join("east"), 3, 0x10);
         let west = tagged_scans(&scratch.join("west"), 5, 0x90);
-        let project =
-            library.create_project("Two Coasts", StripMode::Single, Some(east.clone()), None)
-                .unwrap();
+        let project = library
+            .create_project("Two Coasts", StripMode::Single, Some(east.clone()), None)
+            .unwrap();
 
-        let first = library.create_chapter(&project.id, "East", None, Some(east)).unwrap()
-            .created().unwrap();
-        let second = library.create_chapter(&project.id, "West", None, Some(west)).unwrap()
-            .created().unwrap();
+        let first = library
+            .create_chapter(&project.id, "East", None, Some(east))
+            .unwrap()
+            .created()
+            .unwrap();
+        let second = library
+            .create_chapter(&project.id, "West", None, Some(west))
+            .unwrap()
+            .created()
+            .unwrap();
 
         assert_eq!(first.pages.len(), 3);
         assert_eq!(second.pages.len(), 5);
         let shas = |chapter: &ApiChapter| -> Vec<String> {
-            chapter.pages.iter().map(|page| page.source_sha.clone()).collect()
+            chapter
+                .pages
+                .iter()
+                .map(|page| page.source_sha.clone())
+                .collect()
         };
         assert!(
             shas(&first).iter().all(|sha| !shas(&second).contains(sha)),
             "the two chapters ingested the same files"
         );
         assert!(first.source_path.ends_with("east"), "{}", first.source_path);
-        assert!(second.source_path.ends_with("west"), "{}", second.source_path);
+        assert!(
+            second.source_path.ends_with("west"),
+            "{}",
+            second.source_path
+        );
     }
 
     /// The same thing over the repository's own scans rather than over
@@ -3172,7 +3990,10 @@ mod tests {
             }
             names.iter().map(|name| (*name).to_owned()).collect()
         };
-        let in_one = copy("Ch. 1", &["page-dialogue.png", "page-sfx.png", "page-screentone.png"]);
+        let in_one = copy(
+            "Ch. 1",
+            &["page-dialogue.png", "page-sfx.png", "page-screentone.png"],
+        );
         let in_two = copy("Ch. 2", &["strip-01.png", "strip-02.png"]);
 
         let project = library
@@ -3181,8 +4002,16 @@ mod tests {
         // No path given: the subfolder named after the chapter is the chapter,
         // which is the inference - and it is distinct per chapter, so the guard
         // never fires and neither chapter borrows the other's files.
-        let one = library.create_chapter(&project.id, "Ch. 1", None, None).unwrap().created().unwrap();
-        let two = library.create_chapter(&project.id, "Ch. 2", None, None).unwrap().created().unwrap();
+        let one = library
+            .create_chapter(&project.id, "Ch. 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
+        let two = library
+            .create_chapter(&project.id, "Ch. 2", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
         let files = |chapter: &ApiChapter| -> Vec<String> {
             let mut names: Vec<String> = chapter.pages.iter().map(|p| p.file.clone()).collect();
@@ -3203,16 +4032,23 @@ mod tests {
     /// points at a folder of scans should not make anyone re-state it for the
     /// first chapter - but it can no longer hand that folder to a second.
     #[test]
-    fn a_second_chapter_with_nothing_to_tell_it_apart_is_refused_rather_than_given_the_first_ones_files()
-     {
+    fn a_second_chapter_with_nothing_to_tell_it_apart_is_refused_rather_than_given_the_first_ones_files(
+    ) {
         let scratch = Scratch::new("fallback-guard");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 4);
 
-        let first = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let first = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
         assert_eq!(first.pages.len(), 4);
 
-        match library.create_chapter(&project.id, "Ch 2", None, None).unwrap() {
+        match library
+            .create_chapter(&project.id, "Ch 2", None, None)
+            .unwrap()
+        {
             NewChapter::SourceTaken { chapter } => assert_eq!(chapter, "Ch 1"),
             other => panic!("the project folder was handed out twice: {other:?}"),
         }
@@ -3237,11 +4073,15 @@ mod tests {
     /// *read back out of it* rather than guessed at.
     #[test]
     fn a_chapter_from_before_the_seam_carried_a_path_keeps_its_files_and_still_says_where_they_are()
-     {
+    {
         let scratch = Scratch::new("legacy");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 3);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
         // Roll the row back to what a build before this one wrote.
         let mut index = library.index().unwrap();
@@ -3250,14 +4090,24 @@ mod tests {
 
         let listed = library.list_projects().unwrap();
         let legacy = &listed[0].chapters[0];
-        assert_eq!(legacy.pages.len(), 3, "an unrecorded source lost the chapter its pages");
+        assert_eq!(
+            legacy.pages.len(),
+            3,
+            "an unrecorded source lost the chapter its pages"
+        );
         assert_eq!(legacy.id, chapter.id);
-        assert!(legacy.source_path.ends_with("raws"), "{}", legacy.source_path);
+        assert!(
+            legacy.source_path.ends_with("raws"),
+            "{}",
+            legacy.source_path
+        );
 
         // And the guard sees it, so the folder it reads is not handed to a
         // second chapter just because the row does not name it.
         assert!(matches!(
-            library.create_chapter(&project.id, "Ch 2", None, None).unwrap(),
+            library
+                .create_chapter(&project.id, "Ch 2", None, None)
+                .unwrap(),
             NewChapter::SourceTaken { .. }
         ));
     }
@@ -3270,7 +4120,11 @@ mod tests {
         let scratch = Scratch::new("broken-job");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 3);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
         std::fs::write(library.job_path(&project.id, &chapter.id), b"{ not json").unwrap();
 
         let listed = library.list_projects().unwrap();
@@ -3295,8 +4149,14 @@ mod tests {
     fn a_chapter_with_no_source_folder_has_no_job_and_still_lists() {
         let scratch = Scratch::new("no-source");
         let library = library(&scratch);
-        let project = library.create_project("Sketches", StripMode::Single, None, None).unwrap();
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let project = library
+            .create_project("Sketches", StripMode::Single, None, None)
+            .unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
         assert!(chapter.pages.is_empty());
         assert!(matches!(
             library.resolve_chapter(&chapter.id),
@@ -3310,14 +4170,33 @@ mod tests {
         let library = library(&scratch);
         let first = a_project(&library, &scratch, 2);
         let second = library
-            .create_project("Second", StripMode::Single, Some(scratch.join("raws")), None)
+            .create_project(
+                "Second",
+                StripMode::Single,
+                Some(scratch.join("raws")),
+                None,
+            )
             .unwrap();
-        let a = library.create_chapter(&first.id, "A", None, None).unwrap().created().unwrap();
-        let b = library.create_chapter(&second.id, "B", None, None).unwrap().created().unwrap();
+        let a = library
+            .create_chapter(&first.id, "A", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
+        let b = library
+            .create_chapter(&second.id, "B", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
         assert_ne!(a.id, b.id, "two chapters shared an id");
-        assert_eq!(library.resolve_chapter(&a.id).unwrap(), library.job_path(&first.id, &a.id));
-        assert_eq!(library.resolve_chapter(&b.id).unwrap(), library.job_path(&second.id, &b.id));
+        assert_eq!(
+            library.resolve_chapter(&a.id).unwrap(),
+            library.job_path(&first.id, &a.id)
+        );
+        assert_eq!(
+            library.resolve_chapter(&b.id).unwrap(),
+            library.job_path(&second.id, &b.id)
+        );
         assert!(matches!(
             library.resolve_chapter("c404"),
             Err(LibraryError::Unknown { .. })
@@ -3331,24 +4210,45 @@ mod tests {
         let scratch = Scratch::new("regions");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 2);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
         let mut job = Job::open(&library.resolve_chapter(&chapter.id).unwrap()).unwrap();
         let page_width = job.project.sources[0].w;
-        job.complete_region(0, &a_patch("r1", Rect::new(0, 0, page_width / 4, 8), Engine::Fill), None)
+        job.complete_region(
+            0,
+            &a_patch("r1", Rect::new(0, 0, page_width / 4, 8), Engine::Fill),
+            None,
+        )
+        .unwrap();
+        job.leave_untouched(
+            0,
+            Rect::new(4, 6, 10, 10),
+            "review.reason.gateSkippedNotJapanese",
+        )
+        .unwrap();
+        job.leave_untouched(1, Rect::new(2, 2, 8, 8), "decline.reason.qualityMetric")
             .unwrap();
-        job.leave_untouched(0, Rect::new(4, 6, 10, 10), "review.reason.gateSkippedNotJapanese")
-            .unwrap();
-        job.leave_untouched(1, Rect::new(2, 2, 8, 8), "decline.reason.qualityMetric").unwrap();
 
         // A listing carries headers only, and a header still answers the
         // two questions Home asks of it.
         let listed = library.list_projects().unwrap();
         let headers = &listed[0].chapters[0].pages;
         assert_eq!(headers[0].status, "cleaned");
-        assert_eq!(headers[1].status, "unclean", "an untouched region cleaned a page");
-        assert!(headers.iter().all(|page| !page.resident && page.regions.is_empty()));
-        assert_eq!(headers[0].region_count, 2, "a header counts what it did not build");
+        assert_eq!(
+            headers[1].status, "unclean",
+            "an untouched region cleaned a page"
+        );
+        assert!(headers
+            .iter()
+            .all(|page| !page.resident && page.regions.is_empty()));
+        assert_eq!(
+            headers[0].region_count, 2,
+            "a header counts what it did not build"
+        );
 
         let pages = library.load_pages(&chapter.id, &[0, 1]).unwrap();
         assert!(pages.iter().all(|page| page.resident));
@@ -3362,7 +4262,11 @@ mod tests {
         assert_eq!(mask.provenance.created, "2025-10-09T08:53:20Z");
 
         // The bbox crosses the seam as a percentage of the page, not as pixels.
-        assert!((cleaned.bbox.w - 25.0).abs() < 1e-9, "bbox {:?} is not in percent", cleaned.bbox);
+        assert!(
+            (cleaned.bbox.w - 25.0).abs() < 1e-9,
+            "bbox {:?} is not in percent",
+            cleaned.bbox
+        );
 
         let gated = &pages[0].regions[1];
         assert_eq!(gated.outcome, "gate-skipped");
@@ -3371,7 +4275,10 @@ mod tests {
 
         let declined = &pages[1].regions[0];
         assert_eq!(declined.outcome, "declined");
-        assert_eq!(declined.decline_reason.as_deref(), Some("decline.reason.qualityMetric"));
+        assert_eq!(
+            declined.decline_reason.as_deref(),
+            Some("decline.reason.qualityMetric")
+        );
     }
 
     /// The Layers panel's delete, and its undo, end to end: the mask leaves the
@@ -3383,32 +4290,59 @@ mod tests {
         let scratch = Scratch::new("delete-mask");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 2);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
         let path = library.resolve_chapter(&chapter.id).unwrap();
         let region = format!("{}-r0", page_id(&chapter.id, 0));
         let mut job = Job::open(&path).unwrap();
-        job.complete_region(0, &a_patch(&region, Rect::new(0, 0, 12, 8), Engine::Fill), None)
-            .unwrap();
+        job.complete_region(
+            0,
+            &a_patch(&region, Rect::new(0, 0, 12, 8), Engine::Fill),
+            None,
+        )
+        .unwrap();
 
         // The seam addresses the mask, never the region: `<region id>-m1`.
-        let (deleted, status) =
-            library.set_mask_visible(region_of_mask(&format!("{region}-m1")), false).unwrap().unwrap();
+        let (deleted, status) = library
+            .set_mask_visible(region_of_mask(&format!("{region}-m1")), false)
+            .unwrap()
+            .unwrap();
         assert_eq!(deleted.id, region);
-        assert!(deleted.mask.is_none(), "a deleted mask is still on the region");
-        assert_eq!(deleted.outcome, "pending", "a region with no mask is back in the queue");
-        assert_eq!(status, "unclean", "the page kept a cleaned mark with nothing applied");
+        assert!(
+            deleted.mask.is_none(),
+            "a deleted mask is still on the region"
+        );
+        assert_eq!(
+            deleted.outcome, "pending",
+            "a region with no mask is back in the queue"
+        );
+        assert_eq!(
+            status, "unclean",
+            "the page kept a cleaned mark with nothing applied"
+        );
 
         // Persisted, and the composite can no longer see it - which is what
         // takes the fill off the page the user is looking at.
         let reopened = Job::open(&path).unwrap();
-        let record = reopened.project.patches.iter().find(|r| r.id == region).unwrap();
+        let record = reopened
+            .project
+            .patches
+            .iter()
+            .find(|r| r.id == region)
+            .unwrap();
         assert!(!record.visible);
         assert!(
             reopened.sidecar().join(&record.buffer_ref).exists(),
             "the buffers went with the delete, so the undo cannot be served"
         );
-        assert_eq!(library.list_projects().unwrap()[0].chapters[0].pages[0].status, "unclean");
+        assert_eq!(
+            library.list_projects().unwrap()[0].chapters[0].pages[0].status,
+            "unclean"
+        );
 
         // And undo is the same call the other way.
         let (restored, status) = library.set_mask_visible(&region, true).unwrap().unwrap();
@@ -3424,16 +4358,29 @@ mod tests {
         let scratch = Scratch::new("create-then-undo");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 1);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
         let path = library.resolve_chapter(&chapter.id).unwrap();
         let region = format!("{}-h1", page_id(&chapter.id, 0));
         let mut job = Job::open(&path).unwrap();
-        job.complete_region(0, &a_patch(&region, Rect::new(0, 0, 12, 8), Engine::Fill), None)
-            .unwrap();
+        job.complete_region(
+            0,
+            &a_patch(&region, Rect::new(0, 0, 12, 8), Engine::Fill),
+            None,
+        )
+        .unwrap();
 
         let reopened = Job::open(&path).unwrap();
-        let record = reopened.project.patches.iter().find(|r| r.id == region).unwrap();
+        let record = reopened
+            .project
+            .patches
+            .iter()
+            .find(|r| r.id == region)
+            .unwrap();
         let buf_path = reopened.sidecar().join(&record.buffer_ref);
         assert!(buf_path.exists());
 
@@ -3482,8 +4429,14 @@ mod tests {
                 },
             ],
         });
-        assert_eq!(chapter_holding(&index, "ch12-p001-r0").as_deref(), Some("ch12"));
-        assert_eq!(chapter_holding(&index, "ch1-p001-r0").as_deref(), Some("ch1"));
+        assert_eq!(
+            chapter_holding(&index, "ch12-p001-r0").as_deref(),
+            Some("ch12")
+        );
+        assert_eq!(
+            chapter_holding(&index, "ch1-p001-r0").as_deref(),
+            Some("ch1")
+        );
         assert_eq!(chapter_holding(&index, "ch3-p001-r0"), None);
     }
 
@@ -3497,7 +4450,11 @@ mod tests {
         let scratch = Scratch::new("window");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 4);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
         let mut job = Job::open(&library.resolve_chapter(&chapter.id).unwrap()).unwrap();
         for page in 0..4 {
@@ -3509,7 +4466,10 @@ mod tests {
             .unwrap();
         }
 
-        let opened = library.open_chapter(&project.id, &chapter.id, false).unwrap().unwrap();
+        let opened = library
+            .open_chapter(&project.id, &chapter.id, false)
+            .unwrap()
+            .unwrap();
         assert_eq!(opened.chapter.pages.len(), 4);
         for page in &opened.chapter.pages {
             assert!(!page.resident, "page {} arrived resident", page.index);
@@ -3521,7 +4481,9 @@ mod tests {
         // next.
         let window = library.load_pages(&chapter.id, &[0, 1, 2]).unwrap();
         assert_eq!(window.len(), 3);
-        assert!(window.iter().all(|page| page.resident && page.regions.len() == 1));
+        assert!(window
+            .iter()
+            .all(|page| page.resident && page.regions.len() == 1));
         assert_eq!(window[2].index, 2);
     }
 
@@ -3533,7 +4495,11 @@ mod tests {
         let scratch = Scratch::new("window-edge");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 2);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
         let window = library.load_pages(&chapter.id, &[1, 2, 9]).unwrap();
         assert_eq!(window.len(), 1);
@@ -3548,7 +4514,11 @@ mod tests {
         let scratch = Scratch::new("review-index");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 3);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
         let mut job = Job::open(&library.resolve_chapter(&chapter.id).unwrap()).unwrap();
         job.complete_region(
@@ -3558,17 +4528,28 @@ mod tests {
         )
         .unwrap();
         // Cleaned and unremarkable: not an issue, and it must not be listed.
-        job.complete_region(1, &a_patch("r2", Rect::new(0, 0, 8, 8), Engine::Fill), None).unwrap();
-        job.leave_untouched(2, Rect::new(4, 4, 6, 6), "review.reason.gateSkippedOutsideBubble")
+        job.complete_region(1, &a_patch("r2", Rect::new(0, 0, 8, 8), Engine::Fill), None)
             .unwrap();
+        job.leave_untouched(
+            2,
+            Rect::new(4, 4, 6, 6),
+            "review.reason.gateSkippedOutsideBubble",
+        )
+        .unwrap();
 
-        let opened = library.open_chapter(&project.id, &chapter.id, false).unwrap().unwrap();
+        let opened = library
+            .open_chapter(&project.id, &chapter.id, false)
+            .unwrap()
+            .unwrap();
         let review = &opened.chapter.review;
         assert!(opened.chapter.pages.iter().all(|page| !page.resident));
         assert_eq!(review.len(), 2);
         assert_eq!(review[0].reason_key, "review.reason.fittingReconstructed");
         assert_eq!(review[0].page_index, 0);
-        assert_eq!(review[1].reason_key, "review.reason.gateSkippedOutsideBubble");
+        assert_eq!(
+            review[1].reason_key,
+            "review.reason.gateSkippedOutsideBubble"
+        );
         assert_eq!(review[1].page_index, 2);
         assert_eq!(review[1].page_id, page_id(&chapter.id, 2));
     }
@@ -3581,7 +4562,11 @@ mod tests {
         let scratch = Scratch::new("review-parity");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 2);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
         let mut job = Job::open(&library.resolve_chapter(&chapter.id).unwrap()).unwrap();
         job.complete_region(
@@ -3596,17 +4581,25 @@ mod tests {
             Some("review.reason.cloudAccepted".into()),
         )
         .unwrap();
-        job.leave_untouched(1, Rect::new(2, 2, 4, 4), "review.reason.declined").unwrap();
+        job.leave_untouched(1, Rect::new(2, 2, 4, 4), "review.reason.declined")
+            .unwrap();
 
-        let opened = library.open_chapter(&project.id, &chapter.id, false).unwrap().unwrap();
+        let opened = library
+            .open_chapter(&project.id, &chapter.id, false)
+            .unwrap()
+            .unwrap();
         let pages = library.load_pages(&chapter.id, &[0, 1]).unwrap();
         let expected: Vec<_> = pages
             .iter()
             .flat_map(|page| page.regions.iter())
             .filter_map(|region| review_reason(region).map(|key| (region.id.clone(), key)))
             .collect();
-        let indexed: Vec<_> =
-            opened.chapter.review.iter().map(|r| (r.id.clone(), r.reason_key)).collect();
+        let indexed: Vec<_> = opened
+            .chapter
+            .review
+            .iter()
+            .map(|r| (r.id.clone(), r.reason_key))
+            .collect();
         assert_eq!(indexed, expected);
         assert_eq!(indexed.len(), 3);
     }
@@ -3620,7 +4613,11 @@ mod tests {
         let scratch = Scratch::new("review-deleted");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 1);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
         // A region id the library can route: `chapter_holding` recovers the
         // chapter from the id alone, and it does that by prefix.
@@ -3634,17 +4631,29 @@ mod tests {
         .unwrap();
         drop(job);
 
-        let before = library.open_chapter(&project.id, &chapter.id, false).unwrap().unwrap();
+        let before = library
+            .open_chapter(&project.id, &chapter.id, false)
+            .unwrap()
+            .unwrap();
         assert_eq!(before.chapter.review.len(), 1);
 
         library.set_mask_visible(&region_id, false).unwrap();
-        let after = library.open_chapter(&project.id, &chapter.id, false).unwrap().unwrap();
+        let after = library
+            .open_chapter(&project.id, &chapter.id, false)
+            .unwrap()
+            .unwrap();
         assert!(after.chapter.review.is_empty());
-        assert_eq!(after.chapter.pages[0].region_count, 0, "an empty row was left behind");
+        assert_eq!(
+            after.chapter.pages[0].region_count, 0,
+            "an empty row was left behind"
+        );
         assert_eq!(after.chapter.pages[0].status, "unclean");
 
         let loaded = library.load_pages(&chapter.id, &[0]).unwrap();
-        assert!(loaded[0].regions.is_empty(), "the deleted region is still listed");
+        assert!(
+            loaded[0].regions.is_empty(),
+            "the deleted region is still listed"
+        );
 
         // And undo puts the row back where it was, review flag and all.
         library.set_mask_visible(&region_id, true).unwrap();
@@ -3664,23 +4673,39 @@ mod tests {
         let scratch = Scratch::new("restore-null-patch");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 1);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
         let path = library.resolve_chapter(&chapter.id).unwrap();
         let region = format!("{}-r0", page_id(&chapter.id, 0));
         let mut job = Job::open(&path).unwrap();
-        job.complete_region(0, &a_patch(&region, Rect::new(0, 0, 12, 8), Engine::Fill), None)
-            .unwrap();
+        job.complete_region(
+            0,
+            &a_patch(&region, Rect::new(0, 0, 12, 8), Engine::Fill),
+            None,
+        )
+        .unwrap();
         drop(job);
 
         // Delete, undo, redo - the redo is `restoreRegion` with no region, and
         // the command's null branch is this pair of calls.
         library.set_mask_visible(&region, false).unwrap().unwrap();
         library.set_mask_visible(&region, true).unwrap().unwrap();
-        assert!(library.set_mask_visible(&region, false).unwrap().is_some(), "the redo found nothing");
+        assert!(
+            library.set_mask_visible(&region, false).unwrap().is_some(),
+            "the redo found nothing"
+        );
 
         let reopened = Job::open(&path).unwrap();
-        let record = reopened.project.patches.iter().find(|r| r.id == region).unwrap();
+        let record = reopened
+            .project
+            .patches
+            .iter()
+            .find(|r| r.id == region)
+            .unwrap();
         assert!(!record.visible);
         assert!(
             reopened.sidecar().join(&record.buffer_ref).exists(),
@@ -3705,13 +4730,21 @@ mod tests {
         let scratch = Scratch::new("rerun-deleted");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 2);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
         let path = library.resolve_chapter(&chapter.id).unwrap();
         let region = format!("{}-r0", page_id(&chapter.id, 0));
         let mut job = Job::open(&path).unwrap();
-        job.complete_region(0, &a_patch(&region, Rect::new(0, 0, 12, 8), Engine::Fill), None)
-            .unwrap();
+        job.complete_region(
+            0,
+            &a_patch(&region, Rect::new(0, 0, 12, 8), Engine::Fill),
+            None,
+        )
+        .unwrap();
         job.mark_examined(0).unwrap();
         drop(job);
         invalidate_manifest_cache(&path);
@@ -3723,9 +4756,15 @@ mod tests {
             .iter()
             .map(|entry| entry.page_index)
             .collect();
-        assert_eq!(queued, vec![1], "the examined page was queued again by the deletion");
+        assert_eq!(
+            queued,
+            vec![1],
+            "the examined page was queued again by the deletion"
+        );
         assert!(
-            crate::run::plan(&library, "page", &chapter.id, Some(0)).unwrap().is_empty(),
+            crate::run::plan(&library, "page", &chapter.id, Some(0))
+                .unwrap()
+                .is_empty(),
             "a page-scoped rerun revived the page the user deleted from"
         );
 
@@ -3743,11 +4782,16 @@ mod tests {
         let scratch = Scratch::new("header-counts");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 3);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
         let mut job = Job::open(&library.resolve_chapter(&chapter.id).unwrap()).unwrap();
         // Page 0: one finished region, one flagged one.
-        job.complete_region(0, &a_patch("r0", Rect::new(0, 0, 8, 8), Engine::Fill), None).unwrap();
+        job.complete_region(0, &a_patch("r0", Rect::new(0, 0, 8, 8), Engine::Fill), None)
+            .unwrap();
         job.complete_region(
             0,
             &a_patch("r1", Rect::new(9, 9, 8, 8), Engine::Fill),
@@ -3755,20 +4799,39 @@ mod tests {
         )
         .unwrap();
         // Page 1: one finished region and nothing else.
-        job.complete_region(1, &a_patch("r2", Rect::new(0, 0, 8, 8), Engine::Fill), None).unwrap();
-        // Page 2: the gate held one back. Flagged, and finished with nothing.
-        job.leave_untouched(2, Rect::new(4, 4, 6, 6), "review.reason.gateSkippedOutsideBubble")
+        job.complete_region(1, &a_patch("r2", Rect::new(0, 0, 8, 8), Engine::Fill), None)
             .unwrap();
+        // Page 2: the gate held one back. Flagged, and finished with nothing.
+        job.leave_untouched(
+            2,
+            Rect::new(4, 4, 6, 6),
+            "review.reason.gateSkippedOutsideBubble",
+        )
+        .unwrap();
         drop(job);
 
         let expected = [(2u32, 1u32, 1u32), (1, 1, 0), (1, 0, 1)];
         let counted = |pages: &[ApiPage]| -> Vec<(u32, u32, u32)> {
-            pages.iter().map(|p| (p.region_count, p.done_count, p.review_count)).collect()
+            pages
+                .iter()
+                .map(|p| (p.region_count, p.done_count, p.review_count))
+                .collect()
         };
 
-        let opened = library.open_chapter(&project.id, &chapter.id, false).unwrap().unwrap();
-        assert!(opened.chapter.pages.iter().all(|page| !page.resident && page.regions.is_empty()));
-        assert_eq!(counted(&opened.chapter.pages), expected, "headers count nothing");
+        let opened = library
+            .open_chapter(&project.id, &chapter.id, false)
+            .unwrap()
+            .unwrap();
+        assert!(opened
+            .chapter
+            .pages
+            .iter()
+            .all(|page| !page.resident && page.regions.is_empty()));
+        assert_eq!(
+            counted(&opened.chapter.pages),
+            expected,
+            "headers count nothing"
+        );
 
         // The same numbers on the page that *is* loaded: the header is the
         // resident page with its regions shed, not a second opinion.
@@ -3782,7 +4845,11 @@ mod tests {
             .open_chapter(&project.id, &chapter.id, false)
             .unwrap()
             .unwrap();
-        assert_eq!(counted(&reopened.chapter.pages), expected, "counts did not survive a reopen");
+        assert_eq!(
+            counted(&reopened.chapter.pages),
+            expected,
+            "counts did not survive a reopen"
+        );
     }
 
     /// An edit lands on a page the window is not holding - the reader is
@@ -3794,26 +4861,52 @@ mod tests {
         let scratch = Scratch::new("header-counts-edit");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 4);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
         let region_id = format!("{}-p004-r0", chapter.id);
         let mut job = Job::open(&library.resolve_chapter(&chapter.id).unwrap()).unwrap();
-        job.complete_region(3, &a_patch(&region_id, Rect::new(0, 0, 8, 8), Engine::Fill), None)
-            .unwrap();
+        job.complete_region(
+            3,
+            &a_patch(&region_id, Rect::new(0, 0, 8, 8), Engine::Fill),
+            None,
+        )
+        .unwrap();
         drop(job);
 
-        let before = library.open_chapter(&project.id, &chapter.id, false).unwrap().unwrap();
-        assert_eq!((before.chapter.pages[3].region_count, before.chapter.pages[3].done_count), (1, 1));
+        let before = library
+            .open_chapter(&project.id, &chapter.id, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                before.chapter.pages[3].region_count,
+                before.chapter.pages[3].done_count
+            ),
+            (1, 1)
+        );
 
         // Only pages 0..=2 are ever loaded; page 3 is edited while nobody holds it.
         library.load_pages(&chapter.id, &[0, 1, 2]).unwrap();
         library.set_mask_visible(&region_id, false).unwrap();
 
-        let after = library.open_chapter(&project.id, &chapter.id, false).unwrap().unwrap();
+        let after = library
+            .open_chapter(&project.id, &chapter.id, false)
+            .unwrap()
+            .unwrap();
         let page = &after.chapter.pages[3];
         assert!(!page.resident);
-        assert_eq!(page.region_count, 0, "the deleted region is still counted as a row");
-        assert_eq!(page.done_count, 0, "a deleted mask is not a finished region");
+        assert_eq!(
+            page.region_count, 0,
+            "the deleted region is still counted as a row"
+        );
+        assert_eq!(
+            page.done_count, 0,
+            "a deleted mask is not a finished region"
+        );
         assert_eq!(page.review_count, 0, "and it is not an issue either");
         assert_eq!(page.status, "unclean");
     }
@@ -3828,17 +4921,29 @@ mod tests {
         let scratch = Scratch::new("untouched-ids");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 1);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
         let mut job = Job::open(&library.resolve_chapter(&chapter.id).unwrap()).unwrap();
-        job.leave_untouched(0, Rect::new(6, 6, 10, 10), "review.reason.declined").unwrap();
-        job.leave_untouched(0, Rect::new(6, 6, 24, 4), "review.reason.gateSkippedNotJapanese")
+        job.leave_untouched(0, Rect::new(6, 6, 10, 10), "review.reason.declined")
             .unwrap();
+        job.leave_untouched(
+            0,
+            Rect::new(6, 6, 24, 4),
+            "review.reason.gateSkippedNotJapanese",
+        )
+        .unwrap();
 
         let pages = library.load_pages(&chapter.id, &[0]).unwrap();
         let regions = &pages[0].regions;
         assert_eq!(regions.len(), 2);
-        assert_ne!(regions[0].id, regions[1].id, "two regions collapsed onto one id");
+        assert_ne!(
+            regions[0].id, regions[1].id,
+            "two regions collapsed onto one id"
+        );
         // The whole rectangle is what separates them, and it is what an id
         // derived from geometry has to carry.
         assert!(regions[0].id.ends_with("-u6-6-10-10"), "{}", regions[0].id);
@@ -3866,6 +4971,7 @@ mod tests {
         answers_a_future!(rename_project, A, B, C);
         answers_a_future!(open_chapter, A, B, C, D);
         answers_a_future!(create_project, A, B, C, D, E);
+        answers_a_future!(crate::model_workflows::list_workflow_capabilities, A);
         // Six, since `layout` joined the seam.
         answers_a_future!(crate::exporting::export_chapter, A, B, C, D, E, F);
     }
@@ -3900,7 +5006,11 @@ mod tests {
         let scratch = Scratch::new("review-state");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 1);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
         let mut job = Job::open(&library.resolve_chapter(&chapter.id).unwrap()).unwrap();
 
         job.complete_region(
@@ -3934,11 +5044,23 @@ mod tests {
         assert!(regions[1].unusually_large);
         assert_eq!(regions[1].mask.as_ref().unwrap().fill_mode, "reconstruct");
 
-        let rejected = regions[2].mask.as_ref().unwrap().cloud_outcome.as_ref().unwrap();
+        let rejected = regions[2]
+            .mask
+            .as_ref()
+            .unwrap()
+            .cloud_outcome
+            .as_ref()
+            .unwrap();
         assert!(!rejected.accepted);
         assert_eq!(rejected.rejection_cause, Some("residual-test"));
 
-        let accepted = regions[3].mask.as_ref().unwrap().cloud_outcome.as_ref().unwrap();
+        let accepted = regions[3]
+            .mask
+            .as_ref()
+            .unwrap()
+            .cloud_outcome
+            .as_ref()
+            .unwrap();
         assert!(accepted.accepted);
         assert_eq!(accepted.rejection_cause, None);
     }
@@ -3948,13 +5070,22 @@ mod tests {
         let scratch = Scratch::new("interrupted");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 4);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
-        assert!(library.list_projects().unwrap()[0].interrupted_job.is_none());
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
+        assert!(library.list_projects().unwrap()[0]
+            .interrupted_job
+            .is_none());
 
         let mut job = Job::open(&library.resolve_chapter(&chapter.id).unwrap()).unwrap();
         job.mark_interrupted(Some(2)).unwrap();
 
-        let interrupted = library.list_projects().unwrap()[0].interrupted_job.clone().unwrap();
+        let interrupted = library.list_projects().unwrap()[0]
+            .interrupted_job
+            .clone()
+            .unwrap();
         assert_eq!(interrupted.chapter_id, chapter.id);
         assert_eq!(interrupted.page_index, 2);
     }
@@ -3969,13 +5100,21 @@ mod tests {
         scans(&root, 2);
         std::fs::write(root.join("003.png"), b"not an image").unwrap();
         std::fs::write(root.join(".DS_Store"), b"junk").unwrap();
-        let project =
-            library.create_project("WM", StripMode::Single, Some(root), None).unwrap();
-        library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created();
+        let project = library
+            .create_project("WM", StripMode::Single, Some(root), None)
+            .unwrap();
+        library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created();
 
         let chapter = library.list_projects().unwrap()[0].chapters[0].clone();
         assert_eq!(chapter.pages.len(), 2, "a refused file took a page index");
-        let keys: Vec<&str> = chapter.input_reports.iter().map(|n| n.key.as_str()).collect();
+        let keys: Vec<&str> = chapter
+            .input_reports
+            .iter()
+            .map(|n| n.key.as_str())
+            .collect();
         assert!(keys.contains(&"notice.input.junkSkipped"));
         assert!(keys.contains(&"notice.input.fileSkipped"));
         let skipped = chapter
@@ -4025,17 +5164,26 @@ mod tests {
         // Junk: counted, never named.
         std::fs::write(root.join(".DS_Store"), b"junk").unwrap();
 
-        let project =
-            library.create_project("Refusals", StripMode::Single, Some(root), None).unwrap();
-        let chapter =
-            library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let project = library
+            .create_project("Refusals", StripMode::Single, Some(root), None)
+            .unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
         assert_eq!(chapter.pages.len(), 2, "a refused file took a page index");
 
         let reasons: Vec<String> = chapter
             .input_reports
             .iter()
             .filter(|notice| notice.key == "notice.input.fileSkipped")
-            .map(|notice| notice.params["reasonKey"].as_str().unwrap_or_default().to_owned())
+            .map(|notice| {
+                notice.params["reasonKey"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
             .collect();
         for expected in [
             "input.skipReason.notAnImage",
@@ -4070,9 +5218,16 @@ mod tests {
         let scratch = Scratch::new("open");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 2);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
-        let opened = library.open_chapter(&project.id, &chapter.id, false).unwrap().unwrap();
+        let opened = library
+            .open_chapter(&project.id, &chapter.id, false)
+            .unwrap()
+            .unwrap();
         assert_eq!(opened.project.id, project.id);
         assert_eq!(opened.chapter.id, chapter.id);
         assert_eq!(opened.chapter.pages.len(), 2);
@@ -4089,66 +5244,134 @@ mod tests {
         let scratch = Scratch::new("json");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 1);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
         let chapter_id = chapter.id.clone();
         let mut job = Job::open(&library.resolve_chapter(&chapter.id).unwrap()).unwrap();
-        job.complete_region(0, &a_patch("r1", Rect::new(0, 0, 8, 8), Engine::Fill), None).unwrap();
+        job.complete_region(0, &a_patch("r1", Rect::new(0, 0, 8, 8), Engine::Fill), None)
+            .unwrap();
 
         let listed = library.list_projects().unwrap();
         let value = serde_json::to_value(&listed).unwrap();
         let project = &value[0];
         for key in [
-            "id", "name", "mode", "readingDirection", "created", "appVersion", "sourcePath",
-            "lastOpened", "starred", "interruptedJob", "conversion", "chapters",
+            "id",
+            "name",
+            "mode",
+            "readingDirection",
+            "created",
+            "appVersion",
+            "sourcePath",
+            "lastOpened",
+            "starred",
+            "interruptedJob",
+            "conversion",
+            "chapters",
         ] {
             assert!(project.get(key).is_some(), "ApiProject has no {key}");
         }
         let chapter = &project["chapters"][0];
         for key in [
-            "id", "projectId", "name", "number", "order", "lastOpened", "sourcePath",
-            "sourceFormat", "noTextDetected", "inputReports", "pages", "review",
+            "id",
+            "projectId",
+            "name",
+            "number",
+            "order",
+            "lastOpened",
+            "sourcePath",
+            "sourceFormat",
+            "noTextDetected",
+            "inputReports",
+            "pages",
+            "review",
         ] {
             assert!(chapter.get(key).is_some(), "ApiChapter has no {key}");
         }
         let page = &chapter["pages"][0];
         for key in [
-            "id", "chapterId", "index", "number", "file", "sourceSha", "width", "height",
-            "status", "skipReason", "regions", "regionCount", "doneCount", "reviewCount",
+            "id",
+            "chapterId",
+            "index",
+            "number",
+            "file",
+            "sourceSha",
+            "width",
+            "height",
+            "status",
+            "skipReason",
+            "regions",
+            "regionCount",
+            "doneCount",
+            "reviewCount",
             "resident",
         ] {
             assert!(page.get(key).is_some(), "ApiPage has no {key}");
         }
         // The stand-in canvas fields a real backend does not send.
         for key in ["layout", "panels"] {
-            assert!(page.get(key).is_none(), "ApiPage still carries the mock's {key}");
+            assert!(
+                page.get(key).is_none(),
+                "ApiPage still carries the mock's {key}"
+            );
         }
         // A listing is headers only, so the region shape is checked against a
         // page that has actually been paged in.
         let loaded = serde_json::to_value(library.load_pages(&chapter_id, &[0]).unwrap()).unwrap();
         let region = &loaded[0]["regions"][0];
         for key in [
-            "id", "pageId", "sourceSha", "bbox", "source", "detected", "outcome",
-            "gateSkipCause", "declineReason", "unusuallyLarge", "mask",
+            "id",
+            "pageId",
+            "sourceSha",
+            "bbox",
+            "source",
+            "detected",
+            "outcome",
+            "gateSkipCause",
+            "declineReason",
+            "unusuallyLarge",
+            "mask",
         ] {
             assert!(region.get(key).is_some(), "ApiRegion has no {key}");
         }
         for key in ["kind", "text"] {
-            assert!(region.get(key).is_none(), "ApiRegion still carries the mock's {key}");
+            assert!(
+                region.get(key).is_none(),
+                "ApiRegion still carries the mock's {key}"
+            );
         }
         let mask = &region["mask"];
         for key in [
-            "id", "regionId", "sequence", "fillMode", "elapsedMs", "fittingReconstructed",
-            "cloudOutcome", "provenance",
+            "id",
+            "regionId",
+            "sequence",
+            "fillMode",
+            "elapsedMs",
+            "fittingReconstructed",
+            "cloudOutcome",
+            "provenance",
         ] {
             assert!(mask.get(key).is_some(), "Mask has no {key}");
         }
         // Provenance keeps its field names verbatim - snake_case, the one
         // island in a camelCase payload, because that record round-trips.
         for key in [
-            "engine", "engine_version", "model_sha256", "execution_provider",
-            "params_snapshot", "mask_sha256", "source_sha256", "cloud", "created",
+            "engine",
+            "engine_version",
+            "model_sha256",
+            "execution_provider",
+            "params_snapshot",
+            "mask_sha256",
+            "source_sha256",
+            "cloud",
+            "created",
         ] {
-            assert!(mask["provenance"].get(key).is_some(), "Provenance has no {key}");
+            assert!(
+                mask["provenance"].get(key).is_some(),
+                "Provenance has no {key}"
+            );
         }
         assert_eq!(project["mode"], "single");
         assert_eq!(project["readingDirection"], "rtl");
@@ -4187,7 +5410,15 @@ mod tests {
 
     #[test]
     fn a_zero_sized_page_has_no_percentage_rather_than_a_division() {
-        assert_eq!(percent_of(Rect::new(4, 4, 8, 8), 0, 0), Bbox { x: 0.0, y: 0.0, w: 0.0, h: 0.0 });
+        assert_eq!(
+            percent_of(Rect::new(4, 4, 8, 8), 0, 0),
+            Bbox {
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0
+            }
+        );
     }
 
     #[test]
@@ -4195,7 +5426,11 @@ mod tests {
         let scratch = Scratch::new("manifest-cache");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 4);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
         let chapter_id = chapter.id.clone();
         let path = library.resolve_chapter(&chapter_id).unwrap();
 
@@ -4205,40 +5440,54 @@ mod tests {
         // 1. First load_pages call parses from disk.
         let pages1 = library.load_pages(&chapter_id, &[0, 1]).unwrap();
         assert_eq!(pages1.len(), 2);
-        assert_eq!(parse_count(&path), 1, "first load_pages should parse manifest once");
+        assert_eq!(
+            parse_count(&path),
+            1,
+            "first load_pages should parse manifest once"
+        );
 
         // 2. Second consecutive load_pages call hits cache and does not re-parse.
         let pages2 = library.load_pages(&chapter_id, &[1, 2]).unwrap();
         assert_eq!(pages2.len(), 2);
-        assert_eq!(parse_count(&path), 1, "second load_pages should reuse cached manifest");
+        assert_eq!(
+            parse_count(&path),
+            1,
+            "second load_pages should reuse cached manifest"
+        );
 
         // 3. A write occurs (e.g. adding a patch and flushing).
         let mut job = Job::open(&path).unwrap();
-        job.complete_region(
-            0,
-            &a_patch("r1", Rect::new(0, 0, 8, 8), Engine::Fill),
-            None,
-        )
-        .unwrap();
+        job.complete_region(0, &a_patch("r1", Rect::new(0, 0, 8, 8), Engine::Fill), None)
+            .unwrap();
         drop(job);
 
         // 4. Next load_pages detects change and parses the updated manifest from disk.
         let pages3 = library.load_pages(&chapter_id, &[0]).unwrap();
         assert_eq!(pages3.len(), 1);
         assert_eq!(pages3[0].regions.len(), 1);
-        assert_eq!(parse_count(&path), 2, "load_pages after write should re-parse modified manifest");
+        assert_eq!(
+            parse_count(&path),
+            2,
+            "load_pages after write should re-parse modified manifest"
+        );
 
         // 5. Subsequent load_pages again uses cache.
         let pages4 = library.load_pages(&chapter_id, &[0]).unwrap();
         assert_eq!(pages4.len(), 1);
-        assert_eq!(parse_count(&path), 2, "subsequent load_pages should reuse cached manifest");
+        assert_eq!(
+            parse_count(&path),
+            2,
+            "subsequent load_pages should reuse cached manifest"
+        );
     }
 
     #[test]
     fn concurrent_chapter_creations_and_opens_do_not_lose_updates() {
         let scratch = Scratch::new("concurrent-index-lock");
         let library = Arc::new(library(&scratch));
-        let project = library.create_project("Concurrent", StripMode::Single, None, None).unwrap();
+        let project = library
+            .create_project("Concurrent", StripMode::Single, None, None)
+            .unwrap();
         let project_id = project.id.clone();
 
         let mut handles = Vec::new();
@@ -4256,7 +5505,11 @@ mod tests {
 
         let index = library.index().unwrap();
         let proj = index.projects.iter().find(|p| p.id == project_id).unwrap();
-        assert_eq!(proj.chapters.len(), 8, "all concurrent chapters must be preserved in index");
+        assert_eq!(
+            proj.chapters.len(),
+            8,
+            "all concurrent chapters must be preserved in index"
+        );
     }
 
     #[test]
@@ -4264,12 +5517,22 @@ mod tests {
         let scratch = Scratch::new("remove-untouched-counters");
         let library = library(&scratch);
         let project = a_project(&library, &scratch, 2);
-        let chapter = library.create_chapter(&project.id, "Ch 1", None, None).unwrap().created().unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap()
+            .created()
+            .unwrap();
 
         let path = library.resolve_chapter(&chapter.id).unwrap();
         let mut job = Job::open(&path).unwrap();
-        job.leave_untouched(0, Rect::new(4, 6, 10, 10), "review.reason.gateSkippedNotJapanese").unwrap();
-        job.leave_untouched(1, Rect::new(2, 2, 8, 8), "decline.reason.qualityMetric").unwrap();
+        job.leave_untouched(
+            0,
+            Rect::new(4, 6, 10, 10),
+            "review.reason.gateSkippedNotJapanese",
+        )
+        .unwrap();
+        job.leave_untouched(1, Rect::new(2, 2, 8, 8), "decline.reason.qualityMetric")
+            .unwrap();
         job.project.counters.gate_dropped = 1;
         job.project.counters.declined = 1;
         job.flush().unwrap();
@@ -4390,9 +5653,18 @@ mod tests {
         // Unsafe fields rejected and stripped/fallen back
         assert_eq!(api_cloud.profile_id, None, "URL in profile_id stripped");
         assert_eq!(api_cloud.job_id, None, "Bearer token in job_id stripped");
-        assert_eq!(api_cloud.attempt_id, None, "Control chars in attempt_id stripped");
-        assert_eq!(api_cloud.model, "unknown", "Unsafe URL in model falls back to unknown");
-        assert_eq!(api_cloud.model_revision, None, "Overly long string stripped");
+        assert_eq!(
+            api_cloud.attempt_id, None,
+            "Control chars in attempt_id stripped"
+        );
+        assert_eq!(
+            api_cloud.model, "unknown",
+            "Unsafe URL in model falls back to unknown"
+        );
+        assert_eq!(
+            api_cloud.model_revision, None,
+            "Overly long string stripped"
+        );
 
         // The core provenance in memory / on disk was untouched
         assert_eq!(prov.cloud, Some(dirty_cloud));

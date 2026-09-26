@@ -16,7 +16,13 @@ use crate::patch::Patch;
 #[derive(Debug, thiserror::Error)]
 pub enum CompositeError {
     #[error("patch {id} is {pw}×{ph} but its mask bounds are {mw}×{mh}")]
-    Malformed { id: String, pw: u32, ph: u32, mw: u32, mh: u32 },
+    Malformed {
+        id: String,
+        pw: u32,
+        ph: u32,
+        mw: u32,
+        mh: u32,
+    },
     #[error("patch {id} is {patch:?}/{patch_depth:?} but the page is {page:?}/{page_depth:?}")]
     ModeMismatch {
         id: String,
@@ -193,7 +199,9 @@ pub fn changed_pixels(before: &Raster, after: &Raster) -> Vec<(u32, u32)> {
     if !before.same_geometry(after) {
         // A geometry change is a total change; reporting it as "every pixel"
         // keeps the caller's assertion honest rather than silently empty.
-        return (0..after.height).flat_map(|y| (0..after.width).map(move |x| (x, y))).collect();
+        return (0..after.height)
+            .flat_map(|y| (0..after.width).map(move |x| (x, y)))
+            .collect();
     }
     let samples = before.mode.samples();
     let mut changed = Vec::new();
@@ -210,7 +218,11 @@ pub fn changed_pixels(before: &Raster, after: &Raster) -> Vec<(u32, u32)> {
 /// `dilate(union(applied masks), edit_margin)` - the right-hand side of the
 /// contract. Built here so the test and the exporter agree on what it means.
 pub fn permitted_region(patches: &[Patch], page_w: u32, page_h: u32) -> Mask {
-    let masks: Vec<&Mask> = patches.iter().filter(|p| p.visible).map(|p| &p.mask).collect();
+    let masks: Vec<&Mask> = patches
+        .iter()
+        .filter(|p| p.visible)
+        .map(|p| &p.mask)
+        .collect();
     if masks.is_empty() {
         return Mask::empty(Rect::new(0, 0, 0, 0));
     }
@@ -220,7 +232,7 @@ pub fn permitted_region(patches: &[Patch], page_w: u32, page_h: u32) -> Mask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image::{BitDepth, fixtures};
+    use crate::image::{fixtures, BitDepth};
     use crate::patch::{Engine, Provenance};
 
     fn provenance() -> Provenance {
@@ -251,10 +263,13 @@ mod tests {
             palette: None,
             trns: None,
             srgb_intent: None,
-            data: vec![0; {
-                let bits = bounds.w as usize * page.mode.samples() * page.depth.bits() as usize;
-                bits.div_ceil(8) * bounds.h as usize
-            }],
+            data: vec![
+                0;
+                {
+                    let bits = bounds.w as usize * page.mode.samples() * page.depth.bits() as usize;
+                    bits.div_ceil(8) * bounds.h as usize
+                }
+            ],
         };
         let ceiling = match page.depth {
             BitDepth::Sixteen => u16::MAX,
@@ -285,14 +300,67 @@ mod tests {
             }
         }
 
-        Patch { id: "p1".into(), ink: mask.clone(), mask, pixels, order: 0, visible: true, provenance: provenance() }
+        Patch {
+            id: "p1".into(),
+            ink: mask.clone(),
+            mask,
+            pixels,
+            order: 0,
+            visible: true,
+            provenance: provenance(),
+        }
+    }
+
+    #[test]
+    fn shrinking_a_text_shaped_layer_reveals_its_exact_lower_composite() {
+        use crate::text_shape::{round_source_dilate, MaskRaster};
+        for name in ["l8", "rgba8", "l16"] {
+            let page = fixtures::by_name(name).raster;
+            let mut base = Mask::empty(Rect::new(20, 20, 1, 1));
+            base.set(20, 20, true);
+            let base = MaskRaster::from(base);
+            let small = round_source_dilate(&base, 2, page.width, page.height).unwrap().to_mask();
+            let large = round_source_dilate(&base, 5, page.width, page.height).unwrap().to_mask();
+            let mut lower_patch = synthetic_patch(&page, Rect::new(8, 8, 32, 30));
+            lower_patch.id = "lower".into();
+            let lower = composite(&page, &[lower_patch.clone()]).unwrap();
+            let mut top_large = synthetic_patch(&page, large.bounds);
+            top_large.id = "text".into();
+            top_large.order = 1;
+            top_large.mask = large.clone();
+            let (x, y) = (25, 20);
+            let changed = if lower.sample(x, y, 0) == 0 { 255 } else { 0 };
+            top_large.pixels.set_sample((x as i64 - large.bounds.x) as u32,
+                                        (y as i64 - large.bounds.y) as u32, 0, changed);
+            let wide = composite(&page, &[lower_patch.clone(), top_large.clone()]).unwrap();
+            assert_ne!(wide.sample(x, y, 0), lower.sample(x, y, 0), "{name}");
+
+            let mut top_small = synthetic_patch(&page, small.bounds);
+            top_small.id = "text".into();
+            top_small.order = 1;
+            top_small.mask = small.clone();
+            let shrunk = composite(&page, &[lower_patch, top_small]).unwrap();
+            for py in 0..page.height {
+                for px in 0..page.width {
+                    if small.contains(px as i64, py as i64) { continue; }
+                    for channel in 0..page.mode.samples() {
+                        assert_eq!(shrunk.sample(px, py, channel), lower.sample(px, py, channel),
+                                   "{name} failed to restore lower sample at {px},{py}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
     fn nothing_changes_under_an_empty_patch_set() {
         for fixture in fixtures::all() {
             let out = composite(&fixture.raster, &[]).unwrap();
-            assert!(changed_pixels(&fixture.raster, &out).is_empty(), "{}", fixture.name);
+            assert!(
+                changed_pixels(&fixture.raster, &out).is_empty(),
+                "{}",
+                fixture.name
+            );
         }
     }
 
@@ -308,7 +376,11 @@ mod tests {
             let out = composite(page, std::slice::from_ref(&patch)).unwrap();
 
             let changed = changed_pixels(page, &out);
-            assert!(!changed.is_empty(), "{}: the patch changed nothing", fixture.name);
+            assert!(
+                !changed.is_empty(),
+                "{}: the patch changed nothing",
+                fixture.name
+            );
 
             let permitted = permitted_region(std::slice::from_ref(&patch), page.width, page.height);
             for (x, y) in &changed {
@@ -359,8 +431,15 @@ mod tests {
 
         let forwards = composite(&page, &[first.clone(), second.clone()]).unwrap();
         let backwards = composite(&page, &[second, first]).unwrap();
-        assert_eq!(forwards.data, backwards.data, "argument order changed the result");
-        assert_eq!(forwards.sample(10, 10, 0), 200, "the later id did not win the tie");
+        assert_eq!(
+            forwards.data, backwards.data,
+            "argument order changed the result"
+        );
+        assert_eq!(
+            forwards.sample(10, 10, 0),
+            200,
+            "the later id did not win the tie"
+        );
     }
 
     /* -- the windowed composite ---------------------------------------- */
@@ -389,7 +468,12 @@ mod tests {
                 Rect::new(0, 0, page.width, page.height),
             ] {
                 let window = composite_region(page, patches, rect, None).unwrap();
-                assert_eq!((window.width, window.height), (rect.w, rect.h), "{}", fixture.name);
+                assert_eq!(
+                    (window.width, window.height),
+                    (rect.w, rect.h),
+                    "{}",
+                    fixture.name
+                );
                 assert_eq!(window.mode, page.mode, "{}", fixture.name);
                 assert_eq!(window.depth, page.depth, "{}", fixture.name);
                 for y in 0..rect.h {
@@ -448,10 +532,57 @@ mod tests {
         assert_eq!(all.sample(1, 1, 0), 200);
 
         let below = composite_region(&page, &patches, rect, Some(1)).unwrap();
-        assert_eq!(below.sample(1, 1, 0), 30, "the ceiling let the patch at its own order in");
+        assert_eq!(
+            below.sample(1, 1, 0),
+            30,
+            "the ceiling let the patch at its own order in"
+        );
 
         let none = composite_region(&page, &patches, rect, Some(0)).unwrap();
-        assert_eq!(none.sample(1, 1, 0), page.sample(10, 10, 0), "a zero ceiling is the raw page");
+        assert_eq!(
+            none.sample(1, 1, 0),
+            page.sample(10, 10, 0),
+            "a zero ceiling is the raw page"
+        );
+    }
+
+    #[test]
+    fn each_layer_preserves_its_immediate_underlay_outside_the_mask_and_export_matches_preview() {
+        use crate::export::{export_page, Target};
+        use crate::image::{decode, encode, lossless_format_for};
+        for fixture in fixtures::all() {
+            let page = &fixture.raster;
+            let mut a = synthetic_patch(page, Rect::new(8, 8, 24, 20));
+            a.id = "a".into();
+            let mut b = synthetic_patch(page, Rect::new(16, 12, 24, 20));
+            b.id = "b".into();
+            b.order = 1;
+            let underlay = composite(page, std::slice::from_ref(&a)).unwrap();
+            let preview = composite(page, &[a.clone(), b.clone()]).unwrap();
+            for y in 0..page.height {
+                for x in 0..page.width {
+                    if b.mask.contains(x as i64, y as i64) {
+                        continue;
+                    }
+                    for channel in 0..page.mode.samples() {
+                        assert_eq!(
+                            preview.sample(x, y, channel),
+                            underlay.sample(x, y, channel),
+                            "{} at ({x},{y}) channel {channel}",
+                            fixture.name
+                        );
+                    }
+                }
+            }
+            let source = encode(page, lossless_format_for(page)).unwrap();
+            let exported = export_page(&source, &[a, b], Target::SameAsSource).unwrap();
+            let decoded = decode(&exported.bytes).unwrap();
+            assert_eq!(
+                decoded.data, preview.data,
+                "{} preview/export pixel mismatch",
+                fixture.name
+            );
+        }
     }
 
     #[test]

@@ -351,6 +351,59 @@ fn export_open_job(
         ));
     }
 
+    // Validate every visible patch before creating an output directory or file.
+    // load_patch rechecks text-shaped sidecars against their stored write plan.
+    for record in job.project.patches.iter().filter(|record| record.visible) {
+        job.load_patch(record).map_err(|error| format!("{}: {error}", record.id))?;
+    }
+
+    if let Container::Layered { layered } = container {
+        let strip = strip_of(job);
+        for (position, &source_idx) in job.project.strip.order.iter().enumerate() {
+            let Some(source_path) = job.source_path(source_idx) else { continue };
+            let bytes = std::fs::read(&source_path)
+                .map_err(|error| format!("{}: {error}", source_path.display()))?;
+            let header = match Format::sniff(&bytes) {
+                Some(Format::Png) => png_header(&bytes),
+                Some(Format::Tiff) => tiff_header(&bytes),
+                None => return Err(format!("{}: unknown image format", source_path.display())),
+            }
+            .map_err(|error| format!("{}: {error}", source_path.display()))?;
+            let page = Raster {
+                width: header.width,
+                height: header.height,
+                mode: header.mode,
+                depth: header.depth,
+                icc: header.icc,
+                palette: None,
+                trns: None,
+                srgb_intent: None,
+                data: Vec::new(),
+            };
+            let patches = page_patches_for(job, &strip, longstrip, position, source_idx)?;
+            let regions: Vec<&Patch> = if layered {
+                patches
+                    .iter()
+                    .filter(|patch| patch.visible && !patch.mask.is_empty())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let document = psd::Document {
+                background: &page,
+                regions: &regions,
+                merged: &page,
+            };
+            match psd::preflight_document(&document) {
+                Ok(()) => {}
+                Err(cleaner_core::export::ExportError::NotLayerable(refusal)) => {
+                    return Ok(ExportResult::refused(refusal.reason_key(), None));
+                }
+                Err(error) => return Err(format!("{}: {error}", source_path.display())),
+            }
+        }
+    }
+
     std::fs::create_dir_all(&destination_dir)
         .map_err(|e| format!("{}: {e}", destination_dir.display()))?;
     // `default_output_dir` builds a path lexically (a `parent()`/`file_name()`
@@ -581,10 +634,15 @@ fn write_layered(job: &Job, layered: bool, destination_dir: &Path) -> Result<u32
     Ok(file_count)
 }
 
-/// `<stem>_mask.png`: the union of the page's ink masks - the lettering the
-/// visible edits removed, not the area they painted - white inside.
+/// `<stem>_mask.png`: legacy exports describe lettering; text-shaped exports
+/// describe the exact approved write support shown by their preview.
+fn exported_mask(patch: &Patch) -> &Mask {
+    if patch.provenance.params_snapshot.get("geometry_policy").and_then(|v| v.as_str())
+        == Some("text_shape") { &patch.mask } else { &patch.ink }
+}
+
 fn write_mask_file(path: &Path, patches: &[Patch], width: u32, height: u32) -> Result<(), String> {
-    let masks: Vec<&Mask> = patches.iter().filter(|p| p.visible).map(|p| &p.ink).collect();
+    let masks: Vec<&Mask> = patches.iter().filter(|p| p.visible).map(exported_mask).collect();
     write_file(path, |file| {
         export_mask_to(&masks, width, height, file).map_err(|e| format!("{}: {e}", path.display()))
     })
@@ -713,7 +771,7 @@ fn write_stitched(
                     .iter()
                     .map(StripPatch::in_strip_coordinates)
                     .filter(|p| p.visible)
-                    .map(|p| &p.ink)
+                    .map(exported_mask)
                     .collect();
                 let mask_path = destination_dir.join(format!("{}_mask.png", chapter_stem(job)));
                 write_file(&mask_path, |file| {
@@ -798,7 +856,7 @@ impl PageSource for JobPages<'_> {
 /// which for a heavily cleaned 200-page chapter is not nothing.
 fn global_patches(job: &Job, strip: &Strip) -> Result<Vec<StripPatch>, String> {
     let mut global = Vec::new();
-    for record in &job.project.patches {
+    for record in job.project.patches.iter().filter(|record| record.visible) {
         let Some(anchor) = job.project.strip.order.iter().position(|i| *i == record.source_idx)
         else {
             continue;
@@ -852,7 +910,7 @@ fn owned_patches(job: &Job, source_idx: usize) -> Result<Vec<Patch>, String> {
     job.project
         .patches
         .iter()
-        .filter(|record| record.source_idx == source_idx)
+        .filter(|record| record.visible && record.source_idx == source_idx)
         .map(|record| load(job, record))
         .collect()
 }
@@ -869,6 +927,9 @@ fn owned_patches(job: &Job, source_idx: usize) -> Result<Vec<Patch>, String> {
 fn page_patches(job: &Job, strip: &Strip, position: usize) -> Result<Vec<Patch>, String> {
     let mut patches = Vec::new();
     for (anchor, record) in intersecting_records(job, strip, position) {
+        if !record.visible {
+            continue;
+        }
         let patch = load(job, record)?;
         let Some(lifted) = StripPatch::lift(strip, anchor, &patch) else { continue };
         patches.extend(patches_on_page(strip, position, std::slice::from_ref(&lifted)));
@@ -963,6 +1024,7 @@ mod tests {
     use cleaner_core::mask::Mask;
     use cleaner_core::patch::{Engine, Provenance};
     use cleaner_core::project::Project;
+    use cleaner_core::text_shape::{MaskPlan, MaskQualityState, MASK_PLAN_VERSION};
 
     struct Scratch(PathBuf);
 
@@ -1068,6 +1130,86 @@ mod tests {
             cloud: None,
             created: 0,
         }
+    }
+
+    #[test]
+    fn tampered_text_shape_sidecar_refuses_export_before_any_output() {
+        let scratch = Scratch::new("tampered-support-export");
+        let mut job = a_job(&scratch);
+        let source = &job.project.sources[0];
+        let mut base = Mask::empty(Rect::new(10, 10, 3, 2));
+        base.set(10, 10, true);
+        base.set(12, 11, true);
+        let empty = Mask::empty(Rect::new(0, 0, 0, 0));
+        let plan = MaskPlan {
+            version: MASK_PLAN_VERSION,
+            region_id: "shape".into(),
+            source_sha256: source.sha256.clone(),
+            lower_composite_sha256: "test-underlay".into(),
+            algorithm_id: "synthetic-test".into(),
+            model_id: None,
+            candidate_bounds: Rect::new(8, 8, 8, 8),
+            refinement_crop: Rect::new(8, 8, 8, 8),
+            base_revision: 1,
+            correction_revision: 1,
+            plan_revision: 1,
+            base_mask: base.into(),
+            additions: empty.clone().into(),
+            removals: empty.into(),
+            padding_px: 0,
+            model_hole_margin_px: 0,
+            reading_context: Rect::new(0, 0, source.w, source.h),
+            blend_alpha: None,
+            quality: MaskQualityState::Ready,
+        };
+        let prepared = plan.prepare(source.w, source.h).unwrap();
+        job.store_text_shape_plan(0, &plan, &prepared).unwrap();
+        let support = prepared.write_support.to_mask();
+        let patch = Patch {
+            id: "shape".into(), mask: support.clone(), ink: support,
+            pixels: cleaner_core::engines::model::page_crop(&fixtures::by_name("l8").raster,
+                prepared.write_support.bounds),
+            order: 0, visible: true, provenance: provenance(),
+        };
+        job.complete_text_shape_region(0, &patch, &prepared.identity.identity_sha256, None).unwrap();
+        let row = &job.project.patches[0];
+        let mut tampered = patch.mask;
+        tampered.set(11, 10, true);
+        std::fs::write(job.sidecar().join(&row.mask_ref),
+            cleaner_core::project::buffers::encode_mask(&tampered)).unwrap();
+        assert!(matches!(
+            crate::tile::render(job.path(), 0, crate::tile::Variant::Cleaned, Some(0)),
+            Err(crate::tile::TileError::Store(cleaner_core::project::StoreError::StalePlan))
+        ));
+        let destination = scratch.join("output");
+        let error = export_open_job(&job, "PNG", destination.to_str().unwrap(), "flattened", "per-page")
+            .unwrap_err();
+        assert!(error.contains("prepared text-shaped mask plan"));
+        assert!(!destination.exists(), "export created output before validating patches");
+    }
+
+    #[test]
+    fn text_shaped_mask_file_uses_the_previewed_write_support() {
+        let mut support = Mask::empty(Rect::new(10, 10, 5, 5));
+        support.set(10, 10, true);
+        support.set(14, 14, true);
+        let mut ink = Mask::empty(support.bounds);
+        ink.set(10, 10, true);
+        let mut provenance = provenance();
+        provenance.params_snapshot = serde_json::json!({"geometry_policy": "text_shape"});
+        let patch = Patch {
+            id: "text-shape".into(), mask: support, ink,
+            pixels: cleaner_core::engines::model::page_crop(&fixtures::by_name("l8").raster,
+                Rect::new(10, 10, 5, 5)),
+            order: 0, visible: true, provenance,
+        };
+        let path = std::env::temp_dir().join(format!("mc-text-shape-mask-{}.png", std::process::id()));
+        write_mask_file(&path, &[patch], 64, 48).unwrap();
+        let exported = cleaner_core::image::decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(exported.sample(10, 10, 0), 255);
+        assert_eq!(exported.sample(14, 14, 0), 255, "padding belongs to exported W");
+        assert_eq!(exported.sample(12, 12, 0), 0, "the gap remains outside W");
+        std::fs::remove_file(path).ok();
     }
 
     /// `export_open_job` with the two parameters most tests do not vary.
@@ -1413,6 +1555,45 @@ mod tests {
             export_open_job(&strip_job, "PSD", "new-folder", "flattened", "stitched").unwrap();
         assert_eq!(stitched.status, "refused");
         assert_eq!(stitched.reason_key, Some("notice.export.refusedStitchedLayered"));
+    }
+
+    #[test]
+    fn oversized_psd_page_refuses_chapter_before_output_exists() {
+        let scratch = Scratch::new("psd-file-size-preflight");
+        let mut job = a_strip_job(&scratch, StripMode::Single);
+        let source = &mut job.project.sources[2];
+        source.w = 14_000;
+        source.h = 14_000;
+        source.mode = cleaner_core::image::ColorMode::Rgb;
+        source.bit_depth = cleaner_core::image::BitDepth::Sixteen;
+        let destination = scratch.join("psd-output");
+
+        let result = export_open_job(
+            &job, "PSD", destination.to_str().unwrap(), "separate-layer", "per-page",
+        ).unwrap();
+        assert_eq!(result.status, "refused");
+        assert_eq!(result.reason_key, Some("notice.export.refusedLayeredFileSize"));
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn invisible_patch_with_missing_sidecar_is_ignored_by_all_export_paths() {
+        let scratch = Scratch::new("invisible-missing-sidecar");
+        let mut job = a_strip_job(&scratch, StripMode::Longstrip);
+        overhanging_fill(&mut job, 1, Rect::new(10, 10, 8, 8), 200);
+        job.project.patches[0].visible = false;
+        let buffer = job.sidecar().join(&job.project.patches[0].buffer_ref);
+        std::fs::remove_file(buffer).unwrap();
+        let strip = strip_of(&job);
+
+        assert!(owned_patches(&job, 1).unwrap().is_empty());
+        assert!(page_patches(&job, &strip, 1).unwrap().is_empty());
+        assert!(global_patches(&job, &strip).unwrap().is_empty());
+        let destination = scratch.join("pages");
+        let result = export_open_job(
+            &job, "PNG", destination.to_str().unwrap(), "flattened", "per-page",
+        ).unwrap();
+        assert_eq!(result.file_count, Some(3));
     }
 
     /// The seam takes an absolute path, and refuses a

@@ -39,11 +39,13 @@
 //! the second one can leave a secret behind, and the user has to hear about it.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use serde_json::{Map, Value};
 
 /// Where the file lives, under the app's config directory.
 const FILE: &str = "settings.json";
+static SETTINGS_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     use tauri::Manager;
@@ -55,7 +57,11 @@ pub fn path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 pub fn read(app: &tauri::AppHandle) -> Result<Value, String> {
     let path = path(app)?;
-    match std::fs::read(&path) {
+    read_file(&path)
+}
+
+fn read_file(path: &std::path::Path) -> Result<Value, String> {
+    match std::fs::read(path) {
         // No file yet is not an error: it is a first launch, and the interface's
         // own defaults are the right answer.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Value::Object(Map::new())),
@@ -122,7 +128,11 @@ fn check_no_cloud_secrets(key_path: &str, value: &Value) -> Result<(), String> {
 }
 
 /// Merge a patch and return the whole snapshot.
-pub fn write(app: &tauri::AppHandle, mut patch: Value) -> Result<Value, String> {
+pub fn write(app: &tauri::AppHandle, patch: Value) -> Result<Value, String> {
+    write_patch(&path(app)?, patch)
+}
+
+fn write_patch(path: &std::path::Path, mut patch: Value) -> Result<Value, String> {
     // Reject any cloud secrets or cloud configuration attempting to be stored in settings.json
     check_no_cloud_secrets("", &patch)?;
 
@@ -133,7 +143,8 @@ pub fn write(app: &tauri::AppHandle, mut patch: Value) -> Result<Value, String> 
         _ => None,
     };
 
-    let mut current = match read(app)? {
+    let _guard = SETTINGS_WRITE_LOCK.lock().map_err(|e| e.to_string())?;
+    let mut current = match read_file(path)? {
         Value::Object(map) => map,
         // A settings file that is not an object is not repairable by merging
         // into it; start again rather than lose the patch.
@@ -180,7 +191,7 @@ pub fn write(app: &tauri::AppHandle, mut patch: Value) -> Result<Value, String> 
     }
 
     let merged = Value::Object(current);
-    write_file(&path(app)?, &merged)?;
+    write_file(path, &merged)?;
     match refusal {
         Some(err) => Err(format!("the credential store kept the token: {err}")),
         None => Ok(merged),
@@ -367,11 +378,13 @@ fn restrict(path: &std::path::Path) -> Result<(), String> {
 /// file that already has it, needs a way in that is not a patch. Nothing is
 /// written when the key was not there.
 pub fn forget(app: &tauri::AppHandle, key: &str) -> Result<(), String> {
-    let Value::Object(mut current) = read(app)? else { return Ok(()) };
+    let _guard = SETTINGS_WRITE_LOCK.lock().map_err(|e| e.to_string())?;
+    let path = path(app)?;
+    let Value::Object(mut current) = read_file(&path)? else { return Ok(()) };
     if current.remove(key).is_none() {
         return Ok(());
     }
-    write_file(&path(app)?, &Value::Object(current))
+    write_file(&path, &Value::Object(current))
 }
 
 /// The snapshot the interface is allowed to see.
@@ -403,6 +416,51 @@ pub fn write_settings(app: tauri::AppHandle, patch: Value) -> Result<Value, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn concurrent_patches_keep_both_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "mc-settings-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("settings.json");
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for field in ["theme", "accelerator"] {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                for n in 0..80 {
+                    barrier.wait();
+                    let patch = Value::Object(Map::from_iter([(field.to_owned(), Value::from(n))]));
+                    write_patch(&path, patch).unwrap();
+                    barrier.wait();
+                }
+            }));
+        }
+        let mut first_missing = None;
+        for n in 0..80 {
+            barrier.wait();
+            barrier.wait();
+            let snapshot = read_file(&path).unwrap();
+            if (snapshot.get("theme"), snapshot.get("accelerator"))
+                != (Some(&serde_json::json!(n)), Some(&serde_json::json!(n)))
+                && first_missing.is_none()
+            {
+                first_missing = Some((n, snapshot));
+            }
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(first_missing.is_none(), "concurrent writes lost a field: {first_missing:?}");
+    }
 
     /// The seam's rule about the token, enforced at
     /// the boundary rather than assumed: on a machine with no credential store

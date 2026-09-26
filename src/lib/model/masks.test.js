@@ -18,6 +18,7 @@ import {
   regionMenuSections,
   rowEngines,
 } from './masks.js'
+import { rungLabel } from './ladder.js'
 
 /**
  * @param {string} engine
@@ -122,6 +123,14 @@ describe('cloud masks', () => {
 })
 
 describe('regionMenuSections', () => {
+  it('offers only Delete for an approved component whose sidecar cannot be replaced safely', () => {
+    const region = masked('fill')
+    region.id = 'c1-p001-hreview-sam-00001-deadbeef'
+    region.mask.id = `${region.id}-m1`
+    expect(reRunnable(region.mask)).toBe(false)
+    expect(ids(regionMenuSections(region))).toEqual(['delete'])
+  })
+
   it('offers Try again, the engines and Delete for an ordinary mask', () => {
     const sections = regionMenuSections(masked('lama'), { engines: { flux: false } })
     expect(ids(sections)).toEqual([
@@ -231,6 +240,41 @@ describe('regionMenuSections', () => {
       }
     }
   })
+})
+
+/**
+ * A paint or clone stroke is copied pixels, not a cleaning: there is nothing
+ * to run again from the layers below it (docs/repeated-inpaint-plan.md, M1
+ * item 5). Try again and Clean with are refused for it everywhere they are
+ * offered, and the layer keeps the name of the tool that made it rather than
+ * borrowing an engine's.
+ */
+describe('paint and clone masks', () => {
+  for (const engine of ['paint', 'clone']) {
+    it(`refuse Try again and every engine for a ${engine} stroke, and keep Delete`, () => {
+      const region = masked(engine)
+      expect(reRunnable(region.mask)).toBe(false)
+      // Whatever the machine could run and whether the cloud is ready: an
+      // engine list would be an offer to re-clean something never cleaned.
+      for (const options of [{}, { engines: { flux: true } }, { engines: { flux: true }, cloud: true }]) {
+        const sections = regionMenuSections(region, options)
+        expect(ids(sections)).toEqual(['delete'])
+        expect(sections.map((section) => section.id)).toEqual(['remove'])
+      }
+    })
+
+    it(`deletes a ${engine} stroke as a layer, not as a region`, () => {
+      const [remove] = regionMenuSections(masked(engine))
+      expect(remove.items[0]).toMatchObject({ id: 'delete', labelKey: 'masks.action.delete' })
+    })
+
+    it(`names a ${engine} stroke by the tool that made it, and never as Cloud`, () => {
+      const { mask } = masked(engine)
+      expect(maskEngine(mask)).toBe(engine)
+      expect(isCloudMask(mask)).toBe(false)
+      expect(rungLabel(/** @type {string} */ (maskEngine(mask)))).toBe(`ladder.rung.${engine}`)
+    })
+  }
 })
 
 describe('provenanceFacts', () => {

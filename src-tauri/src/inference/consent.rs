@@ -42,10 +42,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use cleaner_core::engines::render::{
-    CloudProvider, ExecutionTarget, PreparedRender, RenderRecipe,
-};
-use cleaner_core::fit::{self, EdgeMap};
+use cleaner_core::engines::render::{CloudProvider, ExecutionTarget, RenderRecipe};
 use cleaner_core::image::{BitDepth, ColorMode, Format, Raster};
 use cleaner_core::ingest::sha256_hex;
 use cleaner_core::mask::Rect;
@@ -54,9 +51,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::inference::config::{
-    compute_canonical_endpoint_fingerprint, InferenceConfig,
-};
+use crate::inference::config::{compute_canonical_endpoint_fingerprint, InferenceConfig};
 use crate::inference::policy::{Grant, GrantError, GrantScope, GrantService};
 use crate::library::Library;
 use crate::run;
@@ -155,6 +150,10 @@ pub struct ConsentProposal {
     pub mask_hash: String,
     pub revision: u64,
     pub revision_hash: String,
+    #[serde(default)]
+    pub input_sha256: String,
+    #[serde(default)]
+    pub predecessors_sha256: String,
     pub recipe: RenderRecipe,
     pub region_ids: Vec<String>,
     pub intent: OperationIntent,
@@ -304,7 +303,11 @@ pub fn validate_operation_intent_bounds(intent: &OperationIntent) -> Result<(), 
                 }
             }
         }
-        OperationIntent::RerunMask { mask_id, kind, engine } => {
+        OperationIntent::RerunMask {
+            mask_id,
+            kind,
+            engine,
+        } => {
             if mask_id.is_empty() || mask_id.len() > MAX_MASK_ID_LEN {
                 return Err(ConsentError::InvalidParameter("mask_id length invalid"));
             }
@@ -328,8 +331,9 @@ pub fn compute_operation_digest(intent: &OperationIntent) -> Result<String, Cons
 
     let mut hasher = Sha256::new();
     hasher.update(b"domain:operation_intent_v1:");
-    let json_bytes = serde_json::to_vec(intent)
-        .map_err(|e| ConsentError::Internal(format!("failed to serialize operation intent: {e}")))?;
+    let json_bytes = serde_json::to_vec(intent).map_err(|e| {
+        ConsentError::Internal(format!("failed to serialize operation intent: {e}"))
+    })?;
     hasher.update(&json_bytes);
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -380,7 +384,11 @@ pub fn compute_region_revision_fingerprint(
     compute_region_revision_hash(source_sha256, record, mask, ink)
 }
 
-pub(crate) fn encode_rgb8_png(width: u32, height: u32, data: &[u8]) -> Result<Vec<u8>, ConsentError> {
+pub(crate) fn encode_rgb8_png(
+    width: u32,
+    height: u32,
+    data: &[u8],
+) -> Result<Vec<u8>, ConsentError> {
     let raster = Raster {
         width,
         height,
@@ -396,7 +404,11 @@ pub(crate) fn encode_rgb8_png(width: u32, height: u32, data: &[u8]) -> Result<Ve
         .map_err(|e| ConsentError::RenderPrepareFailed(e.to_string()))
 }
 
-pub(crate) fn encode_gray8_png(width: u32, height: u32, data: &[u8]) -> Result<Vec<u8>, ConsentError> {
+pub(crate) fn encode_gray8_png(
+    width: u32,
+    height: u32,
+    data: &[u8],
+) -> Result<Vec<u8>, ConsentError> {
     let raster = Raster {
         width,
         height,
@@ -450,12 +462,14 @@ impl ConsentService {
 
     /// Return the current mutation epoch for a profile.
     pub fn get_profile_epoch(&self, provider: CloudProvider, profile_id: &str) -> u64 {
-        self.resolve_grant_service().get_profile_epoch(provider, profile_id)
+        self.resolve_grant_service()
+            .get_profile_epoch(provider, profile_id)
     }
 
     /// Atomically revoke all proposals, grants, and advance the profile epoch for a profile.
     pub fn invalidate_profile(&self, provider: CloudProvider, profile_id: &str) {
-        self.resolve_grant_service().invalidate_profile(provider, profile_id);
+        self.resolve_grant_service()
+            .invalidate_profile(provider, profile_id);
         drop(self.proposals.lock().unwrap_or_else(|p| p.into_inner()));
     }
 
@@ -477,8 +491,14 @@ impl ConsentService {
             return Err(ConsentError::CloudDisabled);
         }
 
-        let provider = request.target.provider().ok_or(ConsentError::LocalTargetNotAllowed)?;
-        let profile_id = request.target.profile_id().ok_or(ConsentError::LocalTargetNotAllowed)?;
+        let provider = request
+            .target
+            .provider()
+            .ok_or(ConsentError::LocalTargetNotAllowed)?;
+        let profile_id = request
+            .target
+            .profile_id()
+            .ok_or(ConsentError::LocalTargetNotAllowed)?;
 
         // 1. Capture profile mutation epoch BEFORE reading config or performing raster work
         let start_epoch = self.get_profile_epoch(provider, profile_id);
@@ -499,17 +519,31 @@ impl ConsentService {
         validate_operation_intent_bounds(&request.intent)?;
         let operation_digest = compute_operation_digest(&request.intent)?;
 
-        let (crop_bounds, crop_png_sha256, hint_png_sha256, source_hash, mask_hash, revision, revision_hash, source_idx, region_id) = {
+        let (
+            crop_bounds,
+            crop_png_sha256,
+            hint_png_sha256,
+            source_hash,
+            mask_hash,
+            revision,
+            revision_hash,
+            input_sha256,
+            predecessors_sha256,
+            source_idx,
+            region_id,
+        ) = {
             let _lock = run::lock_job(job_path);
             let job = Job::open(job_path).map_err(|e| ConsentError::Internal(e.to_string()))?;
             let source_idx = Library::resolve_page(&job.project, request.page_index as usize)
-                .ok_or_else(|| ConsentError::PageNotFound(request.page_index, request.chapter_id.clone()))?;
+                .ok_or_else(|| {
+                    ConsentError::PageNotFound(request.page_index, request.chapter_id.clone())
+                })?;
 
             let source_path = job
                 .source_path(source_idx)
                 .ok_or(ConsentError::SourceImageError)?;
-            let source_bytes = std::fs::read(&source_path)
-                .map_err(|_| ConsentError::SourceImageError)?;
+            let source_bytes =
+                std::fs::read(&source_path).map_err(|_| ConsentError::SourceImageError)?;
             let source_hash = sha256_hex(&source_bytes);
             let page = cleaner_core::image::decode(&source_bytes)
                 .map_err(|e| ConsentError::RenderPrepareFailed(e.to_string()))?;
@@ -527,6 +561,14 @@ impl ConsentService {
                 .find(|r| r.id == region_id)
                 .ok_or_else(|| ConsentError::RegionNotFound(region_id.clone()))?;
 
+            if record.geometry_policy == cleaner_core::text_shape::GeometryPolicy::TextShape
+                || job.project.text_shape_plans.iter().any(|plan| plan.region_id == region_id)
+            {
+                return Err(ConsentError::RenderPrepareFailed(
+                    "cloud FLUX does not support text-shaped write plans".into(),
+                ));
+            }
+
             if record.source_idx != source_idx {
                 return Err(ConsentError::PageMismatch);
             }
@@ -537,16 +579,14 @@ impl ConsentService {
 
             let seed = patch.mask.clone();
             if seed.is_empty() {
-                return Err(ConsentError::RenderPrepareFailed("seed mask is empty".to_string()));
+                return Err(ConsentError::RenderPrepareFailed(
+                    "seed mask is empty".to_string(),
+                ));
             }
-            let noise = fit::page_noise_sigma(&page);
-            let edges = EdgeMap::sobel(&page);
-            let fitted = fit::fit(&page, &seed, 1.0, noise, &edges, true);
-
-            let prepared = PreparedRender::prepare(&page, &fitted)
-                .map_err(|e| ConsentError::RenderPrepareFailed(e.to_string()))?;
-
-            let crop_bounds = prepared.crop();
+            let cloud = crate::underlay::prepare_cloud(&job, source_idx, &page, record, &patch)
+                .map_err(ConsentError::RenderPrepareFailed)?;
+            let prepared = &cloud.prepared;
+            let crop_bounds = cloud.crop_bounds;
             let crop_png = encode_rgb8_png(crop_bounds.w, crop_bounds.h, prepared.image_rgb8())?;
             let crop_png_sha256 = sha256_hex(&crop_png);
 
@@ -557,7 +597,19 @@ impl ConsentService {
             let (revision, revision_hash) =
                 compute_region_revision_hash(&source_hash, record, &patch.mask, &patch.ink);
 
-            (crop_bounds, crop_png_sha256, hint_png_sha256, source_hash, mask_hash, revision, revision_hash, source_idx, region_id)
+            (
+                crop_bounds,
+                crop_png_sha256,
+                hint_png_sha256,
+                source_hash,
+                mask_hash,
+                revision,
+                revision_hash,
+                cloud.input.digest,
+                cloud.input.predecessors,
+                source_idx,
+                region_id,
+            )
         };
 
         let proposal_id = generate_proposal_id()?;
@@ -581,6 +633,8 @@ impl ConsentService {
             mask_hash,
             revision,
             revision_hash,
+            input_sha256,
+            predecessors_sha256,
             recipe: request.recipe,
             region_ids: vec![region_id],
             intent: request.intent,
@@ -591,13 +645,12 @@ impl ConsentService {
             expires_at_ms,
         };
 
-        let canonical_job_path = job_path.canonicalize().unwrap_or_else(|_| job_path.to_path_buf());
+        let canonical_job_path = job_path
+            .canonicalize()
+            .unwrap_or_else(|_| job_path.to_path_buf());
 
         {
-            let mut map = self
-                .proposals
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut map = self.proposals.lock().unwrap_or_else(|p| p.into_inner());
 
             // Atomically verify epoch before inserting proposal into cache
             let current_epoch = self.get_profile_epoch(provider, profile_id);
@@ -654,16 +707,12 @@ impl ConsentService {
 
         // 1. Fetch and validate cached proposal under mutex
         let (proposal, stored_canonical_job_path, start_epoch) = {
-            let map = self
-                .proposals
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let map = self.proposals.lock().unwrap_or_else(|p| p.into_inner());
 
-            let stored = map
-                .get(proposal_id)
-                .ok_or(ConsentError::ProposalNotFound)?;
+            let stored = map.get(proposal_id).ok_or(ConsentError::ProposalNotFound)?;
 
-            let current_epoch = self.get_profile_epoch(stored.proposal.provider, &stored.proposal.profile_id);
+            let current_epoch =
+                self.get_profile_epoch(stored.proposal.provider, &stored.proposal.profile_id);
             if stored.profile_epoch != current_epoch {
                 return Err(ConsentError::ProfileMutated);
             }
@@ -683,11 +732,17 @@ impl ConsentService {
                 });
             }
 
-            if &stored.proposal.intent != intent || stored.proposal.operation_digest != incoming_op_digest {
+            if &stored.proposal.intent != intent
+                || stored.proposal.operation_digest != incoming_op_digest
+            {
                 return Err(ConsentError::IntentMismatch);
             }
 
-            (stored.proposal.clone(), stored.canonical_job_path.clone(), current_epoch)
+            (
+                stored.proposal.clone(),
+                stored.canonical_job_path.clone(),
+                current_epoch,
+            )
         };
 
         // 2. Validate current configuration and endpoint fingerprint
@@ -707,7 +762,9 @@ impl ConsentService {
         }
 
         // 3. Lock job and re-prepare raster crops to revalidate all identities
-        let current_canonical_job_path = job_path.canonicalize().unwrap_or_else(|_| job_path.to_path_buf());
+        let current_canonical_job_path = job_path
+            .canonicalize()
+            .unwrap_or_else(|_| job_path.to_path_buf());
         if current_canonical_job_path != stored_canonical_job_path {
             return Err(ConsentError::PageMismatch);
         }
@@ -726,8 +783,8 @@ impl ConsentService {
         let source_path = job
             .source_path(source_idx)
             .ok_or(ConsentError::SourceImageError)?;
-        let source_bytes = std::fs::read(&source_path)
-            .map_err(|_| ConsentError::SourceImageError)?;
+        let source_bytes =
+            std::fs::read(&source_path).map_err(|_| ConsentError::SourceImageError)?;
         let current_source_hash = sha256_hex(&source_bytes);
         if current_source_hash != proposal.source_hash {
             return Err(ConsentError::SourceMismatch);
@@ -744,6 +801,14 @@ impl ConsentService {
                 .find(|r| &r.id == region_id)
                 .ok_or_else(|| ConsentError::RegionNotFound(region_id.clone()))?;
 
+            if record.geometry_policy == cleaner_core::text_shape::GeometryPolicy::TextShape
+                || job.project.text_shape_plans.iter().any(|plan| &plan.region_id == region_id)
+            {
+                return Err(ConsentError::RenderPrepareFailed(
+                    "cloud FLUX does not support text-shaped write plans".into(),
+                ));
+            }
+
             if record.source_idx != proposal.source_idx {
                 return Err(ConsentError::PageMismatch);
             }
@@ -758,23 +823,24 @@ impl ConsentService {
             }
 
             // Full structured re-preparation
-            let noise = fit::page_noise_sigma(&page);
-            let edges = EdgeMap::sobel(&page);
-            let fitted = fit::fit(&page, &patch.mask, 1.0, noise, &edges, true);
-
-            let prepared = PreparedRender::prepare(&page, &fitted)
-                .map_err(|e| ConsentError::RenderPrepareFailed(e.to_string()))?;
-
-            if prepared.crop() != proposal.crop_bounds {
+            let cloud = crate::underlay::prepare_cloud(&job, source_idx, &page, record, &patch)
+                .map_err(ConsentError::RenderPrepareFailed)?;
+            let prepared = &cloud.prepared;
+            if cloud.crop_bounds != proposal.crop_bounds
+                || cloud.input.digest != proposal.input_sha256
+                || cloud.input.predecessors != proposal.predecessors_sha256
+            {
                 return Err(ConsentError::CropDigestMismatch);
             }
 
-            let crop_png = encode_rgb8_png(prepared.crop().w, prepared.crop().h, prepared.image_rgb8())?;
+            let crop_png =
+                encode_rgb8_png(prepared.crop().w, prepared.crop().h, prepared.image_rgb8())?;
             if sha256_hex(&crop_png) != proposal.crop_png_sha256 {
                 return Err(ConsentError::CropDigestMismatch);
             }
 
-            let hint_png = encode_gray8_png(prepared.crop().w, prepared.crop().h, prepared.hint_gray8())?;
+            let hint_png =
+                encode_gray8_png(prepared.crop().w, prepared.crop().h, prepared.hint_gray8())?;
             if sha256_hex(&hint_png) != proposal.hint_png_sha256 {
                 return Err(ConsentError::CropDigestMismatch);
             }
@@ -782,13 +848,16 @@ impl ConsentService {
             let (current_revision, current_revision_hash) =
                 compute_region_revision_hash(&current_source_hash, record, &patch.mask, &patch.ink);
 
-            if current_revision != proposal.revision || current_revision_hash != proposal.revision_hash {
+            if current_revision != proposal.revision
+                || current_revision_hash != proposal.revision_hash
+            {
                 return Err(ConsentError::RevisionMismatch);
             }
         }
 
         // 4. Issue authorization grant via GrantService with atomic epoch validation
         let scope = GrantScope {
+            capability: crate::inference::policy::FLUX_CAPABILITY.to_string(),
             provider: proposal.provider,
             profile_id: proposal.profile_id,
             canonical_endpoint_fingerprint: proposal.canonical_endpoint_fingerprint,
@@ -799,6 +868,8 @@ impl ConsentService {
             crop_bounds: proposal.crop_bounds,
             mask_hash: proposal.mask_hash,
             revision: proposal.revision,
+            input_sha256: proposal.input_sha256.clone(),
+            predecessors_sha256: proposal.predecessors_sha256.clone(),
             recipe: proposal.recipe,
             region_ids: proposal.region_ids,
         };
@@ -813,16 +884,14 @@ impl ConsentService {
 
         // Explicit confirmed grant binding: record nonce ONLY after successful issuance
         {
-            let mut map = self
-                .proposals
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut map = self.proposals.lock().unwrap_or_else(|p| p.into_inner());
 
             let stored = map
                 .get_mut(proposal_id)
                 .ok_or(ConsentError::ProposalNotFound)?;
 
-            let current_epoch = self.get_profile_epoch(stored.proposal.provider, &stored.proposal.profile_id);
+            let current_epoch =
+                self.get_profile_epoch(stored.proposal.provider, &stored.proposal.profile_id);
             if stored.profile_epoch != current_epoch || current_epoch != start_epoch {
                 let _ = self.resolve_grant_service().revoke_grant(&grant.nonce);
                 return Err(ConsentError::ProfileMutated);
@@ -846,10 +915,9 @@ impl ConsentService {
             return Err(ConsentError::CloudDisabled);
         }
 
-        let config = crate::inference::config::read_inference_config(app)
-            .map_err(ConsentError::Internal)?;
-        let library = Library::for_app(app)
-            .map_err(|e| ConsentError::Internal(e.to_string()))?;
+        let config =
+            crate::inference::config::read_inference_config(app).map_err(ConsentError::Internal)?;
+        let library = Library::for_app(app).map_err(|e| ConsentError::Internal(e.to_string()))?;
         let job_path = library
             .resolve_chapter(&request.chapter_id)
             .map_err(|e| ConsentError::Internal(e.to_string()))?;
@@ -872,10 +940,9 @@ impl ConsentService {
             return Err(ConsentError::CloudDisabled);
         }
 
-        let config = crate::inference::config::read_inference_config(app)
-            .map_err(ConsentError::Internal)?;
-        let library = Library::for_app(app)
-            .map_err(|e| ConsentError::Internal(e.to_string()))?;
+        let config =
+            crate::inference::config::read_inference_config(app).map_err(ConsentError::Internal)?;
+        let library = Library::for_app(app).map_err(|e| ConsentError::Internal(e.to_string()))?;
 
         let proposal = self.get_proposal(proposal_id)?;
         let job_path = library
@@ -895,14 +962,10 @@ impl ConsentService {
 
     /// Retrieve an unexpired proposal by ID.
     pub fn get_proposal(&self, proposal_id: &str) -> Result<ConsentProposal, ConsentError> {
-        let map = self
-            .proposals
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let stored = map
-            .get(proposal_id)
-            .ok_or(ConsentError::ProposalNotFound)?;
-        let current_epoch = self.get_profile_epoch(stored.proposal.provider, &stored.proposal.profile_id);
+        let map = self.proposals.lock().unwrap_or_else(|p| p.into_inner());
+        let stored = map.get(proposal_id).ok_or(ConsentError::ProposalNotFound)?;
+        let current_epoch =
+            self.get_profile_epoch(stored.proposal.provider, &stored.proposal.profile_id);
         if stored.profile_epoch != current_epoch {
             return Err(ConsentError::ProfileMutated);
         }
@@ -924,14 +987,10 @@ impl ConsentService {
         &self,
         proposal_id: &str,
     ) -> Result<(ConsentProposal, PathBuf), ConsentError> {
-        let map = self
-            .proposals
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let stored = map
-            .get(proposal_id)
-            .ok_or(ConsentError::ProposalNotFound)?;
-        let current_epoch = self.get_profile_epoch(stored.proposal.provider, &stored.proposal.profile_id);
+        let map = self.proposals.lock().unwrap_or_else(|p| p.into_inner());
+        let stored = map.get(proposal_id).ok_or(ConsentError::ProposalNotFound)?;
+        let current_epoch =
+            self.get_profile_epoch(stored.proposal.provider, &stored.proposal.profile_id);
         if stored.profile_epoch != current_epoch {
             return Err(ConsentError::ProfileMutated);
         }
@@ -954,15 +1013,11 @@ impl ConsentService {
         proposal_id: &str,
         grant_nonce: &str,
     ) -> Result<(ConsentProposal, PathBuf), ConsentError> {
-        let map = self
-            .proposals
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let stored = map
-            .get(proposal_id)
-            .ok_or(ConsentError::ProposalNotFound)?;
+        let map = self.proposals.lock().unwrap_or_else(|p| p.into_inner());
+        let stored = map.get(proposal_id).ok_or(ConsentError::ProposalNotFound)?;
 
-        let current_epoch = self.get_profile_epoch(stored.proposal.provider, &stored.proposal.profile_id);
+        let current_epoch =
+            self.get_profile_epoch(stored.proposal.provider, &stored.proposal.profile_id);
         if stored.profile_epoch != current_epoch {
             return Err(ConsentError::ProfileMutated);
         }
@@ -1001,10 +1056,7 @@ impl ConsentService {
 
     /// Explicitly revoke a proposal by ID.
     pub fn revoke_proposal(&self, proposal_id: &str) -> Result<(), ConsentError> {
-        let mut map = self
-            .proposals
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut map = self.proposals.lock().unwrap_or_else(|p| p.into_inner());
         map.remove(proposal_id)
             .map(|_| ())
             .ok_or(ConsentError::ProposalNotFound)
@@ -1053,10 +1105,9 @@ mod tests {
 
     fn test_config() -> InferenceConfig {
         let mut config = InferenceConfig::default();
-        let (origin, fp) = crate::inference::config::validate_https_endpoint(
-            "https://modal.example.com/mc/v1",
-        )
-        .unwrap();
+        let (origin, fp) =
+            crate::inference::config::validate_https_endpoint("https://modal.example.com/mc/v1")
+                .unwrap();
         config.modal_profiles.insert(
             "modal-prof-1".to_string(),
             crate::inference::config::CloudProfile {
@@ -1119,6 +1170,78 @@ mod tests {
 
         job.complete_region(0, &patch, None).unwrap();
         (manifest, bounds)
+    }
+
+    #[test]
+    fn text_shaped_region_is_refused_at_proposal_without_mutation() {
+        let scratch = test_scratch("text-shape-proposal-refusal");
+        let (manifest, _) = setup_test_job(&scratch, "reg-1");
+        let mut job = Job::open(&manifest).unwrap();
+        job.project.patches[0].geometry_policy = cleaner_core::text_shape::GeometryPolicy::TextShape;
+        job.flush().unwrap();
+        let before = std::fs::read(&manifest).unwrap();
+        let service = ConsentService::new_isolated(Arc::new(GrantService::new()));
+        let result = service.prepare_proposal(PrepareProposalRequest {
+            chapter_id: "chap-1".into(), page_index: 0,
+            region_id: Some("reg-1".into()),
+            target: ExecutionTarget::Modal { profile_id: "modal-prof-1".into() },
+            recipe: test_recipe(), intent: OperationIntent::CleanAnyway,
+        }, &test_config(), true, &manifest);
+        assert!(matches!(result, Err(ConsentError::RenderPrepareFailed(reason))
+            if reason.contains("text-shaped")));
+        assert_eq!(std::fs::read(&manifest).unwrap(), before);
+    }
+
+    #[test]
+    fn consent_rejects_a_changed_visible_predecessor_even_when_target_is_unchanged() {
+        let scratch = test_scratch("predecessor-stale");
+        let (manifest, _) = setup_test_job(&scratch, "reg-1");
+        let mut job = Job::open(&manifest).unwrap();
+        let target = job
+            .load_patch(
+                job.project
+                    .patches
+                    .iter()
+                    .find(|p| p.id == "reg-1")
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut first = target.clone();
+        first.id = "earlier".into();
+        first.order = 0;
+        first.pixels.data.fill(240);
+        job.complete_region(0, &first, None).unwrap();
+
+        let config = test_config();
+        let service = ConsentService::new_isolated(Arc::new(GrantService::new()));
+        let req = PrepareProposalRequest {
+            chapter_id: "chap-1".into(),
+            page_index: 0,
+            region_id: Some("reg-1".into()),
+            target: ExecutionTarget::Modal {
+                profile_id: "modal-prof-1".into(),
+            },
+            recipe: test_recipe(),
+            intent: OperationIntent::CleanAnyway,
+        };
+        let proposal = service
+            .prepare_proposal(req.clone(), &config, true, &manifest)
+            .unwrap();
+        assert_ne!(proposal.input_sha256, "");
+        first.pixels.data.fill(60);
+        job.complete_region(0, &first, None).unwrap();
+        let err = service
+            .confirm_proposal(ConfirmProposalOptions {
+                proposal_id: &proposal.proposal_id,
+                intent: &req.intent,
+                config: &config,
+                cloud_allowed: true,
+                job_path: &manifest,
+                grant_ttl: Duration::from_secs(60),
+                max_attempts: 1,
+            })
+            .unwrap_err();
+        assert_eq!(err, ConsentError::CropDigestMismatch);
     }
 
     #[test]
@@ -1257,10 +1380,19 @@ mod tests {
 
         // Mutate mask file on disk using job.sidecar
         let job = Job::open(&manifest).unwrap();
-        let record = job.project.patches.iter().find(|r| r.id == "reg-1").unwrap();
+        let record = job
+            .project
+            .patches
+            .iter()
+            .find(|r| r.id == "reg-1")
+            .unwrap();
         let mask_file = job.sidecar().join(&record.mask_ref);
         let changed = Mask::empty(bounds);
-        std::fs::write(&mask_file, cleaner_core::project::buffers::encode_mask(&changed)).unwrap();
+        std::fs::write(
+            &mask_file,
+            cleaner_core::project::buffers::encode_mask(&changed),
+        )
+        .unwrap();
 
         let err = service
             .confirm_proposal(ConfirmProposalOptions {
@@ -1276,7 +1408,9 @@ mod tests {
 
         assert!(matches!(
             err,
-            ConsentError::MaskMismatch | ConsentError::RevisionMismatch | ConsentError::CropDigestMismatch
+            ConsentError::MaskMismatch
+                | ConsentError::RevisionMismatch
+                | ConsentError::CropDigestMismatch
         ));
     }
 
@@ -1423,7 +1557,9 @@ mod tests {
             recipe: test_recipe(),
             intent: OperationIntent::ApplyTool {
                 tool: "brush".into(),
-                params: Some(serde_json::json!({ "huge": "x".repeat(MAX_OPERATION_PARAMS_LEN + 100) })),
+                params: Some(
+                    serde_json::json!({ "huge": "x".repeat(MAX_OPERATION_PARAMS_LEN + 100) }),
+                ),
             },
         };
 
@@ -2045,7 +2181,10 @@ mod tests {
             max_attempts: 1,
         });
         assert!(
-            matches!(confirm_res, Err(ConsentError::ProfileMutated | ConsentError::ProposalAlreadyConsumed)),
+            matches!(
+                confirm_res,
+                Err(ConsentError::ProfileMutated | ConsentError::ProposalAlreadyConsumed)
+            ),
             "Must fail closed after invalidation on poisoned mutex"
         );
 
@@ -2091,15 +2230,19 @@ mod tests {
                 engine: Some("cloud".into()),
             }
         );
-        assert!(serde_json::from_value::<OperationIntent>(serde_json::json!({
-            "action": "rerunMask",
-            "maskId": "r1-m1",
-            "kind": "engine",
-        }))
-        .is_err());
+        assert!(
+            serde_json::from_value::<OperationIntent>(serde_json::json!({
+                "action": "rerunMask",
+                "maskId": "r1-m1",
+                "kind": "engine",
+            }))
+            .is_err()
+        );
         assert_eq!(
-            serde_json::from_value::<OperationIntent>(serde_json::json!({ "action": "cleanAnyway" }))
-                .unwrap(),
+            serde_json::from_value::<OperationIntent>(
+                serde_json::json!({ "action": "cleanAnyway" })
+            )
+            .unwrap(),
             OperationIntent::CleanAnyway
         );
     }

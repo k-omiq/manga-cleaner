@@ -612,6 +612,18 @@ mod tests {
         assert_eq!(rescued(not_japanese, Some(&reading("セリフだ"))), clean);
     }
 
+    #[test]
+    fn punctuation_changes_the_one_kana_rescue_floor() {
+        let held = Verdict::Uncertain;
+        for text in ["あ!", "あ."] {
+            assert_eq!(rescued(held.clone(), Some(&reading(text))), held, "{text}");
+        }
+        for text in ["あ。", "あ、"] {
+            assert_eq!(rescued(held.clone(), Some(&reading(text))),
+                Verdict::Clean { script: RESCUED_SCRIPT.to_owned() }, "{text}");
+        }
+    }
+
     /// A rescued region says in its own verdict that a reader put it there.
     /// The string reaches provenance and the probe, and a rescue that called
     /// itself `Japanese` would be indistinguishable from an identification.

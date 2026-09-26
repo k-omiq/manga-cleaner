@@ -29,7 +29,7 @@ from provisioner.fake_sdks import (
     modal_app_loader,
 )
 from provisioner.journal import InstallationJournal
-from provisioner.modal_driver import ModalDriver
+from provisioner.modal_driver import TOKEN_CREATE_INTENT_KEY, ModalDriver
 from provisioner.progress import STATES, STEPS
 from provisioner.protocol import HELPER_PROTOCOL_VERSION
 
@@ -607,6 +607,27 @@ class ModalDriverTest(ProviderCases, unittest.TestCase):
         response = self.h.resume()
         self.assertTrue(response["success"], response)
         self.check_runtime_credential(response["data"]["runtime_credential"])
+
+    def test_kill_after_token_create_reports_orphan_on_resume(self) -> None:
+        self.h.cloud.kill_after = "proxy_tokens.create"
+        with self.assertRaises(Killed):
+            self.h.apply()
+        self.assertIs(self.h.journal().provider_state[TOKEN_CREATE_INTENT_KEY], True)
+        self.assertEqual(len(self.h.cloud.proxy_tokens), 1)
+        self.assertIsNone(self.h.journal().runtime_credential_ref)
+
+        creates_before = self.h.cloud.count("proxy_tokens.create")
+        deletes_before = self.h.cloud.count("proxy_tokens.delete")
+        response = self.h.resume()
+        self.assertEqual(response["error"]["code"], "ERR_ORPHANED_TOKEN")
+        self.assertIn("Modal dashboard", response["error"]["actionable_guidance"])
+        self.assertIn("remove", response["error"]["remedy_steps"][0])
+        self.assertIn("Cleanup", response["error"]["remedy_steps"][1])
+        self.assertEqual(self.h.cloud.count("proxy_tokens.create"), creates_before)
+        self.assertEqual(self.h.cloud.count("proxy_tokens.delete"), deletes_before)
+        self.assertEqual(len(self.h.cloud.proxy_tokens), 1)
+        self.h.cloud.proxy_tokens.clear()  # Simulate removal in the Modal dashboard.
+        self.assertTrue(self.cleanup_apply()["success"])
 
     def test_a_probed_token_id_stays_readable_for_cleanup(self) -> None:
         """Each request is its own redaction session, so a later journal save keeps the token ID."""

@@ -96,10 +96,11 @@ export function firstLaunchPlan(view) {
  * @param {FirstLaunchPlan} plan
  * @param {Record<string, string|null>} detection
  * @param {Record<string, boolean>} cleaners
+ * @param {{textPolicy?: string, ocrRescue?: boolean}} [workflow] - see `filesFor`
  * @returns {string[]}
  */
-export function neededFiles(plan, detection, cleaners) {
-  const ids = filesFor(detection, cleaners).filter((id) => plan.files[id])
+export function neededFiles(plan, detection, cleaners, workflow = {}) {
+  const ids = filesFor(detection, cleaners, workflow).filter((id) => plan.files[id])
   return plan.files[RUNTIME_ID] && ids.length ? [RUNTIME_ID, ...ids] : ids
 }
 

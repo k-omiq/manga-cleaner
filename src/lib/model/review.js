@@ -34,6 +34,8 @@ const GATE_SKIP_KEYS = {
   'low-confidence': 'review.reason.gateSkippedLowConfidence',
   'outside-bubble': 'review.reason.gateSkippedOutsideBubble',
   'not-japanese': 'review.reason.gateSkippedNotJapanese',
+  'language-skipped': 'review.reason.languageSkipped',
+  'outside-language-unverified': 'review.reason.outsideLanguageUnverified',
 }
 
 const CLOUD_REJECTION_KEYS = {
@@ -50,8 +52,11 @@ const CLOUD_REJECTION_KEYS = {
  */
 export function reviewReason(region) {
   const mask = region.mask
+  if (mask?.dependencyReview) return mask.dependencyReview === 'changed' ? 'review.reason.inputChanged' : 'review.reason.inputUnknown'
+  if (mask?.maskQualityState) return 'review.reason.maskNeedsCorrection'
   if (mask?.fittingReconstructed) return 'review.reason.fittingReconstructed'
   if (region.unusuallyLarge) return 'review.reason.unusuallyLarge'
+  if (region.declineReason === 'review.reason.maskNeedsCorrection') return 'review.reason.maskNeedsCorrection'
   if (region.outcome === 'declined') return 'review.reason.declined'
   if (region.outcome === 'gate-skipped') {
     // An unrecognised cause still flags the region. Returning null here would

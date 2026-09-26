@@ -25,8 +25,7 @@ use cleaner_core::cloud_wire::{
     ResultMetadata, WireRenderRecipe, PROTOCOL_VERSION,
 };
 use cleaner_core::engines::flux::wire_sampling;
-use cleaner_core::engines::render::{CloudProvider, ExecutionTarget, PreparedRender, RenderRecipe};
-use cleaner_core::fit::{self, EdgeMap};
+use cleaner_core::engines::render::{CloudProvider, ExecutionTarget, RenderRecipe};
 use cleaner_core::ingest::sha256_hex;
 use cleaner_core::project::Job;
 use serde::{Deserialize, Serialize};
@@ -97,11 +96,10 @@ pub(crate) fn cloud_attempt_sink(app: &tauri::AppHandle) -> ProgressSink {
 /// journal, with every render reporting to [`cloud_attempt_sink`].
 pub(crate) fn app_inference_service(app: &tauri::AppHandle) -> Result<InferenceService, String> {
     let dir = get_app_journal_dir(app)?;
-    Ok(InferenceService::new(
-        dir,
-        cleaner_core::cloud_wire::provisional_fixture_limits(),
+    Ok(
+        InferenceService::new(dir, cleaner_core::cloud_wire::provisional_fixture_limits())
+            .with_progress(cloud_attempt_sink(app)),
     )
-    .with_progress(cloud_attempt_sink(app)))
 }
 
 /// Helper to resolve a profile's canonical origin fingerprint from stored app configuration.
@@ -146,7 +144,7 @@ impl std::error::Error for BuildClientError {}
 /// Helper to construct a hardened cloud HTTP transport client for a stored profile.
 ///
 /// Fails closed if the profile is not found or runtime credentials are missing from SecretManager.
-fn build_client_for_profile(
+pub(crate) fn build_client_for_profile(
     config: &InferenceConfig,
     provider: CloudProvider,
     profile_id: &str,
@@ -366,9 +364,7 @@ fn sanitize_consent_error(err: ConsentError) -> String {
             "profile or credentials were modified since proposal was prepared".to_string()
         }
         ConsentError::GrantIssuanceError(ref ge) => sanitize_grant_error(ge),
-        ConsentError::UnsupportedNewRegion(_) => {
-            "unsupported new region geometry".to_string()
-        }
+        ConsentError::UnsupportedNewRegion(_) => "unsupported new region geometry".to_string(),
         ConsentError::RandomSourceError => "system random source error".to_string(),
         ConsentError::Internal(_) => "internal consent service error".to_string(),
     }
@@ -514,21 +510,22 @@ pub(crate) fn write_inference_config_at(
     // Read existing config to compute the union of old and incoming profiles.
     // If on-disk config is corrupted or unreadable, invalidate all authorization state globally
     // so we can self-heal / repair the configuration safely without aborting.
-    let (beam_ids, modal_ids, had_corrupted_disk) = match config::read_inference_config_from_path(path) {
-        Ok(old_cfg) => {
-            let mut beam: BTreeSet<String> = old_cfg.beam_profiles.keys().cloned().collect();
-            beam.extend(config.beam_profiles.keys().cloned());
-            let mut modal: BTreeSet<String> = old_cfg.modal_profiles.keys().cloned().collect();
-            modal.extend(config.modal_profiles.keys().cloned());
-            (beam, modal, false)
-        }
-        Err(_) => {
-            consent_svc.invalidate_all();
-            let beam: BTreeSet<String> = config.beam_profiles.keys().cloned().collect();
-            let modal: BTreeSet<String> = config.modal_profiles.keys().cloned().collect();
-            (beam, modal, true)
-        }
-    };
+    let (beam_ids, modal_ids, had_corrupted_disk) =
+        match config::read_inference_config_from_path(path) {
+            Ok(old_cfg) => {
+                let mut beam: BTreeSet<String> = old_cfg.beam_profiles.keys().cloned().collect();
+                beam.extend(config.beam_profiles.keys().cloned());
+                let mut modal: BTreeSet<String> = old_cfg.modal_profiles.keys().cloned().collect();
+                modal.extend(config.modal_profiles.keys().cloned());
+                (beam, modal, false)
+            }
+            Err(_) => {
+                consent_svc.invalidate_all();
+                let beam: BTreeSet<String> = config.beam_profiles.keys().cloned().collect();
+                let modal: BTreeSet<String> = config.modal_profiles.keys().cloned().collect();
+                (beam, modal, true)
+            }
+        };
 
     // Revoke outstanding grants, pending proposals, and advance epochs for all old and new profiles so deleted/mutated profiles don't survive
     for profile_id in &beam_ids {
@@ -578,8 +575,7 @@ pub fn store_cloud_secret(
     }
 
     // Resolve verified origin fingerprint from stored configuration
-    let current_cfg = config::read_inference_config(&app)
-        .map_err(|e| sanitize_config_error(&e))?;
+    let current_cfg = config::read_inference_config(&app).map_err(|e| sanitize_config_error(&e))?;
     let origin_fp = resolve_profile_fingerprint(&current_cfg, provider, &profile_id)?;
 
     let key = SecretKey::new(provider, profile_id.clone(), origin_fp, role);
@@ -623,8 +619,7 @@ pub fn delete_cloud_secret(
     config::validate_profile_id(&profile_id)
         .map_err(|_| "invalid profile identifier".to_string())?;
 
-    let current_cfg = config::read_inference_config(&app)
-        .map_err(|e| sanitize_config_error(&e))?;
+    let current_cfg = config::read_inference_config(&app).map_err(|e| sanitize_config_error(&e))?;
     let origin_fp = resolve_profile_fingerprint(&current_cfg, provider, &profile_id)?;
 
     let key = SecretKey::new(provider, profile_id.clone(), origin_fp, role);
@@ -653,8 +648,7 @@ pub fn get_cloud_secret_summary(
     config::validate_profile_id(&profile_id)
         .map_err(|_| "invalid profile identifier".to_string())?;
 
-    let current_cfg = config::read_inference_config(&app)
-        .map_err(|e| sanitize_config_error(&e))?;
+    let current_cfg = config::read_inference_config(&app).map_err(|e| sanitize_config_error(&e))?;
     let origin_fp = resolve_profile_fingerprint(&current_cfg, provider, &profile_id)?;
 
     let key = SecretKey::new(provider, profile_id, origin_fp, role);
@@ -863,8 +857,8 @@ pub async fn get_cloud_model_info(
     tauri::async_runtime::spawn_blocking(move || {
         config::validate_profile_id(&profile_id)
             .map_err(|_| "invalid profile identifier".to_string())?;
-        let current_cfg = config::read_inference_config(&app)
-            .map_err(|e| sanitize_config_error(&e))?;
+        let current_cfg =
+            config::read_inference_config(&app).map_err(|e| sanitize_config_error(&e))?;
 
         let client = build_client_for_profile(&current_cfg, provider, &profile_id)
             .map_err(|e| sanitize_build_client_error(&e))?;
@@ -1088,11 +1082,11 @@ pub fn prepare_cloud_consent_inner(
         return Err("Backend authorization blocked: cloudEngines permission denied".to_string());
     }
 
-    let pinned_recipe = recipe
-        .ok_or_else(|| "recipe is required for prepare_cloud_consent".to_string())?;
+    let pinned_recipe =
+        recipe.ok_or_else(|| "recipe is required for prepare_cloud_consent".to_string())?;
 
-    let ch_id = chapter_id
-        .ok_or_else(|| "chapterId is required for prepare_cloud_consent".to_string())?;
+    let ch_id =
+        chapter_id.ok_or_else(|| "chapterId is required for prepare_cloud_consent".to_string())?;
     let pg_idx = page_index.unwrap_or(0);
 
     let req = PrepareProposalRequest {
@@ -1236,71 +1230,74 @@ pub(crate) fn revalidate_proposal_before_dispatch(
     proposal: &ConsentProposal,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     let _lock = run::lock_job(canonical_job_path);
-    let job = Job::open(canonical_job_path).map_err(|_| {
-        "failed to open project manifest before dispatch".to_string()
-    })?;
+    let job = Job::open(canonical_job_path)
+        .map_err(|_| "failed to open project manifest before dispatch".to_string())?;
 
     let re_resolved_source_idx = Library::resolve_page(&job.project, proposal.page_index as usize)
         .ok_or_else(|| "page index not found in project manifest before dispatch".to_string())?;
     if re_resolved_source_idx != proposal.source_idx {
-        return Err("page index no longer maps to proposal source index before dispatch".to_string());
+        return Err(
+            "page index no longer maps to proposal source index before dispatch".to_string(),
+        );
     }
 
-    let source_path = job.source_path(proposal.source_idx).ok_or_else(|| {
-        "source image not found before dispatch".to_string()
-    })?;
-    let source_bytes = std::fs::read(&source_path).map_err(|_| {
-        "failed to read source image before dispatch".to_string()
-    })?;
+    let source_path = job
+        .source_path(proposal.source_idx)
+        .ok_or_else(|| "source image not found before dispatch".to_string())?;
+    let source_bytes = std::fs::read(&source_path)
+        .map_err(|_| "failed to read source image before dispatch".to_string())?;
     let cur_source_hash = sha256_hex(&source_bytes);
     if cur_source_hash != proposal.source_hash {
         return Err("source image digest mismatch before dispatch".to_string());
     }
 
-    let page = cleaner_core::image::decode(&source_bytes).map_err(|_| {
-        "failed to decode source image before dispatch".to_string()
-    })?;
-    let patch_rec = job.project.patches.iter().find(|r| r.id == proposal.region_ids[0]).ok_or_else(|| {
-        "region not found in project manifest before dispatch".to_string()
-    })?;
+    let page = cleaner_core::image::decode(&source_bytes)
+        .map_err(|_| "failed to decode source image before dispatch".to_string())?;
+    let patch_rec = job
+        .project
+        .patches
+        .iter()
+        .find(|r| r.id == proposal.region_ids[0])
+        .ok_or_else(|| "region not found in project manifest before dispatch".to_string())?;
     if patch_rec.source_idx != proposal.source_idx {
         return Err("patch record source index mismatch before dispatch".to_string());
     }
-    let patch = job.load_patch(patch_rec).map_err(|_| {
-        "failed to load patch before dispatch".to_string()
-    })?;
+    let patch = job
+        .load_patch(patch_rec)
+        .map_err(|_| "failed to load patch before dispatch".to_string())?;
 
     let cur_mask_hash = sha256_hex(&patch.mask.bits);
     if cur_mask_hash != proposal.mask_hash {
         return Err("mask digest mismatch before dispatch".to_string());
     }
 
-    let noise = fit::page_noise_sigma(&page);
-    let edges = EdgeMap::sobel(&page);
-    let fitted = fit::fit(&page, &patch.mask, 1.0, noise, &edges, true);
-    let prepared = PreparedRender::prepare(&page, &fitted).map_err(|_| {
-        "failed to prepare render before dispatch".to_string()
-    })?;
+    let cloud = crate::underlay::prepare_cloud(&job, proposal.source_idx, &page, patch_rec, &patch)
+        .map_err(|_| "failed to prepare render before dispatch".to_string())?;
+    let prepared = &cloud.prepared;
 
-    if prepared.crop() != proposal.crop_bounds {
+    if cloud.crop_bounds != proposal.crop_bounds {
         return Err("crop bounds mismatch before dispatch".to_string());
     }
+    if cloud.input.digest != proposal.input_sha256
+        || cloud.input.predecessors != proposal.predecessors_sha256
+    {
+        return Err("underlay changed before dispatch".to_string());
+    }
 
-    let crop_png = encode_rgb8_png(prepared.crop().w, prepared.crop().h, prepared.image_rgb8()).map_err(|_| {
-        "failed to encode crop PNG before dispatch".to_string()
-    })?;
+    let crop_png = encode_rgb8_png(prepared.crop().w, prepared.crop().h, prepared.image_rgb8())
+        .map_err(|_| "failed to encode crop PNG before dispatch".to_string())?;
     if sha256_hex(&crop_png) != proposal.crop_png_sha256 {
         return Err("crop PNG digest mismatch before dispatch".to_string());
     }
 
-    let hint_png = encode_gray8_png(prepared.crop().w, prepared.crop().h, prepared.hint_gray8()).map_err(|_| {
-        "failed to encode hint PNG before dispatch".to_string()
-    })?;
+    let hint_png = encode_gray8_png(prepared.crop().w, prepared.crop().h, prepared.hint_gray8())
+        .map_err(|_| "failed to encode hint PNG before dispatch".to_string())?;
     if sha256_hex(&hint_png) != proposal.hint_png_sha256 {
         return Err("hint PNG digest mismatch before dispatch".to_string());
     }
 
-    let (cur_rev, cur_rev_hash) = compute_region_revision_hash(&cur_source_hash, patch_rec, &patch.mask, &patch.ink);
+    let (cur_rev, cur_rev_hash) =
+        compute_region_revision_hash(&cur_source_hash, patch_rec, &patch.mask, &patch.ink);
     if cur_rev != proposal.revision || cur_rev_hash != proposal.revision_hash {
         return Err("region revision mismatch before dispatch".to_string());
     }
@@ -1331,8 +1328,7 @@ pub fn submit_cloud_attempt_inner(
         return Err("Authorization blocked: invalid or missing grant nonce".to_string());
     }
 
-    journal::validate_safe_id(attempt_id, "attempt_id")
-        .map_err(sanitize_journal_error)?;
+    journal::validate_safe_id(attempt_id, "attempt_id").map_err(sanitize_journal_error)?;
 
     let derived_attempt_id = attempt_id_for_nonce(trimmed_nonce);
     if attempt_id != derived_attempt_id {
@@ -1401,29 +1397,26 @@ pub fn submit_cloud_attempt_inner(
     }
 
     // Look up confirmed proposal from ConsentService with explicit grant nonce binding
-    let pid = proposal_id
-        .ok_or_else(|| "proposalId is required to bind submission to confirmed proposal".to_string())?;
-    journal::validate_safe_id(pid, "proposal_id")
-        .map_err(sanitize_journal_error)?;
+    let pid = proposal_id.ok_or_else(|| {
+        "proposalId is required to bind submission to confirmed proposal".to_string()
+    })?;
+    journal::validate_safe_id(pid, "proposal_id").map_err(sanitize_journal_error)?;
 
     let (proposal, canonical_job_path) = ConsentService::global()
         .get_confirmed_proposal_with_job_path(pid, trimmed_nonce)
         .map_err(|e| format!("Authorization blocked: {}", sanitize_consent_error(e)))?;
 
     // Read stored configuration and validate profile & endpoint binding
-    let stored_ep_fp = match proposal.provider {
-        CloudProvider::Beam => config
-            .beam_profiles
-            .get(&proposal.profile_id)
-            .map(|p| compute_canonical_endpoint_fingerprint(&p.endpoint_url).unwrap_or_default()),
-        CloudProvider::Modal => config
-            .modal_profiles
-            .get(&proposal.profile_id)
-            .map(|p| compute_canonical_endpoint_fingerprint(&p.endpoint_url).unwrap_or_default()),
-    }
-    .ok_or_else(|| {
-        "profile does not exist in inference configuration".to_string()
-    })?;
+    let stored_ep_fp =
+        match proposal.provider {
+            CloudProvider::Beam => config.beam_profiles.get(&proposal.profile_id).map(|p| {
+                compute_canonical_endpoint_fingerprint(&p.endpoint_url).unwrap_or_default()
+            }),
+            CloudProvider::Modal => config.modal_profiles.get(&proposal.profile_id).map(|p| {
+                compute_canonical_endpoint_fingerprint(&p.endpoint_url).unwrap_or_default()
+            }),
+        }
+        .ok_or_else(|| "profile does not exist in inference configuration".to_string())?;
 
     if stored_ep_fp != proposal.canonical_endpoint_fingerprint {
         return Err("Authorization blocked: profile endpoint has mutated".to_string());
@@ -1461,6 +1454,7 @@ pub fn submit_cloud_attempt_inner(
 
     // Construct GrantScope from authoritative proposal
     let scope = GrantScope {
+        capability: crate::inference::policy::FLUX_CAPABILITY.to_string(),
         provider: proposal.provider,
         profile_id: proposal.profile_id.clone(),
         canonical_endpoint_fingerprint: proposal.canonical_endpoint_fingerprint.clone(),
@@ -1471,6 +1465,8 @@ pub fn submit_cloud_attempt_inner(
         crop_bounds: proposal.crop_bounds,
         mask_hash: proposal.mask_hash.clone(),
         revision: proposal.revision,
+        input_sha256: proposal.input_sha256.clone(),
+        predecessors_sha256: proposal.predecessors_sha256.clone(),
         recipe: proposal.recipe.clone(),
         region_ids: proposal.region_ids.clone(),
     };
@@ -1480,13 +1476,13 @@ pub fn submit_cloud_attempt_inner(
         .map_err(|e| sanitize_build_client_error(&e))?;
 
     // Authoritative pre-POST local revalidation under project lock
-    let (crop_png, hint_png) =
-        revalidate_proposal_before_dispatch(&canonical_job_path, &proposal)?;
+    let (crop_png, hint_png) = revalidate_proposal_before_dispatch(&canonical_job_path, &proposal)?;
 
     let wire_recipe: WireRenderRecipe = proposal.recipe.clone().into();
     let job_id = format!(
         "job-{}",
-        &sha256_hex(format!("{}:{}", proposal.region_ids[0], proposal.page_index).as_bytes())[0..24]
+        &sha256_hex(format!("{}:{}", proposal.region_ids[0], proposal.page_index).as_bytes())
+            [0..24]
     );
     let sampling = wire_sampling();
 
@@ -1528,6 +1524,8 @@ pub fn submit_cloud_attempt_inner(
         source_image_hash: proposal.source_hash.clone(),
         region_id: proposal.region_ids[0].clone(),
         region_revision: proposal.revision,
+        input_sha256: Some(proposal.input_sha256.clone()),
+        predecessors_sha256: Some(proposal.predecessors_sha256.clone()),
         crop_sha256: proposal.crop_png_sha256.clone(),
         hint_sha256: proposal.hint_png_sha256.clone(),
         request_digest: request_digest.clone(),
@@ -1535,13 +1533,17 @@ pub fn submit_cloud_attempt_inner(
         page_index: Some(proposal.page_index),
     };
 
-    let (_rec, guard) = journal.create_intent(create_intent)
+    let (_rec, guard) = journal
+        .create_intent(create_intent)
         .map_err(sanitize_journal_error)?;
 
     // Consume grant at the last safe point before marking Dispatching and network dispatch
     if let Err(e) = GrantService::global().validate_and_consume(trimmed_nonce, &scope) {
         let _ = journal.abort_intent_no_dispatch(&guard);
-        return Err(format!("Authorization blocked: {}", sanitize_grant_error(&e)));
+        return Err(format!(
+            "Authorization blocked: {}",
+            sanitize_grant_error(&e)
+        ));
     }
 
     // Transition from Intent to Dispatching immediately before network dispatch
@@ -1556,7 +1558,8 @@ pub fn submit_cloud_attempt_inner(
     drop(guard);
 
     if simulate_mode == Some("ambiguous_acceptance") {
-        let guard = journal.acquire_lock(&derived_attempt_id)
+        let guard = journal
+            .acquire_lock(&derived_attempt_id)
             .map_err(sanitize_journal_error)?;
         let _ = journal.record_dispatch_transport_error(&guard);
         return Ok(CloudAttemptSubmissionDto {
@@ -1572,9 +1575,11 @@ pub fn submit_cloud_attempt_inner(
     // HTTP POST dispatch executed with no attempt lock held (Property 6)
     match client.submit_job(&req_meta, &crop_png, &hint_png, journal.limits()) {
         Ok(accepted) => {
-            let guard = journal.acquire_lock(&derived_attempt_id)
+            let guard = journal
+                .acquire_lock(&derived_attempt_id)
                 .map_err(sanitize_journal_error)?;
-            journal.record_accepted_handle(&guard, &accepted.handle)
+            journal
+                .record_accepted_handle(&guard, &accepted.handle)
                 .map_err(sanitize_journal_error)?;
             Ok(CloudAttemptSubmissionDto {
                 attempt_id: derived_attempt_id,
@@ -1586,7 +1591,8 @@ pub fn submit_cloud_attempt_inner(
             })
         }
         Err(e) => {
-            let guard = journal.acquire_lock(&derived_attempt_id)
+            let guard = journal
+                .acquire_lock(&derived_attempt_id)
                 .map_err(sanitize_journal_error)?;
             let _ = journal.record_dispatch_transport_error(&guard);
             Ok(CloudAttemptSubmissionDto {
@@ -1595,7 +1601,10 @@ pub fn submit_cloud_attempt_inner(
                 status: "unknown".to_string(),
                 request_digest: Some(request_digest),
                 auto_retryable: Some(false),
-                error: Some(format!("Transport error during dispatch: {}", sanitize_http_transport_error(&e))),
+                error: Some(format!(
+                    "Transport error during dispatch: {}",
+                    sanitize_http_transport_error(&e)
+                )),
             })
         }
     }
@@ -1632,8 +1641,8 @@ pub async fn submit_cloud_attempt(
 
         guard_cloud_execution_enabled(cloud_allowed)?;
 
-        let current_cfg = config::read_inference_config(&app)
-            .map_err(|e| sanitize_config_error(&e))?;
+        let current_cfg =
+            config::read_inference_config(&app).map_err(|e| sanitize_config_error(&e))?;
         let journal = get_app_journal(&app)?;
 
         submit_cloud_attempt_inner(
@@ -1662,11 +1671,9 @@ pub fn get_cloud_attempt_status_inner(
     attempt_id: &str,
     handle: Option<&str>,
 ) -> Result<CloudAttemptStatusDto, String> {
-    journal::validate_safe_id(attempt_id, "attempt_id")
-        .map_err(sanitize_journal_error)?;
+    journal::validate_safe_id(attempt_id, "attempt_id").map_err(sanitize_journal_error)?;
     if let Some(h) = handle {
-        journal::validate_safe_id(h, "handle")
-            .map_err(sanitize_journal_error)?;
+        journal::validate_safe_id(h, "handle").map_err(sanitize_journal_error)?;
     }
 
     let record = {
@@ -1685,8 +1692,12 @@ pub fn get_cloud_attempt_status_inner(
         | AttemptPhase::ResultCached { handle: h, .. }
         | AttemptPhase::AttachmentPending { handle: h, .. }
         | AttemptPhase::Committed { handle: h, .. } => Some(h.as_str()),
-        AttemptPhase::Cancelled { handle: Some(h), .. }
-        | AttemptPhase::Failed { handle: Some(h), .. } => Some(h.as_str()),
+        AttemptPhase::Cancelled {
+            handle: Some(h), ..
+        }
+        | AttemptPhase::Failed {
+            handle: Some(h), ..
+        } => Some(h.as_str()),
         _ => None,
     };
     if let (Some(caller_h), Some(actual_h)) = (handle, rec_handle) {
@@ -1789,11 +1800,8 @@ pub fn get_cloud_attempt_status_inner(
                                     journal.limits(),
                                 ) {
                                     if let Ok(guard) = journal.acquire_lock(attempt_id) {
-                                        let _ = journal.cache_result(
-                                            &guard,
-                                            &png_bytes,
-                                            &result_meta,
-                                        );
+                                        let _ =
+                                            journal.cache_result(&guard, &png_bytes, &result_meta);
                                     }
                                 }
                                 return Ok(CloudAttemptStatusDto {
@@ -1922,11 +1930,9 @@ pub fn get_cloud_attempt_result_inner(
     attempt_id: &str,
     handle: Option<&str>,
 ) -> Result<CloudAttemptResultDto, String> {
-    journal::validate_safe_id(attempt_id, "attempt_id")
-        .map_err(sanitize_journal_error)?;
+    journal::validate_safe_id(attempt_id, "attempt_id").map_err(sanitize_journal_error)?;
     if let Some(h) = handle {
-        journal::validate_safe_id(h, "handle")
-            .map_err(sanitize_journal_error)?;
+        journal::validate_safe_id(h, "handle").map_err(sanitize_journal_error)?;
     }
 
     let record = {
@@ -1945,8 +1951,12 @@ pub fn get_cloud_attempt_result_inner(
         | AttemptPhase::ResultCached { handle: h, .. }
         | AttemptPhase::AttachmentPending { handle: h, .. }
         | AttemptPhase::Committed { handle: h, .. } => Some(h.as_str()),
-        AttemptPhase::Cancelled { handle: Some(h), .. }
-        | AttemptPhase::Failed { handle: Some(h), .. } => Some(h.as_str()),
+        AttemptPhase::Cancelled {
+            handle: Some(h), ..
+        }
+        | AttemptPhase::Failed {
+            handle: Some(h), ..
+        } => Some(h.as_str()),
         _ => None,
     };
     if let (Some(caller_h), Some(actual_h)) = (handle, rec_handle) {
@@ -1977,7 +1987,9 @@ pub fn get_cloud_attempt_result_inner(
             let guard = journal
                 .acquire_lock(attempt_id)
                 .map_err(sanitize_journal_error)?;
-            let _png = journal.read_cached_png(&guard).map_err(sanitize_journal_error)?;
+            let _png = journal
+                .read_cached_png(&guard)
+                .map_err(sanitize_journal_error)?;
             Ok(CloudAttemptResultDto {
                 attempt_id: attempt_id.to_string(),
                 handle: h.clone(),
@@ -1990,10 +2002,11 @@ pub fn get_cloud_attempt_result_inner(
         }
         AttemptPhase::Accepted { handle: h } => {
             let h_str = h.clone();
-            let current_cfg = config.ok_or_else(|| "inference configuration is required to fetch remote result".to_string())?;
-            let client =
-                build_client_for_profile(current_cfg, record.provider, &record.profile_id)
-                    .map_err(|e| sanitize_build_client_error(&e))?;
+            let current_cfg = config.ok_or_else(|| {
+                "inference configuration is required to fetch remote result".to_string()
+            })?;
+            let client = build_client_for_profile(current_cfg, record.provider, &record.profile_id)
+                .map_err(|e| sanitize_build_client_error(&e))?;
             let req_meta = record.to_request_metadata();
             // Network operations executed without holding attempt lock (Property 6)
             let st = client
@@ -2069,11 +2082,9 @@ pub fn cancel_cloud_attempt_inner(
     attempt_id: &str,
     handle: Option<&str>,
 ) -> Result<CloudCancelResultDto, String> {
-    journal::validate_safe_id(attempt_id, "attempt_id")
-        .map_err(sanitize_journal_error)?;
+    journal::validate_safe_id(attempt_id, "attempt_id").map_err(sanitize_journal_error)?;
     if let Some(h) = handle {
-        journal::validate_safe_id(h, "handle")
-            .map_err(sanitize_journal_error)?;
+        journal::validate_safe_id(h, "handle").map_err(sanitize_journal_error)?;
     }
 
     let guard = journal
@@ -2090,8 +2101,12 @@ pub fn cancel_cloud_attempt_inner(
         | AttemptPhase::ResultCached { handle: h, .. }
         | AttemptPhase::AttachmentPending { handle: h, .. }
         | AttemptPhase::Committed { handle: h, .. } => Some(h.as_str()),
-        AttemptPhase::Cancelled { handle: Some(h), .. }
-        | AttemptPhase::Failed { handle: Some(h), .. } => Some(h.as_str()),
+        AttemptPhase::Cancelled {
+            handle: Some(h), ..
+        }
+        | AttemptPhase::Failed {
+            handle: Some(h), ..
+        } => Some(h.as_str()),
         _ => None,
     };
     if let (Some(caller_h), Some(actual_h)) = (handle, rec_handle) {
@@ -2108,7 +2123,9 @@ pub fn cancel_cloud_attempt_inner(
             // Drop lock before network cancel request (Property 6)
             drop(guard);
 
-            let cfg = config.ok_or_else(|| "inference configuration is required to cancel remote job".to_string())?;
+            let cfg = config.ok_or_else(|| {
+                "inference configuration is required to cancel remote job".to_string()
+            })?;
             let client = build_client_for_profile(cfg, record.provider, &record.profile_id)
                 .map_err(|e| sanitize_build_client_error(&e))?;
             let cancel_resp = client
@@ -2125,7 +2142,9 @@ pub fn cancel_cloud_attempt_inner(
             let h_str = h.clone();
             drop(guard);
 
-            let cfg = config.ok_or_else(|| "inference configuration is required to cancel remote job".to_string())?;
+            let cfg = config.ok_or_else(|| {
+                "inference configuration is required to cancel remote job".to_string()
+            })?;
             let client = build_client_for_profile(cfg, record.provider, &record.profile_id)
                 .map_err(|e| sanitize_build_client_error(&e))?;
             let cancel_resp = client
@@ -2192,8 +2211,7 @@ pub async fn cancel_cloud_attempt(
     handle: Option<String>,
 ) -> Result<CloudCancelResultDto, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        journal::validate_safe_id(&attempt_id, "attempt_id")
-            .map_err(sanitize_journal_error)?;
+        journal::validate_safe_id(&attempt_id, "attempt_id").map_err(sanitize_journal_error)?;
         let live = service::request_render_cancel(&attempt_id);
         let journal = get_app_journal(&app)?;
         let current_cfg = config::read_inference_config(&app).ok();
@@ -2294,6 +2312,9 @@ fn is_project_recovery_stale(library: &Library, record: &AttemptRecord) -> bool 
                 .iter()
                 .find(|r| r.id == record.region_id)
                 .ok_or(())?;
+            if patch_rec.source_idx != s_idx {
+                return Ok(true);
+            }
             let patch = job.load_patch(patch_rec).map_err(|_| ())?;
             let (cur_rev, _) = compute_region_revision_hash(
                 &record.source_image_hash,
@@ -2301,7 +2322,15 @@ fn is_project_recovery_stale(library: &Library, record: &AttemptRecord) -> bool 
                 &patch.mask,
                 &patch.ink,
             );
-            Ok(cur_rev != record.region_revision)
+            if cur_rev != record.region_revision {
+                return Ok(true);
+            }
+            let page = cleaner_core::image::decode(&src_bytes).map_err(|_| ())?;
+            let cloud = crate::underlay::prepare_cloud(&job, s_idx, &page, patch_rec, &patch)
+                .map_err(|_| ())?;
+            Ok(record.input_sha256.as_deref() != Some(cloud.input.digest.as_str())
+                || record.predecessors_sha256.as_deref()
+                    != Some(cloud.input.predecessors.as_str()))
         })();
 
         // Missing or unreadable project state fails closed (is_stale = true)
@@ -2356,18 +2385,15 @@ pub fn reconcile_cloud_recovery_inner(
     simulate_stale: Option<bool>,
 ) -> Result<CloudRecoveryDecisionDto, String> {
     if let Some(r) = region_id {
-        journal::validate_safe_id(r, "region_id")
-            .map_err(sanitize_journal_error)?;
+        journal::validate_safe_id(r, "region_id").map_err(sanitize_journal_error)?;
     }
     if let Some(c) = chapter_id {
-        journal::validate_safe_id(c, "chapter_id")
-            .map_err(sanitize_journal_error)?;
+        journal::validate_safe_id(c, "chapter_id").map_err(sanitize_journal_error)?;
     }
 
     let id = match attempt_id {
         Some(i) => {
-            journal::validate_safe_id(i, "attempt_id")
-                .map_err(sanitize_journal_error)?;
+            journal::validate_safe_id(i, "attempt_id").map_err(sanitize_journal_error)?;
             i.to_string()
         }
         None => {
@@ -2406,11 +2432,12 @@ pub fn reconcile_cloud_recovery_inner(
     }
 
     let (decision, record) = {
-        let guard = journal.acquire_lock(&id)
+        let guard = journal.acquire_lock(&id).map_err(sanitize_journal_error)?;
+        let dec = journal
+            .recover_attempt(&guard)
             .map_err(sanitize_journal_error)?;
-        let dec = journal.recover_attempt(&guard)
-            .map_err(sanitize_journal_error)?;
-        let rec = journal.read_record_locked(&guard)
+        let rec = journal
+            .read_record_locked(&guard)
             .map_err(sanitize_journal_error)?;
         (dec, rec)
     };
@@ -2653,7 +2680,8 @@ pub fn recover_all_attempts(
         match service.recover_attempt_locally(&attempt_id, job_path.as_deref()) {
             Ok(RecoveryDecision::AlreadyCommitted { .. }) => report.attached.push(entry),
             Ok(
-                RecoveryDecision::ResumePolling { .. } | RecoveryDecision::ResumeCancelPolling { .. },
+                RecoveryDecision::ResumePolling { .. }
+                | RecoveryDecision::ResumeCancelPolling { .. },
             ) => match job_path {
                 Some(path) => {
                     report.still_running.push(entry);
@@ -2706,7 +2734,10 @@ fn reconcile_and_resume(app: &tauri::AppHandle) -> Result<CloudRecoveryReportDto
     }
     let Ok(config) = config::read_inference_config(app) else {
         // No profile to reach the gateway with: these cannot be waited on.
-        let waiting: Vec<String> = waits.into_iter().map(|(attempt_id, _)| attempt_id).collect();
+        let waiting: Vec<String> = waits
+            .into_iter()
+            .map(|(attempt_id, _)| attempt_id)
+            .collect();
         let (unreachable, running) = std::mem::take(&mut report.still_running)
             .into_iter()
             .partition(|entry| waiting.contains(&entry.attempt_id));
@@ -3452,6 +3483,8 @@ mod tests {
                 .into(),
             region_id: "reg-1".into(),
             region_revision: 1,
+            input_sha256: None,
+            predecessors_sha256: None,
             crop_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
             hint_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
             request_digest: "0000000000000000000000000000000000000000000000000000000000000000"
@@ -3527,10 +3560,12 @@ mod tests {
                     "0000000000000000000000000000000000000000000000000000000000000000".into(),
                 region_id: "reg-1".into(),
                 region_revision: 1,
-                crop_sha256:
-                    "0000000000000000000000000000000000000000000000000000000000000000".into(),
-                hint_sha256:
-                    "0000000000000000000000000000000000000000000000000000000000000000".into(),
+                input_sha256: None,
+                predecessors_sha256: None,
+                crop_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .into(),
+                hint_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .into(),
                 request_digest: String::new(),
                 chapter_id: Some("chap-1".into()),
                 page_index: Some(0),
@@ -3540,25 +3575,36 @@ mod tests {
         };
 
         // 1. Intent phase cancellation cleanly aborts
-        let (_rec, guard) = journal.create_intent(make_intent("att-cancel-intent")).unwrap();
+        let (_rec, guard) = journal
+            .create_intent(make_intent("att-cancel-intent"))
+            .unwrap();
         let aborted = journal.abort_intent_no_dispatch(&guard).unwrap();
-        assert!(matches!(aborted.phase, AttemptPhase::Cancelled { handle: None, .. }));
+        assert!(matches!(
+            aborted.phase,
+            AttemptPhase::Cancelled { handle: None, .. }
+        ));
 
         // 2. Dispatching phase cancellation is invalid
-        let (_rec, guard2) = journal.create_intent(make_intent("att-cancel-disp")).unwrap();
+        let (_rec, guard2) = journal
+            .create_intent(make_intent("att-cancel-disp"))
+            .unwrap();
         journal.mark_dispatching(&guard2).unwrap();
         let rec = journal.read_record_locked(&guard2).unwrap();
         assert_eq!(rec.phase, AttemptPhase::Dispatching);
 
         // 3. ResultCached / Completed cancellation is invalid
-        let (_rec, guard3) = journal.create_intent(make_intent("att-cancel-cached")).unwrap();
+        let (_rec, guard3) = journal
+            .create_intent(make_intent("att-cancel-cached"))
+            .unwrap();
         journal.mark_dispatching(&guard3).unwrap();
         journal.record_accepted_handle(&guard3, "h-300").unwrap();
         let rec3 = journal.read_record_locked(&guard3).unwrap();
         assert!(matches!(rec3.phase, AttemptPhase::Accepted { .. }));
 
         // 4. Failed phase cancellation is invalid
-        let (_rec, guard4) = journal.create_intent(make_intent("att-cancel-failed")).unwrap();
+        let (_rec, guard4) = journal
+            .create_intent(make_intent("att-cancel-failed"))
+            .unwrap();
         journal.mark_dispatching(&guard4).unwrap();
         journal.record_accepted_handle(&guard4, "h-400").unwrap();
         journal.record_failed(&guard4).unwrap();
@@ -3602,14 +3648,14 @@ mod tests {
             seed: 42,
             steps: 4,
             guidance_scaled: 350,
-            source_image_hash:
-                "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            source_image_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+                .into(),
             region_id: "reg-1".into(),
             region_revision: 1,
-            crop_sha256:
-                "0000000000000000000000000000000000000000000000000000000000000000".into(),
-            hint_sha256:
-                "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            input_sha256: None,
+            predecessors_sha256: None,
+            crop_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            hint_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
             request_digest: String::new(),
             chapter_id: Some("chap-1".into()),
             page_index: Some(0),
@@ -3622,7 +3668,10 @@ mod tests {
 
         // Pre-POST revalidation detects mismatch while in Intent phase -> cleanly aborts
         let aborted = journal.abort_intent_no_dispatch(&guard).unwrap();
-        assert!(matches!(aborted.phase, AttemptPhase::Cancelled { handle: None, .. }));
+        assert!(matches!(
+            aborted.phase,
+            AttemptPhase::Cancelled { handle: None, .. }
+        ));
 
         // Calling mark_dispatching on aborted intent fails closed
         assert!(journal.mark_dispatching(&guard).is_err());
@@ -3655,14 +3704,14 @@ mod tests {
             seed: 42,
             steps: 4,
             guidance_scaled: 350,
-            source_image_hash:
-                "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            source_image_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+                .into(),
             region_id: "reg-1".into(),
             region_revision: 1,
-            crop_sha256:
-                "0000000000000000000000000000000000000000000000000000000000000000".into(),
-            hint_sha256:
-                "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            input_sha256: None,
+            predecessors_sha256: None,
+            crop_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            hint_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
             request_digest: String::new(),
             chapter_id: Some("non-existent-chap".into()),
             page_index: Some(0),
@@ -3681,7 +3730,12 @@ mod tests {
     fn setup_two_page_cmd_test_job(
         root: &Path,
         patch_id: &str,
-    ) -> (PathBuf, ConsentProposal, crate::inference::policy::Grant, Arc<GrantService>) {
+    ) -> (
+        PathBuf,
+        ConsentProposal,
+        crate::inference::policy::Grant,
+        Arc<GrantService>,
+    ) {
         let raws = root.join("raws");
         std::fs::create_dir_all(&raws).unwrap();
         let mut raster = cleaner_core::image::fixtures::by_name("l8").raster;
@@ -3887,6 +3941,28 @@ mod tests {
     }
 
     #[test]
+    fn test_revalidation_reports_underlay_drift_separately_from_crop_bounds() {
+        let scratch = std::env::temp_dir()
+            .join("mc-cmd-reval-underlay")
+            .join(format!("{}", current_epoch_ms()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let (manifest, mut proposal, _, _) =
+            setup_two_page_cmd_test_job(&scratch, "reg-underlay");
+        let input_sha256 = proposal.input_sha256.clone();
+        proposal.input_sha256 = "0".repeat(64);
+        assert_eq!(
+            revalidate_proposal_before_dispatch(&manifest, &proposal).unwrap_err(),
+            "underlay changed before dispatch"
+        );
+        proposal.input_sha256 = input_sha256;
+        proposal.predecessors_sha256 = "0".repeat(64);
+        assert_eq!(
+            revalidate_proposal_before_dispatch(&manifest, &proposal).unwrap_err(),
+            "underlay changed before dispatch"
+        );
+    }
+
+    #[test]
     fn test_submit_cloud_attempt_snapshot_validation_and_malformed_rejection() {
         let valid_snap_json = serde_json::json!({
             "source_image_hash": "0000000000000000000000000000000000000000000000000000000000000000",
@@ -3944,17 +4020,22 @@ mod tests {
         assert!(serde_json::from_value::<ProjectRegionSnapshot>(unknown_field).is_err());
 
         // 5. Malformed snapshot: non-object types -> fails deserialization
-        assert!(serde_json::from_value::<ProjectRegionSnapshot>(serde_json::json!("not_an_object")).is_err());
+        assert!(
+            serde_json::from_value::<ProjectRegionSnapshot>(serde_json::json!("not_an_object"))
+                .is_err()
+        );
         assert!(serde_json::from_value::<ProjectRegionSnapshot>(serde_json::json!(42)).is_err());
-        assert!(serde_json::from_value::<ProjectRegionSnapshot>(serde_json::json!([1, 2, 3])).is_err());
+        assert!(
+            serde_json::from_value::<ProjectRegionSnapshot>(serde_json::json!([1, 2, 3])).is_err()
+        );
     }
 
     #[test]
     fn test_prepare_cloud_consent_rejects_missing_recipe_without_defaults() {
         // Missing recipe must be rejected with static sanitized error; no defaults or placeholders invented
         let recipe: Option<RenderRecipe> = None;
-        let res: Result<RenderRecipe, String> = recipe
-            .ok_or_else(|| "recipe is required for prepare_cloud_consent".to_string());
+        let res: Result<RenderRecipe, String> =
+            recipe.ok_or_else(|| "recipe is required for prepare_cloud_consent".to_string());
         assert!(res.is_err());
         let err = res.unwrap_err();
         assert_eq!(err, "recipe is required for prepare_cloud_consent");
@@ -3996,10 +4077,12 @@ mod tests {
                     "0000000000000000000000000000000000000000000000000000000000000000".into(),
                 region_id: "reg-1".into(),
                 region_revision: 1,
-                crop_sha256:
-                    "0000000000000000000000000000000000000000000000000000000000000000".into(),
-                hint_sha256:
-                    "0000000000000000000000000000000000000000000000000000000000000000".into(),
+                input_sha256: None,
+                predecessors_sha256: None,
+                crop_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .into(),
+                hint_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .into(),
                 request_digest: String::new(),
                 chapter_id: Some("chap-1".into()),
                 page_index: Some(0),
@@ -4009,9 +4092,14 @@ mod tests {
         };
 
         // 1. Locally cancelled attempt with no remote handle
-        let (_rec, guard) = journal.create_intent(make_intent("att-no-handle-cancel")).unwrap();
+        let (_rec, guard) = journal
+            .create_intent(make_intent("att-no-handle-cancel"))
+            .unwrap();
         let aborted = journal.abort_intent_no_dispatch(&guard).unwrap();
-        assert!(matches!(aborted.phase, AttemptPhase::Cancelled { handle: None, .. }));
+        assert!(matches!(
+            aborted.phase,
+            AttemptPhase::Cancelled { handle: None, .. }
+        ));
 
         // Status response must NOT echo caller-supplied handle
         let status_res = match &aborted.phase {
@@ -4041,7 +4129,9 @@ mod tests {
         assert_eq!(cancel_res.handle, "");
 
         // 2. Dispatch transport error attempt with no remote handle
-        let (_rec, guard2) = journal.create_intent(make_intent("att-no-handle-unknown")).unwrap();
+        let (_rec, guard2) = journal
+            .create_intent(make_intent("att-no-handle-unknown"))
+            .unwrap();
         journal.mark_dispatching(&guard2).unwrap();
         journal.record_dispatch_transport_error(&guard2).unwrap();
         let unknown_rec = journal.read_record_locked(&guard2).unwrap();
@@ -4063,9 +4153,13 @@ mod tests {
         assert_eq!(unknown_status.handle, None);
 
         // 3. Stored handle exact-match validation
-        let (_rec, guard3) = journal.create_intent(make_intent("att-with-handle")).unwrap();
+        let (_rec, guard3) = journal
+            .create_intent(make_intent("att-with-handle"))
+            .unwrap();
         journal.mark_dispatching(&guard3).unwrap();
-        journal.record_accepted_handle(&guard3, "h-remote-123").unwrap();
+        journal
+            .record_accepted_handle(&guard3, "h-remote-123")
+            .unwrap();
         let accepted_rec = journal.read_record_locked(&guard3).unwrap();
 
         let rec_handle = match &accepted_rec.phase {
@@ -4084,7 +4178,9 @@ mod tests {
         let mismatch_h = Some("h-mismatch-999".to_string());
         let validation_err = if let (Some(ref ch), Some(ah)) = (&mismatch_h, rec_handle) {
             if ch.as_str() != ah {
-                Some(format!("caller handle '{ch}' does not match attempt handle '{ah}'"))
+                Some(format!(
+                    "caller handle '{ch}' does not match attempt handle '{ah}'"
+                ))
             } else {
                 None
             }
@@ -4092,7 +4188,9 @@ mod tests {
             None
         };
         assert!(validation_err.is_some());
-        assert!(validation_err.unwrap().contains("does not match attempt handle"));
+        assert!(validation_err
+            .unwrap()
+            .contains("does not match attempt handle"));
     }
 
     #[test]
@@ -4110,21 +4208,23 @@ mod tests {
             model_id: "flux-schnell".to_string(),
             model_revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
             native_mask_conditioning: false,
-            source_image_hash:
-                "1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            source_image_hash: "1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
             region_id: "reg-1".to_string(),
             region_revision: 5,
-            crop_sha256:
-                "2222222222222222222222222222222222222222222222222222222222222222".to_string(),
-            hint_sha256:
-                "3333333333333333333333333333333333333333333333333333333333333333".to_string(),
+            input_sha256: None,
+            predecessors_sha256: None,
+            crop_sha256: "2222222222222222222222222222222222222222222222222222222222222222"
+                .to_string(),
+            hint_sha256: "3333333333333333333333333333333333333333333333333333333333333333"
+                .to_string(),
             width: 128,
             height: 128,
             seed: 42,
             steps: 4,
             guidance_scaled: 350,
-            request_digest:
-                "4444444444444444444444444444444444444444444444444444444444444444".to_string(),
+            request_digest: "4444444444444444444444444444444444444444444444444444444444444444"
+                .to_string(),
             chapter_id: Some("chap-1".to_string()),
             page_index: Some(0),
             created_at_ms: 1000,
@@ -4286,6 +4386,8 @@ mod tests {
             source_image_hash: "src-hash".to_string(),
             region_id: "reg-1".to_string(),
             region_revision: 1,
+            input_sha256: None,
+            predecessors_sha256: None,
             crop_sha256: "crop-sha".to_string(),
             hint_sha256: "hint-sha".to_string(),
             width: 128,
@@ -4316,6 +4418,86 @@ mod tests {
 
         // 3. Record has both, but chapter does not exist in library -> fails closed (stale)
         record.page_index = Some(0);
+        assert!(is_project_recovery_stale(&library, &record));
+    }
+
+    #[test]
+    fn test_recovery_detects_underlay_and_predecessor_drift() {
+        let scratch = std::env::temp_dir()
+            .join("mc-cmd-recov-underlay")
+            .join(format!("{}", current_epoch_ms()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let (manifest, proposal, _, _) = setup_two_page_cmd_test_job(&scratch, "reg-recovery");
+        let library = Library::at(scratch.join("library"));
+        let project = library
+            .create_project("Recovery", cleaner_core::project::StripMode::Single, None, None)
+            .unwrap();
+        let chapter = library
+            .create_chapter(&project.id, "Chapter", None, Some(scratch.join("raws")))
+            .unwrap()
+            .created()
+            .unwrap();
+        let chapter_path = library.resolve_chapter(&chapter.id).unwrap();
+        let source_job = Job::open(&manifest).unwrap();
+        let patch_rec = &source_job.project.patches[0];
+        let patch = source_job.load_patch(patch_rec).unwrap();
+        let mut job = Job::open(&chapter_path).unwrap();
+        job.complete_region(0, &patch, None).unwrap();
+
+        let record = AttemptRecord {
+            schema_version: 1,
+            attempt_id: "att-recov-underlay".into(),
+            job_id: "job-recov-underlay".into(),
+            provider: CloudProvider::Modal,
+            profile_id: "modal-prof-1".into(),
+            endpoint_fingerprint: "0".repeat(64),
+            recipe_id: "sdnq-v1".into(),
+            preprocessing_version: "1.0.0".into(),
+            model_id: "flux-schnell".into(),
+            model_revision: "0123456789abcdef0123456789abcdef01234567".into(),
+            native_mask_conditioning: false,
+            source_image_hash: proposal.source_hash.clone(),
+            region_id: proposal.region_ids[0].clone(),
+            region_revision: proposal.revision,
+            input_sha256: Some(proposal.input_sha256.clone()),
+            predecessors_sha256: Some(proposal.predecessors_sha256.clone()),
+            crop_sha256: proposal.crop_png_sha256.clone(),
+            hint_sha256: proposal.hint_png_sha256.clone(),
+            width: proposal.crop_width,
+            height: proposal.crop_height,
+            seed: 42,
+            steps: 4,
+            guidance_scaled: 350,
+            request_digest: "request".into(),
+            chapter_id: Some(chapter.id),
+            page_index: Some(0),
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+            phase: AttemptPhase::ResultCached {
+                handle: "handle".into(),
+                result_digest: "result".into(),
+                cached_png_bytes: 100,
+                reported_cost_usd: None,
+            },
+        };
+        assert!(!is_project_recovery_stale(&library, &record));
+
+        let mut input_drift = record.clone();
+        input_drift.input_sha256 = Some("0".repeat(64));
+        assert!(is_project_recovery_stale(&library, &input_drift));
+        let mut predecessor_drift = record.clone();
+        predecessor_drift.predecessors_sha256 = Some("0".repeat(64));
+        assert!(is_project_recovery_stale(&library, &predecessor_drift));
+
+        let mut earlier = patch.clone();
+        earlier.id = "reg-earlier".into();
+        earlier.order = 0;
+        earlier.mask = cleaner_core::mask::Mask::filled(cleaner_core::mask::Rect::new(90, 90, 16, 16));
+        earlier.ink = earlier.mask.clone();
+        earlier.pixels.width = 16;
+        earlier.pixels.height = 16;
+        earlier.pixels.data = vec![255; 16 * 16];
+        job.complete_region(0, &earlier, None).unwrap();
         assert!(is_project_recovery_stale(&library, &record));
     }
 
@@ -4382,13 +4564,17 @@ mod tests {
 
             let cw_schema = sanitize_config_write_error(&format!("schema version error in {s}"));
             assert_no_sentinel_leak(&cw_schema, "sanitize_config_write_error(schema)");
-            assert_eq!(cw_schema, "unsupported inference configuration schema version");
+            assert_eq!(
+                cw_schema,
+                "unsupported inference configuration schema version"
+            );
 
             let cw_profile = sanitize_config_write_error(&format!("exceeds maximum limit in {s}"));
             assert_no_sentinel_leak(&cw_profile, "sanitize_config_write_error(limit)");
             assert_eq!(cw_profile, "maximum profile count exceeded");
 
-            let cw_origin = sanitize_config_write_error(&format!("canonical origin mismatch with {s}"));
+            let cw_origin =
+                sanitize_config_write_error(&format!("canonical origin mismatch with {s}"));
             assert_no_sentinel_leak(&cw_origin, "sanitize_config_write_error(origin)");
             assert_eq!(cw_origin, "profile canonical origin mismatch");
 
@@ -4397,24 +4583,35 @@ mod tests {
             assert_eq!(cw_ep, "invalid endpoint configuration in profile");
 
             // 2. Build client error sanitization
-            let bc_cfg = sanitize_build_client_error(&BuildClientError::Configuration(s.to_string()));
+            let bc_cfg =
+                sanitize_build_client_error(&BuildClientError::Configuration(s.to_string()));
             assert_no_sentinel_leak(&bc_cfg, "sanitize_build_client_error(Configuration)");
             assert_eq!(bc_cfg, "invalid or missing profile configuration");
 
-            let bc_cred = sanitize_build_client_error(&BuildClientError::CredentialMissing(s.to_string()));
+            let bc_cred =
+                sanitize_build_client_error(&BuildClientError::CredentialMissing(s.to_string()));
             assert_no_sentinel_leak(&bc_cred, "sanitize_build_client_error(CredentialMissing)");
             assert_eq!(bc_cred, "runtime credential missing or invalid for profile");
 
             // 3. HTTP Transport error sanitization
-            let t_status_401 = sanitize_http_transport_error(&HttpTransportError::UnexpectedStatus { status: 401 });
+            let t_status_401 =
+                sanitize_http_transport_error(&HttpTransportError::UnexpectedStatus {
+                    status: 401,
+                });
             assert_no_sentinel_leak(&t_status_401, "sanitize_http_transport_error(401)");
             assert_eq!(t_status_401, "gateway authorization failure (status 401)");
 
-            let t_status_403 = sanitize_http_transport_error(&HttpTransportError::UnexpectedStatus { status: 403 });
+            let t_status_403 =
+                sanitize_http_transport_error(&HttpTransportError::UnexpectedStatus {
+                    status: 403,
+                });
             assert_no_sentinel_leak(&t_status_403, "sanitize_http_transport_error(403)");
             assert_eq!(t_status_403, "gateway authorization failure (status 403)");
 
-            let t_status_500 = sanitize_http_transport_error(&HttpTransportError::UnexpectedStatus { status: 500 });
+            let t_status_500 =
+                sanitize_http_transport_error(&HttpTransportError::UnexpectedStatus {
+                    status: 500,
+                });
             assert_no_sentinel_leak(&t_status_500, "sanitize_http_transport_error(500)");
             assert_eq!(t_status_500, "gateway returned unexpected HTTP status 500");
 
@@ -4423,19 +4620,31 @@ mod tests {
             assert_eq!(t_cred, "runtime credential invalid or missing for target");
 
             let t_ep = sanitize_http_transport_error(&HttpTransportError::EndpointValidationFailed);
-            assert_no_sentinel_leak(&t_ep, "sanitize_http_transport_error(EndpointValidationFailed)");
+            assert_no_sentinel_leak(
+                &t_ep,
+                "sanitize_http_transport_error(EndpointValidationFailed)",
+            );
             assert_eq!(t_ep, "endpoint validation failed for target");
 
             let t_conn = sanitize_http_transport_error(&HttpTransportError::ConnectionError);
             assert_no_sentinel_leak(&t_conn, "sanitize_http_transport_error(ConnectionError)");
-            assert_eq!(t_conn, "gateway endpoint unreachable or connection timed out");
+            assert_eq!(
+                t_conn,
+                "gateway endpoint unreachable or connection timed out"
+            );
 
             let t_timeout = sanitize_http_transport_error(&HttpTransportError::Timeout);
             assert_no_sentinel_leak(&t_timeout, "sanitize_http_transport_error(Timeout)");
-            assert_eq!(t_timeout, "gateway endpoint unreachable or connection timed out");
+            assert_eq!(
+                t_timeout,
+                "gateway endpoint unreachable or connection timed out"
+            );
 
             let t_json = sanitize_http_transport_error(&HttpTransportError::JsonDeserialization);
-            assert_no_sentinel_leak(&t_json, "sanitize_http_transport_error(JsonDeserialization)");
+            assert_no_sentinel_leak(
+                &t_json,
+                "sanitize_http_transport_error(JsonDeserialization)",
+            );
             assert_eq!(t_json, "gateway protocol or response validation error");
 
             let t_wire = sanitize_http_transport_error(&HttpTransportError::WireValidation);
@@ -4455,7 +4664,10 @@ mod tests {
                 ConsentError::SourceImageError,
                 ConsentError::RenderPrepareFailed(s.to_string()),
                 ConsentError::ProposalNotFound,
-                ConsentError::ProposalExpired { expired_at_ms: 1000, now_ms: 2000 },
+                ConsentError::ProposalExpired {
+                    expired_at_ms: 1000,
+                    now_ms: 2000,
+                },
                 ConsentError::ProposalAlreadyConsumed,
                 ConsentError::ProposalNotConfirmed,
                 ConsentError::GrantNonceMismatch,
@@ -4483,12 +4695,20 @@ mod tests {
             // 5. Grant error sanitization
             let ge_list = vec![
                 GrantError::NotFound,
-                GrantError::Expired { expired_at_ms: 1000, now_ms: 2000 },
+                GrantError::Expired {
+                    expired_at_ms: 1000,
+                    now_ms: 2000,
+                },
                 GrantError::ClockRollbackDetected,
                 GrantError::Revoked,
                 GrantError::ProfileMutated,
-                GrantError::AttemptsExceeded { max_attempts: 1, attempts_used: 2 },
-                GrantError::ScopeMismatch { field: "crop_sha256" },
+                GrantError::AttemptsExceeded {
+                    max_attempts: 1,
+                    attempts_used: 2,
+                },
+                GrantError::ScopeMismatch {
+                    field: "crop_sha256",
+                },
                 GrantError::InvalidParameter(s.to_string()),
                 GrantError::RandomSourceError,
             ];
@@ -4499,26 +4719,69 @@ mod tests {
 
             // 6. Journal error sanitization
             let je_list = vec![
-                JournalError::InvalidIdentifier { field: "attempt_id", value: s.to_string() },
-                JournalError::InvalidIdentifier { field: "handle", value: s.to_string() },
-                JournalError::UnsupportedSchemaVersion { expected: 1, actual: 99 },
-                JournalError::ForeignGuard { expected_root: "/path/a".to_string(), guard_root: s.to_string() },
-                JournalError::Wire(cleaner_core::cloud_wire::WireValidationError::PayloadSizeExceeded { actual: 10, limit: 5 }),
-                JournalError::Decode(cleaner_core::cloud_decode::ResultDecodeError::UnexpectedColorType),
-                JournalError::AttemptLocked { attempt_id: s.to_string() },
-                JournalError::AttemptAlreadyExists { attempt_id: s.to_string() },
-                JournalError::AttemptNotFound { attempt_id: s.to_string() },
+                JournalError::InvalidIdentifier {
+                    field: "attempt_id",
+                    value: s.to_string(),
+                },
+                JournalError::InvalidIdentifier {
+                    field: "handle",
+                    value: s.to_string(),
+                },
+                JournalError::UnsupportedSchemaVersion {
+                    expected: 1,
+                    actual: 99,
+                },
+                JournalError::ForeignGuard {
+                    expected_root: "/path/a".to_string(),
+                    guard_root: s.to_string(),
+                },
+                JournalError::Wire(
+                    cleaner_core::cloud_wire::WireValidationError::PayloadSizeExceeded {
+                        actual: 10,
+                        limit: 5,
+                    },
+                ),
+                JournalError::Decode(
+                    cleaner_core::cloud_decode::ResultDecodeError::UnexpectedColorType,
+                ),
+                JournalError::AttemptLocked {
+                    attempt_id: s.to_string(),
+                },
+                JournalError::AttemptAlreadyExists {
+                    attempt_id: s.to_string(),
+                },
+                JournalError::AttemptNotFound {
+                    attempt_id: s.to_string(),
+                },
                 JournalError::InvalidTransition {
                     current: "intent".to_string(),
                     attempted: s.to_string(),
                 },
-                JournalError::StaleAttachment { field: "region_revision", expected: s.to_string(), actual: s.to_string() },
-                JournalError::DuplicateCommit { patch_id: s.to_string() },
-                JournalError::LimitExceeded { field: "crop_png", actual: 99999999, max: 1000 },
-                JournalError::RequestDigestMismatch { expected: s.to_string(), computed: s.to_string() },
-                JournalError::ResultDigestMismatch { expected: s.to_string(), computed: s.to_string() },
+                JournalError::StaleAttachment {
+                    field: "region_revision",
+                    expected: s.to_string(),
+                    actual: s.to_string(),
+                },
+                JournalError::DuplicateCommit {
+                    patch_id: s.to_string(),
+                },
+                JournalError::LimitExceeded {
+                    field: "crop_png",
+                    actual: 99999999,
+                    max: 1000,
+                },
+                JournalError::RequestDigestMismatch {
+                    expected: s.to_string(),
+                    computed: s.to_string(),
+                },
+                JournalError::ResultDigestMismatch {
+                    expected: s.to_string(),
+                    computed: s.to_string(),
+                },
                 JournalError::Io(std::io::Error::other(s)),
-                JournalError::Json(serde_json::from_str::<serde_json::Value>("not valid json").unwrap_err()),
+                JournalError::Json(
+                    serde_json::from_str::<serde_json::Value>("not valid json").unwrap_err(),
+                ),
             ];
             for je in je_list {
                 let res = sanitize_journal_error(je);
@@ -4554,25 +4817,39 @@ mod tests {
 
     #[test]
     fn test_adversarial_revalidate_proposal_before_dispatch_errors_sanitized() {
-        let non_existent_path = PathBuf::from("/private/var/folders/secret_temp/non_existent.mtclean");
+        let non_existent_path =
+            PathBuf::from("/private/var/folders/secret_temp/non_existent.mtclean");
         let proposal = ConsentProposal {
             proposal_id: "prop-1".into(),
             provider: CloudProvider::Modal,
             profile_id: "modal-1".into(),
             profile_name: "Modal 1".into(),
             endpoint_url: "https://modal.run/ep".into(),
-            canonical_endpoint_fingerprint: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            canonical_endpoint_fingerprint:
+                "0000000000000000000000000000000000000000000000000000000000000000".into(),
             crop_bounds: cleaner_core::mask::Rect::new(0, 0, 64, 64),
             crop_width: 64,
             crop_height: 64,
-            crop_png_sha256: "3333333333333333333333333333333333333333333333333333333333333333".into(),
-            hint_png_sha256: "4444444444444444444444444444444444444444444444444444444444444444".into(),
-            operation_digest: "6666666666666666666666666666666666666666666666666666666666666666".into(),
+            crop_png_sha256: "3333333333333333333333333333333333333333333333333333333333333333"
+                .into(),
+            hint_png_sha256: "4444444444444444444444444444444444444444444444444444444444444444"
+                .into(),
+            operation_digest: "6666666666666666666666666666666666666666666666666666666666666666"
+                .into(),
             source_hash: "1111111111111111111111111111111111111111111111111111111111111111".into(),
             mask_hash: "2222222222222222222222222222222222222222222222222222222222222222".into(),
             revision: 1,
-            revision_hash: "5555555555555555555555555555555555555555555555555555555555555555".into(),
-            recipe: RenderRecipe::new("sdnq-v1", "1.0.0", "flux-schnell", "0123456789abcdef0123456789abcdef01234567", false),
+            revision_hash: "5555555555555555555555555555555555555555555555555555555555555555"
+                .into(),
+            input_sha256: String::new(),
+            predecessors_sha256: String::new(),
+            recipe: RenderRecipe::new(
+                "sdnq-v1",
+                "1.0.0",
+                "flux-schnell",
+                "0123456789abcdef0123456789abcdef01234567",
+                false,
+            ),
             region_ids: vec!["reg-1".into()],
             intent: OperationIntent::CleanAnyway,
             chapter_id: "chap-1".into(),
@@ -4643,7 +4920,9 @@ mod tests {
             None,
         );
         assert!(res_dis.is_err());
-        assert!(res_dis.unwrap_err().contains("cloudEngines permission denied"));
+        assert!(res_dis
+            .unwrap_err()
+            .contains("cloudEngines permission denied"));
 
         // 2. prepare_cloud_consent_inner negative condition: simulate_blocked = true
         let res_sim = prepare_cloud_consent_inner(
@@ -4659,7 +4938,9 @@ mod tests {
             Some(true),
         );
         assert!(res_sim.is_err());
-        assert!(res_sim.unwrap_err().contains("cloudEngines permission denied"));
+        assert!(res_sim
+            .unwrap_err()
+            .contains("cloudEngines permission denied"));
 
         // 3. prepare_cloud_consent_inner negative condition: missing recipe
         let res_no_rec = prepare_cloud_consent_inner(
@@ -4675,7 +4956,10 @@ mod tests {
             None,
         );
         assert!(res_no_rec.is_err());
-        assert_eq!(res_no_rec.unwrap_err(), "recipe is required for prepare_cloud_consent");
+        assert_eq!(
+            res_no_rec.unwrap_err(),
+            "recipe is required for prepare_cloud_consent"
+        );
 
         // 4. prepare_cloud_consent_inner negative condition: missing chapterId
         let res_no_ch = prepare_cloud_consent_inner(
@@ -4691,7 +4975,10 @@ mod tests {
             None,
         );
         assert!(res_no_ch.is_err());
-        assert_eq!(res_no_ch.unwrap_err(), "chapterId is required for prepare_cloud_consent");
+        assert_eq!(
+            res_no_ch.unwrap_err(),
+            "chapterId is required for prepare_cloud_consent"
+        );
 
         // 5. prepare_cloud_consent_inner success
         let res_ok = prepare_cloud_consent_inner(
@@ -4733,7 +5020,9 @@ mod tests {
             None,
         );
         assert!(conf_dis.is_err());
-        assert!(conf_dis.unwrap_err().contains("cloudEngines permission denied"));
+        assert!(conf_dis
+            .unwrap_err()
+            .contains("cloudEngines permission denied"));
 
         // 8. confirm_cloud_consent_inner negative condition: non-existent proposal ID
         let conf_notfound = confirm_cloud_consent_inner(
@@ -4796,10 +5085,12 @@ mod tests {
                     "0000000000000000000000000000000000000000000000000000000000000000".into(),
                 region_id: "reg-1".into(),
                 region_revision: 1,
-                crop_sha256:
-                    "0000000000000000000000000000000000000000000000000000000000000000".into(),
-                hint_sha256:
-                    "0000000000000000000000000000000000000000000000000000000000000000".into(),
+                input_sha256: None,
+                predecessors_sha256: None,
+                crop_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .into(),
+                hint_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .into(),
                 request_digest: String::new(),
                 chapter_id: Some("chap-1".into()),
                 page_index: Some(0),
@@ -4822,7 +5113,9 @@ mod tests {
             None,
         );
         assert!(sub_dis.is_err());
-        assert!(sub_dis.unwrap_err().contains("cloudEngines permission denied"));
+        assert!(sub_dis
+            .unwrap_err()
+            .contains("cloudEngines permission denied"));
 
         // 2. submit_cloud_attempt_inner negative condition: empty nonce
         let sub_nonce = submit_cloud_attempt_inner(
@@ -4838,7 +5131,9 @@ mod tests {
             None,
         );
         assert!(sub_nonce.is_err());
-        assert!(sub_nonce.unwrap_err().contains("invalid or missing grant nonce"));
+        assert!(sub_nonce
+            .unwrap_err()
+            .contains("invalid or missing grant nonce"));
 
         // 3. submit_cloud_attempt_inner negative condition: mismatched attemptId
         let sub_att = submit_cloud_attempt_inner(
@@ -4854,22 +5149,32 @@ mod tests {
             None,
         );
         assert!(sub_att.is_err());
-        assert!(sub_att.unwrap_err().contains("caller attemptId does not match"));
+        assert!(sub_att
+            .unwrap_err()
+            .contains("caller attemptId does not match"));
 
         // 4. get_cloud_attempt_status_inner negative condition: attempt not found
-        let stat_nf = get_cloud_attempt_status_inner(&journal, Some(&config), "att-non-existent", None);
+        let stat_nf =
+            get_cloud_attempt_status_inner(&journal, Some(&config), "att-non-existent", None);
         assert!(stat_nf.is_err());
         assert_eq!(stat_nf.unwrap_err(), "attempt not found in journal");
 
         // 5. get_cloud_attempt_result_inner negative condition: non-completed phase
-        let (_rec, guard) = journal.create_intent(make_intent("att-intent-test")).unwrap();
+        let (_rec, guard) = journal
+            .create_intent(make_intent("att-intent-test"))
+            .unwrap();
         drop(guard);
-        let res_noncomp = get_cloud_attempt_result_inner(&journal, Some(&config), "att-intent-test", None);
+        let res_noncomp =
+            get_cloud_attempt_result_inner(&journal, Some(&config), "att-intent-test", None);
         assert!(res_noncomp.is_err());
-        assert_eq!(res_noncomp.unwrap_err(), "cannot retrieve result for attempt in non-completed phase");
+        assert_eq!(
+            res_noncomp.unwrap_err(),
+            "cannot retrieve result for attempt in non-completed phase"
+        );
 
         // 6. cancel_cloud_attempt_inner: Intent phase cancels cleanly
-        let cancel_intent = cancel_cloud_attempt_inner(&journal, Some(&config), "att-intent-test", None);
+        let cancel_intent =
+            cancel_cloud_attempt_inner(&journal, Some(&config), "att-intent-test", None);
         assert!(cancel_intent.is_ok());
         let cancel_dto = cancel_intent.unwrap();
         assert_eq!(cancel_dto.status, "cancelled");
@@ -4879,30 +5184,57 @@ mod tests {
         let (_rec2, guard2) = journal.create_intent(make_intent("att-disp-test")).unwrap();
         journal.mark_dispatching(&guard2).unwrap();
         drop(guard2);
-        let cancel_disp = cancel_cloud_attempt_inner(&journal, Some(&config), "att-disp-test", None);
+        let cancel_disp =
+            cancel_cloud_attempt_inner(&journal, Some(&config), "att-disp-test", None);
         assert!(cancel_disp.is_err());
         assert!(cancel_disp.unwrap_err().contains("currently dispatching"));
 
         // 8. reconcile_cloud_recovery_inner: empty journal returns terminal
         let empty_journal = AttemptJournal::new(scratch.join("empty_journal"), limits);
-        let recov_empty = reconcile_cloud_recovery_inner(&empty_journal, None, None, None, None, None, None, None, None);
+        let recov_empty = reconcile_cloud_recovery_inner(
+            &empty_journal,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(recov_empty.is_ok());
         let recov_empty_dto = recov_empty.unwrap();
         assert_eq!(recov_empty_dto.decision, "terminal");
-        assert_eq!(recov_empty_dto.message.as_deref(), Some("No uncommitted attempts found in journal"));
+        assert_eq!(
+            recov_empty_dto.message.as_deref(),
+            Some("No uncommitted attempts found in journal")
+        );
 
         // 9. reconcile_cloud_recovery_inner: cancelled attempt returns terminal
-        let recov_cancelled = reconcile_cloud_recovery_inner(&journal, None, Some("att-intent-test"), None, None, None, None, None, None);
+        let recov_cancelled = reconcile_cloud_recovery_inner(
+            &journal,
+            None,
+            Some("att-intent-test"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(recov_cancelled.is_ok());
-        assert_eq!(recov_cancelled.unwrap(), CloudRecoveryDecisionDto {
-            decision: "terminal".to_string(),
-            attempt_id: Some("att-intent-test".to_string()),
-            handle: None,
-            result_digest: None,
-            patch_id: None,
-            auto_retryable: Some(false),
-            message: Some("explicit pre-dispatch abort".to_string()),
-        });
+        assert_eq!(
+            recov_cancelled.unwrap(),
+            CloudRecoveryDecisionDto {
+                decision: "terminal".to_string(),
+                attempt_id: Some("att-intent-test".to_string()),
+                handle: None,
+                result_digest: None,
+                patch_id: None,
+                auto_retryable: Some(false),
+                message: Some("explicit pre-dispatch abort".to_string()),
+            }
+        );
     }
 
     #[test]

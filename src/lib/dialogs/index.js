@@ -26,6 +26,7 @@ import ShortcutsDialog from './ShortcutsDialog.svelte'
 import ExportDialog from './ExportDialog.svelte'
 import FormatConversionDialog from './FormatConversionDialog.svelte'
 import CloudConsentDialog from './CloudConsentDialog.svelte'
+import WorkflowReviewDialog from './WorkflowReviewDialog.svelte'
 
 /**
  * Null-prototype on purpose. `kind` is a plain string that reaches this table
@@ -38,6 +39,7 @@ const DIALOGS = Object.assign(Object.create(null), homeDialogs, {
   export: ExportDialog,
   formatConversion: FormatConversionDialog,
   cloudConsent: CloudConsentDialog,
+  workflowReview: WorkflowReviewDialog,
 })
 
 /**

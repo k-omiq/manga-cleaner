@@ -1,9 +1,10 @@
 /**
- * The two pipelines a page goes through, and the engines each one offers.
+ * The two pipelines a page goes through, the engines each one offers, and the
+ * capability graph Settings and setup draw the models from.
  *
  * **Detection** finds the text to remove. **Cleaning** redraws what was under
- * it. Onboarding and Settings both draw from this one table, so the two can
- * never disagree about which engine needs which files.
+ * it. Onboarding and Settings both draw from this one module, so the two can
+ * never disagree about which choice needs which files.
  *
  * `files` are catalogue ids from `src-tauri/src/weights.rs`, written out
  * because an engine is a *combination* of files and the catalogue's
@@ -11,12 +12,17 @@
  * `ready` when the app can download and run it today; the rest are listed so
  * the choice reads as a roadmap, and are drawn disabled.
  *
+ * **What a choice needs follows the workflow, not a universal list.** Legacy
+ * script filtering needs its detector files, the script gate pair and, only
+ * when the optional rescue is on and Japanese is cleaned, the three manga-ocr
+ * files. The all-text policy never needs the gate or OCR. See `filesFor`.
+ *
  * `rating` is two scores out of 5, higher is better on both:
  *  - `efficiency` - speed per page for the quality it gives
  *  - `light` - how little disk and memory it needs
  * These are provisional: derived from file sizes and the per-page timings in
  * `docs/findings.md`, not from a common benchmark. See "What has not been
- * measured" there.
+ * measured" there. Every table that draws them says so beside the stars.
  */
 
 /** The source languages the detection pipeline cleans. Latin text is left alone by design. */
@@ -26,8 +32,15 @@ export const LANGUAGES = Object.freeze([
   { id: 'ko', labelKey: 'pipelines.language.ko' },
 ])
 
-/** What every current detector needs: text mask, balloons, and the script gate. */
-const BASE_DETECTION = Object.freeze(['textDetector', 'balloonDetector', 'scriptGate', 'scriptGateLabels'])
+/** The legacy script gate: the model and the labels it must match. One logical capability. */
+export const SCRIPT_GATE_FILES = Object.freeze(['scriptGate', 'scriptGateLabels'])
+
+/** The optional Japanese OCR rescue reader: encoder, decoder, vocabulary. One logical capability. */
+export const OCR_FILES = Object.freeze(['ocrEncoder', 'ocrDecoder', 'ocrVocab'])
+
+/** The two text policies, as `session.textPolicy` stores them. */
+export const LEGACY_POLICY = 'legacy_gate'
+export const ALL_TEXT_POLICY = 'all_text'
 
 /**
  * @typedef {Object} Engine
@@ -47,32 +60,57 @@ export const DETECTORS = Object.freeze([
     id: 'ctd-rtdetr',
     name: 'CTD + RT-DETR v2',
     noteKey: 'pipelines.detector.ctdRtdetr',
-    files: [...BASE_DETECTION],
+    // The detector pair only. The script gate belongs to the legacy policy
+    // and OCR to its optional rescue, so neither rides along with a detector.
+    files: ['textDetector', 'balloonDetector'],
     languages: ['ja', 'zh', 'ko'],
     ready: true,
     rating: { efficiency: 4, light: 4 },
   },
-  {
-    id: 'ctd-rtdetr-ocr',
-    name: 'CTD + RT-DETR v2 + manga-ocr',
-    noteKey: 'pipelines.detector.ctdRtdetrOcr',
-    files: [...BASE_DETECTION, 'ocrEncoder', 'ocrDecoder', 'ocrVocab'],
-    languages: ['ja'],
-    ready: true,
-    rating: { efficiency: 3, light: 2 },
-  },
-  // The next pipeline (`Plan for models/AGENT_START_HERE.md`): RT-DETR v2 for
-  // text and bubbles, COO MTSv3 for sound effects, SAM-TS for the removal mask.
-  {
-    id: 'rtdetr-coo-samts',
-    name: 'RT-DETR v2 + COO + SAM-TS',
-    noteKey: 'pipelines.detector.rtdetrCoo',
-    files: [],
-    languages: ['ja', 'zh', 'ko'],
-    ready: false,
-    rating: { efficiency: 4, light: 3 },
-  },
 ])
+
+/**
+ * Detector ids a stored session may still hold, and what each one meant.
+ *
+ * `ctd-rtdetr-ocr` was a per-language row that queued the 440 MB reader while
+ * the run obeyed the separate `ocrRescue` switch. OCR rescue is one explicit
+ * capability now, so the row reads back as the plain detector with the rescue
+ * switched on: nobody who picked it loses what they asked for.
+ */
+export const RETIRED_DETECTORS = Object.freeze({
+  'ctd-rtdetr-ocr': Object.freeze({ detector: 'ctd-rtdetr', ocrRescue: true, languages: Object.freeze(['ja']) }),
+})
+
+/**
+ * Read a stored detector choice for a language, migrating a retired id.
+ *
+ * @param {string} language
+ * @param {unknown} value - what the session stored
+ * @returns {{detector: string|null|undefined, ocrRescue: boolean}} `undefined` when the value is not a choice this language can hold
+ */
+export function migrateDetectorChoice(language, value) {
+  if (value === null) return { detector: null, ocrRescue: false }
+  if (typeof value !== 'string') return { detector: undefined, ocrRescue: false }
+  const retired = Object.hasOwn(RETIRED_DETECTORS, value) ? RETIRED_DETECTORS[value] : null
+  if (retired) {
+    return retired.languages.includes(language)
+      ? { detector: retired.detector, ocrRescue: retired.ocrRescue }
+      : { detector: undefined, ocrRescue: false }
+  }
+  return detectorsFor(language).some((engine) => engine.id === value)
+    ? { detector: value, ocrRescue: false }
+    : { detector: undefined, ocrRescue: false }
+}
+
+/** Independent, read-only model analysis. Legacy clean-time detector choices
+ * above retain their defaults until prepared mask write support is complete. */
+export const WORKFLOW_PRESETS = Object.freeze([
+  { id: 'regions', name: 'Regions only', needs: ['rt'], description: 'RT-DETR text and bubble boxes' },
+  { id: 'mask', name: 'Mask only', needs: ['sam'], description: 'SAM-TS-L lettering pixels, without RT-DETR or OCR' },
+  { id: 'text_shape', name: 'Text-shaped review', needs: ['rt', 'sam'], description: 'RT-DETR context with the unchanged SAM mask' },
+])
+
+export const OPTIONAL_SFX = Object.freeze({ id: 'coo-mtsv3', name: 'COO MTSv3 SFX assist', selectable: false })
 
 /** @type {readonly Engine[]} */
 export const CLEANERS = Object.freeze([
@@ -115,22 +153,304 @@ export function cleaner(id) {
 }
 
 /**
- * The catalogue ids a set of choices needs, deduplicated, in first-seen order.
+ * The detector a language resolves to, retired ids included, or null when the
+ * language is skipped or holds nothing this table can run.
  *
- * @param {Record<string, string|null>} detection - language id → detector id, or null to skip the language
- * @param {Record<string, boolean>} cleaners - cleaner id → wanted
+ * @param {Record<string, string|null>|null|undefined} detection
+ * @param {string} language
+ */
+function chosenDetector(detection, language) {
+  const { detector: id } = migrateDetectorChoice(language, detection?.[language] ?? null)
+  const engine = id ? detector(id) : null
+  return engine?.ready && engine.languages?.includes(language) ? engine : null
+}
+
+/**
+ * Whether a set of choices asks for the Japanese OCR rescue and can use it:
+ * the switch is on (or a retired `ctd-rtdetr-ocr` row still says so), and
+ * Japanese is cleaned. The native run applies the same rule
+ * (`RunSelection::from_args`: `ocr_rescue &= ja`).
+ *
+ * @param {Record<string, string|null>|null|undefined} detection
+ * @param {boolean|undefined} ocrRescue
+ */
+export function rescueRuns(detection, ocrRescue) {
+  if (!chosenDetector(detection, 'ja')) return false
+  return ocrRescue === true || migrateDetectorChoice('ja', detection?.ja ?? null).ocrRescue
+}
+
+/**
+ * The logical models a workflow needs before it can run, in download order.
+ *
+ * - **Legacy script filtering** with at least one language cleaned: the text
+ *   finder, the speech bubble finder, the script gate pair, and the OCR
+ *   reader only when `rescueRuns`.
+ * - **All text**: the speech bubble finder for the review's small whole-page
+ *   profile and the SAM-TS-L graphs. Never the gate, never OCR. SAM is an
+ *   import, so it is listed but never downloaded.
+ *
+ * @param {{textPolicy?: string, detection?: Record<string, string|null>|null, ocrRescue?: boolean}} [choices]
+ * @returns {string[]} logical model ids (`MODELS`)
+ */
+export function workflowNeeds({ textPolicy = LEGACY_POLICY, detection = null, ocrRescue = false } = {}) {
+  if (textPolicy === ALL_TEXT_POLICY) return ['rtSmall', 'samTs']
+  const cleaned = LANGUAGES.some((language) => chosenDetector(detection, language.id))
+  if (!cleaned) return []
+  return rescueRuns(detection, ocrRescue)
+    ? ['ctd', 'rtSmall', 'scriptGate', 'mangaOcr']
+    : ['ctd', 'rtSmall', 'scriptGate']
+}
+
+/**
+ * Where the engine runtime leaves a workflow. Every native workflow loads its
+ * models through ONNX Runtime, so a workflow with every file on disk still
+ * cannot run while the runtime is missing: a readiness line that counted files
+ * alone called it ready, and the run then refused to start.
+ *
+ * A workflow with no needs (legacy with every language skipped) runs nothing,
+ * so the runtime does not decide anything for it.
+ *
+ * **Installed is not enough.** The catalogue's `installed` is a file found; a
+ * native run also loads it and refuses to start when that fails - a CUDA build
+ * on a machine without CUDA, a quarantined or damaged library. `load` is what
+ * the `diagnostics` command said when it made that same load: `loaded`,
+ * `failed`, `checking` while the question is out, `unchecked` when the
+ * question itself was refused. Only `loaded` makes an installed runtime
+ * `installed` here; anything else keeps the workflow from reading as ready.
+ *
+ * @param {{installed?: boolean, available?: boolean, downloading?: boolean}|null|undefined} runtime - the catalogue's runtime row
+ * @param {readonly string[]} needs - what `workflowNeeds` answered
+ * @param {'loaded'|'failed'|'checking'|'unchecked'} [load] - whether the installed runtime loads
+ * @returns {'notNeeded'|'installed'|'unloadable'|'checking'|'unchecked'|'downloading'|'missing'|'unavailable'}
+ */
+export function runtimeState(runtime, needs, load) {
+  if (needs.length === 0) return 'notNeeded'
+  if (runtime?.installed === true) {
+    if (load === 'loaded') return 'installed'
+    if (load === 'failed') return 'unloadable'
+    return load === 'unchecked' ? 'unchecked' : 'checking'
+  }
+  if (runtime?.downloading === true) return 'downloading'
+  return runtime?.available === false ? 'unavailable' : 'missing'
+}
+
+/**
+ * The catalogue ids a set of choices needs, deduplicated, in first-seen order.
+ * Pure: the same answer for the same choices, whatever is installed.
+ *
+ * Downloads follow the selected workflow. Legacy filtering needs each cleaned
+ * language's detector files, then the script gate pair, then the three OCR
+ * files only when the rescue is on and Japanese is cleaned. All-text needs the
+ * speech bubble finder and nothing from the gate or the reader. Imported
+ * graphs (SAM-TS-L, full RT-DETR) are never downloads. Every ready cleaner
+ * that is wanted adds its own files after that.
+ *
+ * @param {Record<string, string|null>|null|undefined} detection - language id → detector id, or null to skip the language
+ * @param {Record<string, boolean>|null|undefined} cleaners - cleaner id → wanted
+ * @param {{textPolicy?: string, ocrRescue?: boolean}} [options] - the policy (legacy by default) and the rescue switch
  * @returns {string[]}
  */
-export function filesFor(detection, cleaners) {
+export function filesFor(detection, cleaners, { textPolicy = LEGACY_POLICY, ocrRescue = false } = {}) {
   const ids = new Set()
-  for (const language of LANGUAGES) {
-    const engine = detector(detection?.[language.id] ?? '')
-    if (engine?.ready && engine.languages?.includes(language.id)) for (const file of engine.files) ids.add(file)
+  if (textPolicy === ALL_TEXT_POLICY) {
+    for (const file of model('rtSmall')?.files ?? []) ids.add(file)
+  } else {
+    for (const language of LANGUAGES) {
+      for (const file of chosenDetector(detection, language.id)?.files ?? []) ids.add(file)
+    }
+    const needs = workflowNeeds({ textPolicy, detection, ocrRescue })
+    if (needs.includes('scriptGate')) for (const file of SCRIPT_GATE_FILES) ids.add(file)
+    if (needs.includes('mangaOcr')) for (const file of OCR_FILES) ids.add(file)
   }
   for (const engine of CLEANERS) {
     if (engine.ready && cleaners?.[engine.id]) for (const file of engine.files) ids.add(file)
   }
   return [...ids]
+}
+
+/* ------------------------------------------------------------------ */
+/* The capability graph                                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * What a removal can stop, by workflow. Named so a Delete can say which of
+ * them it disables before it happens.
+ *
+ * - `legacy` - legacy automatic cleaning (CTD + RT-DETR + script gate)
+ * - `ocrRescue` - the optional Japanese OCR rescue inside legacy filtering
+ * - `reviewSmall` - the text-shaped review's small whole-page RT profile
+ * - `reviewFull` - the text-shaped review's full two-tile RT profile
+ * - `review` - the text-shaped review itself (its lettering mask)
+ * - `lama` - LaMa redraw
+ */
+export const WORKFLOWS = Object.freeze(['legacy', 'ocrRescue', 'reviewSmall', 'reviewFull', 'review', 'lama'])
+
+/**
+ * @typedef {Object} LogicalModel
+ * @property {string} id
+ * @property {string} nameKey - what the row is called
+ * @property {string|null} product - the product name, data rather than copy
+ * @property {'download'|'import'|'excluded'} source - how it reaches the machine
+ * @property {string[]} files - catalogue ids, for downloads; empty otherwise
+ * @property {string|null} group - the native group id that installs and removes the files as one unit
+ * @property {'samTs'|'fullRt'|null} importId - which import command owns it
+ * @property {string[]} disables - the workflows its removal stops
+ * @property {string} roleKey - one line on what it does and for whom
+ * @property {string|null} removeKey - the confirmation a removal asks, naming what it disables
+ */
+
+/** @type {readonly LogicalModel[]} */
+export const MODELS = Object.freeze([
+  {
+    id: 'ctd',
+    nameKey: 'models.kind.textDetector',
+    product: 'CTD',
+    source: 'download',
+    files: ['textDetector'],
+    group: null,
+    importId: null,
+    disables: ['legacy'],
+    roleKey: 'settings.detection.role.ctd',
+    removeKey: 'settings.models.remove.ctd',
+  },
+  {
+    id: 'rtSmall',
+    nameKey: 'models.kind.balloonDetector',
+    product: 'RT-DETR v2 small',
+    source: 'download',
+    files: ['balloonDetector'],
+    group: null,
+    importId: null,
+    disables: ['legacy', 'reviewSmall'],
+    roleKey: 'settings.detection.role.rtSmall',
+    removeKey: 'settings.models.remove.rtSmall',
+  },
+  {
+    id: 'rtFull',
+    nameKey: 'settings.detection.model.rtFull',
+    product: 'RT-DETR v2 full',
+    source: 'import',
+    files: [],
+    group: null,
+    importId: 'fullRt',
+    disables: ['reviewFull'],
+    roleKey: 'settings.detection.role.rtFull',
+    removeKey: 'settings.models.remove.rtFull',
+  },
+  {
+    id: 'samTs',
+    nameKey: 'settings.detection.model.samTs',
+    product: 'SAM-TS-L',
+    source: 'import',
+    files: [],
+    group: null,
+    importId: 'samTs',
+    disables: ['review'],
+    roleKey: 'settings.detection.role.samTs',
+    removeKey: 'settings.models.remove.samTs',
+  },
+  {
+    id: 'coo',
+    nameKey: 'settings.detection.model.coo',
+    product: 'COO MTSv3',
+    source: 'excluded',
+    files: [],
+    group: null,
+    importId: null,
+    disables: [],
+    roleKey: 'settings.detection.role.coo',
+    removeKey: null,
+  },
+  {
+    id: 'scriptGate',
+    nameKey: 'settings.models.groups.scriptGate',
+    product: null,
+    source: 'download',
+    files: [...SCRIPT_GATE_FILES],
+    group: 'scriptGate',
+    importId: null,
+    disables: ['legacy'],
+    roleKey: 'settings.detection.role.scriptGate',
+    removeKey: 'settings.models.remove.scriptGate',
+  },
+  {
+    id: 'mangaOcr',
+    nameKey: 'settings.models.groups.mangaOcr',
+    product: 'manga-ocr',
+    source: 'download',
+    files: [...OCR_FILES],
+    group: 'mangaOcr',
+    importId: null,
+    disables: ['ocrRescue'],
+    roleKey: 'settings.detection.role.mangaOcr',
+    removeKey: 'settings.models.remove.mangaOcr',
+  },
+  {
+    id: 'lama',
+    nameKey: 'models.kind.inpainter',
+    product: 'LaMa Manga',
+    source: 'download',
+    files: ['inpainter'],
+    group: null,
+    importId: null,
+    disables: ['lama'],
+    roleKey: 'settings.cleaning.role.lama',
+    removeKey: 'settings.models.remove.lama',
+  },
+])
+
+/**
+ * The sections Settings draws, in order, each with the logical models it
+ * holds. `pipeline` is the Settings tab the section lives on.
+ */
+export const CAPABILITIES = Object.freeze([
+  { id: 'findRegions', pipeline: 'detection', headingKey: 'settings.detection.capability.findRegions', noteKey: 'settings.detection.capability.findRegionsNote', models: ['ctd', 'rtSmall', 'rtFull'] },
+  { id: 'shapeMask', pipeline: 'detection', headingKey: 'settings.detection.capability.shapeMask', noteKey: 'settings.detection.capability.shapeMaskNote', models: ['samTs'] },
+  { id: 'sfx', pipeline: 'detection', headingKey: 'settings.detection.capability.sfx', noteKey: 'settings.detection.capability.sfxNote', models: ['coo'] },
+  { id: 'japanese', pipeline: 'detection', headingKey: 'settings.detection.capability.japanese', noteKey: 'settings.detection.capability.japaneseNote', models: ['scriptGate', 'mangaOcr'] },
+  { id: 'rebuild', pipeline: 'cleaning', headingKey: 'settings.cleaning.capability.rebuild', noteKey: 'settings.cleaning.capability.rebuildNote', models: ['lama'] },
+])
+
+/** @param {string} id @returns {LogicalModel|null} */
+export function model(id) {
+  return MODELS.find((entry) => entry.id === id) ?? null
+}
+
+/**
+ * The logical model a catalogue file belongs to, or null for a file no model
+ * claims (a weight the backend added before this table knew it).
+ *
+ * @param {string} fileId
+ * @returns {LogicalModel|null}
+ */
+export function modelOfFile(fileId) {
+  return MODELS.find((entry) => entry.files.includes(fileId)) ?? null
+}
+
+/**
+ * What removing a logical model, or any one of its files, stops. A group
+ * member answers for its whole group: the native delete removes the group as
+ * one unit. Another model's files are never part of the answer, so removing
+ * Japanese filtering or OCR never names the shared RT-DETR weights.
+ *
+ * @param {string} id - a logical model id or a catalogue file id
+ * @returns {{model: LogicalModel, files: string[], disables: string[]}|null}
+ */
+export function removalImpact(id) {
+  const entry = model(id) ?? modelOfFile(id)
+  if (!entry || entry.source === 'excluded') return null
+  return { model: entry, files: [...entry.files], disables: [...entry.disables] }
+}
+
+/**
+ * Whether the workflow the choices select uses a logical model, so a removal
+ * can add that it stops the cleaning in force now.
+ *
+ * @param {string} id
+ * @param {{textPolicy?: string, detection?: Record<string, string|null>|null, ocrRescue?: boolean}} [choices]
+ */
+export function usedNow(id, choices = {}) {
+  return workflowNeeds(choices).includes(id)
 }
 
 /**

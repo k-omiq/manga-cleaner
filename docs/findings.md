@@ -668,6 +668,41 @@ Windows or Linux, and a one-machine number is never written as though it were ge
 
 ## What has not been measured
 
+- **The engine star ratings in setup and Settings.** Efficiency and Lightweight, out of five,
+  in `src/lib/model/pipelines.js`, are provisional: they come from file sizes and the per-page
+  timings above, not from one benchmark run over every engine on the same pages. The engines
+  marked Soon (RT-DETR v2 + COO + SAM-TS, Big LaMa, Qwen-Image-Edit-2511) and the FLUX family
+  have never been benchmarked here, so their stars are estimates from published model sizes.
+  Replace each row's `rating` once a common benchmark exists.
+- **Per-language detection selects languages, not detectors.** The run now reads
+  `session.detection` (`RunSelection::from_args` in `src-tauri/src/run.rs`): a skipped language is
+  held for review at clean time, a run with every language skipped refuses with a notice, and the
+  Japanese choice with OCR turns the rescue on. Every enabled language still runs the same
+  CTD + RT-DETR detector, because it is the only legacy detector there is. An outside-bubble
+  opt-in region under a partial selection is held for review, since nothing tells which language
+  it belongs to.
+- **The text-shaped detection path is review evidence on one machine.** RT-DETR v2 and SAM-TS-L
+  mask-only ONNX exports exist and are wired as the optional text-shaped review
+  (`docs/model-workflow-benchmarks.md`, `docs/component-write-contract.md`). COO MTSv3 is excluded
+  while its rights are unresolved. The RT full graph does not merge boxes across its two-tile seam,
+  which reference parity depends on. A small whole-page RT run cannot be stopped mid-run (about
+  86 ms); cancel takes effect after it returns. Evicting parked sessions before SAM means CTD,
+  LaMa and the sidecar reload on next use, at a cost not measured. Completed analysis request ids
+  stay in memory as small single-use tombstones for the life of the process.
+- **The review's canvas tints and cloud analysis flow were seen only in Chromium.** The SAM mask
+  and W tints are now source-pixel canvases (`src/lib/dialogs/MaskTint.svelte`) instead of CSS
+  luminance masks, and were checked for exact pixel counts at fit, 1:1 and 400% in the Vite mock.
+  Nobody has looked at them, or at the cloud consent, progress and review-only screens, in the
+  shipped macOS 11 WKWebView, where `getImageData` on a decoded data URL is expected but not
+  confirmed to be untainted. The cloud flow has run only against the mock endpoint.
+- **The FLUX, Big LaMa and Qwen cleaners have no downloader.** FLUX models come from the
+  separate helper and show as Via helper when it lists them; Big LaMa and Qwen are drawn
+  disabled.
+- **The tray template icon has not been seen in a real menu bar.** A monochrome template image
+  now ships (`src-tauri/assets/tray/`), made from a script and checked only as a file. On a 1x
+  screen AppKit downscales the 36 px image, and nobody has looked at the result. The non-macOS
+  branch was not compiled here. Close-to-tray, the tray click and the single-instance guard have
+  not been run on Windows or Linux.
 - **Nothing has been executed on Windows or Linux.** Every DirectML and CUDA entry is an
   unmeasured candidate, reported as such, with no measured peak, so the memory gate never fires
   on one. The same holds for custom-protocol throughput there: no number is offered and the tile
@@ -703,8 +738,8 @@ Windows or Linux, and a one-machine number is never written as though it were ge
   rather than from a file Photoshop wrote. No text layer is written at all, so the vertical-text
   hazard this item once named is moot. Beside it: the large-document variant is not written and a
   page over 30 000 px a side is refused rather than promoted to it; the 2 GB file-size ceiling is
-  computable before the first byte and is not computed, so a large layered set could produce a
-  file Photoshop refuses and be reported as exported; a stitched PSD is refused although a
+  now computed before the first byte and a larger file is refused, but the limit comes from the
+  specification and no file near it has been opened in Photoshop; a stitched PSD is refused although a
   row-streamed background would make it possible; an indexed or sub-8-bit page is refused rather
   than promoted, because the statement a promotion would need has nowhere to reach the interface;
   and the file carries no provenance record, so a typesetter cannot tell from it which engine
@@ -712,7 +747,9 @@ Windows or Linux, and a one-machine number is never written as though it were ge
 - **A chapter written before pages were imported into the library is not migrated,** and behaves
   exactly as it did, including breaking if the scan folder goes. Nothing hashes the original a
   converted page was made from either, so replacing that original after the chapter exists is
-  neither honoured nor reported, and there is no free-space check in front of the doubled write.
+  neither honoured nor reported. The import now checks free space before the doubled write, with
+  an estimate that errs high, so it may refuse a chapter that would have fit. Retained Try again
+  revisions of legacy regions also use disk, and nothing prunes them.
 - **The rescue's thresholds are floors with reasons rather than measurements.** All twelve rescues
   came back fully Japanese and every reading that failed the share test failed it at zero, so the
   whole evidence is two clusters with the band between them empty and the threshold placed in the
@@ -728,9 +765,12 @@ Windows or Linux, and a one-machine number is never written as though it were ge
   calls sure although the two questions differ in what a wrong yes costs: painting over art there,
   a review row here. The lowest box adopted scored 0.53 and nothing between 0.5 and 0.53 was seen
   either way. No threshold seed fallback was written for an adopted box with no segmentation under
-  it, because every one of them had segmentation; and a box straddling a segment cut is kept only
-  where it lies wholly inside a crop, so one taller than the detection overlap is adopted by
-  neither, which only a long strip could produce and no strip fixture does.
+  it, because every one of them had segmentation. A box straddling a segment cut and taller than
+  the detection overlap is now joined across the cut and held for review at its full extent
+  (`a_box_taller_than_the_strip_overlap_is_held_at_its_full_extent`), on a synthetic strip only. The
+  top fragment is processed as an ordinary box before the next crop confirms the join; the join then
+  replaces that provisional result with the one held row, so the work may be wasted but nothing is
+  painted.
 - **The inner paper reading's margin is two points wide on one scan set,** 28 pages of one title
   screened at one line count: the narration boxes reach 14 per cent, the allowance is 16 and the
   nearest thing that must not pass is at 19. A finer or lighter tone puts fewer dots off a capped
@@ -749,11 +789,11 @@ Windows or Linux, and a one-machine number is never written as though it were ge
 - **A Manga109-trained detector,** which would have answered the free-text and sound-effect
   questions directly, is blocked twice over: the published ones are AGPL through their training
   framework, and the dataset that would let one be trained here is licence-gated.
-- **An optional model that will not open is silent.** The reader is attached when its three files
-  are present and the gate falls back without it when opening fails, on a truncated download, a
-  vocabulary that does not match, or a provider that refuses the graph. That is the right
-  behaviour and the wrong reporting, against the rule that every refusal is named. The failure has
-  not been observed.
+- **An optional model that will not open is now named, and was tested only in part.** When the
+  reader fails to open, the run goes on without it and raises `notice.run.ocrRescueUnavailable`
+  with the reason. The zero-byte truncation case runs in the tests. The case of a nonempty corrupt
+  file is skipped when the gate weights are absent. A failure in a real install has not been
+  observed.
 - **The redraw sidecar's return to its floor between regions,** instrumented and never judged
   for want of a threshold. Nor does its allocator fail fast: the limit is documented upstream as
   a guideline, and a 1024² render exceeded a 12 GB limit by 440 MB and completed normally. What
@@ -764,17 +804,18 @@ Windows or Linux, and a one-machine number is never written as though it were ge
 - **The disagreement between two harnesses on one machine,** 1.7× to 2.1× on the same models.
   The in-process rung peaks came off the same tool that produced the wrong sidecar figure and
   may be the same wrong line of its output.
-- **Nothing in the cloud path has run against a real Modal or Beam account.** Every test of it uses
-  fakes: stand-ins for the two provider SDKs, checked against the SDKs' own source, loopback
-  gateways, and the gateway app driven in process. The first real setup is therefore the first live
-  test of each of these. On Modal: that the edge proxy's auth holds with the headers the app sends,
-  that the access token can be allowed on both RBAC and non-RBAC workspaces, how long results are
-  retained, the Dict size limits, and the length limit on the web URL's label. On Beam: how an HTTP
-  enqueue body maps to task arguments, the shape of the task id answer, reading a Map from inside a
-  container, the invoke URL's format, the name and id filters, what `authorized` actually checks,
-  and whether RTX5090 runs the CUDA 12.9 wheels. Image build time, GPU memory at 24 GB, cold start
-  and the cost of one render are all unmeasured, and the consent dialog shows no estimate because no
-  gateway reports one.
+- **The cloud path has run once on a real Modal account, never on Beam.** On 25 September 2026
+  the setup helper deployed to workspace `k-omiq` on an L4 and a contract client rendered a
+  synthetic 512x384 crop; the numbers are in [cloud-work-log.md](cloud-work-log.md). Setup took
+  191 s, a cold render 71 s and a warm one 10 s, the pipeline held about 7.0 GiB of GPU memory,
+  cancel, recovery after scale to zero and cleanup worked, and the whole run metered $0.10 to $0.15, covered by Modal's credits. The
+  desktop app did not drive it: the Rust client, the keychain and the consent flow in WKWebView
+  are still untested live, and so are real manga crops, larger crops, a workspace with environment
+  access control, how long results are retained, the Dict size limits and a render past its
+  15-minute bound. The gateway reports no cost, so the consent dialog still shows none. Nothing
+  has run on Beam: how an HTTP enqueue body maps to task arguments, the shape of the task id
+  answer, reading a Map from inside a container, the invoke URL's format, the name and id filters,
+  what `authorized` actually checks, and whether RTX5090 runs the CUDA 12.9 wheels are all unknown.
 - **The request limits the cloud runs under are the drafted ones.** The wire contract's size and
   pixel limits were written before any measurement, and cloud execution now runs with them as host
   safety ceilings. None has been checked against what a provider accepts or what the GPU renders
@@ -787,11 +828,13 @@ Windows or Linux, and a one-machine number is never written as though it were ge
   ignore file are untested there. The release workflow's helper build step has not run either; a
   build without the helper refuses setup with a typed error rather than looking for a Python on the
   machine.
-- **A few narrow windows where the account and the app can disagree.** Modal's access token is
-  created before the setup journal records it, so a helper killed between the two leaves a token in
-  the account that cleanup does not know about. A render past its 15-minute interactive bound stays
-  accepted until the next start resumes waiting on it. Two settings writes at the same moment can
-  still race, and the later one wins whole. The gateway reads its own job records through the Modal
+- **A few narrow windows where the account and the app can disagree.** The setup journal now
+  records the intent to create Modal's access token before the token exists, so a helper killed
+  between the two is detected on the next start as an orphaned token (`ERR_ORPHANED_TOKEN`). The
+  app cannot delete that token itself: the user removes it in the Modal dashboard, resume stays
+  blocked, and recovery is Cleanup and then a new setup. A render past its 15-minute interactive
+  bound stays accepted until the next start resumes waiting on it. Settings writes are now
+  serialised by one lock. The gateway reads its own job records through the Modal
   SDK, which unpickles them; the records are written by the app's own worker inside the user's
   account, so the trust boundary is the account, and nothing narrower has been added.
 - **Beam cleanup empties the job map but cannot delete it.** beta9 0.1.268 has no call that removes
@@ -808,6 +851,69 @@ Windows or Linux, and a one-machine number is never written as though it were ge
 - **The cloud interface has not run in the shipped webview.** It is tested in jsdom and was walked
   through in a Chromium mock. The app ships WKWebView on macOS, where focus and event timing differ,
   and no `cloud://attempt` or `provision://progress` event has yet crossed a real Tauri bridge.
+- **The M0 failure ledger has no human labels.** `spikes/m0-ledger` runs the current pipeline on
+  real pages and writes one row per region with its artifacts. On three of the user's scans it gave
+  22 regions: 21 cleaned and 1 held by policy. Missed discovery, a weak mask and bad inpainting are
+  categories only a person can assign, so those columns are empty. A detector seed the pipeline
+  drops as empty gets no row. The raw crop and ink are proxies and carry a `_proxy` name; the
+  pipeline does not expose its true base mask or candidate box. Times are CPU only (61.1 s, 19.7 s
+  and 27.4 s) and the peak RSS is cumulative for the process.
+- **No labeled holdout exists, so M5's exit has no numbers.** `spikes/holdout-metrics` computes
+  instance and page recall, text-pixel recall, non-text exposure, protected-art damage, false
+  candidates per page and correction time from labels, by slice. Nobody has labeled a page, and
+  no human mask or reconstruction review has run. The padding default, mask threshold, crop
+  overlap and provider limits wait on those numbers.
+- **The underlay read sizes are measurements, not budgets.** On a synthetic 4000x6000 page with 96
+  intersecting and 32 outside patches, the Gray8 window was 2,611,456 B with a 45,236,224 B peak RSS
+  and a 624 ms read; the RGB8 window was 7,834,368 B with a 126,812,160 B peak and a 1,462 ms read.
+  No cache was added. Real page histories and GPU paths were not measured.
+- **Needs review's Undo is the chapter's last action.** It reverses the latest journal entry, not the
+  specific change that flagged the layer, and is labeled "Undo last action". Undoing the one causing
+  change is not built.
+- **Cloud analysis (M7) has run only against fakes.** Consent, grants, the journal, tile submission,
+  validation, stitching and review-only evidence are tested with an in-process contract fake and the
+  Python gateway driven in process; no actual HTTP loopback test drives the analysis path end to end.
+  The gateway answers each tile in one synchronous request, so there is no poll handle and no remote
+  cancel: Cancel stops the tiles not yet sent, and a tile already sent runs to its end. Remote
+  evidence lives in memory and is lost on restart. No real Modal or Beam account has run it, so
+  latency, transfer time, GPU and host memory, the bill, provider retention and training terms, and
+  cleanup are all unknown, and the consent screen shows the cost as unknown. Whether remote SAM is
+  worth an upload has not been measured against the local path.
+- **Long-strip joins are safe, not complete.** A box touching the bottom of one crop is cleaned
+  before the next crop can confirm that it continues. When the join is confirmed, the provisional
+  result is replaced by one held review row and never painted, so that work may be wasted. A real
+  tall fragment pair with strong sideways drift across a cut stays as two held review rows. The
+  whole-strip box merger can still combine strongly overlapping detections before the continuation
+  check sees them.
+- **Workflow status trusts a file's size and time.** The status view caches graph and runtime
+  digests by path, size and modification time, so an edit that keeps both reads as verified there.
+  Analysis, writes and the explicit Check still hash in full. Memory readiness counts parked CTD,
+  LaMa and sidecar sessions as room that can be freed without knowing their size; analysis evicts
+  them, checks again and refuses by name if room is still short. In Settings, a Check that fails for
+  another reason, such as a missing or unreadable file, makes the all-text summary say the checksum
+  failed, while the model's own row shows the actual error.
+- **The underlay predecessor digest follows manifest row order,** not z-order. A hand-reordered
+  manifest changes the digest and reads as drift. Changing that needs a versioned hash and a reader
+  migration.
+- **Some cloud edges are handled in the interface only.** A cloud render that lands on a mask
+  deleted while it was pending is ignored by the interface; what the real backend does there is not
+  verified. A plain undo pressed while a render is pending undoes the previous, unrelated entry, and
+  the landing render then clears the redo stack. Settings checks that the runtime loads through
+  `diagnostics`, but first-launch setup and the text-shaped review's readiness still count an
+  installed runtime as ready. The orphaned-token recovery text names Modal's "Settings, then Proxy
+  Auth Tokens" path, which was not checked against Modal's current dashboard.
+- **No analysis worker is deployed by setup.** The Modal and Beam deployments do not upload SAM or
+  RT graphs to the user's account, because the rights decision forbids the app hosting or
+  distributing them. A live analysis route therefore answers a structured 503 until someone deploys
+  graphs there. Starlette is not installed here, so the Beam mount test is skipped.
+- **The cloud analysis interface has known gaps.** The capability list shows SAM and RT until the
+  first request asks the endpoint, because listing on open would wake a paid endpoint. A cloud
+  result replaces the local review of that page. File errors and three internal tile-planner errors
+  still show the generic failure text.
+- **Cloud recovery fails closed on old records.** Attempt records written before the underlay
+  hashes existed now read as stale, so such a result cannot attach. Revoking a cloud profile leaves
+  its unconfirmed proposals in a bounded in-memory cache until they expire; the profile epoch
+  refuses them at confirm.
 - **The old cloud review causes are still read.** The native library index (`library.rs`) and the
   frontend review model still map the review states of the earlier cloud design (a rejected request,
   an accepted one). Nothing writes them any more and no released build ever did, but removing them

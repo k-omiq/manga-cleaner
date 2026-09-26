@@ -222,6 +222,28 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+      - name: Verify cloud helper inside macOS app
+        if: startsWith(matrix.platform, 'darwin-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          HELPER="target/${{ matrix.target }}/release/bundle/macos/Manga Cleaner.app/Contents/MacOS/manga-cleaner-provisioner"
+          test -x "$HELPER"
+          "$HELPER" --self-check | python3 -c 'import json,sys; assert json.load(sys.stdin)["ok"] is True'
+      - name: Verify cloud helper inside Windows installer
+        if: startsWith(matrix.platform, 'windows-')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Get-ChildItem "target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer was not produced' }
+          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) { $sevenZip = Join-Path $env:ProgramFiles '7-Zip/7z.exe' }
+          if (-not (Test-Path $sevenZip)) { throw '7-Zip is required to inspect the NSIS installer' }
+          $listing = & $sevenZip l -slt $installer.FullName
+          if ($LASTEXITCODE -ne 0 -or -not ($listing | Select-String -Quiet 'Path = .*manga-cleaner-provisioner\.exe$')) {
+            throw 'The Windows installer does not contain manga-cleaner-provisioner.exe'
+          }
       - name: Collect updater artifacts
         shell: bash
         # Renamed to MangaCleaner_<version>_<platform>.<ext>: the platform tag keeps

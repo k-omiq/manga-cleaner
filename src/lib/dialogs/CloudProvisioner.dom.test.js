@@ -11,7 +11,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/svelte'
 import { tick } from 'svelte'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createMockBackend, PROVISION_APPLY_STEPS } from '../api/mock.js'
+import { createMockBackend, PINNED_CLOUD_MODEL_ID, PROVISION_APPLY_STEPS } from '../api/mock.js'
 import { t } from '../i18n/index.js'
 import { clearNotices } from '../state/app.svelte.js'
 import CloudProvisioner, { isValidInstallationId, isValidPlanHash } from './CloudProvisioner.svelte'
@@ -249,6 +249,51 @@ describe('CloudProvisioner helper validations', () => {
 })
 
 describe('setting up end to end on the mock backend', () => {
+  it('identifies a missing bundled helper without blaming the network', async () => {
+    render(CloudProvisioner, {
+      props: {
+        inline: true,
+        installationId: ID,
+        backend: createMockBackend({ timing: ZERO }),
+        runCloudProvisioner: scripted({ inspect: refused('ERR_HELPER_MISSING') }),
+      },
+    })
+    await typeModalKeys()
+    await fireEvent.click(button(t('settings.cloud.setup.connect.continue')))
+    expect(await screen.findByText(t('settings.cloud.setup.error.helperMissing'))).toBeTruthy()
+    expect(screen.queryByText(t('settings.cloud.setup.error.unavailable'))).toBeNull()
+  })
+
+  it('imports Modal’s copyable command and uses its token for inspect and plan', async () => {
+    const runner = scripted({
+      inspect: (spec) => {
+        expect(spec.params.credentials).toEqual(MODAL)
+        return ok({ eligible: true, workspace_name: 'k-omiq' })
+      },
+      plan: (spec) => {
+        expect(spec.params.credentials).toEqual(MODAL)
+        return ok(planData())
+      },
+    })
+    render(CloudProvisioner, {
+      props: { inline: true, installationId: ID, backend: createMockBackend({ timing: ZERO }), runCloudProvisioner: runner },
+    })
+
+    await typeKey(
+      'settings.cloud.setup.connect.modalCommand',
+      'modal token set --token-id ak-test-id --token-secret as-test-secret --profile=k-omiq',
+    )
+    expect(screen.getByText(t('settings.cloud.setup.connect.modalCommandImported', { profile: 'k-omiq' }))).toBeTruthy()
+    expect(/** @type {HTMLInputElement} */ (screen.getByLabelText(t('settings.cloud.setup.connect.modalCommand'))).value).toBe('')
+    expect(/** @type {HTMLInputElement} */ (screen.getByLabelText(t('settings.cloud.setup.connect.modalTokenId'))).value).toBe(MODAL.token_id)
+    expect(/** @type {HTMLInputElement} */ (screen.getByLabelText(t('settings.cloud.setup.connect.modalTokenSecret'))).value).toBe(MODAL.token_secret)
+    await fireEvent.click(button(t('settings.cloud.setup.connect.continue')))
+    await heading('settings.cloud.setup.heading.review')
+    expect(screen.getByText('k-omiq')).toBeTruthy()
+    expect(runner).toHaveBeenCalledTimes(2)
+    expect(stored()).not.toContain(MODAL.token_secret)
+  })
+
   it('reviews the plan, runs the checklist, and hands over the saved endpoint', async () => {
     const backend = createMockBackend({ timing: ZERO })
     /** @type {any[]} */
@@ -267,6 +312,7 @@ describe('setting up end to end on the mock backend', () => {
     const gpu = /** @type {HTMLSelectElement} */ (screen.getByLabelText(t('settings.cloud.setup.review.gpu')))
     expect(Array.from(gpu.options, (option) => option.value)).toEqual(['L4', 'A10', 'L40S'])
     expect(gpu.value).toBe('L4')
+    expect(screen.getByText(PINNED_CLOUD_MODEL_ID)).toBeTruthy()
     const idle = /** @type {HTMLSelectElement} */ (screen.getByLabelText(t('settings.cloud.setup.review.idle')))
     expect(idle.value).toBe('120')
     for (const name of [`mc-weights-${ID}`, `mc-jobs-${ID}`, `mc-${ID}`, `mc-token-${ID}`]) {
@@ -691,5 +737,53 @@ describe('deleting what a setup created', () => {
     await heading('settings.cloud.setup.heading.cleaned')
     expect(screen.getByText(t('settings.cloud.setup.cleanup.doneEmpty', { providerKey: BEAM_KEY }))).toBeTruthy()
     expect(oncleaned).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('a Modal token setup could not record', () => {
+  it('names it, lists the way out in order, offers Clean up and not Resume, and shows none of the helper’s own words', async () => {
+    const orphaned = {
+      success: false,
+      data: null,
+      error: {
+        code: 'ERR_ORPHANED_TOKEN',
+        message: 'helper message with as-leaked-secret',
+        actionable_guidance: 'helper guidance with as-leaked-secret',
+        remedy_steps: ['helper step one with as-leaked-secret', 'helper step two'],
+      },
+    }
+    const runner = scripted({
+      inspect: ok({ eligible: true }),
+      plan: ok(planData()),
+      apply: orphaned,
+      cleanup_plan: ok({ plan_hash: HASH, resources_to_delete: [{ type: 'app', name: `mc-${ID}` }], foreign_resources_ignored: [] }),
+    })
+    render(CloudProvisioner, { props: { inline: true, installationId: ID, runCloudProvisioner: runner, backend: handBackend().backend } })
+    await connectModal()
+    await approveAndStart()
+
+    await heading('settings.cloud.setup.heading.failed')
+    const alert = screen.getByRole('alert')
+    expect(alert.textContent).toContain(t('settings.cloud.setup.error.orphanedToken'))
+    expect(alert.textContent).not.toContain(t('settings.cloud.setup.error.generic'))
+    expect(alert.textContent).toContain(t('settings.cloud.setup.failed.code', { code: 'ERR_ORPHANED_TOKEN' }))
+
+    // The three steps, in the catalogue's words and in order, under a heading
+    // that names them.
+    const steps = screen.getByRole('list', { name: t('settings.cloud.setup.orphaned.heading') })
+    expect(within(steps).getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+      t('settings.cloud.setup.orphaned.dashboard'),
+      t('settings.cloud.setup.orphaned.cleanup'),
+      t('settings.cloud.setup.orphaned.again'),
+    ])
+    expect(document.body.textContent).not.toContain('as-leaked-secret')
+    expect(document.body.textContent).not.toContain('helper step two')
+
+    // Resume stays blocked; nothing here says it would pick up.
+    expect(screen.queryByRole('button', { name: t('settings.cloud.setup.failed.resume') })).toBeNull()
+    expect(screen.queryByText(t('settings.cloud.setup.failed.kept'))).toBeNull()
+    await fireEvent.click(button(t('settings.cloud.setup.failed.cleanup')))
+    await heading('settings.cloud.setup.heading.cleanup')
+    expect(runner).toHaveBeenLastCalledWith({ op: 'cleanup_plan', provider: 'modal', params: { installation_id: ID } })
   })
 })

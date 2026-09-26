@@ -1,4 +1,32 @@
 fn main() {
+    // A release app without this sidecar shows Cloud but cannot connect to
+    // either provider. Fail the build instead of shipping that broken state.
+    if std::env::var("PROFILE").as_deref() == Ok("release") {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let target = std::env::var("TARGET").expect("cargo sets TARGET for build scripts");
+        let config: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(manifest.join("tauri.conf.json")).expect("read Tauri config"),
+        )
+        .expect("parse Tauri config");
+        let bundled = config["bundle"]["externalBin"]
+            .as_array()
+            .is_some_and(|bins| bins.iter().any(|bin| bin == "binaries/manga-cleaner-provisioner"));
+        assert!(
+            bundled,
+            "release build is missing bundle.externalBin for the cloud helper; run .github/scripts/build-cloud-provisioner.py first"
+        );
+        let suffix = if target.contains("windows") { ".exe" } else { "" };
+        let helper = manifest
+            .join("binaries")
+            .join(format!("manga-cleaner-provisioner-{target}{suffix}"));
+        assert!(
+            helper.is_file(),
+            "release build is missing {}. Freeze the cloud helper for this target first",
+            helper.display()
+        );
+        println!("cargo:rerun-if-changed={}", helper.display());
+        println!("cargo:rerun-if-changed=tauri.conf.json");
+    }
     // `crate::provision` looks for the development sidecar under the name the
     // release script gives it, which ends in the target triple.
     println!(

@@ -540,6 +540,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "chapter-rtdetr"
+version = "1.0.0-beta.2"
+dependencies = [
+ "anyhow",
+ "cleaner-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2422,6 +2432,7 @@ name = "manga-cleaner"
 version = "1.0.0-beta.2"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "cleaner-core",
  "flate2",
  "getrandom 0.3.4",
@@ -2429,6 +2440,7 @@ dependencies = [
  "keyring",
  "libc",
  "ort",
+ "png 0.18.1",
  "reqwest",
  "serde",
  "serde_json",
@@ -4197,6 +4209,18 @@ dependencies = [
  "anyhow",
  "cleaner-core",
  "ort",
+]
+
+[[package]]
+name = "spike-m0-ledger"
+version = "1.0.0-beta.2"
+dependencies = [
+ "anyhow",
+ "cleaner-core",
+ "libc",
+ "manga-cleaner",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

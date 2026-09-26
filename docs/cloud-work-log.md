@@ -732,3 +732,43 @@ The milestone count does not change: every phase from P5 on still needs live
 evidence. P5 to P9 are implemented offline. P10 is not implemented: chapter
 runs stay local only. P11 is partial: CPU-only CI and the release step exist,
 and nothing has run end to end against a real account.
+
+## Live Modal check (2026-09-25; uncommitted)
+
+The user signed the Modal CLI in to workspace `k-omiq` and approved one live run on
+the FLUX render path, with cleanup afterwards. Beam has no account, so nothing ran
+there. Cloud text analysis (M7) did not run: setup deploys no analysis worker.
+
+**How it ran.** The setup helper ran from this checkout (`python -m provisioner`,
+Modal SDK 1.5.5) with a scratch journal. A small script played the desktop's part: it
+read the API token from `~/.modal.toml` and passed it on stdin, and nothing printed it.
+Renders went through a Python client written to the `/mc/v1` contract, not through the
+desktop's Rust client, keychain or interface. The crop was synthetic: a 512x384 speech
+balloon with two lines of text on a dot tone, and a dilated text mask as the hint.
+Installation `mc-lv0925`, GPU L4, idle 120 s.
+
+| Step | Result |
+| --- | --- |
+| `inspect`, `plan` | Signed in, workspace `k-omiq`, environment `main`; plan listed a volume, a dict, the app and one proxy token |
+| `apply` | Completed in 190.7 s: image build 124.4 s, deploy 2.6 s, weights 52.3 s for 5,475,930,180 bytes, token 2.3 s, health 6.5 s |
+| `probe_compatibility` | Compatible, 997.6 ms, no GPU started |
+| `/health` without the proxy token | HTTP 401 at Modal's edge |
+| Cold render | Accepted in 2.39 s (16,560 bytes uploaded); running at 46.3 s; completed at 67.6 s; result 217,384 bytes in 3.29 s; 70.9 s from submit to result |
+| Warm render (twice) | Completed at 7.9 s; 10.2 s and 10.0 s from submit to result |
+| Determinism | Cold and warm results are the same bytes, and match the digest in the status document |
+| Cancel after 1 s on a warm worker | Cancel acknowledged in 1.41 s; status `cancelled` at 5.0 s; no result |
+| GPU memory | 7,176 MiB with the pipeline loaded; at most 7,180 MiB sampled every 250 ms during a render; L4 total 23,034 MiB |
+| Host memory | Worker process RSS 7,121,456 kB after renders; a torch compile helper 5,213,984 kB (shared pages may count twice). The sandbox has no peak counter |
+| Recovery after scale to zero | Status and result of the cold job still answered (HTTP 200, digest matches, 3.91 s). Only a CPU gateway container started, with no GPU |
+| Refusals | Unknown handle: 404 `not_found`. Wrong request digest: 400 `invalid_digest`, `enqueued: false`, `retryable: false` |
+| `cleanup_plan`, `cleanup_apply` | Deleted the proxy token, app, dict and volume in 3.8 s; none missing. Afterwards the CLI lists no volume, dict or container, the app record reads `stopped`, and the old proxy token gets HTTP 401 |
+| Bill (`modal billing`) | Metered $0.15 just after the renders (deployed apps $0.14, ephemeral $0.01) and $0.10 a few minutes after cleanup, as Modal settled its metering; covered by credits; billed $0.00. Per resource for the app: L4 $0.0631, CPU $0.0181, memory $0.0090 |
+
+The gateway reported no cost (`reported_cost_usd` null), so the consent dialog still
+shows the cost as unknown. The billing report also listed an A10G line at $0 for the
+app; the worker ran on an L4.
+
+**Not covered by this run:** the desktop app driving setup and renders (Rust client,
+keychain, WKWebView consent), real manga crops, larger crops, a Modal workspace with
+environment access control, how long job records stay readable, Dict size limits, a
+render past the 15-minute bound, a setup interrupted live, and every Beam item.

@@ -14,11 +14,13 @@ mod history;
 pub mod inference;
 mod library;
 mod models;
+mod model_workflows;
 pub mod provision;
 mod region;
 pub mod run;
 mod settings;
 mod tile;
+mod underlay;
 mod weights;
 
 /// The tray icon's id, so close-to-tray can check the icon exists.
@@ -30,13 +32,18 @@ pub fn run() {
     tauri::Builder::default()
         // First, so a second launch while the window is hidden in the tray
         // shows this one instead of starting another copy.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main(app)
+        }))
         .setup(|app| {
-            use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
+            use tauri::{
+                menu::{Menu, MenuItem},
+                tray::TrayIconBuilder,
+            };
             let show = MenuItem::with_id(app, "show", "Show Manga Cleaner", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit Manga Cleaner", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &quit])?;
-            let mut tray = TrayIconBuilder::with_id(TRAY_ID)
+            let tray = TrayIconBuilder::with_id(TRAY_ID)
                 .menu(&menu)
                 .tooltip("Manga Cleaner")
                 // A menu-bar icon opens its menu on click on macOS. Elsewhere a
@@ -61,9 +68,20 @@ pub fn run() {
                     "quit" => app.exit(0),
                     _ => {}
                 });
-            if let Some(icon) = app.default_window_icon() {
-                tray = tray.icon(icon.clone());
-            }
+            // The macOS menu bar wants a template image, black plus alpha,
+            // which the system tints to match a light or dark menu bar; the
+            // full-colour app icon would not follow it. The asset and its
+            // generator live in `assets/tray/`. Other platforms keep the app
+            // icon.
+            #[cfg(target_os = "macos")]
+            let tray = tray
+                .icon(tauri::include_image!("assets/tray/tray-template@2x.png"))
+                .icon_as_template(true);
+            #[cfg(not(target_os = "macos"))]
+            let tray = match app.default_window_icon() {
+                Some(icon) => tray.icon(icon.clone()),
+                None => tray,
+            };
             // Not fatal: a Linux desktop without an AppIndicator host has no
             // tray, and the editor works without one. Close-to-tray checks
             // that the icon exists before it hides the window.
@@ -107,6 +125,11 @@ pub fn run() {
             settings::read_settings,
             settings::write_settings,
             inference::commands::read_inference_config,
+            inference::analysis::list_remote_analysis_capabilities,
+            inference::analysis::propose_remote_analysis,
+            inference::analysis::confirm_remote_analysis,
+            inference::analysis::cancel_remote_analysis,
+            inference::analysis::get_remote_analysis_status,
             inference::commands::write_inference_config,
             inference::commands::store_cloud_secret,
             inference::commands::delete_cloud_secret,
@@ -141,6 +164,7 @@ pub fn run() {
             library::delete_chapter,
             library::delete_mask,
             library::restore_region,
+            library::keep_dependency_result,
             region::apply_tool,
             region::create_region,
             region::rerun_mask,
@@ -153,12 +177,27 @@ pub fn run() {
             models::list_loaded_models,
             models::unload_model,
             models::list_accelerators,
+            model_workflows::list_workflow_capabilities,
+            model_workflows::import_full_rt,
+            model_workflows::remove_full_rt,
+            model_workflows::import_sam_ts,
+            model_workflows::remove_sam_ts,
+            model_workflows::verify_sam_ts,
+            model_workflows::analyze_capabilities,
+            model_workflows::analyze_chapter_page,
+            model_workflows::cancel_capability_analysis,
+            model_workflows::load_component_correction,
+            model_workflows::prepare_component_write,
+            model_workflows::apply_component_write,
             weights::list_models,
             weights::download_model,
+            weights::download_model_group,
             weights::cancel_download,
             weights::delete_model,
+            weights::delete_model_group,
             weights::discard_partial,
             weights::verify_model,
+            weights::verify_model_group,
             weights::download_runtime,
             weights::delete_runtime,
             run::run_clean,

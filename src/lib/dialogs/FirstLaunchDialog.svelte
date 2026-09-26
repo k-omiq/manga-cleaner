@@ -242,7 +242,7 @@
 
   <main class="stage">
     {#key step}
-      <section class="step" class:wide={WIDE.includes(step)} class:welcome={step === 'welcome'}>
+      <section class="step" class:wide={WIDE.includes(step)}>
         <h1 class="heading" class:hero={step === 'welcome'} tabindex="-1" bind:this={heading}>
           {t(HEADINGS[/** @type {keyof typeof HEADINGS} */ (step)])}
         </h1>
@@ -323,18 +323,21 @@
     overflow-y: auto;
     display: flex;
     justify-content: center;
-    padding: clamp(48px, 12vh, 120px) 24px 32px;
+    padding: 48px 24px;
   }
 
+  /* Auto block margins centre the step in the stage while it fits, and fall
+     to zero once it does not, so a tall step scrolls from its heading instead
+     of being clipped above the fold as `align-items: center` would. */
   .step {
     display: flex;
     flex-direction: column;
     width: 100%;
     max-width: 520px;
+    margin-block: auto;
     animation: mcIn var(--dur-slow) var(--ease);
   }
   .step.wide { max-width: 680px }
-  .step.welcome { padding-top: clamp(0px, 8vh, 80px) }
 
   .heading {
     margin: 0 0 var(--s-6);

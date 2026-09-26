@@ -51,9 +51,15 @@ pub const MAX_CACHED_GRANTS: usize = 256;
 /// Maximum number of region IDs in a single grant scope.
 pub const MAX_REGIONS_PER_GRANT: usize = 1024;
 
+pub const FLUX_CAPABILITY: &str = "flux_render@1";
+
+fn default_capability() -> String { FLUX_CAPABILITY.to_string() }
+
 /// Immutable scope binding for an authorization grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantScope {
+    #[serde(default = "default_capability")]
+    pub capability: String,
     pub provider: CloudProvider,
     pub profile_id: String,
     pub canonical_endpoint_fingerprint: String,
@@ -64,6 +70,10 @@ pub struct GrantScope {
     pub crop_bounds: Rect,
     pub mask_hash: String,
     pub revision: u64,
+    #[serde(default)]
+    pub input_sha256: String,
+    #[serde(default)]
+    pub predecessors_sha256: String,
     pub recipe: RenderRecipe,
     pub region_ids: Vec<String>,
 }
@@ -135,17 +145,28 @@ fn generate_nonce() -> Result<String, GrantError> {
 
 /// Validate a [`GrantScope`] before issuance.
 pub fn validate_grant_scope(scope: &GrantScope) -> Result<(), GrantError> {
+    if !matches!(scope.capability.as_str(), FLUX_CAPABILITY | "text_mask_sam_ts@1" | "text_regions_rt@1") {
+        return Err(GrantError::InvalidParameter("unknown cloud capability".into()));
+    }
+    if scope.capability != FLUX_CAPABILITY
+        && (scope.recipe.recipe_id != scope.capability || scope.recipe.model_id != scope.capability)
+    {
+        return Err(GrantError::InvalidParameter("analysis grant recipe does not match capability".into()));
+    }
     validate_profile_id(&scope.profile_id)
         .map_err(|e| GrantError::InvalidParameter(format!("profile_id invalid: {e}")))?;
 
     if !is_lower_hex_64(&scope.canonical_endpoint_fingerprint) {
         return Err(GrantError::InvalidParameter(
-            "canonical_endpoint_fingerprint must be a 64-character lowercase SHA-256 hex string".to_string(),
+            "canonical_endpoint_fingerprint must be a 64-character lowercase SHA-256 hex string"
+                .to_string(),
         ));
     }
 
     if scope.source_hash.is_empty() {
-        return Err(GrantError::InvalidParameter("source_hash cannot be empty".to_string()));
+        return Err(GrantError::InvalidParameter(
+            "source_hash cannot be empty".to_string(),
+        ));
     }
 
     if !is_lower_hex_64(&scope.crop_sha256) {
@@ -173,7 +194,9 @@ pub fn validate_grant_scope(scope: &GrantScope) -> Result<(), GrantError> {
     }
 
     if scope.mask_hash.is_empty() {
-        return Err(GrantError::InvalidParameter("mask_hash cannot be empty".to_string()));
+        return Err(GrantError::InvalidParameter(
+            "mask_hash cannot be empty".to_string(),
+        ));
     }
 
     if scope.region_ids.is_empty() {
@@ -353,10 +376,7 @@ impl GrantService {
     ) -> Result<(), GrantError> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
 
-        let grant = state
-            .grants
-            .get_mut(nonce)
-            .ok_or(GrantError::NotFound)?;
+        let grant = state.grants.get_mut(nonce).ok_or(GrantError::NotFound)?;
 
         if grant.revoked {
             return Err(GrantError::Revoked);
@@ -385,12 +405,17 @@ impl GrantService {
         }
 
         // Exact immutable scope verification
+        if grant.scope.capability != requested_scope.capability {
+            return Err(GrantError::ScopeMismatch { field: "capability" });
+        }
         if grant.scope.provider != requested_scope.provider {
             return Err(GrantError::ScopeMismatch { field: "provider" });
         }
 
         if grant.scope.profile_id != requested_scope.profile_id {
-            return Err(GrantError::ScopeMismatch { field: "profile_id" });
+            return Err(GrantError::ScopeMismatch {
+                field: "profile_id",
+            });
         }
 
         if grant.scope.canonical_endpoint_fingerprint
@@ -402,23 +427,33 @@ impl GrantService {
         }
 
         if grant.scope.source_hash != requested_scope.source_hash {
-            return Err(GrantError::ScopeMismatch { field: "source_hash" });
+            return Err(GrantError::ScopeMismatch {
+                field: "source_hash",
+            });
         }
 
         if grant.scope.crop_sha256 != requested_scope.crop_sha256 {
-            return Err(GrantError::ScopeMismatch { field: "crop_sha256" });
+            return Err(GrantError::ScopeMismatch {
+                field: "crop_sha256",
+            });
         }
 
         if grant.scope.hint_sha256 != requested_scope.hint_sha256 {
-            return Err(GrantError::ScopeMismatch { field: "hint_sha256" });
+            return Err(GrantError::ScopeMismatch {
+                field: "hint_sha256",
+            });
         }
 
         if grant.scope.operation_digest != requested_scope.operation_digest {
-            return Err(GrantError::ScopeMismatch { field: "operation_digest" });
+            return Err(GrantError::ScopeMismatch {
+                field: "operation_digest",
+            });
         }
 
         if grant.scope.crop_bounds != requested_scope.crop_bounds {
-            return Err(GrantError::ScopeMismatch { field: "crop_bounds" });
+            return Err(GrantError::ScopeMismatch {
+                field: "crop_bounds",
+            });
         }
 
         if grant.scope.mask_hash != requested_scope.mask_hash {
@@ -429,12 +464,22 @@ impl GrantService {
             return Err(GrantError::ScopeMismatch { field: "revision" });
         }
 
+        if grant.scope.input_sha256 != requested_scope.input_sha256 {
+            return Err(GrantError::ScopeMismatch { field: "input_sha256" });
+        }
+
+        if grant.scope.predecessors_sha256 != requested_scope.predecessors_sha256 {
+            return Err(GrantError::ScopeMismatch { field: "predecessors_sha256" });
+        }
+
         if grant.scope.recipe != requested_scope.recipe {
             return Err(GrantError::ScopeMismatch { field: "recipe" });
         }
 
         if grant.scope.region_ids != requested_scope.region_ids {
-            return Err(GrantError::ScopeMismatch { field: "region_ids" });
+            return Err(GrantError::ScopeMismatch {
+                field: "region_ids",
+            });
         }
 
         // Increment attempt
@@ -446,10 +491,7 @@ impl GrantService {
     pub fn revoke_grant(&self, nonce: &str) -> Result<(), GrantError> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
 
-        let grant = state
-            .grants
-            .get_mut(nonce)
-            .ok_or(GrantError::NotFound)?;
+        let grant = state.grants.get_mut(nonce).ok_or(GrantError::NotFound)?;
         grant.revoked = true;
         Ok(())
     }
@@ -481,7 +523,11 @@ impl GrantService {
 
     /// Return current number of cached grants in memory.
     pub fn len(&self) -> usize {
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).grants.len()
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .grants
+            .len()
     }
 
     /// Check if grant cache is empty.
@@ -509,23 +555,24 @@ mod tests {
 
     fn dummy_scope() -> GrantScope {
         GrantScope {
+            capability: FLUX_CAPABILITY.to_string(),
             provider: CloudProvider::Modal,
             profile_id: "modal-prof-1".to_string(),
-            canonical_endpoint_fingerprint: "d9e8f7a6b5c4d3e2f1a0d9e8f7a6b5c4d3e2f1a0d9e8f7a6b5c4d3e2f1a01234".to_string(),
+            canonical_endpoint_fingerprint:
+                "d9e8f7a6b5c4d3e2f1a0d9e8f7a6b5c4d3e2f1a0d9e8f7a6b5c4d3e2f1a01234".to_string(),
             source_hash: "a1b2c3d4e5f6".to_string(),
-            crop_sha256: "112233445566778899001122334455667788990011223344556677889900aabb".to_string(),
-            hint_sha256: "2233445566778899001122334455667788990011223344556677889900112233".to_string(),
-            operation_digest: "3344556677889900112233445566778899001122334455667788990011223344".to_string(),
+            crop_sha256: "112233445566778899001122334455667788990011223344556677889900aabb"
+                .to_string(),
+            hint_sha256: "2233445566778899001122334455667788990011223344556677889900112233"
+                .to_string(),
+            operation_digest: "3344556677889900112233445566778899001122334455667788990011223344"
+                .to_string(),
             crop_bounds: Rect::new(10, 20, 100, 150),
             mask_hash: "m1m2m3m4".to_string(),
             revision: 42,
-            recipe: RenderRecipe::new(
-                "sdnq-v1",
-                "1.0.0",
-                "flux-schnell",
-                "rev-2026-09",
-                false,
-            ),
+            input_sha256: String::new(),
+            predecessors_sha256: String::new(),
+            recipe: RenderRecipe::new("sdnq-v1", "1.0.0", "flux-schnell", "rev-2026-09", false),
             region_ids: vec!["reg-1".to_string(), "reg-2".to_string()],
         }
     }
@@ -547,44 +594,106 @@ mod tests {
     }
 
     #[test]
+    fn changed_underlay_refuses_dispatch_without_spending_grant() {
+        let service = GrantService::new();
+        let mut scope = dummy_scope();
+        scope.input_sha256 = "a".repeat(64);
+        scope.predecessors_sha256 = "b".repeat(64);
+        let grant = service.issue_grant(scope.clone(), MAX_GRANT_TTL, 1).unwrap();
+        let mut changed = scope.clone();
+        changed.input_sha256 = "c".repeat(64);
+        assert_eq!(service.validate_and_consume(&grant.nonce, &changed),
+            Err(GrantError::ScopeMismatch { field: "input_sha256" }));
+        changed = scope.clone();
+        changed.predecessors_sha256 = "d".repeat(64);
+        assert_eq!(service.validate_and_consume(&grant.nonce, &changed),
+            Err(GrantError::ScopeMismatch { field: "predecessors_sha256" }));
+        assert_eq!(service.get_grant(&grant.nonce).unwrap().attempts_used, 0);
+        let mut analysis = scope.clone();
+        analysis.capability = "text_mask_sam_ts@1".into();
+        analysis.recipe = RenderRecipe::new("text_mask_sam_ts@1", "1.0.0",
+            "text_mask_sam_ts@1", "c".repeat(40), false);
+        assert_eq!(service.validate_and_consume(&grant.nonce, &analysis),
+            Err(GrantError::ScopeMismatch { field: "capability" }));
+        assert_eq!(service.validate_and_consume(&grant.nonce, &scope), Ok(()));
+        let analysis_grant = service.issue_grant(analysis, MAX_GRANT_TTL, 1).unwrap();
+        assert_eq!(service.validate_and_consume(&analysis_grant.nonce, &scope),
+            Err(GrantError::ScopeMismatch { field: "capability" }));
+    }
+
+    #[test]
+    fn legacy_grants_default_to_flux_capability() {
+        let mut value = serde_json::to_value(dummy_scope()).unwrap();
+        value.as_object_mut().unwrap().remove("capability");
+        let restored: GrantScope = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.capability, FLUX_CAPABILITY);
+    }
+
+    #[test]
     fn grant_scope_validation_on_issuance() {
         let service = GrantService::new();
         let mut scope = dummy_scope();
 
         // Invalid profile ID
         scope.profile_id = "bad/id".to_string();
-        assert!(service.issue_grant(scope.clone(), Duration::from_secs(60), 1).is_err());
+        assert!(service
+            .issue_grant(scope.clone(), Duration::from_secs(60), 1)
+            .is_err());
 
         scope = dummy_scope();
         scope.canonical_endpoint_fingerprint = "short".to_string();
-        assert!(service.issue_grant(scope.clone(), Duration::from_secs(60), 1).is_err());
+        assert!(service
+            .issue_grant(scope.clone(), Duration::from_secs(60), 1)
+            .is_err());
 
         scope = dummy_scope();
-        scope.crop_sha256 = "UPPERCASE112233445566778899001122334455667788990011223344556677889900".to_string();
-        assert!(service.issue_grant(scope.clone(), Duration::from_secs(60), 1).is_err(), "Uppercase hex must fail");
+        scope.crop_sha256 =
+            "UPPERCASE112233445566778899001122334455667788990011223344556677889900".to_string();
+        assert!(
+            service
+                .issue_grant(scope.clone(), Duration::from_secs(60), 1)
+                .is_err(),
+            "Uppercase hex must fail"
+        );
 
         scope = dummy_scope();
         scope.hint_sha256 = "short".to_string();
-        assert!(service.issue_grant(scope.clone(), Duration::from_secs(60), 1).is_err());
+        assert!(service
+            .issue_grant(scope.clone(), Duration::from_secs(60), 1)
+            .is_err());
 
         scope = dummy_scope();
         scope.operation_digest = "short".to_string();
-        assert!(service.issue_grant(scope.clone(), Duration::from_secs(60), 1).is_err());
+        assert!(service
+            .issue_grant(scope.clone(), Duration::from_secs(60), 1)
+            .is_err());
 
         scope = dummy_scope();
         scope.crop_bounds = Rect::new(0, 0, 0, 10);
-        assert!(service.issue_grant(scope.clone(), Duration::from_secs(60), 1).is_err());
+        assert!(service
+            .issue_grant(scope.clone(), Duration::from_secs(60), 1)
+            .is_err());
 
         scope = dummy_scope();
         scope.region_ids = vec![];
-        assert!(service.issue_grant(scope.clone(), Duration::from_secs(60), 1).is_err());
+        assert!(service
+            .issue_grant(scope.clone(), Duration::from_secs(60), 1)
+            .is_err());
 
         // Invalid TTL & attempts
         scope = dummy_scope();
-        assert!(service.issue_grant(scope.clone(), Duration::from_secs(0), 1).is_err());
-        assert!(service.issue_grant(scope.clone(), Duration::from_secs(301), 1).is_err());
-        assert!(service.issue_grant(scope.clone(), Duration::from_secs(60), 0).is_err());
-        assert!(service.issue_grant(scope.clone(), Duration::from_secs(60), 11).is_err());
+        assert!(service
+            .issue_grant(scope.clone(), Duration::from_secs(0), 1)
+            .is_err());
+        assert!(service
+            .issue_grant(scope.clone(), Duration::from_secs(301), 1)
+            .is_err());
+        assert!(service
+            .issue_grant(scope.clone(), Duration::from_secs(60), 0)
+            .is_err());
+        assert!(service
+            .issue_grant(scope.clone(), Duration::from_secs(60), 11)
+            .is_err());
     }
 
     #[test]
@@ -606,34 +715,46 @@ mod tests {
 
         // Canonical endpoint fingerprint mismatch (e.g. path change)
         let mut wrong = scope.clone();
-        wrong.canonical_endpoint_fingerprint = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        wrong.canonical_endpoint_fingerprint =
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string();
         assert_eq!(
             service.validate_and_consume(&grant.nonce, &wrong),
-            Err(GrantError::ScopeMismatch { field: "canonical_endpoint_fingerprint" })
+            Err(GrantError::ScopeMismatch {
+                field: "canonical_endpoint_fingerprint"
+            })
         );
 
         // Crop SHA256 mismatch
         let mut wrong = scope.clone();
-        wrong.crop_sha256 = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        wrong.crop_sha256 =
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string();
         assert_eq!(
             service.validate_and_consume(&grant.nonce, &wrong),
-            Err(GrantError::ScopeMismatch { field: "crop_sha256" })
+            Err(GrantError::ScopeMismatch {
+                field: "crop_sha256"
+            })
         );
 
         // Hint SHA256 mismatch
         let mut wrong = scope.clone();
-        wrong.hint_sha256 = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        wrong.hint_sha256 =
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string();
         assert_eq!(
             service.validate_and_consume(&grant.nonce, &wrong),
-            Err(GrantError::ScopeMismatch { field: "hint_sha256" })
+            Err(GrantError::ScopeMismatch {
+                field: "hint_sha256"
+            })
         );
 
         // Operation digest mismatch
         let mut wrong = scope.clone();
-        wrong.operation_digest = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        wrong.operation_digest =
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string();
         assert_eq!(
             service.validate_and_consume(&grant.nonce, &wrong),
-            Err(GrantError::ScopeMismatch { field: "operation_digest" })
+            Err(GrantError::ScopeMismatch {
+                field: "operation_digest"
+            })
         );
 
         // Region IDs mismatch
@@ -641,7 +762,9 @@ mod tests {
         wrong.region_ids = vec!["reg-1".to_string(), "reg-3".to_string()];
         assert_eq!(
             service.validate_and_consume(&grant.nonce, &wrong),
-            Err(GrantError::ScopeMismatch { field: "region_ids" })
+            Err(GrantError::ScopeMismatch {
+                field: "region_ids"
+            })
         );
     }
 
@@ -682,8 +805,14 @@ mod tests {
         // Revoke all grants for Modal / modal-prof-1
         service.revoke_profile_grants(CloudProvider::Modal, "modal-prof-1");
 
-        assert_eq!(service.validate_and_consume(&grant1.nonce, &scope), Err(GrantError::Revoked));
-        assert_eq!(service.validate_and_consume(&grant2.nonce, &scope), Err(GrantError::Revoked));
+        assert_eq!(
+            service.validate_and_consume(&grant1.nonce, &scope),
+            Err(GrantError::Revoked)
+        );
+        assert_eq!(
+            service.validate_and_consume(&grant2.nonce, &scope),
+            Err(GrantError::Revoked)
+        );
     }
 
     #[test]
@@ -751,7 +880,10 @@ mod tests {
         assert_eq!(service.len(), MAX_CACHED_GRANTS);
 
         // New grant is valid
-        assert_eq!(service.validate_and_consume(&new_grant.nonce, &scope), Ok(()));
+        assert_eq!(
+            service.validate_and_consume(&new_grant.nonce, &scope),
+            Ok(())
+        );
     }
 
     #[test]
@@ -771,8 +903,14 @@ mod tests {
 
         service.revoke_all();
 
-        assert_eq!(service.validate_and_consume(&grant1.nonce, &scope1), Err(GrantError::Revoked));
-        assert_eq!(service.validate_and_consume(&grant2.nonce, &scope2), Err(GrantError::Revoked));
+        assert_eq!(
+            service.validate_and_consume(&grant1.nonce, &scope1),
+            Err(GrantError::Revoked)
+        );
+        assert_eq!(
+            service.validate_and_consume(&grant2.nonce, &scope2),
+            Err(GrantError::Revoked)
+        );
     }
 
     #[test]
@@ -781,7 +919,10 @@ mod tests {
         let scope = dummy_scope();
 
         // Initially epoch is 0
-        assert_eq!(service.get_profile_epoch(CloudProvider::Modal, "modal-prof-1"), 0);
+        assert_eq!(
+            service.get_profile_epoch(CloudProvider::Modal, "modal-prof-1"),
+            0
+        );
 
         // Advance epoch to 1
         let new_epoch = service.invalidate_profile(CloudProvider::Modal, "modal-prof-1");
@@ -864,12 +1005,18 @@ mod tests {
         .join();
 
         // Mutex is now poisoned. All operations must safely recover and never fail-open or no-op.
-        assert_eq!(service.get_profile_epoch(CloudProvider::Modal, "modal-prof-1"), 0);
+        assert_eq!(
+            service.get_profile_epoch(CloudProvider::Modal, "modal-prof-1"),
+            0
+        );
 
         // Invalidation must advance epoch and revoke existing grants
         let new_epoch = service.invalidate_profile(CloudProvider::Modal, "modal-prof-1");
         assert_eq!(new_epoch, 1);
-        assert_eq!(service.validate_and_consume(&grant1.nonce, &scope), Err(GrantError::Revoked));
+        assert_eq!(
+            service.validate_and_consume(&grant1.nonce, &scope),
+            Err(GrantError::Revoked)
+        );
 
         // Issue new grant with current epoch succeeds
         let grant2 = service

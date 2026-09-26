@@ -16,6 +16,7 @@
    */
   import { app, dismissNotice } from './lib/state/app.svelte.js'
   import { getBackend } from './lib/api/backend.js'
+  import { downloadFailureShown, reportModelDownloadFailure } from './lib/api/model-download-notices.js'
   import { session, installThemeSync, applyTheme, reconcileSettings } from './lib/state/session.svelte.js'
   import { loadCapabilities } from './lib/state/capabilities.svelte.js'
   import { startCloud } from './lib/state/cloud.svelte.js'
@@ -69,6 +70,17 @@
       live = false
     }
   })
+
+  // Model transfers can outlive Settings, onboarding, and the screen that
+  // started them. Keep a root observer for failures so background errors are
+  // visible after those inline rows have unmounted. A screen that shows the
+  // row keeps the more detailed per-file error and suppresses a duplicate
+  // notice; Settings counts only on the section that lists the row.
+  $effect(() => getBackend().subscribe((event) => {
+    if (event.type !== 'model-progress' || !event.done || !event.error || event.error === 'cancelled') return
+    const covered = downloadFailureShown(event, { firstLaunch, topModal: app.modals.at(-1)?.kind ?? null })
+    reportModelDownloadFailure(event, { covered })
+  }))
 
   // The first-launch download offer.
   //

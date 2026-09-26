@@ -45,6 +45,7 @@ import { createEventStream } from './tauri-events.js'
  */
 const IMPLEMENTED = Object.freeze({
   about: 'about',
+  diagnostics: 'diagnostics',
   readSettings: 'read_settings',
   writeSettings: 'write_settings',
   readInferenceConfig: 'read_inference_config',
@@ -54,6 +55,11 @@ const IMPLEMENTED = Object.freeze({
   getCloudSecretSummary: 'get_cloud_secret_summary',
   checkCloudConnection: 'check_cloud_connection',
   getCloudModelInfo: 'get_cloud_model_info',
+  listRemoteAnalysisCapabilities: 'list_remote_analysis_capabilities',
+  proposeRemoteAnalysis: 'propose_remote_analysis',
+  confirmRemoteAnalysis: 'confirm_remote_analysis',
+  cancelRemoteAnalysis: 'cancel_remote_analysis',
+  getRemoteAnalysisStatus: 'get_remote_analysis_status',
   prepareCloudConsent: 'prepare_cloud_consent',
   confirmCloudConsent: 'confirm_cloud_consent',
   submitCloudAttempt: 'submit_cloud_attempt',
@@ -77,6 +83,7 @@ const IMPLEMENTED = Object.freeze({
   exportChapter: 'export_chapter',
   deleteMask: 'delete_mask',
   restoreRegion: 'restore_region',
+  keepDependencyResult: 'keep_dependency_result',
   applyTool: 'apply_tool',
   createRegion: 'create_region',
   rerunMask: 'rerun_mask',
@@ -91,12 +98,27 @@ const IMPLEMENTED = Object.freeze({
   listAccelerators: 'list_accelerators',
   listModels: 'list_models',
   downloadModel: 'download_model',
+  downloadModelGroup: 'download_model_group',
   cancelDownload: 'cancel_download',
   deleteModel: 'delete_model',
+  deleteModelGroup: 'delete_model_group',
   discardPartial: 'discard_partial',
   verifyModel: 'verify_model',
+  verifyModelGroup: 'verify_model_group',
   downloadRuntime: 'download_runtime',
   deleteRuntime: 'delete_runtime',
+  listWorkflowCapabilities: 'list_workflow_capabilities',
+  importFullRt: 'import_full_rt',
+  removeFullRt: 'remove_full_rt',
+  importSamTs: 'import_sam_ts',
+  removeSamTs: 'remove_sam_ts',
+  verifySamTs: 'verify_sam_ts',
+  analyzeCapabilities: 'analyze_capabilities',
+  analyzeChapterPage: 'analyze_chapter_page',
+  cancelCapabilityAnalysis: 'cancel_capability_analysis',
+  prepareComponentWrite: 'prepare_component_write',
+  loadComponentCorrection: 'load_component_correction',
+  applyComponentWrite: 'apply_component_write',
 })
 
 /** Every method the seam contract fixes, so the adapter can be checked against it. */
@@ -120,6 +142,7 @@ export const SEAM_METHODS = Object.freeze([
   'createRegion',
   'deleteMask',
   'restoreRegion',
+  'keepDependencyResult',
   'rerunMask',
   'cleanAnyway',
   'exportChapter',
@@ -134,6 +157,11 @@ export const SEAM_METHODS = Object.freeze([
   'getCloudSecretSummary',
   'checkCloudConnection',
   'getCloudModelInfo',
+  'listRemoteAnalysisCapabilities',
+  'proposeRemoteAnalysis',
+  'confirmRemoteAnalysis',
+  'cancelRemoteAnalysis',
+  'getRemoteAnalysisStatus',
   'prepareCloudConsent',
   'confirmCloudConsent',
   'submitCloudAttempt',
@@ -145,18 +173,35 @@ export const SEAM_METHODS = Object.freeze([
   'cancelCloudProvisioner',
   'onProvisionProgress',
   'onCloudAttempt',
+  'onRemoteAnalysis',
   'about',
+  'diagnostics',
   'listLoadedModels',
   'unloadModel',
   'listAccelerators',
   'listModels',
   'downloadModel',
+  'downloadModelGroup',
   'cancelDownload',
   'deleteModel',
+  'deleteModelGroup',
   'discardPartial',
   'verifyModel',
+  'verifyModelGroup',
   'downloadRuntime',
   'deleteRuntime',
+  'listWorkflowCapabilities',
+  'importFullRt',
+  'removeFullRt',
+  'importSamTs',
+  'removeSamTs',
+  'verifySamTs',
+  'analyzeCapabilities',
+  'analyzeChapterPage',
+  'cancelCapabilityAnalysis',
+  'prepareComponentWrite',
+  'loadComponentCorrection',
+  'applyComponentWrite',
 ])
 
 /**
@@ -168,12 +213,13 @@ export const SEAM_METHODS = Object.freeze([
  * of its unlisten function, the shape Tauri's own `listen` has. None of the
  * three is a command, so none is in `IMPLEMENTED`.
  */
-export const EVENT_METHODS = Object.freeze(['subscribe', 'onProvisionProgress', 'onCloudAttempt'])
+export const EVENT_METHODS = Object.freeze(['subscribe', 'onProvisionProgress', 'onCloudAttempt', 'onRemoteAnalysis'])
 
 /** The event names the two cloud listeners attach to. */
 export const CLOUD_EVENTS = Object.freeze({
   provisionProgress: 'provision://progress',
   cloudAttempt: 'cloud://attempt',
+  remoteAnalysis: 'cloud://analysis',
 })
 
 /** Whether this page is running inside a Tauri window. */
@@ -223,6 +269,8 @@ export function createTauriBackend({ fallback, invoke, listen }) {
   // from a method the seam declares async.
   const call = invoke ?? (async (command, args) => globalInvoke()(command, args))
   const on = listen ?? globalListen
+  let nextAnalysisRequest = 0
+  const requestIdFor = (requestId) => requestId ?? `analysis-${Date.now()}-${++nextAnalysisRequest}`
 
   /**
    * Settings are stored by the core and *defaulted* by the interface.
@@ -239,6 +287,23 @@ export function createTauriBackend({ fallback, invoke, listen }) {
 
   const implementations = {
     about: () => call(IMPLEMENTED.about),
+    // The one command whose answer still crosses in snake_case:
+    // `src-tauri/src/diagnostics.rs` predates the camelCase rule and has no
+    // `rename_all`. Renamed here so the seam is camelCase like the rest; the
+    // camelCase spelling is read too, so the struct can gain its `rename_all`
+    // without this line having to move in the same change.
+    diagnostics: async () => {
+      const answer = await call(IMPLEMENTED.diagnostics)
+      return {
+        appVersion: answer?.appVersion ?? answer?.app_version ?? '',
+        components: (answer?.components ?? []).map((/** @type {any} */ component) => ({
+          name: component?.name ?? '',
+          available: component?.available === true,
+          detail: component?.detail ?? null,
+          reasonKey: component?.reasonKey ?? component?.reason_key ?? null,
+        })),
+      }
+    },
     readSettings: async () => withDefaults(await call(IMPLEMENTED.readSettings)),
     writeSettings: async (patch) => withDefaults(await call(IMPLEMENTED.writeSettings, { patch })),
     readInferenceConfig: () => call(IMPLEMENTED.readInferenceConfig),
@@ -260,6 +325,13 @@ export function createTauriBackend({ fallback, invoke, listen }) {
       call(IMPLEMENTED.checkCloudConnection, { provider, profileId }),
     getCloudModelInfo: ({ provider, profileId }) =>
       call(IMPLEMENTED.getCloudModelInfo, { provider, profileId }),
+    listRemoteAnalysisCapabilities: ({ provider, profileId }) =>
+      call(IMPLEMENTED.listRemoteAnalysisCapabilities, { provider, profileId }),
+    proposeRemoteAnalysis: (spec) => call(IMPLEMENTED.proposeRemoteAnalysis, { regions: [], ...spec }),
+    confirmRemoteAnalysis: ({ proposalId, rightsAttested, retentionAcknowledged }) =>
+      call(IMPLEMENTED.confirmRemoteAnalysis, { proposalId, rightsAttested, retentionAcknowledged }),
+    cancelRemoteAnalysis: ({ proposalId }) => call(IMPLEMENTED.cancelRemoteAnalysis, { proposalId }),
+    getRemoteAnalysisStatus: ({ proposalId }) => call(IMPLEMENTED.getRemoteAnalysisStatus, { proposalId }),
     prepareCloudConsent: (spec) => call(IMPLEMENTED.prepareCloudConsent, spec),
     confirmCloudConsent: (spec) => call(IMPLEMENTED.confirmCloudConsent, spec),
     submitCloudAttempt: (spec) => call(IMPLEMENTED.submitCloudAttempt, spec),
@@ -297,7 +369,9 @@ export function createTauriBackend({ fallback, invoke, listen }) {
       call(IMPLEMENTED.historyMove, { chapterId, direction }),
     renameProject: (spec) => call(IMPLEMENTED.renameProject, spec),
     deleteProject: (spec) => call(IMPLEMENTED.deleteProject, spec),
-    deleteChapter: (spec) => call(IMPLEMENTED.deleteChapter, spec),
+    // The command's `source_files` is required; the seam leaves it optional.
+    deleteChapter: ({ projectId, chapterId, sourceFiles = false }) =>
+      call(IMPLEMENTED.deleteChapter, { projectId, chapterId, sourceFiles }),
     exportChapter: (spec) => call(IMPLEMENTED.exportChapter, spec),
 
     // Named arguments rather than the spec object, because these two are the
@@ -307,6 +381,7 @@ export function createTauriBackend({ fallback, invoke, listen }) {
     deleteMask: ({ maskId }) => call(IMPLEMENTED.deleteMask, { maskId }),
     restoreRegion: ({ regionId, region }) =>
       call(IMPLEMENTED.restoreRegion, { regionId, region: region ?? null }),
+    keepDependencyResult: ({ regionId }) => call(IMPLEMENTED.keepDependencyResult, { regionId }),
 
     // The four region edits that run an engine. Named arguments rather than
     // the spec object wherever the command's parameters are not the spec's:
@@ -322,10 +397,12 @@ export function createTauriBackend({ fallback, invoke, listen }) {
         pageIndex: pageIndex ?? null,
         regionId: regionId ?? null,
       }),
-    createRegion: ({ chapterId, pageIndex, bbox, tool, params }) =>
+    createRegion: ({ chapterId, pageIndex, sourceIndex, sourceSha, bbox, tool, params }) =>
       call(IMPLEMENTED.createRegion, {
         chapterId,
         pageIndex,
+        expectedSourceIdx: sourceIndex ?? null,
+        expectedSourceSha: sourceSha ?? null,
         bbox,
         tool,
         params: params ?? null,
@@ -393,13 +470,28 @@ export function createTauriBackend({ fallback, invoke, listen }) {
     // ends, or the prompt-per-poll that row removed would be back.
     listModels: ({ retryStore } = {}) => call(IMPLEMENTED.listModels, { retryStore }),
     downloadModel: ({ id }) => call(IMPLEMENTED.downloadModel, { id }),
+    downloadModelGroup: ({ id }) => call(IMPLEMENTED.downloadModelGroup, { id }),
     cancelDownload: ({ id }) => call(IMPLEMENTED.cancelDownload, { id }),
     deleteModel: ({ id }) => call(IMPLEMENTED.deleteModel, { id }),
+    deleteModelGroup: ({ id }) => call(IMPLEMENTED.deleteModelGroup, { id }),
     // The bytes a cancelled transfer left behind, given back.
     discardPartial: ({ id }) => call(IMPLEMENTED.discardPartial, { id }),
     verifyModel: ({ id }) => call(IMPLEMENTED.verifyModel, { id }),
+    verifyModelGroup: ({ id }) => call(IMPLEMENTED.verifyModelGroup, { id }),
     downloadRuntime: () => call(IMPLEMENTED.downloadRuntime),
     deleteRuntime: () => call(IMPLEMENTED.deleteRuntime),
+    listWorkflowCapabilities: () => call(IMPLEMENTED.listWorkflowCapabilities),
+    importFullRt: ({ sourcePath }) => call(IMPLEMENTED.importFullRt, { sourcePath }),
+    removeFullRt: () => call(IMPLEMENTED.removeFullRt),
+    importSamTs: ({ sourceDir }) => call(IMPLEMENTED.importSamTs, { sourceDir }),
+    removeSamTs: () => call(IMPLEMENTED.removeSamTs),
+    verifySamTs: () => call(IMPLEMENTED.verifySamTs),
+    analyzeCapabilities: ({ sourcePath, workflow, rtProfile, rtBackend, samBackend, requestId }) => call(IMPLEMENTED.analyzeCapabilities, { sourcePath, workflow, rtProfile, rtBackend, samBackend, requestId: requestIdFor(requestId) }),
+    analyzeChapterPage: ({ chapterId, pageIndex, workflow, rtProfile, rtBackend, samBackend, requestId }) => call(IMPLEMENTED.analyzeChapterPage, { chapterId, pageIndex, workflow, rtProfile, rtBackend, samBackend, requestId: requestIdFor(requestId) }),
+    cancelCapabilityAnalysis: (requestId) => call(IMPLEMENTED.cancelCapabilityAnalysis, { requestId }),
+    prepareComponentWrite: ({ analysisId, chapterId, pageIndex, componentId, allowOutsideBubbles, paddingPx, additions, removals, correctionRevision }) => call(IMPLEMENTED.prepareComponentWrite, { analysisId, chapterId, pageIndex, componentId, allowOutsideBubbles, paddingPx, additions, removals, correctionRevision }),
+    loadComponentCorrection: ({ analysisId, chapterId, pageIndex, componentId }) => call(IMPLEMENTED.loadComponentCorrection, { analysisId, chapterId, pageIndex, componentId }),
+    applyComponentWrite: ({ planId, approvedSupportSha256 }) => call(IMPLEMENTED.applyComponentWrite, { planId, approvedSupportSha256 }),
 
     runClean: (spec) => call(IMPLEMENTED.runClean, spec),
     cancelRun: (spec = {}) => call(IMPLEMENTED.cancelRun, spec),
@@ -431,6 +523,7 @@ export function createTauriBackend({ fallback, invoke, listen }) {
   // the fallback, so there is no second stream to merge.
   backend.onProvisionProgress = (handler) => on(CLOUD_EVENTS.provisionProgress, handler)
   backend.onCloudAttempt = (handler) => on(CLOUD_EVENTS.cloudAttempt, handler)
+  backend.onRemoteAnalysis = (handler) => on(CLOUD_EVENTS.remoteAnalysis, handler)
 
   return /** @type {import('./backend.js').Backend} */ (backend)
 }
@@ -451,6 +544,11 @@ export const TAURI_REGISTERED_CLOUD_COMMANDS = Object.freeze([
   'get_cloud_secret_summary',
   'check_cloud_connection',
   'get_cloud_model_info',
+  'list_remote_analysis_capabilities',
+  'propose_remote_analysis',
+  'confirm_remote_analysis',
+  'cancel_remote_analysis',
+  'get_remote_analysis_status',
   'prepare_cloud_consent',
   'confirm_cloud_consent',
   'submit_cloud_attempt',

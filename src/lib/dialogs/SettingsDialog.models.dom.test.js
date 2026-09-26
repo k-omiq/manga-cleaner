@@ -41,7 +41,14 @@ import { setBackend } from '../api/backend.js'
 import { t } from '../i18n/index.js'
 import { DEFAULT_DETECTOR } from '../model/pipelines.js'
 import { capabilities } from '../state/capabilities.svelte.js'
-import { session, setDetection, setFluxModel, setSidecarPath } from '../state/session.svelte.js'
+import {
+  session,
+  setDetection,
+  setFluxModel,
+  setOcrRescue,
+  setSidecarPath,
+  setTextPolicy,
+} from '../state/session.svelte.js'
 import SettingsDialog from './SettingsDialog.svelte'
 import { resetFirstLaunch } from './firstlaunch.svelte.js'
 
@@ -65,6 +72,7 @@ function view({ model = {}, runtime = {}, token = {} } = {}) {
         id: 'inpainter',
         fileName: 'lama-manga.onnx',
         bytes: 207_482_644,
+        sha256: '4512adab295ee5a5e02ccd1bdf8d45dccbac88309d9cff1532ffd5de876f02a4',
         kindKey: 'models.kind.inpainter',
         requiredBy: ['lama'],
         installed: false,
@@ -106,6 +114,45 @@ let listModels
 let discardPartial
 /** @type {ReturnType<typeof vi.fn>} */
 let writeSettings
+let downloadModelGroup
+let verifyModelGroup
+let deleteModelGroup
+let downloadModel
+let verifyModel
+let deleteModel
+let verifySamTs
+
+/** The speech bubble finder and the three OCR files, as the catalogue sizes them. */
+const BALLOON_BYTES = 11_380_294
+const OCR_BYTES = 343_454_249 + 117_480_262 + 30_216
+
+/**
+ * What `listWorkflowCapabilities` answers with neither import present: the
+ * shape the review panel reads, with the files it would name once imported.
+ */
+const CAPS = Object.freeze({
+  runtimeInstalled: true,
+  rtInstalled: true,
+  fullRtInstalled: false,
+  fullRtManaged: false,
+  fullRtRevision: null,
+  fullRtFile: { name: 'detector.onnx', bytes: 168_000_000, sha256: 'ab'.repeat(32) },
+  samInstalled: false,
+  samMemoryReady: true,
+  samManaged: false,
+  samRevision: null,
+  samFiles: [
+    { name: 'sam_encoder.onnx', bytes: 1_200_000_000, sha256: 'cd'.repeat(32) },
+    { name: 'sam_decoder.onnx', bytes: 16_000_000, sha256: 'ef'.repeat(32) },
+  ],
+  cooStatus: 'excluded',
+  rtBackends: [],
+  samBackends: [],
+  samWriteQualified: false,
+  samWriteNote: null,
+})
+/** @type {any} */
+let workflowCapabilities = CAPS
 /** What the FLUX helper lists, for the tests that turn it on. */
 let helperModels = []
 
@@ -113,6 +160,13 @@ function stub(answer) {
   listModels = vi.fn(async () => answer())
   discardPartial = vi.fn(async () => true)
   writeSettings = vi.fn(async () => ({}))
+  downloadModelGroup = vi.fn(async () => 'started')
+  verifyModelGroup = vi.fn(async () => true)
+  deleteModelGroup = vi.fn(async () => 'deleted')
+  downloadModel = vi.fn(async () => 'started')
+  verifyModel = vi.fn(async () => true)
+  deleteModel = vi.fn(async () => 'deleted')
+  verifySamTs = vi.fn(async () => true)
   setBackend(
     /** @type {any} */ ({
       listModels: (/** @type {any} */ options) => listModels(options),
@@ -123,6 +177,18 @@ function stub(answer) {
       about: vi.fn(async () => ({ appVersion: '0.0.0-test', facts: [] })),
       subscribe: vi.fn(() => () => {}),
       writeSettings: (/** @type {any} */ patch) => writeSettings(patch),
+      downloadModelGroup: (/** @type {any} */ spec) => downloadModelGroup(spec),
+      verifyModelGroup: (/** @type {any} */ spec) => verifyModelGroup(spec),
+      deleteModelGroup: (/** @type {any} */ spec) => deleteModelGroup(spec),
+      downloadModel: (/** @type {any} */ spec) => downloadModel(spec),
+      verifyModel: (/** @type {any} */ spec) => verifyModel(spec),
+      deleteModel: (/** @type {any} */ spec) => deleteModel(spec),
+      listWorkflowCapabilities: vi.fn(async () => workflowCapabilities),
+      verifySamTs: () => verifySamTs(),
+      importSamTs: vi.fn(async () => ({})),
+      importFullRt: vi.fn(async () => ({})),
+      removeSamTs: vi.fn(async () => true),
+      removeFullRt: vi.fn(async () => true),
     }),
   )
 }
@@ -268,71 +334,289 @@ describe('the two pipelines', () => {
       id: 'textDetector',
       fileName: 'comictextdetector.onnx',
       bytes: 94_669_756,
+      sha256: '1a86ace74961413cbd650002e7bb4dcec4980ffa21b2f19b86933372071d718f',
       kindKey: 'models.kind.textDetector',
       requiredBy: ['autoClean'],
     })
     return answer
   }
 
+  function withModelGroups({ installed = false } = {}) {
+    const answer = both()
+    for (const model of [
+      { id: 'balloonDetector', fileName: 'detector.onnx', bytes: BALLOON_BYTES, sha256: 'c5a1b2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1', kindKey: 'models.kind.balloonDetector' },
+      { id: 'scriptGate', fileName: 'osd_lstm.onnx', bytes: 3_722_314, sha256: 'b18e0c1479d9eb67394993098f7e1079c9a93ef6f7b0416ee333fccb865c6e72', kindKey: 'models.kind.scriptGate' },
+      { id: 'scriptGateLabels', fileName: 'osd_labels.json', bytes: 1_163, sha256: 'a1888156b005065039c356e13a7bbef1ec454b45bf6aaf18c11f4a59b1ee35c5', kindKey: 'models.kind.scriptGateLabels' },
+      { id: 'ocrEncoder', fileName: 'encoder_model.onnx', bytes: 343_454_249, sha256: '15fa8155fe9bc1a7d25d9bb353debaa4def033d0174e907dbd2dd6d995def85f', kindKey: 'models.kind.ocr' },
+      { id: 'ocrDecoder', fileName: 'decoder_model.onnx', bytes: 117_480_262, sha256: 'ef7765261e9d1cdc34d89356986c2bbc2a082897f753a89605ae80fdfa61f5e8', kindKey: 'models.kind.ocrDecoder' },
+      { id: 'ocrVocab', fileName: 'vocab.txt', bytes: 30_216, sha256: '5cb5c5586d98a2f331d9f8828e4586479b0611bfba5d8c3b6dadffc84d6a36a3', kindKey: 'models.kind.ocrVocab' },
+    ]) {
+      answer.models.push({ ...answer.models[0], ...model, installed, path: installed ? `/models/${model.fileName}` : null,
+        readOnly: false, sha256Ok: installed ? true : null, requiredBy: [], downloading: false, partialBytes: null })
+    }
+    return answer
+  }
+
+  /** @param {any} rendered @param {string} language */
+  function languagePicker(rendered, language) {
+    return /** @type {HTMLSelectElement} */ (
+      rendered.getByRole('combobox', { name: t('pipelines.detectorFor', { language: t(`pipelines.language.${language}`) }) })
+    )
+  }
+
+  /** @param {any} rendered */
+  function rescueBox(rendered) {
+    return /** @type {HTMLInputElement} */ (rendered.getByRole('checkbox', { name: t('pipelines.workflow.ocrRescue') }))
+  }
+
+  /** @param {any} rendered @param {string} id */
+  function modelRow(rendered, id) {
+    return /** @type {HTMLElement} */ (rendered.container.querySelector(`[data-model="${id}"]`))
+  }
+
   afterEach(() => {
     for (const language of ['ja', 'zh', 'ko']) setDetection(language, DEFAULT_DETECTOR)
+    setOcrRescue(false)
+    setTextPolicy('legacy_gate')
+    workflowCapabilities = CAPS
     capabilities.sidecar = false
     helperModels = []
     setFluxModel('')
     setSidecarPath('')
   })
 
-  it('manage each file in the section whose engines need it', async () => {
+  it('manage each model in the section whose capability needs it', async () => {
     const detection = await open(both, 'pipelines.detection')
-    await waitFor(() => expect(detection.getByText(t('models.kind.textDetector'))).toBeTruthy())
-    expect(detection.queryByText(t('models.kind.inpainter'))).toBe(null)
+    await waitFor(() => expect(detection.container.querySelector('[data-model="ctd"]')).toBeTruthy())
+    expect(detection.container.querySelector('[data-model="lama"]')).toBe(null)
     cleanup()
 
     const cleaning = await open(both)
-    await waitFor(() => expect(cleaning.getByText(t('models.kind.inpainter'))).toBeTruthy())
-    expect(cleaning.queryByText(t('models.kind.textDetector'))).toBe(null)
+    await waitFor(() => expect(cleaning.container.querySelector('[data-model="lama"]')).toBeTruthy())
+    expect(cleaning.container.querySelector('[data-model="ctd"]')).toBe(null)
   })
 
   it('store Skip as null, and a detector by its id', async () => {
     const detection = await open(both, 'pipelines.detection')
-    const japanese = /** @type {HTMLSelectElement} */ (
-      detection.getByRole('combobox', {
-        name: t('pipelines.detectorFor', { language: t('pipelines.language.ja') }),
-      })
-    )
+    const japanese = languagePicker(detection, 'ja')
     expect(japanese.value).toBe(DEFAULT_DETECTOR)
 
     await fireEvent.change(japanese, { target: { value: '' } })
     expect(session.detection.ja).toBe(null)
     expect(japanese.value).toBe('')
 
-    await fireEvent.change(japanese, { target: { value: 'ctd-rtdetr-ocr' } })
-    expect(session.detection.ja).toBe('ctd-rtdetr-ocr')
+    await fireEvent.change(japanese, { target: { value: DEFAULT_DETECTOR } })
+    expect(session.detection.ja).toBe(DEFAULT_DETECTOR)
   })
 
-  it('offer each language only the detectors that serve it, and Skip', async () => {
+  it('offer every language the one detector and Skip, with no OCR variant', async () => {
     const detection = await open(both, 'pipelines.detection')
-    const options = (/** @type {string} */ language) =>
-      [
-        .../** @type {HTMLSelectElement} */ (
-          detection.getByRole('combobox', {
-            name: t('pipelines.detectorFor', { language: t(`pipelines.language.${language}`) }),
-          })
-        ).options,
-      ].map((option) => option.value)
-    expect(options('ja')).toEqual(['ctd-rtdetr', 'ctd-rtdetr-ocr', ''])
-    expect(options('zh')).toEqual(['ctd-rtdetr', ''])
-    expect(options('ko')).toEqual(['ctd-rtdetr', ''])
+    for (const language of ['ja', 'zh', 'ko']) {
+      expect([...languagePicker(detection, language).options].map((option) => option.value)).toEqual(['ctd-rtdetr', ''])
+    }
   })
 
-  it('say what each engine still costs, or why it cannot be chosen', async () => {
+  it('read a retired OCR detector choice as the plain detector with the rescue ticked', async () => {
+    const detection = await open(() => withModelGroups(), 'pipelines.detection')
+    setDetection('ja', 'ctd-rtdetr-ocr')
+    expect(session.detection.ja).toBe('ctd-rtdetr')
+    expect(session.ocrRescue).toBe(true)
+    await waitFor(() => expect(rescueBox(detection).checked).toBe(true))
+    expect(languagePicker(detection, 'ja').value).toBe('ctd-rtdetr')
+  })
+
+  it('say what each engine still costs, beside a note that the ratings are provisional', async () => {
     const detection = await open(both, 'pipelines.detection')
     const table = detection.getByRole('table', { name: t('pipelines.detection') })
     const state = (/** @type {string} */ name) =>
       within(table).getByText(name).closest('[role="row"]')?.querySelector('.state')?.textContent?.trim()
     // The base detector needs the text detector here, which is not installed.
     await waitFor(() => expect(state('CTD + RT-DETR v2')).toBe(t('models.value.size', { bytes: 94_669_756 })))
-    expect(state('RT-DETR v2 + COO + SAM-TS')).toBe(t('pipelines.status.soon'))
+    expect(document.getElementById(/** @type {string} */ (table.getAttribute('aria-describedby')))?.textContent)
+      .toBe(t('pipelines.workflow.ratingsNote'))
+    cleanup()
+
+    const cleaning = await open(both)
+    const cleaners = cleaning.getByRole('table', { name: t('pipelines.cleaning') })
+    expect(document.getElementById(/** @type {string} */ (cleaners.getAttribute('aria-describedby')))?.textContent)
+      .toBe(t('pipelines.workflow.ratingsNote'))
+  })
+
+  it('draw the capability sections in order, with the SFX finder excluded and nothing to press', async () => {
+    const detection = await open(() => withModelGroups(), 'pipelines.detection')
+    const headings = [...detection.container.querySelectorAll('.capability h3')].map((heading) => heading.textContent)
+    expect(headings).toEqual([
+      t('settings.detection.capability.findRegions'),
+      t('settings.detection.capability.shapeMask'),
+      t('settings.detection.capability.sfx'),
+      t('settings.detection.capability.japanese'),
+    ])
+    const coo = modelRow(detection, 'coo')
+    expect(coo.textContent).toContain(t('settings.models.status.excluded'))
+    expect(coo.querySelectorAll('button')).toHaveLength(0)
+    cleanup()
+
+    const cleaning = await open(both)
+    expect([...cleaning.container.querySelectorAll('.capability h3')].map((heading) => heading.textContent))
+      .toEqual([t('settings.cleaning.capability.rebuild')])
+  })
+
+  it('make the OCR rescue opt-in, and say when its files are missing with the download beside it', async () => {
+    const detection = await open(() => withModelGroups(), 'pipelines.detection')
+    const box = rescueBox(detection)
+    expect(box.checked).toBe(false)
+    const status = /** @type {HTMLElement} */ (detection.container.querySelector('.option [role="status"]'))
+    expect(box.getAttribute('aria-describedby')?.split(' ')).toContain(status.id)
+    expect(status.textContent).toBe('')
+
+    await fireEvent.click(box)
+    expect(session.ocrRescue).toBe(true)
+    await waitFor(() => expect(status.textContent).toBe(t('settings.detection.rescue.missing')))
+    const option = within(/** @type {HTMLElement} */ (detection.container.querySelector('.option')))
+    await fireEvent.click(option.getByRole('button', { name: t('settings.detection.download', { bytes: OCR_BYTES }) }))
+    expect(downloadModelGroup).toHaveBeenCalledWith({ id: 'mangaOcr' })
+
+    await fireEvent.change(languagePicker(detection, 'ja'), { target: { value: '' } })
+    await waitFor(() => expect(status.textContent).toBe(t('settings.detection.rescue.skipped')))
+    expect(option.queryByRole('button')).toBe(null)
+  })
+
+  it('download what the selected workflow needs: legacy never asks for OCR, all-text never for the gate', async () => {
+    setOcrRescue(true)
+    const detection = await open(() => withModelGroups(), 'pipelines.detection')
+    const readiness = () => /** @type {HTMLElement} */ (detection.container.querySelector('.readiness'))
+    const legacyBytes = 94_669_756 + BALLOON_BYTES + 3_722_314 + 1_163
+    await waitFor(() => expect(readiness().textContent).toContain(t('settings.detection.ready.legacyMissing', { bytes: legacyBytes })))
+    await fireEvent.click(within(readiness()).getByRole('button', { name: t('settings.detection.download', { bytes: legacyBytes }) }))
+    await waitFor(() => expect(downloadModelGroup).toHaveBeenCalledWith({ id: 'scriptGate' }))
+    expect(downloadModel.mock.calls.map(([spec]) => spec.id)).toEqual(['textDetector', 'balloonDetector'])
+    expect(downloadModelGroup).not.toHaveBeenCalledWith({ id: 'mangaOcr' })
+    downloadModel.mockClear()
+    downloadModelGroup.mockClear()
+
+    await fireEvent.change(detection.getByRole('combobox', { name: t('pipelines.workflow.policy') }), { target: { value: 'all_text' } })
+    expect(session.textPolicy).toBe('all_text')
+    await waitFor(() => expect(readiness().textContent).toContain(t('settings.detection.ready.allTextImport')))
+    expect(readiness().textContent).toContain(t('settings.detection.ready.allTextMissing', { bytes: BALLOON_BYTES }))
+    await fireEvent.click(within(readiness()).getByRole('button', { name: t('settings.detection.download', { bytes: BALLOON_BYTES }) }))
+    await waitFor(() => expect(downloadModel).toHaveBeenCalledWith({ id: 'balloonDetector' }))
+    expect(downloadModel).toHaveBeenCalledTimes(1)
+    expect(downloadModelGroup).not.toHaveBeenCalled()
+
+    // All-text reads no language and runs no rescue, so neither choice is drawn.
+    expect(detection.queryByRole('combobox', { name: t('pipelines.detectorFor', { language: t('pipelines.language.ja') }) })).toBe(null)
+    expect(detection.queryByRole('checkbox', { name: t('pipelines.workflow.ocrRescue') })).toBe(null)
+    expect(detection.getByText(t('settings.detection.languagesAllText'))).toBeTruthy()
+  })
+
+  it('offer SAM-TS-L and the full RT-DETR graph as local imports, never as downloads', async () => {
+    const detection = await open(() => withModelGroups(), 'pipelines.detection')
+    for (const id of ['samTs', 'rtFull']) {
+      await waitFor(() => expect(modelRow(detection, id).textContent).toContain(t('settings.models.status.importToEnable')))
+      const row = within(modelRow(detection, id))
+      expect(row.getByRole('button', { name: t('settings.models.action.import') })).toBeTruthy()
+      expect(row.queryByRole('button', { name: t('settings.models.action.download') })).toBe(null)
+    }
+    cleanup()
+
+    workflowCapabilities = { ...CAPS, samInstalled: true, samManaged: true, fullRtInstalled: true, fullRtManaged: true, fullRtRevision: 'abc123' }
+    const imported = await open(() => withModelGroups(), 'pipelines.detection')
+    await waitFor(() => expect(modelRow(imported, 'samTs').textContent).toContain(t('settings.models.status.imported')))
+    const sam = within(modelRow(imported, 'samTs'))
+    await fireEvent.click(sam.getByRole('button', { name: t('settings.models.action.verify') }))
+    expect(verifySamTs).toHaveBeenCalled()
+    await fireEvent.click(within(modelRow(imported, 'rtFull')).getByRole('button', { name: t('settings.models.details') }))
+    expect(modelRow(imported, 'rtFull').textContent).toContain(t('settings.models.revision', { revision: 'abc123' }))
+    expect(modelRow(imported, 'rtFull').textContent).toContain(CAPS.fullRtFile.sha256)
+  })
+
+  it('manage the script gate as one row, with per-file Check and Delete under File details', async () => {
+    const detection = await open(() => withModelGroups({ installed: true }), 'pipelines.detection')
+    const element = modelRow(detection, 'scriptGate')
+    const gate = within(element)
+    await waitFor(() => expect(element.textContent).toContain(t('settings.models.fileCount', { count: 2 })))
+    expect(gate.getByText(t('settings.models.groups.scriptGate'), { exact: false })).toBeTruthy()
+    await fireEvent.click(gate.getAllByRole('button', { name: t('settings.models.action.verify') })[0])
+    expect(verifyModelGroup).toHaveBeenCalledWith({ id: 'scriptGate' })
+
+    await fireEvent.click(gate.getByRole('button', { name: t('settings.models.details') }))
+    expect(gate.getByText('osd_lstm.onnx')).toBeTruthy()
+    expect(element.querySelector('code')?.textContent).toBe('b18e0c1479d9eb67394993098f7e1079c9a93ef6f7b0416ee333fccb865c6e72')
+    const labels = /** @type {HTMLElement} */ (gate.getByText('osd_labels.json').closest('li'))
+    await fireEvent.click(within(labels).getByRole('button', { name: t('settings.models.action.verify') }))
+    expect(verifyModel).toHaveBeenCalledWith({ id: 'scriptGateLabels' })
+
+    // A file Delete removes what the backend removes, the whole group, and
+    // asks first in those words.
+    await fireEvent.click(within(labels).getByRole('button', { name: t('settings.models.action.delete') }))
+    const confirm = /** @type {HTMLElement} */ (element.querySelector('.confirm'))
+    expect(confirm.textContent).toContain(t('settings.models.remove.scriptGate'))
+    await fireEvent.click(within(confirm).getByRole('button', { name: t('settings.models.action.delete') }))
+    await waitFor(() => expect(deleteModelGroup).toHaveBeenCalledWith({ id: 'scriptGate' }))
+    expect(deleteModel).not.toHaveBeenCalled()
+  })
+
+  it('name what a removal stops before it happens; Keep and Escape change nothing', async () => {
+    const detection = await open(() => withModelGroups({ installed: true }), 'pipelines.detection')
+    const element = modelRow(detection, 'rtSmall')
+    const row = within(element)
+    const deleteButton = await waitFor(() => row.getByRole('button', { name: t('settings.models.action.delete') }))
+
+    await fireEvent.click(deleteButton)
+    const confirm = () => /** @type {HTMLElement|null} */ (element.querySelector('.confirm'))
+    expect(confirm()?.textContent).toContain(t('settings.models.remove.rtSmall'))
+    expect(confirm()?.textContent).toContain(t('settings.models.remove.inUse'))
+    const keep = within(/** @type {HTMLElement} */ (confirm())).getByRole('button', { name: t('settings.models.remove.keep') })
+    await waitFor(() => expect(document.activeElement).toBe(keep))
+    await fireEvent.click(keep)
+    expect(confirm()).toBe(null)
+    await waitFor(() => expect(document.activeElement?.id).toBe(deleteButton.id))
+
+    await fireEvent.click(deleteButton)
+    const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+    within(/** @type {HTMLElement} */ (confirm())).getByRole('button', { name: t('settings.models.remove.keep') }).dispatchEvent(escape)
+    // Escape answered the question and nothing else: Settings stays open.
+    expect(escape.defaultPrevented).toBe(true)
+    await waitFor(() => expect(confirm()).toBe(null))
+    expect(deleteModel).not.toHaveBeenCalled()
+
+    await fireEvent.click(deleteButton)
+    await fireEvent.click(within(/** @type {HTMLElement} */ (confirm())).getByRole('button', { name: t('settings.models.action.delete') }))
+    await waitFor(() => expect(deleteModel).toHaveBeenCalledWith({ id: 'balloonDetector' }))
+    // Focus carries on from the row's first action, not from the page top.
+    await waitFor(() => expect(element.contains(document.activeElement)).toBe(true))
+  })
+
+  it('delete the OCR rescue as a unit and never take the shared speech bubble finder with it', async () => {
+    const detection = await open(() => withModelGroups({ installed: true }), 'pipelines.detection')
+    const element = modelRow(detection, 'mangaOcr')
+    const ocr = within(element)
+    await fireEvent.click(await waitFor(() => ocr.getByRole('button', { name: t('settings.models.action.verify') })))
+    expect(verifyModelGroup).toHaveBeenCalledWith({ id: 'mangaOcr' })
+    await fireEvent.click(ocr.getByRole('button', { name: t('settings.models.action.delete') }))
+    const confirm = /** @type {HTMLElement} */ (element.querySelector('.confirm'))
+    expect(confirm.textContent).toContain(t('settings.models.remove.mangaOcr'))
+    await fireEvent.click(within(confirm).getByRole('button', { name: t('settings.models.action.delete') }))
+    await waitFor(() => expect(deleteModelGroup).toHaveBeenCalledWith({ id: 'mangaOcr' }))
+    expect(deleteModel).not.toHaveBeenCalled()
+    expect(deleteModelGroup).not.toHaveBeenCalledWith({ id: 'scriptGate' })
+  })
+
+  it('keep the text-shaped review collapsed and optional under legacy, inside Shape the removal mask', async () => {
+    const detection = await open(both, 'pipelines.detection')
+    const review = /** @type {HTMLElement} */ (detection.container.querySelector('.review'))
+    expect(review.closest('.capability')?.querySelector('h3')?.textContent).toBe(t('settings.detection.capability.shapeMask'))
+    expect(review.textContent).toContain(t('settings.detection.review.optional'))
+    expect(detection.queryByText('Independent model analysis')).toBe(null)
+    const summary = within(review).getByRole('button', { name: new RegExp(t('settings.detection.review.summary')) })
+    expect(summary.getAttribute('aria-expanded')).toBe('false')
+    await fireEvent.click(summary)
+    await waitFor(() => expect(detection.getByText('Independent model analysis')).toBeTruthy())
+    cleanup()
+
+    setTextPolicy('all_text')
+    const allText = await open(both, 'pipelines.detection')
+    await waitFor(() => expect(allText.getByText('Independent model analysis')).toBeTruthy())
   })
 
   it('mark a FLUX model the helper lists as found, and the rest as needing it', async () => {

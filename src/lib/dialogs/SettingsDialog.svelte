@@ -1,4 +1,6 @@
 <script module>
+  import { MODELS as PIPELINE_MODELS } from '../model/pipelines.js'
+
   /**
    * Whether a `model-progress` event is about a row this dialog does not know
    * is downloading.
@@ -27,6 +29,17 @@
     // seventh weight added since this snapshot - which is the same remedy.
     return row?.downloading !== true
   }
+
+  /**
+   * The multi-file downloads Settings lists as one row each, with the name it
+   * gives each. Derived from `model/pipelines.js#MODELS`, which is also what
+   * `api/model-download-notices.js` names a failed download by.
+   */
+  export const MODEL_GROUPS = Object.freeze(
+    PIPELINE_MODELS.filter((entry) => entry.group).map((entry) =>
+      Object.freeze({ id: /** @type {string} */ (entry.group), nameKey: entry.nameKey, fileIds: entry.files }),
+    ),
+  )
 </script>
 
 <script>
@@ -74,12 +87,13 @@
    * a binding is *changed*, and it writes its own half of the settings, so it
    * behaves identically here and mounted on its own by `?`.
    */
-  import { Button, Field, Screen, Segmented, Select, TextInput, ThemePicker } from '../ui/index.js'
+  import { Button, Disclosure, Field, Screen, Segmented, Select, TextInput, ThemePicker } from '../ui/index.js'
   import Icon from '../icons/Icon.svelte'
-  import { onMount, untrack } from 'svelte'
+  import { onMount, tick, untrack } from 'svelte'
   import { closeModal } from '../state/app.svelte.js'
   import { getBackend } from '../api/backend.js'
-  import { chooseFolder } from '../api/folder.js'
+  import { chooseFolder, chooseOnnx } from '../api/folder.js'
+  import { showSettingsSection } from '../api/model-download-notices.js'
   import { CATALOGUES, LOCALE, hasKey, t } from '../i18n/index.js'
   import { capabilities, loadCapabilities } from '../state/capabilities.svelte.js'
   import {
@@ -95,10 +109,27 @@
     setOriginalView,
     setReadingDirection,
     setSidecarPath,
+    setTextPolicy,
+    setOcrRescue,
     setTheme,
   } from '../state/session.svelte.js'
-  import { CLEANERS, DETECTORS, LANGUAGES, detectorsFor, engineBytes } from '../model/pipelines.js'
+  import {
+    ALL_TEXT_POLICY,
+    CAPABILITIES,
+    CLEANERS,
+    DETECTORS,
+    LANGUAGES,
+    detectorsFor,
+    engineBytes,
+    migrateDetectorChoice,
+    model as pipelineModel,
+    modelOfFile,
+    runtimeState,
+    usedNow,
+    workflowNeeds,
+  } from '../model/pipelines.js'
   import EngineTable from './EngineTable.svelte'
+  import WorkflowAnalysis from './WorkflowAnalysis.svelte'
   import ShortcutSheet from './ShortcutSheet.svelte'
   import AboutSection from './AboutSection.svelte'
   import InferenceSettings from './InferenceSettings.svelte'
@@ -184,6 +215,12 @@
    * @type {Record<string, {downloaded: number, total: number|null}>}
    */
   let progress = $state({})
+  let groupBusy = $state({})
+  let groupFailures = $state({})
+  let groupNotes = $state({})
+  let groupVerification = $state({})
+
+  // `MODEL_GROUPS` is declared in the module script above, exported.
 
   /** The last failure per id, until something else happens to that row. @type {Record<string, string>} */
   let failures = $state({})
@@ -243,6 +280,66 @@
       catalogue = await getBackend().listModels(options)
     } catch {
       catalogue = null
+    }
+    await refreshRuntimeLoad()
+  }
+
+  /**
+   * Whether the installed runtime **loads**, which the catalogue cannot say.
+   *
+   * The runtime row's `installed` is a file found. A native run also loads
+   * it and refuses to start when that fails - a CUDA build on a machine
+   * without CUDA, a quarantined or damaged library - so a readiness row that
+   * read `installed` alone went green over a run that would not start.
+   * `diagnostics` makes the same load and keeps the failures apart by remedy
+   * (`diagnostics.runtime.*`), so its answer is asked after every catalogue
+   * refresh that finds the runtime here.
+   *
+   * Not asked again once it has loaded: the process keeps the library it
+   * loaded for its lifetime, so the answer cannot change until the file goes,
+   * and then the catalogue says `missing` first. A later answer supersedes an
+   * earlier one still on its way (`runtimeLoadAsk`).
+   *
+   * @type {{state: 'checking'|'loaded'|'unchecked', reasonKey?: undefined}|{state: 'failed', reasonKey: string}}
+   */
+  let runtimeLoad = $state({ state: 'checking' })
+  let runtimeLoadAsk = 0
+
+  /** The keys a load failure may name; anything else reads as the generic one. */
+  const LOAD_REASONS = new Set([
+    'diagnostics.runtime.missing',
+    'diagnostics.runtime.quarantined',
+    'diagnostics.runtime.refused',
+    'diagnostics.runtime.missingDependency',
+    'diagnostics.runtime.unloadable',
+  ])
+
+  async function refreshRuntimeLoad() {
+    const row = catalogue?.runtime
+    const ask = ++runtimeLoadAsk
+    if (!row?.installed) {
+      runtimeLoad = { state: 'checking' }
+      return
+    }
+    if (runtimeLoad.state === 'loaded') return
+    try {
+      const answer = await getBackend().diagnostics()
+      if (ask !== runtimeLoadAsk) return
+      const status = answer?.components?.find((component) => component.name === 'onnxruntime')
+      if (!status) runtimeLoad = { state: 'unchecked' }
+      else if (status.available) runtimeLoad = { state: 'loaded' }
+      else {
+        // The loader's own words are for the log, never the screen.
+        if (status.detail) console.warn('ONNX Runtime did not load:', status.detail)
+        runtimeLoad = {
+          state: 'failed',
+          reasonKey: LOAD_REASONS.has(status.reasonKey ?? '') ? /** @type {string} */ (status.reasonKey) : 'diagnostics.runtime.unloadable',
+        }
+      }
+    } catch (error) {
+      if (ask !== runtimeLoadAsk) return
+      console.error('diagnostics was rejected', error)
+      runtimeLoad = { state: 'unchecked' }
     }
   }
 
@@ -312,6 +409,13 @@
         // Whatever the last press said about this row is about a press that
         // has now been overtaken by an ending.
         note(event.id, null)
+        const group = MODEL_GROUPS.find((candidate) => candidate.id === event.id)
+        if (group && event.total === null) {
+          groupBusy = { ...groupBusy, [group.id]: false }
+          groupFailures = event.error && event.error !== 'cancelled'
+            ? { ...groupFailures, [group.id]: event.error }
+            : Object.fromEntries(Object.entries(groupFailures).filter(([id]) => id !== group.id))
+        }
         // A cancellation is a failure with a name the user chose, so it is
         // not shown as one: the row goes back to "Not installed", which is
         // the true thing about it, and that is the whole report.
@@ -496,6 +600,551 @@
     }
     await refreshCatalogue()
   }
+
+  /** @param {string} id - a native group id */
+  function groupById(id) {
+    return MODEL_GROUPS.find((group) => group.id === id) ?? null
+  }
+
+  /** @param {{id: string, fileIds: readonly string[]}} group */
+  async function downloadGroup(group) {
+    groupFailures = Object.fromEntries(Object.entries(groupFailures).filter(([id]) => id !== group.id))
+    groupNotes = Object.fromEntries(Object.entries(groupNotes).filter(([id]) => id !== group.id))
+    try {
+      const outcome = await getBackend().downloadModelGroup({ id: group.id })
+      groupBusy = { ...groupBusy, [group.id]: outcome === 'started' }
+      if (outcome !== 'started') groupNotes = { ...groupNotes, [group.id]: DECLINED[outcome] ?? null }
+    } catch (error) {
+      groupFailures = { ...groupFailures, [group.id]: String(error) }
+      groupBusy = { ...groupBusy, [group.id]: false }
+    }
+    await refreshCatalogue()
+  }
+
+  /** @param {{id: string, fileIds: readonly string[]}} group */
+  async function cancelGroup(group) {
+    groupBusy = { ...groupBusy, [group.id]: false }
+    await Promise.all(group.fileIds.map((id) => {
+      const model = catalogue?.models.find((entry) => entry.id === id)
+      return (progress[id] || model?.downloading)
+        ? getBackend().cancelDownload({ id }).catch((error) => { groupFailures = { ...groupFailures, [group.id]: String(error) } })
+        : Promise.resolve()
+    }))
+    await refreshCatalogue()
+  }
+
+  /** @param {{id: string, fileIds: readonly string[]}} group */
+  async function verifyGroup(group) {
+    groupFailures = Object.fromEntries(Object.entries(groupFailures).filter(([id]) => id !== group.id))
+    try {
+      const verified = await getBackend().verifyModelGroup({ id: group.id })
+      groupVerification = { ...groupVerification, [group.id]: verified }
+      if (!verified) groupFailures = { ...groupFailures, [group.id]: t('settings.models.groupMismatch') }
+    } catch (error) {
+      groupFailures = { ...groupFailures, [group.id]: String(error) }
+    }
+    await refreshCatalogue()
+  }
+
+  /** @param {{id: string, fileIds: readonly string[]}} group */
+  async function removeGroup(group) {
+    groupFailures = Object.fromEntries(Object.entries(groupFailures).filter(([id]) => id !== group.id))
+    groupNotes = Object.fromEntries(Object.entries(groupNotes).filter(([id]) => id !== group.id))
+    try {
+      const outcome = await getBackend().deleteModelGroup({ id: group.id })
+      if (outcome !== 'deleted') groupNotes = { ...groupNotes, [group.id]: DECLINED[outcome] ?? null }
+      groupVerification = Object.fromEntries(Object.entries(groupVerification).filter(([id]) => id !== group.id))
+    } catch (error) {
+      groupFailures = { ...groupFailures, [group.id]: String(error) }
+    }
+    await refreshCatalogue()
+    await loadCapabilities()
+  }
+
+  /* ---------- the capability graph ---------- */
+
+  /**
+   * The SAM-TS-L and full RT-DETR readiness, from the same
+   * `listWorkflowCapabilities` the review panel reads. `null` until it
+   * answers; `workflowFailed` separates "not asked yet" from "refused", for
+   * the reason `accelFailure` gives.
+   *
+   * @type {any}
+   */
+  let workflowCaps = $state(null)
+  let workflowFailed = $state(false)
+  /** Whether an explicit Check of the SAM graphs passed; null until one runs. @type {boolean|null} */
+  let samVerified = $state(null)
+  /** @type {Record<string, boolean>} */
+  let importBusy = $state({})
+  /** @type {Record<string, string>} */
+  let importFailures = $state({})
+
+  async function refreshWorkflowCaps() {
+    const backend = getBackend()
+    if (typeof backend.listWorkflowCapabilities !== 'function') {
+      workflowFailed = true
+      return
+    }
+    try {
+      workflowCaps = await backend.listWorkflowCapabilities()
+      workflowFailed = false
+    } catch {
+      workflowCaps = null
+      workflowFailed = true
+    }
+  }
+
+  /**
+   * Asked when Detection is first shown, not on mount, for the reason the
+   * accelerator list waits for Performance: the answer digests the RT-DETR
+   * graphs and probes the runtime, which is work only this panel needs.
+   */
+  let workflowAsked = false
+  $effect(() => {
+    if (active !== 'detection') return
+    untrack(() => {
+      if (workflowAsked) return
+      workflowAsked = true
+      refreshWorkflowCaps()
+    })
+  })
+
+  /** @param {Record<string, unknown>} record @param {string} key */
+  function without(record, key) {
+    return Object.fromEntries(Object.entries(record).filter(([held]) => held !== key))
+  }
+
+  /**
+   * The catalogue rows a logical model is made of, in its own order. A file
+   * the catalogue does not list is left out rather than invented.
+   *
+   * @param {import('../model/pipelines.js').LogicalModel} entry
+   */
+  function filesOf(entry) {
+    return entry.files.map((id) => catalogue?.models.find((row) => row.id === id)).filter(Boolean)
+  }
+
+  /**
+   * What one logical row says: total size, one state, and what it is still
+   * missing. Downloads read the catalogue and the live progress; imports
+   * read the workflow readiness answer; COO is excluded and says only that.
+   *
+   * @param {import('../model/pipelines.js').LogicalModel} entry
+   */
+  function viewOf(entry) {
+    if (entry.source === 'excluded') {
+      return { kind: 'excluded', known: true, installed: false, bytes: null, state: { key: 'settings.models.status.excluded' } }
+    }
+    if (entry.source === 'import') return importView(entry)
+    const files = /** @type {any[]} */ (filesOf(entry))
+    const total = files.length
+    const installedCount = files.filter((row) => row.installed).length
+    const installed = total > 0 && installedCount === total
+    const bytes = files.reduce((sum, row) => sum + row.bytes, 0)
+    const missingBytes = files.reduce((sum, row) => (row.installed ? sum : sum + row.bytes), 0)
+    const downloading = Boolean(entry.group && groupBusy[entry.group]) || files.some((row) => progress[row.id] || row.downloading)
+    const readOnly = files.some((row) => row.installed && row.readOnly)
+    const failed = entry.group ? Boolean(groupFailures[entry.group]) : files.some((row) => failures[row.id])
+    const mismatch = files.some((row) => row.installed && row.sha256Ok === false) ||
+      (entry.group ? groupVerification[entry.group] === false : false)
+    const verified = installed && (entry.group ? groupVerification[entry.group] === true : files.every((row) => row.sha256Ok === true))
+    /** @type {{key: string, params?: Object}} */
+    let state
+    if (downloading) {
+      const got = files.reduce((sum, row) => sum + (row.installed ? row.bytes : (progress[row.id]?.downloaded ?? 0)), 0)
+      const percent = bytes > 0 && files.some((row) => progress[row.id]) ? Math.min(99, Math.floor((got / bytes) * 100)) : null
+      state = percent === null
+        ? { key: 'settings.models.status.downloading' }
+        : { key: 'settings.models.status.downloadingPercent', params: { percent } }
+    } else if (failed) state = { key: 'settings.models.status.failed' }
+    else if (mismatch) state = { key: 'settings.models.status.mismatch' }
+    else if (installed) state = { key: 'settings.models.status.installed' }
+    else if (installedCount > 0) state = { key: 'settings.models.status.someInstalled', params: { installed: installedCount, total } }
+    else state = { key: 'settings.models.status.missing' }
+    return { kind: 'download', known: total > 0, files, total, installedCount, installed, bytes, missingBytes, downloading, readOnly, verified, state }
+  }
+
+  /** @param {import('../model/pipelines.js').LogicalModel} entry */
+  function importView(entry) {
+    const caps = workflowCaps
+    if (!caps) {
+      return {
+        kind: 'import', known: false, installed: false, managed: false, bytes: null, files: [], revision: null, verified: false,
+        state: { key: workflowFailed ? 'settings.models.status.readinessUnavailable' : 'settings.models.status.checking' },
+      }
+    }
+    const sam = entry.importId === 'samTs'
+    /** @type {Array<{name: string, bytes: number, sha256: string}>} */
+    const files = sam ? (caps.samFiles ?? []) : (caps.fullRtFile ? [caps.fullRtFile] : [])
+    const installed = (sam ? caps.samInstalled : caps.fullRtInstalled) === true
+    const managed = (sam ? caps.samManaged : caps.fullRtManaged) === true
+    const bytes = files.reduce((sum, file) => sum + (Number(file.bytes) || 0), 0) || null
+    // The full graph is digested on every readiness answer, so present means
+    // verified. The SAM pair is only checked when someone presses Check.
+    const verified = installed && (sam ? samVerified === true : true)
+    /** @type {{key: string, params?: Object}} */
+    let state
+    if (importBusy[entry.id]) state = { key: 'settings.models.status.checking' }
+    else if (!installed) state = { key: 'settings.models.status.importToEnable' }
+    else if (sam && samVerified === false) state = { key: 'settings.models.status.mismatch' }
+    else state = { key: 'settings.models.status.imported' }
+    return { kind: 'import', known: true, installed, managed, bytes, files, revision: sam ? caps.samRevision : caps.fullRtRevision, verified, state }
+  }
+
+  /** The choices the workflow is computed from. */
+  const choices = $derived({ textPolicy: session.textPolicy, detection: session.detection, ocrRescue: session.ocrRescue })
+  const allText = $derived(session.textPolicy === ALL_TEXT_POLICY)
+  /** The logical models the selected workflow needs. */
+  const needs = $derived(workflowNeeds(choices))
+
+  /**
+   * Whether a missing model is one the selected workflow needs now. The
+   * review's small profile is not needed while the full graph is imported.
+   *
+   * @param {string} id
+   */
+  function neededNow(id) {
+    if (!needs.includes(id)) return false
+    if (allText && id === 'rtSmall' && workflowCaps?.fullRtInstalled) return false
+    return true
+  }
+
+  /**
+   * Whether a single-file model's own Delete in File details is held, and
+   * why. A model more than one workflow reads (the small RT-DETR: legacy
+   * cleaning and the review's small profile) is not removed from the details
+   * while the selected workflow uses it. The row's own Delete stays: that is
+   * where the removal is asked, with everything it stops named first. The
+   * group rows never reach this, because no group holds a shared file.
+   *
+   * @param {import('../model/pipelines.js').LogicalModel} entry
+   * @returns {string|null} the reason's key
+   */
+  function fileDeleteHeld(entry) {
+    return !entry.group && entry.disables.length > 1 && neededNow(entry.id) ? 'settings.models.fileShared' : null
+  }
+
+  /**
+   * What the readiness row adds when the runtime is not there: whole keys,
+   * chosen rather than built, so the catalogue test can find each one.
+   */
+  const RUNTIME_LINES = {
+    missing: 'settings.detection.ready.runtime',
+    downloading: 'settings.detection.ready.runtimeDownloading',
+    unavailable: 'settings.detection.ready.runtimeUnavailable',
+    checking: 'settings.detection.ready.runtimeChecking',
+    unchecked: 'settings.detection.ready.runtimeUnchecked',
+  }
+
+  /**
+   * The one line under the policy: can the selected workflow run, and what
+   * would make it. Built from the same `workflowNeeds` the downloads use, so
+   * the sentence and the button can never disagree with setup.
+   *
+   * **The runtime counts.** A native run refuses to start without ONNX
+   * Runtime, so a workflow whose files are all here is still not complete
+   * while it is missing, and the row names it rather than going green. The
+   * same holds for a runtime that is here and will not load: the row says
+   * why, in the words `diagnostics` chose for that failure's remedy.
+   */
+  const readiness = $derived.by(() => {
+    if (!catalogue) return null
+    /** @type {string[]} */
+    const lines = []
+    /** @type {import('../model/pipelines.js').LogicalModel[]} */
+    const toDownload = []
+    let bytes = 0
+    let fetching = false
+    let samHeld = false
+    let importMissing = false
+    for (const id of needs) {
+      // The OCR rescue is an extra: cleaning runs without it, and its switch
+      // says what is missing and offers the download on its own line.
+      if (!neededNow(id) || id === 'mangaOcr') continue
+      const entry = pipelineModel(id)
+      if (!entry) continue
+      const view = viewOf(entry)
+      if (entry.source === 'download' && view.known && !view.installed) {
+        if (view.downloading) fetching = true
+        else toDownload.push(entry)
+        bytes += view.missingBytes ?? 0
+      }
+      if (entry.source === 'import' && view.known && !view.installed) importMissing = true
+    }
+    if (!allText && needs.length === 0) lines.push(t('settings.detection.ready.nothing'))
+    else if (!allText) {
+      lines.push(bytes > 0
+        ? t('settings.detection.ready.legacyMissing', { bytes })
+        : t('settings.detection.ready.legacy'))
+    } else {
+      // The review refuses SAM graphs that failed their checksum, and SAM on
+      // a computer without the free memory for it (`readinessKeyOf`), so the
+      // row does too. Graphs not checked yet do not hold it back: the review
+      // checks them itself when it opens.
+      const samHere = workflowCaps?.samInstalled === true
+      samHeld = samHere && (samVerified === false || workflowCaps.samMemoryReady === false)
+      if (importMissing) lines.push(t('settings.detection.ready.allTextImport'))
+      if (bytes > 0) lines.push(t('settings.detection.ready.allTextMissing', { bytes }))
+      if (samHere && samVerified === false) lines.push(t('settings.detection.ready.allTextSamMismatch'))
+      if (samHere && workflowCaps.samMemoryReady === false) lines.push(t('settings.detection.ready.allTextMemory'))
+      if (!importMissing && bytes === 0 && workflowCaps && !samHeld) lines.push(t('settings.detection.ready.allText'))
+    }
+    // A live progress event is a download the catalogue snapshot may not know
+    // about yet; it is still not a runtime that is here.
+    const row = catalogue.runtime
+    const runtime = runtimeState(
+      row ? { ...row, downloading: row.downloading === true || Boolean(progress[RUNTIME_ID]) } : null,
+      needs,
+      runtimeLoad.state,
+    )
+    const runtimeReady = runtime === 'notNeeded' || runtime === 'installed'
+    if (runtime === 'unloadable') {
+      lines.push(t('settings.detection.ready.runtimeUnloadable', { reasonKey: runtimeLoad.reasonKey ?? 'diagnostics.runtime.unloadable' }))
+    } else if (!runtimeReady) lines.push(t(RUNTIME_LINES[runtime]))
+    const missing = toDownload.reduce((sum, entry) => sum + (viewOf(entry).missingBytes ?? 0), 0)
+    const complete = bytes === 0 && !importMissing && !samHeld && (!allText || Boolean(workflowCaps)) && runtimeReady
+    return { lines, toDownload, missing, fetching, complete, runtime }
+  })
+
+  /** Download everything the selected workflow is missing, each as its own unit. */
+  async function downloadNeeded() {
+    for (const entry of readiness?.toDownload ?? []) {
+      if (entry.group) {
+        const group = groupById(entry.group)
+        if (group) await downloadGroup(group)
+        continue
+      }
+      for (const row of /** @type {any[]} */ (filesOf(entry))) if (!row.installed) await download(row.id)
+    }
+  }
+
+  /**
+   * The OCR rescue switch, honestly: whether it can run with what is here.
+   * `null` says nothing needs saying.
+   */
+  const rescueStatus = $derived.by(() => {
+    if (!session.ocrRescue || allText) return null
+    const ja = migrateDetectorChoice('ja', session.detection.ja ?? null).detector
+    if (!ja) return { key: 'settings.detection.rescue.skipped', download: false }
+    const entry = pipelineModel('mangaOcr')
+    const view = entry && catalogue ? viewOf(entry) : null
+    if (!view || !view.known || view.installed) return null
+    return { key: 'settings.detection.rescue.missing', download: true, view }
+  })
+
+  /* ---------- imports ---------- */
+
+  /** @param {import('../model/pipelines.js').LogicalModel} entry */
+  async function importModel(entry) {
+    const sam = entry.importId === 'samTs'
+    /** @type {string|null} */
+    let path = null
+    try {
+      path = sam
+        ? await chooseFolder({ title: t('settings.detection.sam.chooserTitle') })
+        : await chooseOnnx({ title: t('settings.detection.rtFull.chooserTitle') })
+    } catch {
+      // A chooser that could not open chose nothing, which is also what
+      // closing it does.
+      path = null
+    }
+    if (!path) return
+    importBusy = { ...importBusy, [entry.id]: true }
+    importFailures = without(importFailures, entry.id)
+    try {
+      if (sam) {
+        await getBackend().importSamTs({ sourceDir: path })
+        // The import verifies both graphs against the pinned manifest.
+        samVerified = true
+      } else {
+        await getBackend().importFullRt({ sourcePath: path })
+      }
+    } catch (error) {
+      importFailures = { ...importFailures, [entry.id]: String(error) }
+    } finally {
+      importBusy = { ...importBusy, [entry.id]: false }
+      await refreshWorkflowCaps()
+    }
+  }
+
+  /** SAM only: the full graph is digested on every readiness answer. @param {import('../model/pipelines.js').LogicalModel} entry */
+  async function checkImport(entry) {
+    importFailures = without(importFailures, entry.id)
+    importBusy = { ...importBusy, [entry.id]: true }
+    try {
+      samVerified = (await getBackend().verifySamTs()) === true
+    } catch (error) {
+      samVerified = false
+      importFailures = { ...importFailures, [entry.id]: String(error) }
+    } finally {
+      importBusy = { ...importBusy, [entry.id]: false }
+      await refreshWorkflowCaps()
+    }
+  }
+
+  /** @param {import('../model/pipelines.js').LogicalModel} entry */
+  async function removeImport(entry) {
+    importFailures = without(importFailures, entry.id)
+    importBusy = { ...importBusy, [entry.id]: true }
+    try {
+      if (entry.importId === 'samTs') {
+        await getBackend().removeSamTs()
+        samVerified = null
+      } else {
+        await getBackend().removeFullRt()
+      }
+    } catch (error) {
+      importFailures = { ...importFailures, [entry.id]: String(error) }
+    } finally {
+      importBusy = { ...importBusy, [entry.id]: false }
+      await refreshWorkflowCaps()
+    }
+  }
+
+  /* ---------- removal, confirmed ---------- */
+
+  /**
+   * The removal waiting for a yes: which model (or, for a file no model
+   * claims, which file), and where focus goes if the answer is Keep.
+   *
+   * Inline rather than a modal: the question belongs to one row, and the row
+   * is where the reader is looking. Settings is itself a layer, and a second
+   * one over it for a two-button question is interruption without purpose.
+   *
+   * @type {{modelId: string|null, fileId: string|null, returnId: string}|null}
+   */
+  let confirming = $state(null)
+
+  /** @param {string} id */
+  const rowId = (id) => `${uid}-model-${id}`
+
+  /**
+   * @param {string|null} modelId
+   * @param {string|null} fileId
+   * @param {string} returnId - the id of the Delete that asked
+   */
+  async function askRemove(modelId, fileId, returnId) {
+    confirming = { modelId, fileId, returnId }
+    await tick()
+    document.getElementById(`${uid}-keep`)?.focus()
+  }
+
+  async function keep() {
+    const back = confirming?.returnId
+    confirming = null
+    await tick()
+    if (back) document.getElementById(back)?.focus()
+  }
+
+  async function confirmRemove() {
+    const pending = confirming
+    confirming = null
+    if (!pending) return
+    const entry = pending.modelId ? pipelineModel(pending.modelId) : null
+    if (entry?.source === 'import') await removeImport(entry)
+    else if (entry?.group) {
+      const group = groupById(entry.group)
+      if (group) await removeGroup(group)
+    } else {
+      const id = pending.fileId ?? entry?.files[0]
+      if (id) await remove(id)
+    }
+    await tick()
+    // The row stays; its Delete may not. Its first action is where the
+    // reader carries on from.
+    const row = document.getElementById(rowId(pending.modelId ?? pending.fileId ?? ''))
+    const next = /** @type {HTMLElement|null} */ (row?.querySelector('.row-actions button:not(:disabled)') ?? null)
+    next?.focus()
+  }
+
+  /** Escape answers Keep, and does not also close Settings. @param {KeyboardEvent} event */
+  function onconfirmkeydown(event) {
+    if (event.key !== 'Escape') return
+    event.preventDefault()
+    event.stopPropagation()
+    keep()
+  }
+
+  /** The removal question, as the sentences it is drawn from. */
+  const confirmLines = $derived.by(() => {
+    if (!confirming) return []
+    const entry = confirming.modelId ? pipelineModel(confirming.modelId) : null
+    if (!entry || !entry.removeKey) {
+      const row = catalogue?.models.find((model) => model.id === confirming?.fileId)
+      return [t('settings.models.remove.file', { name: row ? t(row.kindKey) : String(confirming.fileId) })]
+    }
+    const lines = [t(entry.removeKey)]
+    if (usedNow(entry.id, choices) && neededNow(entry.id)) lines.push(t('settings.models.remove.inUse'))
+    return lines
+  })
+
+  /** Whether the review panel is open. Open by default only under all-text. */
+  let reviewOpen = $state(untrack(() => session.textPolicy === ALL_TEXT_POLICY))
+
+  /** @param {boolean} open */
+  function toggleReview(open) {
+    reviewOpen = open
+    // The panel imports and removes graphs on its own; the rows above read
+    // the same answer again once it is put away.
+    if (!open) refreshWorkflowCaps()
+  }
+
+  /** @param {string} value */
+  function choosePolicy(value) {
+    setTextPolicy(/** @type {any} */ (value))
+    if (value === ALL_TEXT_POLICY) reviewOpen = true
+  }
+
+  /** Which model rows have their file details open. @type {Record<string, boolean>} */
+  let detailsOpen = $state({})
+
+  /**
+   * A row's meta line: file count for a multi-file model, total size, one
+   * state, and the facts that qualify it.
+   *
+   * @param {any} view - what `viewOf` answered
+   */
+  function metaOf(view) {
+    const parts = []
+    if (view.kind === 'download' && view.total > 1) parts.push(t('settings.models.fileCount', { count: view.total }))
+    if (view.bytes) parts.push(t('models.value.size', { bytes: view.bytes }))
+    parts.push(t(view.state.key, view.state.params))
+    if (view.kind === 'download' && view.readOnly) parts.push(t('settings.models.status.readOnly'))
+    if (view.kind === 'import' && view.installed && !view.managed) parts.push(t('settings.models.status.readOnly'))
+    if (view.verified && !view.downloading) parts.push(t('settings.models.status.verified'))
+    return parts.join(' · ')
+  }
+
+  /** Whether this backend can import the graph at all. @param {import('../model/pipelines.js').LogicalModel} entry */
+  function canImport(entry) {
+    const backend = getBackend()
+    return typeof (entry.importId === 'samTs' ? backend.importSamTs : backend.importFullRt) === 'function'
+  }
+
+  /** The rescue switch's own Download: the OCR group, as one unit. */
+  async function downloadRescue() {
+    const group = groupById('mangaOcr')
+    if (group) await downloadGroup(group)
+  }
+
+  /**
+   * Whether Detection ends in something focusable: the Japanese filtering
+   * rows' buttons, or a row no capability claims. Otherwise it ends in prose
+   * and the scroller takes the tab stop (WCAG 2.1.1).
+   */
+  const detectionTailFocusable = $derived(
+    Boolean(catalogue) &&
+      (detectionModels.length > 0 ||
+        ['scriptGate', 'mangaOcr'].some((id) => {
+          const entry = pipelineModel(id)
+          return entry ? viewOf(entry).known : false
+        })),
+  )
+
+  /** Detection's rows, grouped the way the graph draws them. */
+  const detectionSections = CAPABILITIES.filter((section) => section.pipeline === 'detection')
+  const cleaningSections = CAPABILITIES.filter((section) => section.pipeline === 'cleaning')
 
   /** The id the ONNX Runtime's own download reports under (`src-tauri/src/weights.rs`). */
   const RUNTIME_ID = 'runtime'
@@ -983,14 +1632,21 @@
     ]
   }
 
+  const textPolicyOptions = [
+    { value: 'legacy_gate', label: t('pipelines.workflow.legacyGate') },
+    { value: 'all_text', label: t('pipelines.workflow.allText') },
+  ]
+
   /**
-   * Which catalogue rows belong to Cleaning: the files a cleaner names. Every
-   * other row is Detection's, so a weight added to the backend before this
-   * table knows it still has a place to be managed from.
+   * Catalogue rows no logical model claims, by the section they belong to:
+   * Cleaning's if a cleaner names the file, Detection's otherwise. Normally
+   * empty; a weight the backend added before the capability graph knew it
+   * still has a place to be checked and deleted from.
    */
   const CLEANING_FILES = new Set(CLEANERS.flatMap((engine) => engine.files))
-  const detectionModels = $derived(catalogue?.models.filter((model) => !CLEANING_FILES.has(model.id)) ?? [])
-  const cleaningModels = $derived(catalogue?.models.filter((model) => CLEANING_FILES.has(model.id)) ?? [])
+  const unclaimed = $derived(catalogue?.models.filter((model) => !modelOfFile(model.id)) ?? [])
+  const detectionModels = $derived(unclaimed.filter((model) => !CLEANING_FILES.has(model.id)))
+  const cleaningModels = $derived(unclaimed.filter((model) => CLEANING_FILES.has(model.id)))
 
   /** The catalogue by id, in the shape `engineBytes` reads. */
   const filesById = $derived(Object.fromEntries((catalogue?.models ?? []).map((model) => [model.id, model])))
@@ -1056,6 +1712,13 @@
   // Cloud). Read once: after that the list owns it.
   let active = $state(untrack(() => initialTab(spec?.props?.tab)))
 
+  // Which section is on screen, for the notice a failed background download
+  // raises: a row's inline error only counts as said while its section shows.
+  $effect(() => {
+    showSettingsSection(active)
+    return () => showSettingsSection(null)
+  })
+
   const uid = $props.id()
   /** @param {string} id */
   const tabId = (id) => `${uid}-tab-${id}`
@@ -1107,11 +1770,29 @@
   }
 </script>
 
-<!-- One catalogue row: a weight's name, size and state, with the presses that
-     apply to it. Detection and Cleaning both draw their files through this. -->
+<!-- The removal question, inside the row that asked it. Escape answers Keep
+     on either button, so it never also closes Settings. -->
+{#snippet confirmStrip()}
+  <div class="confirm" role="group" aria-labelledby="{uid}-confirm-text">
+    <p class="confirm-text" id="{uid}-confirm-text">
+      {#each confirmLines as line (line)}<span>{line}</span>{/each}
+    </p>
+    <div class="confirm-actions">
+      <Button size="sm" id="{uid}-keep" onclick={keep} onkeydown={onconfirmkeydown}>
+        {t('settings.models.remove.keep')}
+      </Button>
+      <Button size="sm" variant="primary" onclick={confirmRemove} onkeydown={onconfirmkeydown}>
+        {t('settings.models.action.delete')}
+      </Button>
+    </div>
+  </div>
+{/snippet}
+
+<!-- A catalogue row no capability claims: a weight's name, size and state,
+     with the presses that apply to it. Normally there are none. -->
 {#snippet fileRow(/** @type {any} */ model)}
   {@const status = statusOf(model.id, model.installed, model.sha256Ok)}
-  <li class="row">
+  <li class="row" id={rowId(model.id)}>
     <div class="row-text">
       <span class="row-name">{t(model.kindKey)}</span>
       <span class="row-meta">
@@ -1143,7 +1824,12 @@
           <Button size="sm" onclick={() => verify(model.id)}>
             {t('settings.models.action.verify')}
           </Button>
-          <Button size="sm" disabled={model.readOnly} onclick={() => remove(model.id)}>
+          <Button
+            size="sm"
+            id="{rowId(model.id)}-delete"
+            disabled={model.readOnly}
+            onclick={() => askRemove(null, model.id, `${rowId(model.id)}-delete`)}
+          >
             {t('settings.models.action.delete')}
           </Button>
         {:else}
@@ -1160,22 +1846,254 @@
         {/if}
       {/if}
     </div>
+    {#if confirming && confirming.modelId === null && confirming.fileId === model.id}
+      {@render confirmStrip()}
+    {/if}
   </li>
 {/snippet}
 
 {#snippet fileList(/** @type {any[]} */ models)}
-  {#if catalogue}
-    {#if models.length > 0}
-      <h3 class="sub">{t('settings.models.heading')}</h3>
+  {#if models.length > 0}
+    <h3 class="sub">{t('settings.models.heading')}</h3>
+    <ul class="rows">
+      {#each models as model (model.id)}
+        {@render fileRow(model)}
+      {/each}
+    </ul>
+  {/if}
+{/snippet}
+
+<!-- One logical model: one name, its total size and one state, the presses
+     that apply to the whole of it, and its component files in the details
+     below. A multi-file model installs, checks and deletes as one unit; the
+     details keep per-file Check and Delete for troubleshooting. -->
+{#snippet modelRow(/** @type {import('../model/pipelines.js').LogicalModel} */ entry)}
+  {@const view = /** @type {any} */ (viewOf(entry))}
+  {@const group = entry.group ? groupById(entry.group) : null}
+  {@const single = entry.source === 'download' && !entry.group ? view.files?.[0] : null}
+  {@const needed = view.known && !view.installed && neededNow(entry.id)}
+  {@const deleteId = `${rowId(entry.id)}-delete`}
+  <li class="row model" class:excluded={view.kind === 'excluded'} id={rowId(entry.id)} data-model={entry.id}>
+    <div class="row-text">
+      <span class="row-name">
+        {t(entry.nameKey)}{#if entry.product}<span class="product">{entry.product}</span>{/if}
+      </span>
+      <span class="row-meta">
+        {metaOf(view)}{#if needed}<span class="needed">{` · ${t('settings.models.status.neededNow')}`}</span>{/if}
+      </span>
+      <span class="row-role">{t(entry.roleKey)}</span>
+      {#if entry.id === 'samTs' && view.installed && workflowCaps && !workflowCaps.samMemoryReady}
+        <span class="row-role">{t('settings.detection.sam.memory')}</span>
+      {/if}
+      {#if single && failures[single.id]}<span class="row-error">{failureText(single.id)}</span>{/if}
+      {#if single && notes[single.id]}<span class="row-error">{t(notes[single.id])}</span>{/if}
+      {#if group && groupFailures[group.id]}<span class="row-error">{groupFailures[group.id]}</span>{/if}
+      {#if group && groupNotes[group.id]}<span class="row-error">{t(groupNotes[group.id])}</span>{/if}
+      {#if importFailures[entry.id]}<span class="row-error">{importFailures[entry.id]}</span>{/if}
+      {#if single?.partialBytes && !progress[single.id]}
+        <span class="row-partial">{t('settings.models.status.partial', { bytes: single.partialBytes })}</span>
+      {/if}
+    </div>
+    <div class="row-actions">
+      {#if view.kind === 'download'}
+        {#if view.downloading}
+          <Button size="sm" onclick={() => (group ? cancelGroup(group) : cancel(single.id))}>
+            {t('settings.models.action.cancel')}
+          </Button>
+        {:else}
+          {#if view.installed}
+            <Button size="sm" onclick={() => (group ? verifyGroup(group) : verify(single.id))}>
+              {t('settings.models.action.verify')}
+            </Button>
+          {:else}
+            <Button size="sm" onclick={() => (group ? downloadGroup(group) : download(single.id))}>
+              {t('settings.models.action.download')}
+            </Button>
+          {/if}
+          {#if view.installedCount > 0}
+            <Button size="sm" id={deleteId} disabled={view.readOnly} onclick={() => askRemove(entry.id, null, deleteId)}>
+              {t('settings.models.action.delete')}
+            </Button>
+          {/if}
+          {#if single?.partialBytes}
+            <Button size="sm" onclick={() => discard(single.id)}>
+              {t('settings.models.action.discard')}
+            </Button>
+          {/if}
+        {/if}
+      {:else if view.kind === 'import'}
+        {#if !view.installed}
+          <Button size="sm" disabled={importBusy[entry.id] || !canImport(entry)} onclick={() => importModel(entry)}>
+            {t('settings.models.action.import')}
+          </Button>
+        {:else}
+          {#if entry.importId === 'samTs'}
+            <Button size="sm" disabled={importBusy[entry.id]} onclick={() => checkImport(entry)}>
+              {t('settings.models.action.verify')}
+            </Button>
+          {/if}
+          {#if view.managed}
+            <Button size="sm" id={deleteId} disabled={importBusy[entry.id]} onclick={() => askRemove(entry.id, null, deleteId)}>
+              {t('settings.models.action.delete')}
+            </Button>
+          {/if}
+        {/if}
+      {/if}
+    </div>
+    {#if confirming && confirming.modelId === entry.id}
+      {@render confirmStrip()}
+    {/if}
+    {#if view.kind !== 'excluded' && ((view.files?.length ?? 0) > 0 || view.revision)}
+      <div class="details">
+        <Disclosure
+          variant="plain"
+          open={detailsOpen[entry.id] === true}
+          ontoggle={(open) => (detailsOpen = { ...detailsOpen, [entry.id]: open })}
+        >
+          {#snippet summary()}{t('settings.models.details')}{/snippet}
+          {#if view.kind === 'import' && view.revision}
+            <p class="file-note">{t('settings.models.revision', { revision: view.revision })}</p>
+          {/if}
+          <ul class="files">
+            {#each view.files as file (file.id ?? file.name)}
+              {@const nameId = `${rowId(entry.id)}-file-${file.id ?? file.name}`}
+              {@const controls = view.kind === 'download' && file.installed && !view.downloading}
+              {@const held = controls && !file.readOnly ? fileDeleteHeld(entry) : null}
+              <li class="file">
+                <div class="file-text">
+                  <span class="file-name" id={nameId}>{file.fileName ?? file.name}</span>
+                  {#if view.kind === 'download'}
+                    {@const status = statusOf(file.id, file.installed, file.sha256Ok)}
+                    <span class="file-meta">
+                      {t('models.value.size', { bytes: file.bytes })} · {t(status.key, status.params)}{#if file.installed && file.readOnly}
+                        · {t('settings.models.status.readOnly')}{/if}
+                    </span>
+                  {:else}
+                    <span class="file-meta">{t('models.value.size', { bytes: file.bytes })}</span>
+                  {/if}
+                  <span class="file-meta">SHA-256 <code>{file.sha256}</code></span>
+                  {#if group && failures[file.id]}<span class="row-error">{failureText(file.id)}</span>{/if}
+                  {#if held}<span class="file-held" id="{nameId}-held">{t(held)}</span>{/if}
+                </div>
+                <!-- Check and Delete per file, for a single-file model as for
+                     a group. A held Delete stays in the tab order with its
+                     reason read beside it (aria-disabled, not disabled). -->
+                {#if controls}
+                  <div class="file-actions">
+                    <Button size="sm" aria-describedby={nameId} onclick={() => verify(file.id)}>
+                      {t('settings.models.action.verify')}
+                    </Button>
+                    <Button
+                      size="sm"
+                      id="{nameId}-delete"
+                      aria-describedby={held ? `${nameId} ${nameId}-held` : nameId}
+                      aria-disabled={held ? 'true' : undefined}
+                      disabled={file.readOnly}
+                      onclick={() => {
+                        if (!held) askRemove(entry.id, file.id, `${nameId}-delete`)
+                      }}
+                    >
+                      {t('settings.models.action.delete')}
+                    </Button>
+                  </div>
+                {/if}
+              </li>
+            {/each}
+          </ul>
+          {#if view.kind === 'download'}
+            <p class="file-note">{t('settings.models.revisionUnavailable')}</p>
+          {:else if entry.importId === 'samTs'}
+            <p class="file-note">{t('settings.models.importPair')}</p>
+          {/if}
+        </Disclosure>
+      </div>
+    {/if}
+  </li>
+{/snippet}
+
+<!-- The OCR rescue switch, legacy only, with what it can actually do now:
+     nothing when Japanese is skipped, nothing until its files are here. The
+     label sits left and the box right, the shape every switch on this screen
+     has; the description and the status are both read with the box. -->
+{#snippet rescueOption()}
+  <div class="option">
+    <div class="option-line">
+      <label class="option-label" for="settings-ocr-rescue">{t('pipelines.workflow.ocrRescue')}</label>
+      <input
+        id="settings-ocr-rescue"
+        class="check"
+        type="checkbox"
+        aria-describedby="settings-ocr-rescue-description settings-ocr-rescue-status"
+        checked={session.ocrRescue}
+        onchange={(event) => setOcrRescue(event.currentTarget.checked)}
+      />
+    </div>
+    <p class="option-description" id="settings-ocr-rescue-description">{t('pipelines.workflow.ocrRescueDescription')}</p>
+    <div class="option-status" class:shown={rescueStatus !== null}>
+      <span id="settings-ocr-rescue-status" role="status">{rescueStatus ? t(rescueStatus.key) : ''}</span>
+      {#if rescueStatus?.download}
+        {#if rescueStatus.view.downloading}
+          <span class="option-progress">{t(rescueStatus.view.state.key, rescueStatus.view.state.params)}</span>
+        {:else}
+          <Button size="sm" onclick={() => downloadRescue()}>
+            {t('settings.detection.download', { bytes: rescueStatus.view.missingBytes })}
+          </Button>
+        {/if}
+      {/if}
+    </div>
+  </div>
+{/snippet}
+
+<!-- The optional text-shaped review: collapsed under legacy, open under
+     all-text, and mounted only while open so its readiness probe and graph
+     check run when someone asks for the review, not whenever Settings opens. -->
+{#snippet review()}
+  <div class="review">
+    <Disclosure variant="plain" open={reviewOpen} ontoggle={toggleReview}>
+      {#snippet summary()}
+        <span class="review-summary">
+          <span class="review-title">{t('settings.detection.review.summary')}</span>
+          <span class="review-tag">{t('settings.detection.review.optional')}</span>
+        </span>
+      {/snippet}
+      <p class="line review-note">{t('settings.detection.review.note')}</p>
+      <WorkflowAnalysis />
+    </Disclosure>
+  </div>
+{/snippet}
+
+<!-- One capability: its heading, what it is for, and its models. -->
+{#snippet capability(/** @type {(typeof CAPABILITIES)[number]} */ section)}
+  {@const entries = section.models.map((id) => pipelineModel(id)).filter((entry) => entry !== null && (entry.source !== 'download' || viewOf(entry).known))}
+  <section class="capability" aria-labelledby="{uid}-cap-{section.id}">
+    <h3 class="sub" id="{uid}-cap-{section.id}">{t(section.headingKey)}</h3>
+    <p class="cap-note">
+      {t(section.id === 'japanese' && allText ? 'settings.detection.capability.japaneseNoteAllText' : section.noteKey)}
+    </p>
+    {#if section.id === 'rebuild'}
+      <div class="engines">
+        <EngineTable
+          engines={CLEANERS}
+          label={t('pipelines.cleaning')}
+          stateOf={engineState}
+          isAvailable={(engine) => engine.ready || found(engine)}
+        />
+      </div>
+    {/if}
+    {#if section.id === 'japanese' && !allText}
+      {@render rescueOption()}
+    {/if}
+    {#if entries.length > 0}
       <ul class="rows">
-        {#each models as model (model.id)}
-          {@render fileRow(model)}
+        {#each entries as entry (entry.id)}
+          {@render modelRow(entry)}
         {/each}
       </ul>
     {/if}
-  {:else}
-    <p class="note">{t('settings.models.unavailable')}</p>
-  {/if}
+    {#if section.id === 'shapeMask'}
+      {@render review()}
+    {/if}
+  </section>
 {/snippet}
 
 <Screen label={t(spec.titleKey)} onclose={() => closeModal(null)}>
@@ -1366,13 +2284,14 @@
       </div>
     </div>
 
-    <!-- Detection. With no file rows it ends in the engine table, which holds
-         nothing focusable, so the scroller carries the tab stop. -->
+    <!-- Detection, as a capability graph. Its tail is the Japanese filtering
+         rows' buttons when the catalogue has them; without them it ends in
+         prose, so the scroller carries the tab stop. -->
     <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
     <div
       class="panel"
       role="tabpanel"
-      tabindex={detectionModels.length > 0 ? undefined : 0}
+      tabindex={detectionTailFocusable ? undefined : 0}
       id={panelId('detection')}
       aria-labelledby={tabId('detection')}
       hidden={active !== 'detection'}
@@ -1380,31 +2299,92 @@
       <div class="column">
         <h2>{t('pipelines.detection')}</h2>
 
-        <div class="languages">
-          {#each LANGUAGES as language (language.id)}
-            <Field label={t(language.labelKey)} layout="row" controlId="settings-detector-{language.id}">
-              {#snippet children()}
-                <div class="pick">
-                  <Select
-                    id="settings-detector-{language.id}"
-                    options={detectorOptions(language.id)}
-                    value={session.detection[language.id] ?? SKIP}
-                    label={t('pipelines.detectorFor', { language: t(language.labelKey) })}
-                    onchange={(value) => setDetection(language.id, value || null)}
-                  />
-                </div>
-              {/snippet}
-            </Field>
-          {/each}
-        </div>
+        <Field
+          label={t('pipelines.workflow.policy')}
+          description={allText
+            ? t('pipelines.workflow.policyDescriptionAllText')
+            : t('pipelines.workflow.policyDescriptionLegacy')}
+          controlId="settings-text-policy"
+        >
+          {#snippet children()}
+            <Select
+              id="settings-text-policy"
+              options={textPolicyOptions}
+              value={session.textPolicy}
+              label={t('pipelines.workflow.policy')}
+              onchange={choosePolicy}
+            />
+          {/snippet}
+        </Field>
 
-        <EngineTable engines={DETECTORS} label={t('pipelines.detection')} stateOf={engineState} />
+        <!-- Whether the selected workflow can run with what is here, from the
+             same needs the downloads follow. -->
+        {#if readiness}
+          <div class="readiness" class:complete={readiness.complete}>
+            <span class="readiness-icon" aria-hidden="true">
+              <Icon name={readiness.complete ? 'check' : 'info'} size={14} />
+            </span>
+            <p class="readiness-text" role="status">
+              {#each readiness.lines as line (line)}<span>{line}</span>{/each}
+            </p>
+            {#if readiness.toDownload.length > 0 || readiness.runtime === 'missing' || readiness.runtime === 'unloadable'}
+              <div class="readiness-actions">
+                {#if readiness.toDownload.length > 0}
+                  <Button size="sm" onclick={downloadNeeded}>
+                    {t('settings.detection.download', { bytes: readiness.missing })}
+                  </Button>
+                {/if}
+                <!-- The runtime has its build choice and its own row in
+                     Performance, so the press goes there rather than
+                     downloading from here. A runtime that will not load is
+                     replaced there too, and its row repeats why. -->
+                {#if readiness.runtime === 'missing' || readiness.runtime === 'unloadable'}
+                  <Button size="sm" onclick={() => select('performance', { focus: true })}>
+                    {t('settings.detection.ready.openPerformance')}
+                  </Button>
+                {/if}
+              </div>
+            {/if}
+          </div>
+        {/if}
 
-        {@render fileList(detectionModels)}
+        {#if !allText}
+          <h3 class="sub">{t('settings.detection.languages')}</h3>
+          <div class="languages">
+            {#each LANGUAGES as language (language.id)}
+              <Field label={t(language.labelKey)} layout="row" controlId="settings-detector-{language.id}">
+                {#snippet children()}
+                  <div class="pick">
+                    <Select
+                      id="settings-detector-{language.id}"
+                      options={detectorOptions(language.id)}
+                      value={session.detection[language.id] ?? SKIP}
+                      label={t('pipelines.detectorFor', { language: t(language.labelKey) })}
+                      onchange={(value) => setDetection(language.id, value || null)}
+                    />
+                  </div>
+                {/snippet}
+              </Field>
+            {/each}
+          </div>
+          <EngineTable engines={DETECTORS} label={t('pipelines.detection')} stateOf={engineState} />
+        {:else}
+          <p class="line">{t('settings.detection.languagesAllText')}</p>
+        {/if}
+
+        {#each detectionSections as section (section.id)}
+          {@render capability(section)}
+        {/each}
+
+        {#if catalogue}
+          {@render fileList(detectionModels)}
+        {:else}
+          <p class="note">{t('settings.models.unavailable')}</p>
+        {/if}
       </div>
     </div>
 
-    <!-- Cleaning -->
+    <!-- Cleaning: the Rebuild background capability, then the FLUX helper. -->
     <div
       class="panel"
       role="tabpanel"
@@ -1415,14 +2395,15 @@
       <div class="column">
         <h2>{t('pipelines.cleaning')}</h2>
 
-        <EngineTable
-          engines={CLEANERS}
-          label={t('pipelines.cleaning')}
-          stateOf={engineState}
-          isAvailable={(engine) => engine.ready || found(engine)}
-        />
+        {#each cleaningSections as section (section.id)}
+          {@render capability(section)}
+        {/each}
 
-        {@render fileList(cleaningModels)}
+        {#if catalogue}
+          {@render fileList(cleaningModels)}
+        {:else}
+          <p class="note">{t('settings.models.unavailable')}</p>
+        {/if}
 
         <!-- An external FLUX install: where it lives, which backend runs it,
              and which of its models. -->
@@ -1538,6 +2519,11 @@
                 {/if}
                 {#if notes[RUNTIME_ID]}
                   <span class="row-error">{t(notes[RUNTIME_ID])}</span>
+                {/if}
+                <!-- Here is not the same as usable: the reason a runtime on
+                     disk would not load, where the readiness row sends. -->
+                {#if catalogue.runtime.installed && runtimeLoad.state === 'failed'}
+                  <span class="row-error">{t(runtimeLoad.reasonKey)}</span>
                 {/if}
                 <!-- Which build is actually here, said only when it is not the
                      one the row names. -->
@@ -1883,6 +2869,185 @@
     flex: none;
     gap: var(--s-2);
   }
+
+  /* ---- the capability graph ------------------------------------------- */
+
+  /* Whether the selected workflow can run: one quiet line under the policy,
+     with its one action. Words carry the state; the icon only repeats it. */
+  .readiness {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--s-3);
+    margin-top: var(--s-4);
+    padding: var(--s-3) var(--s-4);
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    background: var(--panel2);
+  }
+  .readiness-icon {
+    flex: none;
+    display: flex;
+    padding-top: 1px;
+    color: var(--t2);
+  }
+  .readiness.complete .readiness-icon { color: var(--accent) }
+  .readiness-text {
+    flex: 1;
+    min-width: 0;
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--text);
+  }
+  .readiness-text span + span::before { content: ' ' }
+  .readiness-actions {
+    display: flex;
+    flex: none;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--s-2);
+    max-width: 50%;
+  }
+  .readiness :global(.btn) { flex: none; margin-top: -2px }
+
+  .capability { margin-top: var(--s-8) }
+  .capability .sub { margin-top: 0 }
+  .cap-note {
+    margin: 0 0 var(--s-3);
+    font-size: 11.5px;
+    line-height: 1.45;
+    color: var(--t2);
+    max-width: 68ch;
+  }
+  .capability .engines { margin: var(--s-4) 0 var(--s-2) }
+
+  /* A model row wraps so the confirmation and the details can take the
+     full width under the name and the buttons. */
+  .row.model { flex-wrap: wrap; align-items: flex-start }
+  .row.model .row-actions { padding-top: 1px }
+  .product {
+    margin-left: var(--s-2);
+    font-size: 11px;
+    color: var(--t3);
+  }
+  .row-role {
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--t2);
+    max-width: 62ch;
+  }
+  /* A missing model the selected workflow needs: said in words, and in the
+     warning colour as well. */
+  .needed { color: var(--warn) }
+  .row.excluded .row-name,
+  .row.excluded .row-meta { color: var(--t3) }
+
+  .confirm {
+    flex-basis: 100%;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--s-3) var(--s-4);
+    padding: var(--s-3) var(--s-4);
+    border: 1px solid var(--line2);
+    border-radius: var(--r-md);
+    background: var(--panel2);
+    animation: mcFade var(--dur-fast) var(--ease);
+  }
+  .confirm-text {
+    flex: 1 1 280px;
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--text);
+  }
+  .confirm-text span + span::before { content: ' ' }
+  .confirm-actions { display: flex; gap: var(--s-2); flex: none }
+
+  .details { flex-basis: 100%; margin-top: -2px }
+  .details :global(.summary) { color: var(--t2); font-size: 11px }
+  .details :global(.summary:hover) { color: var(--text) }
+  .files {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .file {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--s-4);
+    padding: var(--s-2) 0;
+  }
+  .file + .file { border-top: 1px solid var(--line) }
+  .file-text {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .file-name { font-size: 11.5px; color: var(--text); overflow-wrap: anywhere }
+  .file-meta { font-size: 11px; color: var(--t2); line-height: 1.4; overflow-wrap: anywhere }
+  .file-meta code {
+    font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 10.5px;
+    user-select: all;
+  }
+  .file-actions { display: flex; gap: var(--s-2); flex: none }
+  /* Held, not disabled: it keeps its tab stop so the reason beside it can be
+     reached, and looks like the native disabled state beside it. */
+  .file-actions :global(.btn[aria-disabled='true']) { opacity: .38; cursor: default }
+  .file-held { font-size: 11px; color: var(--t2); line-height: 1.4; max-width: 60ch }
+  .file-note {
+    margin: var(--s-2) 0 0;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--t2);
+    max-width: 68ch;
+  }
+
+  /* The OCR rescue switch: label left, box right, the shape of every switch
+     on this screen, with its description and its honest status under it. */
+  .option {
+    padding: var(--s-2) 0 var(--s-3);
+    border-bottom: 1px solid var(--line);
+  }
+  .option-line {
+    display: flex;
+    align-items: center;
+    gap: var(--s-4);
+    min-height: 32px;
+  }
+  .option-label { flex: 1; font-size: 12.5px; color: var(--t2); cursor: pointer }
+  .option-description {
+    margin: 0;
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--t3);
+    max-width: 62ch;
+  }
+  .option-status {
+    display: none;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--s-2) var(--s-3);
+    margin-top: var(--s-2);
+    font-size: 11.5px;
+    line-height: 1.45;
+    color: var(--warn);
+  }
+  .option-status.shown { display: flex }
+  .option-progress { color: var(--t2) }
+
+  .review { margin-top: var(--s-4) }
+  .review :global(.summary) { font-size: 12.5px; color: var(--text) }
+  .review-summary { display: inline-flex; align-items: baseline; gap: var(--s-2) }
+  .review-title { font-weight: 600 }
+  .review-tag { font-size: 11px; color: var(--t3) }
+  .review-note { margin-top: 0 }
+  /* The panel draws its own top rule and spacing for a stand-alone mount;
+     inside the disclosure the summary already separates it. */
+  .review :global(.workflow-analysis) { border-top: none; margin-top: var(--s-3); padding-top: 0 }
 
   .note,
   .line {

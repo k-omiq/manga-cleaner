@@ -18,6 +18,7 @@ import { createJournal, pushEntry, redoEntry, undoEntry, viewOf } from '../model
 import { reviewReason } from '../model/review.js'
 import { aboutInfo, buildChapter, buildFixtures, buildProject, defaultSettings } from './fixtures.js'
 import { cloudAttemptId, sha256Hex } from './attempt.js'
+import { buildReviewPage, supportOf } from './mockreview.js'
 import { commitMask } from './provenance.js'
 import { createRng } from './rng.js'
 import { createRunner } from './runner.js'
@@ -39,6 +40,7 @@ const DEFAULT_TIMING = Object.freeze({
   openChapter: 220,
   export: 700,
   cloud: 900,
+  analysis: 1400,
   provision: 350,
   region: 70,
   pageTail: 150,
@@ -144,6 +146,34 @@ export function createMockBackend(options = {}) {
     modalProfiles: {},
   })
 
+  /**
+   * How the mock cloud GPU misbehaves, if at all: `stale`, `unknown` or
+   * `missingCapability` (see `confirmRemoteAnalysis`). From the options, or
+   * a `?remoteAnalysis=` knob so the review can be seen failing in a browser.
+   */
+  const remoteScenario = () =>
+    options.remoteAnalysisScenario ?? new URLSearchParams(globalThis.location?.search ?? '').get('remoteAnalysis')
+  const pendingAnalyses = new Map()
+  const usedAnalysisRequests = new Set()
+  const remoteAnalyses = new Map()
+  let nextAnalysisRequest = 0
+  /**
+   * A local analysis: `produce` runs after `timing.analysis` unless the
+   * request is cancelled first, which rejects with the native cancellation.
+   * Registered synchronously, so a cancel that follows the call finds it.
+   */
+  const pendingAnalysis = (requestId, produce = () => { throw new Error('Model review requires the desktop runtime') }) => {
+    const id = requestId ?? `analysis-${Date.now()}-${++nextAnalysisRequest}`
+    if (usedAnalysisRequests.has(id)) return Promise.reject(new Error('Analysis request id was already used'))
+    usedAnalysisRequests.add(id)
+    return new Promise((resolve, reject) => {
+      const timer = timers.setTimeout(() => {
+        pendingAnalyses.delete(id)
+        try { resolve(produce()) } catch (error) { reject(error) }
+      }, timing.analysis)
+      pendingAnalyses.set(id, { reject, timer })
+    })
+  }
   const fixtures = buildFixtures()
   const state = {
     projects: fixtures.projects,
@@ -215,6 +245,7 @@ export function createMockBackend(options = {}) {
   const provisionListeners = new Set()
   /** `cloud://attempt` listeners (IC-3). @type {Set<(payload: Object) => void>} */
   const attemptListeners = new Set()
+  const remoteAnalysisListeners = new Set()
   const emitTo = (listeners, payload) => {
     for (const listener of listeners) listener(structuredClone(payload))
   }
@@ -299,6 +330,150 @@ export function createMockBackend(options = {}) {
     const regionId = maskId.slice(0, maskId.lastIndexOf('-m'))
     const found = findRegion(regionId)
     return found && found.region.mask && found.region.mask.id === maskId ? found : null
+  }
+
+  /* ---------- the text-shaped review ---------- */
+
+  /**
+   * What the native `ReviewStore` holds: one analysis and one prepared write
+   * at a time, plus the corrections each written component was last applied
+   * with (the native side keeps those in the chapter's plan sidecars).
+   *
+   * The pages are drawn by `mockreview.js`, once per page geometry: the same
+   * page analyzed twice is the same picture, so a saved correction still lines
+   * up with it.
+   */
+  const review = {
+    /** @type {any} */ analysis: null,
+    /** @type {any} */ prepared: null,
+    /** @type {Map<string, any>} */ saved: new Map(),
+    /** @type {Map<string, import('./mockreview.js').ReviewPage>} */ pages: new Map(),
+    /** Imported model graphs: both present, so the review can be exercised in a browser. */
+    models: { fullRt: true, sam: true },
+    count: 0,
+  }
+
+  const reviewPageFor = (width, height, panels) => {
+    const key = `${width}x${height}:${JSON.stringify(panels ?? null)}`
+    let page = review.pages.get(key)
+    if (!page) {
+      page = buildReviewPage({ width, height, panels })
+      review.pages.set(key, page)
+    }
+    return page
+  }
+
+  /**
+   * The evidence one workflow sees on a drawn page. Regions only has no mask,
+   * so every box is detector-only; mask only has no boxes, so every component
+   * is outside every bubble.
+   */
+  const evidenceFor = (page, { rt, sam }) => {
+    const components = sam
+      ? page.components.map((component) => ({ ...structuredClone(component),
+        ...(rt ? {} : { rtTextIds: [], rtBubbleIds: [] }) }))
+      : []
+    const regions = rt
+      ? page.regions.map((region) => ({ ...structuredClone(region),
+        ...(sam ? {} : { componentIds: [], detectorOnly: true }) }))
+      : []
+    return {
+      width: page.width,
+      height: page.height,
+      components,
+      regions,
+      links: rt && sam ? structuredClone(page.links) : [],
+      groupingSuggestions: [],
+      maskPixels: sam ? page.maskPixels : 0,
+    }
+  }
+
+  const reviewRegionId = (pageId, componentId) => `${pageId}-hreview-${componentId}`
+
+  /**
+   * A remote analysis's journal record, snake_case as `journal.rs` writes it:
+   * the tile index on the phases that have one, the failure code on `failed`,
+   * and `cancel_requested` only once the user has asked.
+   */
+  const statusOf = (proposalId, record) => {
+    const phase = { phase: record.phase }
+    if (['submitted_tile', 'result_cached_tile', 'unknown_remote_state'].includes(record.phase)) phase.index = record.index ?? 0
+    if (record.phase === 'failed') phase.code = record.code ?? 'analysis_failed'
+    const { proposal } = record
+    return { schema_version: 2, proposal_id: proposalId, provider: proposal.provider,
+      profile_id: proposal.profileId, capability: proposal.capability,
+      source_sha256: proposal.sourcePageSha256, underlay_sha256: proposal.underlaySha256,
+      total_tiles: proposal.tiles.length, completed_tiles: record.completedTiles,
+      reported_cost_usd: null, ...(record.cancelled ? { cancel_requested: true } : {}), phase }
+  }
+
+  /**
+   * One local analysis of a drawn page, checked the way
+   * `model_workflows.rs#analyze_capabilities` checks its request.
+   */
+  const analyzePage = ({ page, target, sourceMime, workflow, rtProfile, rtBackend, samBackend }) => {
+    const rt = workflow === 'regions' || workflow === 'text_shape'
+    const sam = workflow === 'mask' || workflow === 'text_shape'
+    if (!rt && !sam) throw new Error('Choose Regions, Mask, or Text-shaped review')
+    if (rt && rtBackend !== 'ort-cpu') throw new Error(`RT backend ${rtBackend} is not qualified for this analysis path`)
+    if (sam && !['ort-cpu', 'ort-webgpu'].includes(samBackend)) {
+      throw new Error(`SAM backend ${samBackend} is unavailable for this analysis path`)
+    }
+    if (state.missingModels.has(MOCK_RUNTIME_ID)) throw new Error('ONNX Runtime is not installed')
+    if (rt && rtProfile === 'full-halves' && !review.models.fullRt) throw new Error('Full RT-DETR graph is not installed or failed SHA-256')
+    if (rt && rtProfile === 'small-whole' && state.missingModels.has('balloonDetector')) {
+      throw new Error('Small RT-DETR graph is not installed or failed SHA-256')
+    }
+    if (rt && !['full-halves', 'small-whole'].includes(rtProfile)) throw new Error('Choose the full tiled or installed small RT-DETR profile')
+    if (sam && !review.models.sam) throw new Error('SAM-TS graphs are not installed')
+    const webgpu = sam && samBackend === 'ort-webgpu'
+    const eligible = webgpu && sourceMime === 'image/png'
+    const sourceSha256 = sha256Hex(`review-source:${target.key}`)
+    let analysisId = null
+    if (sam) {
+      review.count += 1
+      analysisId = sha256Hex(`analysis-v1:${samBackend}:${sourceSha256}:${review.count}`)
+      review.analysis = { id: analysisId, remote: false, eligible, page, sourceSha256, ...target,
+        bubbled: new Set(rt ? page.components.filter((c) => c.rtBubbleIds.length).map((c) => c.id) : []) }
+      review.prepared = null
+    }
+    return {
+      analysisId,
+      sourceSha256,
+      rtModelSha256: rt ? (rtProfile === 'full-halves' ? '065744e91c0594ad8663aa8b870ce3fb27222942eded5a3cc388ce23421bd195'
+        : '5fe9e4f576e49d4e7e8b0e029d6d3cdc252abd4694113e1cae120e62c931ea79') : null,
+      samEncoderSha256: sam ? '9b3a32f9018008cfd2c7a5b1a7eb6e20822ba43eab58918863f74ac62ecbafbe' : null,
+      samHeadSha256: sam ? 'a2c63ccf54e2e692a281cffd4dcda648f252ae6649dc7d23d0203e5868685281' : null,
+      maskSha256: sam ? sha256Hex(`review-mask:${target.key}`) : null,
+      workflow,
+      rtProfile: rt ? rtProfile : null,
+      rtBackend: rt ? 'ort-cpu' : null,
+      samBackend: sam ? samBackend : null,
+      remoteSource: null,
+      samWriteEligible: eligible,
+      samWebgpuNodes: webgpu ? [412, 37] : null,
+      samCpuFallbackNodes: webgpu ? [0, 0] : null,
+      evidence: evidenceFor(page, { rt, sam }),
+      sourceDataUrl: page.sourceDataUrl.replace('data:image/png', `data:${sourceMime}`),
+      maskDataUrl: sam ? page.maskDataUrl : null,
+      timingsMs: { rtLoad: rt ? 820 : 0, rtPage: rt ? 1410 : 0, samLoad: sam ? 2310 : 0, samPrepare: sam ? 30 : 0,
+        samEncoder: sam ? (webgpu ? 640 : 5120) : 0, samHead: sam ? 90 : 0, samRestore: sam ? 20 : 0 },
+    }
+  }
+
+  /** The chapter page an analysis or a proposal names, refused as the native commands refuse it. */
+  const reviewTarget = (chapterId, pageIndex, refusal) => {
+    const found = findChapter(chapterId)
+    if (!found) throw new Error(`no such chapter: ${chapterId}`)
+    if (found.project.mode === 'longstrip') throw new Error(refusal)
+    const page = found.chapter.pages.find((candidate) => candidate.index === pageIndex)
+    if (!page) throw new Error('Page is no longer in chapter')
+    const format = String(found.chapter.sourceFormat ?? 'PNG').toUpperCase()
+    return {
+      page,
+      drawn: reviewPageFor(page.width, page.height, page.panels),
+      sourceMime: format === 'JPG' || format === 'JPEG' ? 'image/jpeg' : 'image/png',
+    }
   }
 
   /* ---------- the run scheduler ---------- */
@@ -390,6 +565,10 @@ export function createMockBackend(options = {}) {
     outsideEngine,
     outsideBubbles,
     bubbleColor,
+    detection,
+    geometryPolicy,
+    textPolicy,
+    ocrRescue,
   }) => {
     if (runner.isRunning()) return { runId: runner.activeRunId(), pages: [], alreadyRunning: true }
     unloadedModels.clear()
@@ -405,6 +584,10 @@ export function createMockBackend(options = {}) {
       outsideEngine,
       outsideBubbles,
       bubbleColor,
+      detection,
+      geometryPolicy,
+      textPolicy,
+      ocrRescue,
     })
   }
 
@@ -613,26 +796,31 @@ export function createMockBackend(options = {}) {
   /* ---------- the model catalogue ---------- */
 
   /**
-   * The five weights `src-tauri/src/weights.rs` pins, with the real sizes and
-   * the real kind keys. Not the URLs or the digests: nothing here downloads
-   * anything, and a second copy of a digest is a second thing to drift.
+   * The weights `src-tauri/src/weights.rs` pins, including each exact digest,
+   * with the real sizes and kind keys. This lets the UI show the same artifact
+   * identity as native without making up model revisions for mutable URLs.
    */
   const MOCK_CATALOGUE = Object.freeze([
-    { id: 'textDetector', fileName: 'comictextdetector.onnx', bytes: 94_669_756, kindKey: 'models.kind.textDetector', requiredBy: ['autoClean'] },
-    { id: 'inpainter', fileName: 'lama-manga.onnx', bytes: 207_482_644, kindKey: 'models.kind.inpainter', requiredBy: ['lama'] },
-    { id: 'scriptGate', fileName: 'image-script-identification-osd_lstm.onnx', bytes: 3_722_314, kindKey: 'models.kind.scriptGate', requiredBy: ['autoClean'] },
-    { id: 'scriptGateLabels', fileName: 'image-script-identification-osd_labels.json', bytes: 1_163, kindKey: 'models.kind.scriptGateLabels', requiredBy: ['autoClean'] },
-    { id: 'balloonDetector', fileName: 'comic-text-and-bubble-detector-detector-v4-s_int8.onnx', bytes: 11_120_765, kindKey: 'models.kind.balloonDetector', requiredBy: ['autoClean'] },
+    { id: 'textDetector', fileName: 'comictextdetector.onnx', bytes: 94_669_756, sha256: '1a86ace74961413cbd650002e7bb4dcec4980ffa21b2f19b86933372071d718f', kindKey: 'models.kind.textDetector', requiredBy: ['autoClean'] },
+    { id: 'inpainter', fileName: 'lama-manga.onnx', bytes: 207_482_644, sha256: '4512adab295ee5a5e02ccd1bdf8d45dccbac88309d9cff1532ffd5de876f02a4', kindKey: 'models.kind.inpainter', requiredBy: ['lama'] },
+    { id: 'scriptGate', fileName: 'image-script-identification-osd_lstm.onnx', bytes: 3_722_314, sha256: 'b18e0c1479d9eb67394993098f7e1079c9a93ef6f7b0416ee333fccb865c6e72', kindKey: 'models.kind.scriptGate', requiredBy: ['autoClean'] },
+    { id: 'scriptGateLabels', fileName: 'image-script-identification-osd_labels.json', bytes: 1_163, sha256: 'a1888156b005065039c356e13a7bbef1ec454b45bf6aaf18c11f4a59b1ee35c5', kindKey: 'models.kind.scriptGateLabels', requiredBy: ['autoClean'] },
+    { id: 'balloonDetector', fileName: 'comic-text-and-bubble-detector-detector-v4-s_int8.onnx', bytes: 11_120_765, sha256: '5fe9e4f576e49d4e7e8b0e029d6d3cdc252abd4694113e1cae120e62c931ea79', kindKey: 'models.kind.balloonDetector', requiredBy: ['autoClean'] },
     // The gate's rescue reader. `requiredBy` is empty in the real table too,
     // and that is the row's whole character: it is downloadable and nothing
     // needs it, so it belongs in Settings and not in the first-launch offer.
     // Mirrored here so the Models section is exercised against a catalogue
     // that has such a row in it rather than against one where every row is a
     // precondition of something.
-    { id: 'ocrEncoder', fileName: 'manga-ocr-encoder_model.onnx', bytes: 343_454_249, kindKey: 'models.kind.ocr', requiredBy: [] },
-    { id: 'ocrDecoder', fileName: 'manga-ocr-decoder_model.onnx', bytes: 117_480_262, kindKey: 'models.kind.ocrDecoder', requiredBy: [] },
-    { id: 'ocrVocab', fileName: 'manga-ocr-vocab.txt', bytes: 30_216, kindKey: 'models.kind.ocrVocab', requiredBy: [] },
+    { id: 'ocrEncoder', fileName: 'manga-ocr-encoder_model.onnx', bytes: 343_454_249, sha256: '15fa8155fe9bc1a7d25d9bb353debaa4def033d0174e907dbd2dd6d995def85f', kindKey: 'models.kind.ocr', requiredBy: [] },
+    { id: 'ocrDecoder', fileName: 'manga-ocr-decoder_model.onnx', bytes: 117_480_262, sha256: 'ef7765261e9d1cdc34d89356986c2bbc2a082897f753a89605ae80fdfa61f5e8', kindKey: 'models.kind.ocrDecoder', requiredBy: [] },
+    { id: 'ocrVocab', fileName: 'manga-ocr-vocab.txt', bytes: 30_216, sha256: '5cb5c5586d98a2f331d9f8828e4586479b0611bfba5d8c3b6dadffc84d6a36a3', kindKey: 'models.kind.ocrVocab', requiredBy: [] },
   ])
+  const MOCK_MODEL_GROUPS = Object.freeze({
+    scriptGate: ['scriptGate', 'scriptGateLabels'],
+    mangaOcr: ['ocrEncoder', 'ocrDecoder', 'ocrVocab'],
+  })
+  const activeModelGroups = new Set()
 
   /**
    * The published size of the macOS arm64 archive, from
@@ -706,6 +894,12 @@ export function createMockBackend(options = {}) {
         state.missingModels.delete(id)
         state.verifiedModels.set(id, true)
         emit({ type: 'model-progress', id, downloaded: total, total, done: true, error: null })
+        for (const groupId of activeModelGroups) {
+          const members = MOCK_MODEL_GROUPS[groupId]
+          if (!members.every((member) => !state.missingModels.has(member) && !state.downloads.has(member))) continue
+          activeModelGroups.delete(groupId)
+          emit({ type: 'model-progress', id: groupId, downloaded: 0, total: null, done: true, error: null })
+        }
         return
       }
       // Written down on every tick rather than on the way out, because a
@@ -719,6 +913,54 @@ export function createMockBackend(options = {}) {
     state.downloads.set(id, timers.setTimeout(tick, timing.method))
     emit({ type: 'model-progress', id, downloaded: sent, total, done: false, error: null })
     return 'started'
+  }
+
+  async function startModelGroup(groupId) {
+    const members = MOCK_MODEL_GROUPS[groupId]
+    if (!members) throw new Error(`no such model group: ${groupId}`)
+    if (members.some((member) => state.downloads.has(member))) return 'alreadyRunning'
+    const missing = members.filter((member) => state.missingModels.has(member))
+    if (!missing.length) return 'alreadyInstalled'
+    activeModelGroups.add(groupId)
+    for (const member of missing) startDownload(member)
+    return 'started'
+  }
+
+  async function deleteModelGroupFiles(groupId) {
+    const members = MOCK_MODEL_GROUPS[groupId]
+    if (!members) throw new Error(`no such model group: ${groupId}`)
+    const present = members.filter((member) => !state.missingModels.has(member))
+    if (!present.length) return 'notFound'
+    if (present.some((member) => state.downloads.has(member))) return 'busy'
+    await delay(timing.method)
+    for (const member of present) {
+      state.missingModels.add(member)
+      state.verifiedModels.delete(member)
+    }
+    return 'deleted'
+  }
+
+  function cancelDownloadById(id) {
+    const activeGroup = [...activeModelGroups].find((groupId) => MOCK_MODEL_GROUPS[groupId].includes(id))
+    if (activeGroup) {
+      const members = MOCK_MODEL_GROUPS[activeGroup]
+      activeModelGroups.delete(activeGroup)
+      for (const member of members) {
+        const handle = state.downloads.get(member)
+        if (handle === undefined) continue
+        timers.clearTimeout(handle)
+        state.downloads.delete(member)
+        emit({ type: 'model-progress', id: member, downloaded: state.partials.get(member) ?? 0, total: null, done: true, error: 'cancelled' })
+      }
+      emit({ type: 'model-progress', id: activeGroup, downloaded: 0, total: null, done: true, error: 'cancelled' })
+      return true
+    }
+    const handle = state.downloads.get(id)
+    if (handle === undefined) return false
+    timers.clearTimeout(handle)
+    state.downloads.delete(id)
+    emit({ type: 'model-progress', id, downloaded: 0, total: null, done: true, error: 'cancelled' })
+    return true
   }
 
   /* ---------- cloud targets and secrets ---------- */
@@ -1016,6 +1258,7 @@ export function createMockBackend(options = {}) {
         idle_seconds: idleSeconds,
         max_containers: 1,
         model_weights_bytes: MODEL_WEIGHTS_BYTES,
+        model_id: PINNED_CLOUD_MODEL_ID,
       },
       resources_to_create: resources,
       runtime_credential_kind: provider === 'modal' ? 'modal_proxy' : 'beam_bearer',
@@ -1170,7 +1413,11 @@ export function createMockBackend(options = {}) {
       if (outcome) {
         installation.failedOnce = true
         installation.stage = 'failed'
-        return helperFailure(op, params.request_id, 'ERR_EXECUTION_FAILED', `The ${outcome} step failed.`)
+        // `&cloudSetupCode=ERR_ORPHANED_TOKEN` beside the knob picks the code
+        // the failure answers with, so a code's own failed view can be seen.
+        const knobCode = new URLSearchParams(globalThis.location?.search ?? '').get('cloudSetupCode')
+        const code = knobCode && /^ERR_[A-Z_]{1,48}$/.test(knobCode) ? knobCode : 'ERR_EXECUTION_FAILED'
+        return helperFailure(op, params.request_id, code, `The ${outcome} step failed.`)
       }
       return helperSuccess(op, params.request_id, finishInstallation(installation))
     } finally {
@@ -1282,6 +1529,10 @@ export function createMockBackend(options = {}) {
 
     onCloudAttempt(handler) {
       return listenOn(attemptListeners, handler)
+    },
+
+    onRemoteAnalysis(handler) {
+      return listenOn(remoteAnalysisListeners, handler)
     },
 
     async listProjects() {
@@ -1533,6 +1784,10 @@ export function createMockBackend(options = {}) {
       outsideEngine,
       outsideBubbles,
       bubbleColor,
+      detection,
+      geometryPolicy,
+      textPolicy,
+      ocrRescue,
     }) {
       await delay(timing.method)
       return startRun({
@@ -1606,7 +1861,7 @@ export function createMockBackend(options = {}) {
      * Returns the page's status with the region for the same reason every other
      * region-level edit does: a hand mask on an unclean page makes it cleaned.
      */
-    async createRegion({ chapterId, pageIndex, bbox, tool, params = {} }) {
+    async createRegion({ chapterId, pageIndex, sourceIndex, sourceSha, bbox, tool, params = {} }) {
       await delay(timing.method)
       // Always local, as the native command is: a cloud engine is refused while
       // cloud is off, and otherwise dropped for the fill mode's local default.
@@ -1619,6 +1874,8 @@ export function createMockBackend(options = {}) {
       const found = findChapter(chapterId)
       const page = found?.chapter.pages.find((candidate) => candidate.index === pageIndex)
       if (!page || !bbox) return null
+      if (sourceIndex !== undefined && page.sourceIndex !== sourceIndex) return null
+      if (sourceSha !== undefined && page.sourceSha !== sourceSha) return null
       handCounter += 1
       const created = createHandRegion(page, toolContext, {
         id: `${page.id}-h${handCounter}`,
@@ -1708,6 +1965,14 @@ export function createMockBackend(options = {}) {
       else page.regions.push(structuredClone(region))
       if (pageStatus) page.status = pageStatus
       return snapshot(page.regions.find((r) => r.id === regionId))
+    },
+
+    async keepDependencyResult({ regionId }) {
+      await delay(timing.method)
+      const found = findRegion(regionId)
+      if (!found?.region?.mask?.dependencyReview) return null
+      found.region.mask.dependencyReview = null
+      return snapshot(found.region)
     },
 
     async rerunMask({ maskId, kind, engine, params }) {
@@ -2016,16 +2281,29 @@ export function createMockBackend(options = {}) {
      * so the interface has one path back to "not installed" rather than three.
      */
     async downloadModel({ id }) {
-      return startDownload(id)
+      const groupId = Object.keys(MOCK_MODEL_GROUPS).find((candidate) => MOCK_MODEL_GROUPS[candidate].includes(id))
+      return groupId ? startModelGroup(groupId) : startDownload(id)
+    },
+
+    async downloadModelGroup({ id }) {
+      return startModelGroup(id)
+    },
+
+    async verifyModelGroup({ id }) {
+      const members = MOCK_MODEL_GROUPS[id]
+      if (!members) throw new Error(`no such model group: ${id}`)
+      await delay(timing.method)
+      if (members.some((member) => state.missingModels.has(member))) return false
+      for (const member of members) state.verifiedModels.set(member, true)
+      return true
+    },
+
+    async deleteModelGroup({ id }) {
+      return deleteModelGroupFiles(id)
     },
 
     async cancelDownload({ id }) {
-      const handle = state.downloads.get(id)
-      if (handle === undefined) return false
-      timers.clearTimeout(handle)
-      state.downloads.delete(id)
-      emit({ type: 'model-progress', id, downloaded: 0, total: null, done: true, error: 'cancelled' })
-      return true
+      return cancelDownloadById(id)
     },
 
     /**
@@ -2037,6 +2315,8 @@ export function createMockBackend(options = {}) {
     async deleteModel({ id }) {
       await delay(timing.method)
       if (!MOCK_CATALOGUE.some((model) => model.id === id)) throw new Error(`no such model: ${id}`)
+      const groupId = Object.keys(MOCK_MODEL_GROUPS).find((candidate) => MOCK_MODEL_GROUPS[candidate].includes(id))
+      if (groupId) return deleteModelGroupFiles(groupId)
       if (state.missingModels.has(id)) return 'notFound'
       state.missingModels.add(id)
       state.verifiedModels.delete(id)
@@ -2065,6 +2345,195 @@ export function createMockBackend(options = {}) {
       if (state.missingModels.has(id)) return false
       state.verifiedModels.set(id, true)
       return true
+    },
+
+    /**
+     * Ready to review, as a qualified machine with both graphs imported would
+     * be: no model runs here, and the page every analysis answers with is the
+     * one `mockreview.js` draws. The runtime and the small RT graph follow the
+     * Models section's own rows, so removing either there is felt here.
+     */
+    async listWorkflowCapabilities() {
+      await delay(timing.method)
+      const runtimeInstalled = !state.missingModels.has(MOCK_RUNTIME_ID)
+      const { fullRt, sam } = review.models
+      const backend = (id, note) => ({ id, platform: 'macOS', qualified: true, available: runtimeInstalled,
+        selectable: runtimeInstalled, note })
+      return { runtimeInstalled, rtInstalled: !state.missingModels.has('balloonDetector'), fullRtInstalled: fullRt,
+        fullRtManaged: fullRt, fullRtRevision: '16e8a622f91fabc6b5b65c96d32d1183f8843546',
+        fullRtFile: { name: 'detector.onnx', bytes: 168481531, sha256: '065744e91c0594ad8663aa8b870ce3fb27222942eded5a3cc388ce23421bd195' },
+        samInstalled: sam, samMemoryReady: true, samManaged: sam,
+        samRevision: '5dd97423e0fbf2404264979136d47e8101144046',
+        samFiles: sam ? [
+          { name: 'koharu_samts_encoder.onnx', bytes: 1_335_305_985, sha256: '9b3a32f9018008cfd2c7a5b1a7eb6e20822ba43eab58918863f74ac62ecbafbe' },
+          { name: 'koharu_samts_text_head.onnx', bytes: 22_704_641, sha256: 'a2c63ccf54e2e692a281cffd4dcda648f252ae6649dc7d23d0203e5868685281' },
+        ] : [],
+        cooStatus: 'Rights unresolved. No bundled model, download, or desktop execution.',
+        samWriteQualified: runtimeInstalled && sam,
+        samWriteNote: 'Mock: WebGPU analysis of a PNG page can prepare approved writes.',
+        rtBackends: [backend('ort-cpu', 'Mock: a drawn page, no model runs.')],
+        samBackends: [backend('ort-cpu', 'Review only.'), backend('ort-webgpu', 'Mock of the qualified GPU path.')] }
+    },
+    async importFullRt({ sourcePath } = {}) {
+      await delay(timing.method)
+      if (!String(sourcePath ?? '').endsWith('.onnx')) {
+        throw new Error('Full RT-DETR graph size or SHA-256 does not match the pinned manifest')
+      }
+      review.models.fullRt = true
+      return true
+    },
+    async removeFullRt() {
+      await delay(timing.method)
+      const had = review.models.fullRt
+      review.models.fullRt = false
+      return had
+    },
+    async importSamTs({ sourceDir } = {}) {
+      await delay(timing.method)
+      if (!sourceDir) throw new Error('SAM-TS graphs are not installed')
+      review.models.sam = true
+      return true
+    },
+    async removeSamTs() {
+      await delay(timing.method)
+      const had = review.models.sam
+      review.models.sam = false
+      return had
+    },
+    async verifySamTs() {
+      await delay(timing.method)
+      if (!review.models.sam) throw new Error('SAM-TS graphs are not installed')
+      return true
+    },
+    analyzeCapabilities({ sourcePath, workflow, rtProfile, rtBackend, samBackend, requestId } = {}) {
+      return pendingAnalysis(requestId, () => analyzePage({
+        page: reviewPageFor(1200, 1700), target: { key: `path:${sourcePath}`, chapterId: null, pageIndex: null, pageId: null },
+        sourceMime: /\.jpe?g$/i.test(String(sourcePath ?? '')) ? 'image/jpeg' : 'image/png',
+        workflow, rtProfile, rtBackend, samBackend,
+      }))
+    },
+    analyzeChapterPage({ chapterId, pageIndex, workflow, rtProfile, rtBackend, samBackend, requestId } = {}) {
+      let target
+      try {
+        target = reviewTarget(chapterId, pageIndex, 'Chapter model analysis currently requires a paginated chapter')
+      } catch (error) {
+        return Promise.reject(error)
+      }
+      return pendingAnalysis(requestId, () => analyzePage({
+        page: target.drawn, sourceMime: target.sourceMime,
+        target: { key: `${chapterId}:${target.page.id}`, chapterId, pageIndex, pageId: target.page.id },
+        workflow, rtProfile, rtBackend, samBackend,
+      }))
+    },
+    /** `false` when nothing by that id is running, as the native command answers. */
+    async cancelCapabilityAnalysis(requestId) {
+      const pending = pendingAnalyses.get(requestId)
+      if (!pending) return false
+      timers.clearTimeout(pending.timer)
+      pendingAnalyses.delete(requestId)
+      pending.reject('analysis cancelled')
+      return true
+    },
+
+    /**
+     * The write support W of one component, refused in the order
+     * `model_workflows.rs#prepare_component_at` refuses it.
+     */
+    async prepareComponentWrite({ analysisId, chapterId, pageIndex, componentId, allowOutsideBubbles,
+      paddingPx = 0, additions, removals, correctionRevision = 0 } = {}) {
+      await delay(timing.method)
+      const analysis = review.analysis
+      if (!analysis || analysis.id !== analysisId) throw new Error('Analysis expired; analyze the page again')
+      if (analysis.remote) throw new Error('Remote analysis is review-only and cannot prepare a component write')
+      if (!analysis.eligible) throw new Error('This analysis is not qualified for component writing on this host and runtime')
+      if (!allowOutsideBubbles && !analysis.bubbled.has(componentId)) {
+        throw new Error('Outside-bubble component is held until explicitly permitted')
+      }
+      if (!String(componentId).startsWith('sam-')) throw new Error('Only a SAM component can grant write support')
+      const pixels = analysis.page.pixels.get(componentId)
+      if (!pixels) throw new Error('SAM component is absent from this analysis')
+      if (!pixels.length) throw new Error('Empty component has no write support')
+      if (analysis.chapterId !== chapterId || analysis.pageIndex !== pageIndex) {
+        throw new Error('The selected chapter page does not match the analyzed source')
+      }
+      const regionId = reviewRegionId(analysis.pageId, componentId)
+      const saved = review.saved.get(regionId)
+      if (saved && correctionRevision <= saved.correctionRevision &&
+          (JSON.stringify(additions ?? null) !== JSON.stringify(saved.additions ?? null) ||
+            JSON.stringify(removals ?? null) !== JSON.stringify(saved.removals ?? null))) {
+        throw new Error('Mask corrections changed without a new correction revision')
+      }
+      const { width, height } = analysis.page
+      const support = supportOf({ pixels, width, height, paddingPx, additions, removals })
+      review.count += 1
+      const planId = `mock-plan-${review.count}`
+      const supportSha256 = sha256Hex(`support:${componentId}:${support.count}:${support.checksum}:${JSON.stringify(support.bounds)}`)
+      const plan = {
+        planId,
+        componentId,
+        bounds: support.bounds ?? { x: 0, y: 0, w: 0, h: 0 },
+        supportPixels: support.count,
+        supportDataUrl: support.dataUrl ?? '',
+        supportSha256,
+        supportVersion: 'mask-plan-support-v1',
+        planIdentitySha256: sha256Hex(`plan:${planId}:${supportSha256}`),
+        paddingPx,
+        correctionRevision,
+        sourceSha256: analysis.sourceSha256,
+        underlaySha256: sha256Hex(`underlay:${analysis.sourceSha256}:${saved?.planRevision ?? 0}`),
+        renderVersion: 'bounded-ring-median-v1',
+      }
+      review.prepared = { ...plan, chapterId, pageIndex, pageId: analysis.pageId, width, height,
+        additions: additions ?? null, removals: removals ?? null }
+      return snapshot(plan)
+    },
+
+    async loadComponentCorrection({ analysisId, componentId } = {}) {
+      await delay(timing.method)
+      const analysis = review.analysis
+      if (!analysis || analysis.id !== analysisId) throw new Error('Analysis expired; analyze the page again')
+      if (analysis.remote) throw new Error('Remote analysis is review-only and cannot load a component correction')
+      if (!analysis.page.pixels.has(componentId)) throw new Error('SAM component is absent from this analysis')
+      const regionId = reviewRegionId(analysis.pageId, componentId)
+      const saved = review.saved.get(regionId)
+      if (!saved) return null
+      const empty = { bounds: { x: 0, y: 0, w: 0, h: 0 }, bits: [] }
+      return snapshot({ regionId, additions: saved.additions ?? empty, removals: saved.removals ?? empty,
+        paddingPx: saved.paddingPx, correctionRevision: saved.correctionRevision, planRevision: saved.planRevision })
+    },
+
+    /**
+     * Writes the approved W as the component's one region on the page. A
+     * second write of the same component replaces that region, as the native
+     * patch revision does.
+     */
+    async applyComponentWrite({ planId, approvedSupportSha256 } = {}) {
+      await delay(timing.method)
+      const plan = review.prepared
+      if (!plan) throw new Error('Prepared write expired; preview the component again')
+      if (plan.planId !== planId || plan.supportSha256 !== approvedSupportSha256) {
+        throw new Error('Approval does not match the prepared support raster')
+      }
+      if (!plan.supportPixels) throw new Error('Approved support raster changed')
+      const found = findChapter(plan.chapterId)
+      const page = found?.chapter.pages.find((candidate) => candidate.index === plan.pageIndex)
+      if (!page) throw new Error('Page is no longer in chapter')
+      const regionId = reviewRegionId(page.id, plan.componentId)
+      const index = page.regions.findIndex((region) => region.id === regionId)
+      if (index >= 0) page.regions.splice(index, 1)
+      const percent = (value, total) => Math.round(value / total * 10000) / 100
+      const created = createHandRegion(page, toolContext, {
+        id: regionId,
+        bbox: { x: percent(plan.bounds.x, plan.width), y: percent(plan.bounds.y, plan.height),
+          w: percent(plan.bounds.w, plan.width), h: percent(plan.bounds.h, plan.height) },
+        tool: 'contentAwareFill',
+        params: {},
+      })
+      const saved = review.saved.get(regionId)
+      review.saved.set(regionId, { additions: plan.additions, removals: plan.removals, paddingPx: plan.paddingPx,
+        correctionRevision: plan.correctionRevision, planRevision: (saved?.planRevision ?? 0) + 1 })
+      review.prepared = null
+      return { regionId, region: snapshot(created.region), pageStatus: page.status }
     },
 
     /**
@@ -2298,6 +2767,141 @@ export function createMockBackend(options = {}) {
           defaultWorkerDeadlineSec: 120,
         },
       }
+    },
+
+    async listRemoteAnalysisCapabilities({ provider, profileId }) {
+      await delay(timing.method)
+      if (state.settings.cloudEngines !== 'allowed') throw new Error('cloud_disabled')
+      if (state.inferenceConfig.selectedTarget?.type !== provider ||
+          state.inferenceConfig.selectedTarget?.profile_id !== profileId) throw new Error('analysis_profile_not_active')
+      const profiles = provider === 'beam' ? state.inferenceConfig.beamProfiles : state.inferenceConfig.modalProfiles
+      if (!profiles?.[profileId]) throw new Error('analysis_profile_missing')
+      const capabilities = remoteScenario() === 'missingCapability' ? [] : [
+        { capability: 'text_mask_sam_ts@1', graph_sha256s: ['a'.repeat(64), 'b'.repeat(64)], model_revision: 'c'.repeat(40) },
+        { capability: 'text_regions_rt@1', graph_sha256s: ['d'.repeat(64)], model_revision: 'e'.repeat(40) },
+      ]
+      return { protocol_version: '1.0.0', capabilities,
+        limits: { max_tile_side: 1024, max_tile_pixels: 1048576, max_png_bytes: 4194304,
+          max_components: 4096, max_boxes: 4096 } }
+    },
+
+    async proposeRemoteAnalysis({ chapterId, pageIndex, provider, profileId, capability, regions = [] }) {
+      if (!['text_mask_sam_ts@1', 'text_regions_rt@1'].includes(capability)) {
+        throw new Error('capability_unavailable: unsupported analysis capability')
+      }
+      const available = await this.listRemoteAnalysisCapabilities({ provider, profileId })
+      const model = available.capabilities.find((entry) => entry.capability === capability)
+      if (!model) throw new Error('capability_unavailable: gateway does not advertise this analysis model')
+      const { page } = reviewTarget(chapterId, pageIndex, 'Remote analysis currently requires a paginated chapter')
+      const selected = regions.length ? regions : [{ x: 0, y: 0, width: page.width, height: page.height }]
+      const tiles = []
+      for (let y = 0; y < page.height; y += 1024) {
+        for (let x = 0; x < page.width; x += 1024) {
+          const rect = { x, y, width: Math.min(1024, page.width - x), height: Math.min(1024, page.height - y) }
+          if (!selected.some((r) => r.x < x + rect.width && x < r.x + r.width && r.y < y + rect.height && y < r.y + r.height)) continue
+          const digest = sha256Hex(`${chapterId}:${pageIndex}:${x}:${y}`)
+          tiles.push({ rect, pngSha256: digest, encodedBytes: Math.min(4194304, rect.width * rect.height),
+            inputSha256: digest, predecessorsSha256: sha256Hex(`underlay:${digest}`) })
+        }
+      }
+      if (!tiles.length) throw new Error('analysis region outside page')
+      if (tiles.length > 256) throw new Error('analysis tile count exceeded')
+      const proposalId = sha256Hex(`analysis:${chapterId}:${pageIndex}:${Date.now()}:${remoteAnalyses.size}`).slice(0, 32)
+      const proposal = { proposalId, chapterId, pageIndex, provider, profileId,
+        profileName: (provider === 'beam' ? state.inferenceConfig.beamProfiles : state.inferenceConfig.modalProfiles)[profileId].name,
+        capability, graphSha256s: model.graph_sha256s, modelRevision: model.model_revision,
+        sourcePageSha256: sha256Hex(`${chapterId}:${pageIndex}:source`),
+        underlaySha256: sha256Hex(tiles.map((t) => t.inputSha256).join(':')),
+        predecessorsSha256: sha256Hex(tiles.map((t) => t.predecessorsSha256).join(':')),
+        projectRevisionSha256: sha256Hex(`${chapterId}:${pageIndex}:project`),
+        pageWidth: page.width, pageHeight: page.height, pages: 1,
+        totalTilePixels: tiles.reduce((sum, t) => sum + t.rect.width * t.rect.height, 0),
+        totalEncodedBytes: tiles.reduce((sum, t) => sum + t.encodedBytes, 0),
+        includesSurroundingArt: true, costEstimateUsd: null, tiles }
+      proposal.issuedAtMs = Date.now()
+      proposal.expiresAtMs = proposal.issuedAtMs + 300000
+      const record = { proposal, phase: 'proposed', completedTiles: 0, cancelled: false }
+      remoteAnalyses.set(proposalId, record)
+      emitTo(remoteAnalysisListeners, statusOf(proposalId, record))
+      return structuredClone(proposal)
+    },
+
+    /**
+     * Scenarios: `stale` fails the first tile as the page changing would;
+     * `unknown` loses the connection while the second tile is out, leaving it
+     * in the state a crash leaves it in; `missingCapability` advertises
+     * nothing. The default runs every tile and attaches review-only evidence
+     * drawn by `mockreview.js`.
+     */
+    async confirmRemoteAnalysis({ proposalId, rightsAttested, retentionAcknowledged }) {
+      if (state.settings.cloudEngines !== 'allowed') throw new Error('cloud_disabled')
+      if (!rightsAttested) throw new Error('rights_attestation_required')
+      if (!retentionAcknowledged) throw new Error('retention_acknowledgement_required')
+      const record = remoteAnalyses.get(proposalId)
+      if (!record) throw new Error('analysis_proposal_missing')
+      if (record.phase !== 'proposed') throw new Error('analysis_proposal_consumed')
+      if (Date.now() >= record.proposal.expiresAtMs) throw new Error('analysis_proposal_expired')
+      const progress = (phase, extra = {}) => {
+        record.phase = phase
+        record.index = extra.index ?? null
+        record.code = extra.code ?? null
+        emitTo(remoteAnalysisListeners, statusOf(proposalId, record))
+      }
+      progress('confirmed')
+      for (const [index] of record.proposal.tiles.entries()) {
+        if (record.cancelled) { progress('cancelled'); throw new Error('analysis_cancelled') }
+        progress('submitted_tile', { index })
+        await delay(timing.cloud)
+        if (remoteScenario() === 'unknown' && index === 1) {
+          progress('unknown_remote_state', { index })
+          throw new Error('transport error: connection reset while the tile was in flight')
+        }
+        if (record.cancelled) { progress('cancelled'); throw new Error('analysis_cancelled') }
+        if (remoteScenario() === 'stale') {
+          progress('failed', { code: 'analysis_stale' })
+          throw new Error('analysis_stale: source or underlay changed during batch')
+        }
+        record.completedTiles += 1
+        progress('result_cached_tile', { index })
+      }
+      progress('attached_evidence')
+      const { proposal } = record
+      const found = findChapter(proposal.chapterId)
+      const page = found?.chapter.pages.find((candidate) => candidate.index === proposal.pageIndex)
+      const drawn = reviewPageFor(proposal.pageWidth, proposal.pageHeight, page?.panels)
+      const sam = proposal.capability === 'text_mask_sam_ts@1'
+      const analysisId = `remote:${proposal.provider}:${proposal.capability}:${proposalId.slice(0, 24)}`
+      // The native side replaces its one stored analysis with this one, so
+      // a plan prepared from a local analysis is gone too.
+      review.analysis = { id: analysisId, remote: true, eligible: false, page: drawn,
+        sourceSha256: proposal.sourcePageSha256, chapterId: proposal.chapterId, pageIndex: proposal.pageIndex,
+        pageId: page?.id ?? null, bubbled: new Set() }
+      review.prepared = null
+      return { analysisId, sourceSha256: proposal.sourcePageSha256,
+        rtModelSha256: null, samEncoderSha256: null, samHeadSha256: null,
+        maskSha256: sam ? sha256Hex(`remote-mask:${proposalId}`) : null,
+        workflow: proposal.capability, rtProfile: null,
+        rtBackend: sam ? null : 'remote', samBackend: sam ? 'remote' : null,
+        remoteSource: `remote:${proposal.provider}:${proposal.capability}`, samWriteEligible: false,
+        samWebgpuNodes: null, samCpuFallbackNodes: null,
+        evidence: evidenceFor(drawn, { rt: !sam, sam }),
+        sourceDataUrl: drawn.sourceDataUrl, maskDataUrl: sam ? drawn.maskDataUrl : null,
+        timingsMs: { rtLoad: 0, rtPage: 0, samLoad: 0, samPrepare: 0, samEncoder: 0, samHead: 0, samRestore: 0 } }
+    },
+
+    async cancelRemoteAnalysis({ proposalId }) {
+      const record = remoteAnalyses.get(proposalId)
+      if (!record) return false
+      if (['attached_evidence', 'cancelled', 'failed'].includes(record.phase)) return false
+      record.cancelled = true
+      if (record.phase === 'proposed') record.phase = 'cancelled'
+      return true
+    },
+
+    async getRemoteAnalysisStatus({ proposalId }) {
+      const record = remoteAnalyses.get(proposalId)
+      if (!record) throw new Error('analysis_proposal_missing')
+      return statusOf(proposalId, record)
     },
 
     async prepareCloudConsent(spec) {
@@ -2851,6 +3455,36 @@ export function createMockBackend(options = {}) {
     async about() {
       await delay(timing.method)
       return aboutInfo()
+    },
+
+    /**
+     * `src-tauri/src/diagnostics.rs` loads the runtime to answer; the mock has
+     * nothing to load, so an installed runtime loads and a deleted one is
+     * `missing`, as there. `?runtimeLoad=` names a load failure instead -
+     * `unloadable`, `quarantined`, `refused` or `missingDependency` - because
+     * a browser is the only place the readiness row that says so can be seen
+     * before it ships, and this machine never fails that way.
+     */
+    async diagnostics() {
+      await delay(timing.method)
+      const failures = {
+        unloadable: 'diagnostics.runtime.unloadable',
+        quarantined: 'diagnostics.runtime.quarantined',
+        refused: 'diagnostics.runtime.refused',
+        missingDependency: 'diagnostics.runtime.missingDependency',
+      }
+      const knob = new URLSearchParams(globalThis.location?.search ?? '').get('runtimeLoad') ?? ''
+      const failure = Object.hasOwn(failures, knob) ? failures[/** @type {keyof typeof failures} */ (knob)] : null
+      const installed = !state.missingModels.has(MOCK_RUNTIME_ID)
+      return {
+        appVersion: aboutInfo().appVersion,
+        components: [{
+          name: 'onnxruntime',
+          available: installed && !failure,
+          detail: null,
+          reasonKey: installed ? failure : 'diagnostics.runtime.missing',
+        }],
+      }
     },
   }
 }

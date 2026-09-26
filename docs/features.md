@@ -23,9 +23,10 @@ Creating a chapter **copies its pages into the library**. A PNG or TIFF is copie
 GIF or BMP is decoded once and written as a lossless PNG, and that file is the page from then on. The scan folder is
 read at that moment and never written to or read again, so you may move or delete it and the chapter still opens,
 cleans, resumes and exports. The New chapter dialog says so, because a folder you were not told you could delete is
-one you will keep. The cost is a second copy on disk, on the order of a gigabyte for a 200-page colour chapter, and
-nothing checks the free space first: a page whose copy cannot be written is listed with the other skipped files
-rather than failing the chapter.
+one you will keep. The cost is a second copy on disk, on the order of a gigabyte for a 200-page colour chapter. Before
+anything is written, the app estimates the space the copies need, errs on the high side, and refuses the chapter with
+the numbers when the disk has less free; a page whose copy still cannot be written is listed with the other skipped
+files rather than failing the chapter.
 
 Also on the library screen: **Open project** (with a filter field), **Rename** (the library's label only, the folder
 on disk keeps its name), **Remove** (out of the library, pages on disk untouched), **Delete chapter**, **Copy source
@@ -105,6 +106,37 @@ looking like a failure. If the weights are not on the machine, Auto clean is dis
 Models. If the machine runs short of memory mid-run, it says what it will do instead: the FLUX helper stops, then the
 redraw model is unloaded and the regions that needed it are listed for review, then it works one page region at a
 time.
+
+**Source languages** (Settings, Detection) decide what a run cleans. Each of Japanese, Chinese and Korean is on or
+set to Skip, and the choice is captured when a run starts, so a resumed run keeps it. A region whose script belongs to
+a skipped language is held for review rather than cleaned, and a run with every language skipped says so and cleans
+nothing. The script checker cannot tell Japanese kanji from Chinese Han, so Han text stays eligible while either of the
+two is on. Japanese can turn on the optional OCR rescue; it is off unless you choose it, and a run where the reader
+will not open says so and goes on without it. With Outside bubbles set to clean and only some languages on, regions
+outside a balloon are held, because nothing checks their language.
+
+### Text-shaped review (optional)
+
+A second, optional way to clean a page, for lettering that a box-shaped mask handles badly. It is off unless you set
+the workflow policy to **All text** in Settings, Detection, and it needs graphs you import yourself: the SAM-TS-L
+lettering model under **Shape the removal mask** (two ONNX graphs, local import only, never an app download), plus the
+region finder. It reads no language and opens neither the script checker nor the Japanese reader. The SFX finder is not
+part of this version.
+
+The editor then offers **Text-shaped review** for the current page. The analysis finds regions and draws the lettering
+pixels, and the review lists every component, including ones no region claimed, so nothing is dropped silently. The
+tinted area is the exact set of pixels a clean may change; the box around it only helps you find it. Padding (0 px by
+default, up to 64 px) grows that area evenly around the lettering, and add and remove brushes correct it; both are
+recomputed from the original model output each time, so going from 2 to 5 and back to 2 gives the first result again.
+Apply asks the backend to prepare the write, shows it, and writes only if nothing changed in between; reconstruction
+may read more of the page, but only the tinted pixels change. Text outside balloons is held unless you allow it for the
+review, a switch separate from Auto clean's.
+
+Writing is qualified for PNG pages on an Apple M5 with the app's ONNX Runtime on WebGPU only. On any other page type or
+machine (JPEG, CPU, Windows, Linux), the review shows the analysis and prepares nothing. Long-strip chapters are not
+analyzed yet; the review needs a paginated chapter. Every change is one
+undo step and is saved with the mask it used, so it reopens and exports the same. Turning the option off leaves saved
+edits viewable and legacy cleaning unchanged.
 
 ## The engine ladder
 

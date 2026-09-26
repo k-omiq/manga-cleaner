@@ -57,6 +57,7 @@ pub const ERR_PAYLOAD_TOO_LARGE: &str = "ERR_PAYLOAD_TOO_LARGE";
 pub const ERR_VALIDATION: &str = "ERR_VALIDATION_ERROR";
 pub const ERR_SECURITY_VIOLATION: &str = "ERR_SECURITY_VIOLATION";
 pub const ERR_PROVIDER_UNAVAILABLE: &str = "ERR_PROVIDER_UNAVAILABLE";
+pub const ERR_HELPER_MISSING: &str = "ERR_HELPER_MISSING";
 pub const ERR_EXECUTION_FAILED: &str = "ERR_EXECUTION_FAILED";
 pub const ERR_EXECUTION_TIMEOUT: &str = "ERR_EXECUTION_TIMEOUT";
 
@@ -1105,12 +1106,12 @@ fn run_provisioner(
     let Some(helper) = discover_helper() else {
         return make_error_response(
             &request_id,
-            ERR_PROVIDER_UNAVAILABLE,
-            "Cloud provisioner helper binary not found: no executable discovered in MANGA_CLEANER_PROVISIONER_BIN or next to the application",
-            Some("Install or package the cloud provisioner helper binary, or set MANGA_CLEANER_PROVISIONER_BIN to its path."),
+            ERR_HELPER_MISSING,
+            "This Manga Cleaner installation does not contain its cloud setup helper",
+            Some("Install a complete Manga Cleaner build that includes the cloud setup helper."),
             Some(&[
-                "Set MANGA_CLEANER_PROVISIONER_BIN to the absolute path of the provisioner executable",
-                "In a development build, build the sidecar into src-tauri/binaries or make Python 3 with the provisioner requirements available",
+                "Install a complete app bundle and reopen Manga Cleaner",
+                "For a development build, freeze the helper into src-tauri/binaries or install the provisioner requirements into the checkout's Python environment",
             ]),
         );
     };

@@ -108,7 +108,7 @@ pub enum BalloonClass {
 }
 
 impl BalloonClass {
-    fn from_label(label: i64) -> Option<BalloonClass> {
+    pub(crate) fn from_label(label: i64) -> Option<BalloonClass> {
         match label {
             0 => Some(BalloonClass::Bubble),
             1 => Some(BalloonClass::TextInBubble),
@@ -1574,6 +1574,23 @@ mod tests {
         assert!(adopt_uncovered_text(&regions, &[weak], 1000, 1000, 3_600).is_empty());
     }
 
+    #[test]
+    fn a_box_just_above_the_adoption_floor_still_needs_gate_review() {
+        let regions = text_region(0, 0, 60, 60);
+        let candidate = BalloonBox {
+            rect: Rect::new(400, 400, 120, 80),
+            class: BalloonClass::TextFree,
+            score: 0.515,
+        };
+        let adopted = adopt_uncovered_text(&regions, std::slice::from_ref(&candidate), 1000, 1000, 3_600);
+        assert_eq!(adopted.len(), 1, "this score clears the current adoption floor");
+        assert_eq!(adopted[0].members[0].confidence, 0.515);
+        let found = detected(adopted[0].masking, &[candidate]);
+        assert!(matches!(found, Detected::Outside));
+        assert!(!found.inside(),
+            "a weak free-text candidate must stay outside the default cleaning route");
+    }
+
     /// A `text_bubble` box is adopted on the same terms. It almost never
     /// happens - over the 28 real scans the text detector emitted a box for
     /// every one of them - but a balloon whose lettering the text detector
@@ -2188,6 +2205,27 @@ mod tests {
             "the tone covers {}% of the samples, which INNER_OFF_PERCENT would have allowed",
             off * 100 / samples
         );
+    }
+
+    #[test]
+    fn finer_lighter_tone_between_letters_is_held_as_picture() {
+        let page = plate(250, |x, y| ((x * 7 + y * 11) % 17 < 4).then_some(205));
+        let read = interior_of(&page, &segmentation(240, 240, letters), BOX);
+        assert!(!matches!(read, Interior::Solid { .. }), "fine tone read as paper: {read:?}");
+        let (_, samples, off, _, _) = inner_counts(&page, BOX);
+        assert!(off * 100 > samples * INNER_OFF_PERCENT);
+    }
+
+    #[test]
+    fn a_plate_that_is_mostly_frame_is_not_read_as_paper() {
+        let page = plate(250, |x, y| {
+            let x = x as i64;
+            let y = y as i64;
+            (x < BOX.x + 5 || x >= BOX.right() - 5
+                || y < BOX.y + 5 || y >= BOX.bottom() - 5).then_some(20)
+        });
+        let read = interior_of(&page, &segmentation(240, 240, letters), BOX);
+        assert!(!matches!(read, Interior::Solid { .. }), "frame read as paper: {read:?}");
     }
 
     /// Art between the strokes is refused one step earlier, by one-sidedness: a

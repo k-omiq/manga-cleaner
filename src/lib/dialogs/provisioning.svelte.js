@@ -36,6 +36,7 @@ const ERROR_CODE = /^ERR_[A-Z0-9_]{1,48}$/
 const NOTHING_RAN = new Set([
   'ERR_UNAPPROVED_PLAN',
   'ERR_PROVIDER_UNAVAILABLE',
+  'ERR_HELPER_MISSING',
   'ERR_INVALID_REQUEST_PAYLOAD',
   'ERR_INVALID_PROTOCOL_VERSION',
   'ERR_UNSUPPORTED_OPERATION',
@@ -161,11 +162,15 @@ const ERROR_KEYS = new Map([
   ['ERR_UNAPPROVED_PLAN', 'settings.cloud.setup.error.planChanged'],
   ['ERR_PLATFORM_GATED', 'settings.cloud.setup.error.platform'],
   ['ERR_PROVIDER_UNAVAILABLE', 'settings.cloud.setup.error.unavailable'],
+  ['ERR_HELPER_MISSING', 'settings.cloud.setup.error.helperMissing'],
   ['ERR_EXECUTION_FAILED', 'settings.cloud.setup.error.failed'],
   ['ERR_EXECUTION_TIMEOUT', 'settings.cloud.setup.error.timeout'],
   ['ERR_SECRET_STORE', 'settings.cloud.setup.error.secretStore'],
   ['ERR_CONFIG_WRITE', 'settings.cloud.setup.error.configWrite'],
   ['ERR_CANCELLED', 'settings.cloud.setup.error.cancelled'],
+  // The Modal token step saw a create intent with no recorded token: one may
+  // exist that no cleanup can find. `CloudProvisioner` adds the recovery steps.
+  ['ERR_ORPHANED_TOKEN', 'settings.cloud.setup.error.orphanedToken'],
   ['ERR_INVALID_REQUEST_PAYLOAD', 'settings.cloud.setup.error.request'],
   ['ERR_INVALID_PROTOCOL_VERSION', 'settings.cloud.setup.error.request'],
   ['ERR_UNSUPPORTED_OPERATION', 'settings.cloud.setup.error.request'],

@@ -8,9 +8,8 @@
  * lives here: the plan, the choices, each file's status, the run, and what the
  * cloud setup did. `FirstLaunchDialog.svelte` and its steps only draw it.
  *
- * **It adds no seam method.** The run is `downloadRuntime` and then
- * `downloadModel` per file, one at a time. Pause is `cancelDownload`: the
- * backend keeps the `.part`, and the next request resumes it with a `Range`.
+ * The run is `downloadRuntime`, then individual files and atomic logical model
+ * groups. Pause is `cancelDownload`: the backend keeps resumable staging data.
  */
 
 import { getBackend } from '../api/backend.js'
@@ -21,10 +20,11 @@ import {
   setCloudAllowed,
   setDetection,
   setFluxModel,
+  setOcrRescue,
 } from '../state/session.svelte.js'
 import { setDialogOutsideStack } from '../shortcuts.js'
 import { capabilities, loadCapabilities } from '../state/capabilities.svelte.js'
-import { LANGUAGES } from '../model/pipelines.js'
+import { LANGUAGES, OCR_FILES, SCRIPT_GATE_FILES } from '../model/pipelines.js'
 import {
   RUNTIME_ID,
   FIRST_LAUNCH_STEPS,
@@ -94,6 +94,14 @@ let unsubscribe = null
 const waiting = new Map()
 /** Ids the user paused while their start was still in flight. */
 const pauseRequested = new Set()
+/** The native model groups, with the member lists `model/pipelines.js` owns. */
+const MODEL_GROUPS = Object.freeze({
+  scriptGate: SCRIPT_GATE_FILES,
+  mangaOcr: OCR_FILES,
+})
+const GROUP_FOR_MODEL = Object.freeze(Object.fromEntries(
+  Object.entries(MODEL_GROUPS).flatMap(([groupId, members]) => members.map((member) => [member, groupId])),
+))
 
 /**
  * Open the setup over a catalogue answer.
@@ -190,10 +198,30 @@ export function chooseCleaner(id, wanted) {
   firstLaunch.cleaners = { ...firstLaunch.cleaners, [id]: wanted }
 }
 
+/**
+ * Opt in to, or out of, the optional Japanese OCR rescue. Stored at once, for
+ * `chooseDetector`'s reason: it is the same switch Settings > Detection shows,
+ * and the run reads it from the session.
+ *
+ * @param {boolean} enabled
+ */
+export function chooseOcrRescue(enabled) {
+  setOcrRescue(enabled === true)
+}
+
+/**
+ * The workflow the downloads follow: the stored text policy and the rescue
+ * switch. Setup never changes the policy; legacy is the default for a new
+ * machine, and a replay keeps whatever Settings chose.
+ */
+function workflow() {
+  return { textPolicy: session.textPolicy, ocrRescue: session.ocrRescue }
+}
+
 /** The files the current choices need, runtime first. @returns {string[]} */
 export function chosenFiles() {
   const plan = firstLaunch.plan
-  return plan ? neededFiles(plan, firstLaunch.detection, firstLaunch.cleaners) : []
+  return plan ? neededFiles(plan, firstLaunch.detection, firstLaunch.cleaners, workflow()) : []
 }
 
 /** Bytes the current choices still cost. */
@@ -238,6 +266,19 @@ export function startFirstLaunchDownloads() {
 
 /** @param {string} id */
 export async function pauseFile(id) {
+  const groupId = GROUP_FOR_MODEL[id]
+  if (groupId) {
+    const members = MODEL_GROUPS[groupId].filter((member) => firstLaunch.queue.includes(member))
+    const active = members.filter((member) => firstLaunch.status[member] === 'active')
+    const waiting = members.filter((member) => firstLaunch.status[member] === 'waiting')
+    if (!active.length && !waiting.length) return
+    for (const member of [...active, ...waiting]) {
+      if (firstLaunch.status[member] === 'active') pauseRequested.add(member)
+      setStatus(member, 'paused')
+    }
+    if (active.length) await getBackend().cancelDownload({ id: active[0] })
+    return
+  }
   const status = firstLaunch.status[id]
   if (status === 'waiting') {
     setStatus(id, 'paused')
@@ -251,6 +292,24 @@ export async function pauseFile(id) {
 
 /** @param {string} id */
 export function resumeFile(id) {
+  const groupId = GROUP_FOR_MODEL[id]
+  if (groupId) {
+    let resumed = false
+    for (const member of MODEL_GROUPS[groupId]) {
+      const status = firstLaunch.status[member]
+      if (status === 'paused' || status === 'failed') {
+        setStatus(member, 'waiting')
+        resumed = true
+      }
+      const { [member]: _gone, ...errors } = firstLaunch.errors
+      firstLaunch.errors = errors
+    }
+    if (resumed) {
+      for (const member of MODEL_GROUPS[groupId]) pauseRequested.delete(member)
+      run()
+    }
+    return
+  }
   const status = firstLaunch.status[id]
   if (status !== 'paused' && status !== 'failed') return
   pauseRequested.delete(id)
@@ -298,11 +357,18 @@ async function run() {
   try {
     for (let id = nextWaiting(); id; id = nextWaiting()) {
       firstLaunch.current = id
-      setStatus(id, 'active')
+      const groupId = GROUP_FOR_MODEL[id]
+      const groupMembers = groupId
+        ? MODEL_GROUPS[groupId].filter((member) => firstLaunch.queue.includes(member) && firstLaunch.status[member] !== 'done')
+        : null
+      if (groupMembers) {
+        for (const member of groupMembers) setStatus(member, 'active')
+      } else setStatus(id, 'active')
       try {
-        await fetchOne(backend, id)
+        if (groupId && groupMembers) await fetchGroup(backend, groupId, groupMembers)
+        else await fetchOne(backend, id)
       } finally {
-        pauseRequested.delete(id)
+        for (const member of groupMembers ?? [id]) pauseRequested.delete(member)
       }
       // The channel was closed under the run (`resetFirstLaunch`): no event
       // can reach the next file's waiter, so there is nothing to wait for.
@@ -349,6 +415,45 @@ async function fetchOne(backend, id) {
   }
   if (error) fail(id, error)
   else setStatus(id, 'done')
+}
+
+/**
+ * Install a logical capability as one native transaction. Member events carry
+ * per-file progress, while only the group event answers this waiter; a group
+ * failure or cancellation therefore cannot leave a second queued member hung.
+ *
+ * @param {import('../api/backend.js').Backend} backend
+ * @param {string} groupId
+ * @param {string[]} members
+ */
+async function fetchGroup(backend, groupId, members) {
+  const arrival = waitForDone(groupId)
+  /** @type {import('../api/backend.js').DownloadStart} */
+  let outcome
+  try {
+    outcome = await backend.downloadModelGroup({ id: groupId })
+  } catch (error) {
+    discard(groupId)
+    for (const member of members) fail(member, String(error))
+    return
+  }
+  if (outcome === 'alreadyInstalled') {
+    discard(groupId)
+    for (const member of members) setStatus(member, 'done')
+    return
+  }
+  const activeMember = members[0]
+  if (members.some((member) => pauseRequested.has(member))) await backend.cancelDownload({ id: activeMember })
+  const error = await arrival
+  if (error === 'cancelled' && members.some((member) => pauseRequested.has(member))) {
+    for (const member of members) if (firstLaunch.status[member] === 'active') setStatus(member, 'paused')
+    return
+  }
+  if (error) {
+    for (const member of members) fail(member, error)
+    return
+  }
+  for (const member of members) setStatus(member, 'done')
 }
 
 /** @returns {string|undefined} */
@@ -536,19 +641,26 @@ function listen() {
       }
       return
     }
+    // The native group summary deliberately reuses its group id (`scriptGate`
+    // is also one member's file id), but total=null distinguishes that summary
+    // from the successful per-file event. Never let the member event wake the
+    // logical-group waiter early.
+    const groupSummary = GROUP_FOR_MODEL[event.id] === event.id && event.total === null
     // Progress is kept on a pause, so the bar holds where it stopped. A
     // success is marked here rather than after the run's await, so the bar
     // never drops to empty in between - and so a file Settings finished for
     // us is not fetched again when the queue reaches it.
-    if (!event.error) {
+    if (!event.error && !groupSummary) {
       // Marked whether or not it is queued yet: a file Settings finished
       // while the setup was on an earlier step must not be fetched again.
       setStatus(event.id, 'done')
       const { [event.id]: _gone, ...rest } = firstLaunch.progress
       firstLaunch.progress = rest
     }
-    waiting.get(event.id)?.(event.error ?? null)
-    waiting.delete(event.id)
+    if (!GROUP_FOR_MODEL[event.id] || groupSummary) {
+      waiting.get(event.id)?.(event.error ?? null)
+      waiting.delete(event.id)
+    }
   })
 }
 

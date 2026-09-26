@@ -262,7 +262,13 @@ class BeamStarletteMountTest(BeamEndToEndTest):
     """The Beam gateway serves the same app mounted at /mc/v1 inside Starlette."""
 
     def gateway_app(self):
-        return Starlette(routes=[Mount("/mc/v1", app=super().gateway_app())])
+        from deploy.cloud.beam.routes import mount_gateway_app
+        return mount_gateway_app(super().gateway_app())
+
+    def test_analysis_path_reaches_gateway(self):
+        status, _, body = self.request("GET", "/mc/analysis/v1/capabilities")
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body)["error_code"], "capability_unavailable")
 
 
 if __name__ == "__main__":

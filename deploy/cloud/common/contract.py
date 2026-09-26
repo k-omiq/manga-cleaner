@@ -7,6 +7,8 @@ inference across both Modal and Beam backends.
 from __future__ import annotations
 
 import dataclasses
+import base64
+import binascii
 import hashlib
 import json
 import math
@@ -1278,3 +1280,142 @@ def validate_result_bytes(
         limits=limits,
         reported_cost_usd=result_meta.reported_cost_usd,
     )
+
+# Analysis is a separate protocol. FLUX /mc/v1 schemas above stay byte-identical.
+ANALYSIS_VERSION = "1.0.0"
+ANALYSIS_SAM = "text_mask_sam_ts@1"
+ANALYSIS_RT = "text_regions_rt@1"
+ANALYSIS_MAX_PNG_BYTES = 4_194_304
+ANALYSIS_MAX_COMPONENTS = 4096
+ANALYSIS_MAX_BOXES = 4096
+ANALYSIS_MAX_RESPONSE_BYTES = 6_500_000
+
+
+def analysis_rect(value: Any, *, tile: bool = False) -> Dict[str, int]:
+    if type(value) is not dict:
+        raise ContractValidationError("analysis rect must be an object")
+    _assert_no_extra_keys(value, {"x", "y", "width", "height"})
+    rect = {name: _check_exact_int(value.get(name), name, 1 if name in ("width", "height") else 0, 2**32 - 1)
+            for name in ("x", "y", "width", "height")}
+    if rect["x"] + rect["width"] > 2**32 - 1 or rect["y"] + rect["height"] > 2**32 - 1:
+        raise ContractValidationError("analysis rect overflow")
+    if tile and (rect["width"] > 1024 or rect["height"] > 1024):
+        raise ContractValidationError("analysis tile exceeds 1024")
+    return rect
+
+
+def analysis_request_digest(request: Dict[str, Any]) -> tuple[bytes, str]:
+    _assert_no_extra_keys(request, {
+        "protocol_version", "capability", "graph_sha256s", "model_revision", "tile_id",
+        "tile_rect", "tile_png_sha256", "source_page_sha256", "request_digest",
+    })
+    if request.get("protocol_version") != ANALYSIS_VERSION or request.get("capability") not in (ANALYSIS_SAM, ANALYSIS_RT):
+        raise ContractValidationError("unknown analysis version or capability")
+    capability = request["capability"]
+    graphs = request.get("graph_sha256s")
+    if type(graphs) is not list or len(graphs) != (2 if capability == ANALYSIS_SAM else 1):
+        raise ContractValidationError("wrong analysis graph count")
+    for graph in graphs:
+        _validate_lowercase_hex_hash(graph, "graph_sha256s")
+    revision = request.get("model_revision")
+    _validate_revision_identity(revision)
+    tile_id = _check_exact_str(request.get("tile_id"), "tile_id", max_len=64)
+    if not all(c.isascii() and (c.isalnum() or c in "-_") for c in tile_id):
+        raise ContractValidationError("invalid tile id")
+    rect = analysis_rect(request.get("tile_rect"), tile=True)
+    tile_sha = _validate_lowercase_hex_hash(request.get("tile_png_sha256"), "tile_png_sha256")
+    page_sha = _validate_lowercase_hex_hash(request.get("source_page_sha256"), "source_page_sha256")
+    canonical = json.dumps([
+        "MC-ANA-V1", ANALYSIS_VERSION, capability, graphs, revision, tile_id,
+        rect["x"], rect["y"], rect["width"], rect["height"], tile_sha, page_sha,
+    ], separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return canonical, hashlib.sha256(canonical).hexdigest()
+
+
+def validate_analysis_request(request: Dict[str, Any], tile_png: bytes) -> None:
+    _, digest = analysis_request_digest(request)
+    if _validate_lowercase_hex_hash(request.get("request_digest"), "request_digest") != digest:
+        raise ContractValidationError("analysis request digest mismatch")
+    if len(tile_png) > ANALYSIS_MAX_PNG_BYTES or hashlib.sha256(tile_png).hexdigest() != request["tile_png_sha256"]:
+        raise ContractValidationError("analysis tile PNG digest or byte limit mismatch")
+    _validate_analysis_png(tile_png, request["tile_rect"], "RGB")
+
+
+def _validate_analysis_png(data: bytes, rect: Dict[str, int], mode: str) -> None:
+    if len(data) > ANALYSIS_MAX_PNG_BYTES:
+        raise ContractValidationError("analysis PNG too large")
+    try:
+        from PIL import Image
+        from io import BytesIO
+        with Image.open(BytesIO(data)) as image:
+            if image.format != "PNG" or image.mode != mode or image.size != (rect["width"], rect["height"]):
+                raise ContractValidationError("analysis PNG geometry or format mismatch")
+            image.load()
+    except (OSError, ValueError) as exc:
+        raise ContractValidationError("invalid analysis PNG") from exc
+
+
+def validate_analysis_result(result: Dict[str, Any], request: Dict[str, Any]) -> None:
+    _assert_no_extra_keys(result, {
+        "protocol_version", "capability", "request_digest", "tile_id", "tile_rect",
+        "graph_sha256s", "model_revision", "mask_png", "components", "boxes",
+        "timings", "reported_cost_usd",
+    })
+    for key in ("protocol_version", "capability", "request_digest", "tile_id", "tile_rect", "graph_sha256s", "model_revision"):
+        if result.get(key) != request.get(key):
+            raise ContractValidationError("analysis result identity mismatch")
+    components, boxes = result.get("components"), result.get("boxes")
+    if type(components) is not list or len(components) > ANALYSIS_MAX_COMPONENTS or type(boxes) is not list or len(boxes) > ANALYSIS_MAX_BOXES:
+        raise ContractValidationError("analysis result count exceeded")
+    tile = request["tile_rect"]
+    def inside(rect: Any) -> None:
+        r = analysis_rect(rect)
+        if r["x"] + r["width"] > tile["width"] or r["y"] + r["height"] > tile["height"]:
+            raise ContractValidationError("analysis result outside tile")
+    for component in components:
+        inside(component)
+    for box in boxes:
+        if type(box) is not dict:
+            raise ContractValidationError("invalid analysis box")
+        _assert_no_extra_keys(box, {"rect", "class", "score"})
+        inside(box.get("rect"))
+        _check_exact_int(box.get("class"), "class", 0, 2)
+        score = box.get("score")
+        if type(score) not in (float, int) or type(score) is bool or not math.isfinite(score) or not 0 <= score <= 1:
+            raise ContractValidationError("invalid analysis score")
+    timings = result.get("timings")
+    if type(timings) is not dict:
+        raise ContractValidationError("invalid analysis timings")
+    _assert_no_extra_keys(timings, {"load_ms", "preprocess_ms", "inference_ms", "postprocess_ms"})
+    for field in ("load_ms", "preprocess_ms", "inference_ms", "postprocess_ms"):
+        _check_exact_int(timings.get(field), field, 0, 2**32 - 1)
+    _check_optional_float(result.get("reported_cost_usd"), "reported_cost_usd")
+    mask = result.get("mask_png")
+    if request["capability"] == ANALYSIS_SAM:
+        if boxes or type(mask) is not bytes:
+            raise ContractValidationError("invalid SAM result")
+        _validate_analysis_png(mask, tile, "L")
+    elif mask is not None or components:
+        raise ContractValidationError("invalid RT result")
+
+
+def validate_analysis_wire_result(result: Dict[str, Any], request: Dict[str, Any]) -> bytes | None:
+    if len(json.dumps(result, separators=(",", ":")).encode("utf-8")) > ANALYSIS_MAX_RESPONSE_BYTES:
+        raise ContractValidationError("analysis response too large")
+    if "mask_png" in result or "mask_png_b64" not in result:
+        raise ContractValidationError("invalid analysis mask encoding")
+    encoded = result["mask_png_b64"]
+    if encoded is not None:
+        if type(encoded) is not str or len(encoded) > 4 * ((ANALYSIS_MAX_PNG_BYTES + 2) // 3):
+            raise ContractValidationError("analysis encoded mask too large")
+        try:
+            mask = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ContractValidationError("invalid analysis mask encoding") from exc
+    else:
+        mask = None
+    decoded = dict(result)
+    decoded.pop("mask_png_b64")
+    decoded["mask_png"] = mask
+    validate_analysis_result(decoded, request)
+    return mask

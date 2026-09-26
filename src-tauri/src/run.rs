@@ -100,7 +100,7 @@ use cleaner_core::accel::{self, Preference};
 use cleaner_core::detect::{Detector, build_regions_separated};
 use cleaner_core::engines::{denoise, fill, lama};
 use cleaner_core::fit::{self, EdgeMap, Route};
-use cleaner_core::gate::{OutsideText, ScriptGate};
+use cleaner_core::gate::{OutsideText, ScriptGate, Verdict};
 use cleaner_core::image::{Raster, decode};
 use cleaner_core::ingest::sha256_hex;
 use cleaner_core::mask::{Mask, Rect};
@@ -384,6 +384,86 @@ impl Picks {
     /// for both.
     fn for_region(&self, in_balloon: bool) -> EnginePick {
         if in_balloon { self.bubble } else { self.outside }
+    }
+}
+
+fn pick_name(pick: EnginePick) -> &'static str {
+    match pick {
+        EnginePick::Fill => "fill",
+        EnginePick::Denoise => "denoise",
+        EnginePick::Lama => "lama",
+    }
+}
+
+/// The source-language and optional reader choices captured when a run starts.
+/// A CJK script identifier cannot reliably distinguish Japanese kanji from
+/// Chinese Han; Han is therefore eligible when either language is selected.
+/// Hangul and kana selections remain independently enforceable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunSelection {
+    ja: bool,
+    zh: bool,
+    ko: bool,
+    ocr_rescue: bool,
+}
+
+impl Default for RunSelection {
+    fn default() -> Self {
+        Self { ja: true, zh: true, ko: true, ocr_rescue: false }
+    }
+}
+
+impl RunSelection {
+    pub(crate) fn from_args(detection: Option<&serde_json::Value>, ocr_rescue: Option<bool>) -> Result<Self, String> {
+        let mut result = Self::default();
+        if let Some(detection) = detection {
+            let choices = detection.as_object().ok_or("detection must be a language-to-model map")?;
+            for (language, selected) in choices {
+                let enabled = match selected {
+                    serde_json::Value::Null => false,
+                    serde_json::Value::String(id) if id == "ctd-rtdetr" => true,
+                    serde_json::Value::String(id) if id == "ctd-rtdetr-ocr" && language == "ja" => {
+                        result.ocr_rescue = true;
+                        true
+                    }
+                    _ => return Err(format!("unsupported detector choice for {language}")),
+                };
+                match language.as_str() {
+                    "ja" => result.ja = enabled,
+                    "zh" => result.zh = enabled,
+                    "ko" => result.ko = enabled,
+                    _ => return Err(format!("unsupported source language {language}")),
+                }
+            }
+        }
+        if let Some(enabled) = ocr_rescue { result.ocr_rescue = enabled; }
+        result.ocr_rescue &= result.ja;
+        Ok(result)
+    }
+
+    fn any(self) -> bool { self.ja || self.zh || self.ko }
+
+    fn empty_notice(self) -> Option<&'static str> {
+        (!self.any()).then_some("notice.run.allLanguagesSkipped")
+    }
+
+    fn allows(self, verdict: &Verdict) -> bool {
+        match verdict {
+            Verdict::Clean { script } => {
+                let script = script.strip_suffix("-dn").unwrap_or(script);
+                match script {
+                    "Japanese" | "Japanese_vert" | "Japanese_ocr" => self.ja,
+                    "HanS" | "HanS_vert" | "HanT" | "HanT_vert" => self.ja || self.zh,
+                    "Hangul" | "Hangul_vert" => self.ko,
+                    _ => false,
+                }
+            }
+            // Outside-bubble opt-in intentionally bypasses script reading.
+            // A partial language selection cannot tell whether this region
+            // belongs to a skipped language, so hold it for review.
+            Verdict::OptedIn => self.ja && self.zh && self.ko,
+            _ => false,
+        }
     }
 }
 
@@ -849,15 +929,15 @@ pub(crate) const INPAINTER: &str = "lama-manga.onnx";
 /// ([`cleaner_core::gate::ocr`]), and **optional in a way none of the others
 /// are**. It is not in [`REQUIRED_MODELS`], nothing falls back to it, and a
 /// machine without it gates exactly as this application did before it existed:
-/// [`open_gate`] attaches it when all three files are present and otherwise
-/// opens the gate alone. 460 MB is too much to make a precondition of cleaning
+/// a selected run attaches it when all three files are present and otherwise
+/// opens the gate alone with a notice. 460 MB is too much to make a precondition of cleaning
 /// a page for the 4% of regions it recovers.
 pub(crate) const OCR_ENCODER: &str = "manga-ocr-encoder_model.onnx";
 pub(crate) const OCR_DECODER: &str = "manga-ocr-decoder_model.onnx";
 pub(crate) const OCR_VOCAB: &str = "manga-ocr-vocab.txt";
 
 /// The three, in one place, so a caller asking "is the reader installed" asks
-/// the same question [`open_gate`] answers.
+/// the same question the selected run answers.
 pub(crate) const OCR_MODELS: [&str; 3] = [OCR_ENCODER, OCR_DECODER, OCR_VOCAB];
 
 /// The model files a run requires to open a pipeline.
@@ -991,6 +1071,9 @@ pub struct Pipeline {
     /// window's row said otherwise, and a property of the run for the same
     /// reason `picks` is.
     outside: OutsideText,
+    /// A run-local copy of the language choices. Settings changes made while
+    /// a chapter is running cannot change which regions that run may clean.
+    selection: RunSelection,
     /// What the last page failed on, when it failed on a model. Cleared at the
     /// top of every [`Cleaner::clean_page`] so that it answers for the page the
     /// run loop is asking about and not for one three pages ago, and read back
@@ -998,6 +1081,16 @@ pub struct Pipeline {
     fault: Option<EngineFault>,
     previous_strip_detections: Vec<DetectedInSegment>,
     previous_placement: Option<usize>,
+    #[cfg(test)]
+    test_vision: Option<TestVision>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct TestVision {
+    detect: fn(&Raster, usize) -> cleaner_core::detect::Detection,
+    balloons: fn(&Raster, usize) -> Vec<cleaner_core::balloon::BalloonBox>,
+    judge: fn(&cleaner_core::detect::Region) -> Verdict,
 }
 
 /// A session borrowed the first time something needs it and handed back to
@@ -1409,16 +1502,19 @@ impl Pipeline {
                 preference,
                 open_balloons,
             ),
-            gate: OnDemand::new(registry::Kind::ScriptGate, models, preference, open_gate),
+            gate: OnDemand::new(registry::Kind::ScriptGate, models, preference, open_gate_bare),
             engine_version: env!("CARGO_PKG_VERSION"),
             rung2: Rung2::new(models, preference),
             ladder: memory::Ladder::new(),
             picks: None,
             bubble_color: None,
             outside: OutsideText::Review,
+            selection: RunSelection::default(),
             fault: None,
             previous_strip_detections: Vec::new(),
             previous_placement: None,
+            #[cfg(test)]
+            test_vision: None,
         })
     }
 
@@ -1443,6 +1539,71 @@ impl Pipeline {
     pub fn with_outside(mut self, outside: OutsideText) -> Pipeline {
         self.outside = outside;
         self
+    }
+
+    pub fn with_selection(mut self, mut selection: RunSelection) -> Pipeline {
+        if selection.ocr_rescue {
+            if let Some(reason) = unavailable_ocr_reason(&self.gate.models) {
+                events::notice(
+                    "notice.run.ocrRescueUnavailable",
+                    serde_json::json!({ "reason": reason }),
+                    "warn",
+                );
+                selection.ocr_rescue = false;
+            }
+        }
+        self.selection = selection;
+        self.gate.open = if selection.ocr_rescue { open_gate_with_ocr } else { open_gate_bare };
+        if selection.ocr_rescue {
+            self.gate.key = residency::Key::new(
+                registry::Kind::ScriptGate,
+                format!("{}|{:?}|ocr", self.gate.models.display(), self.gate.preference),
+            );
+        }
+        self
+    }
+
+    fn detect_segment(
+        &mut self,
+        crop: &Raster,
+        segment: usize,
+    ) -> Result<(Vec<cleaner_core::balloon::BalloonBox>, cleaner_core::detect::Detection), String> {
+        #[cfg(test)]
+        if let Some(vision) = self.test_vision {
+            return Ok(((vision.balloons)(crop, segment), (vision.detect)(crop, segment)));
+        }
+        #[cfg(not(test))]
+        let _ = segment;
+        let session = self.balloons.get()?;
+        let boxes = session.detect(crop);
+        let balloons = ran(boxes, &*session, &accel::BALLOON, &mut self.fault)?;
+        let session = self.detector.get()?;
+        let output = session.detect(crop);
+        let detection = ran(output, &*session, &accel::DETECTOR, &mut self.fault)?;
+        Ok((balloons, detection))
+    }
+
+    fn judge_region(
+        &mut self,
+        crop: &Raster,
+        segmentation: &cleaner_core::detect::Segmentation,
+        region: &cleaner_core::detect::Region,
+        detected: cleaner_core::balloon::Detected,
+    ) -> Result<Verdict, String> {
+        #[cfg(test)]
+        if let Some(vision) = self.test_vision {
+            return Ok((vision.judge)(region));
+        }
+        let session = self.gate.get()?;
+        let reader_missing = self.selection.ocr_rescue && !session.has_reader();
+        let judged = session.judge(crop, segmentation, region, detected, self.outside);
+        let verdict = ran(judged, &*session, &accel::SCRIPT_ID, &mut self.fault)?;
+        if reader_missing {
+            self.selection.ocr_rescue = false;
+            self.gate.open = open_gate_bare;
+            self.gate.key = session_key(registry::Kind::ScriptGate, &self.gate.models, self.gate.preference);
+        }
+        Ok(verdict)
     }
 }
 
@@ -1472,24 +1633,42 @@ fn open_balloons(
         .map_err(|e| e.to_string())
 }
 
-/// The gate, and the rescue reader beside it **if this machine has one**.
-///
-/// The reader is 460 MB of optional download ([`OCR_MODELS`]), so its absence
-/// is the ordinary case and must cost nothing: no error, no diagnostic, and a
-/// gate that reaches exactly the verdicts it reached before this existed
-/// ([`ScriptGate::with_ocr`] is what makes that true rather than a promise).
-///
-/// **A reader that is present but will not open is also not a failure.** The
-/// three files could be truncated, or the provider could refuse the graph on
-/// some machine nobody has tried; either way the region the reader would have
-/// rescued goes to review, which is where it went before, and a page that
-/// cleans is worth more than a page that refuses to start over a model nothing
-/// requires. What is lost is 4% of regions, and it is lost in the recoverable
-/// direction, which is the gate's whole asymmetry.
+/// The bare gate used when the optional rescue was not selected.
+fn open_gate_bare(models: &Path, preference: Preference) -> Result<ScriptGate, String> {
+    ScriptGate::open(&models.join(GATE_MODEL), &models.join(GATE_LABELS), preference)
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
 fn open_gate(models: &Path, preference: Preference) -> Result<ScriptGate, String> {
+    open_gate_with_ocr(models, preference)
+}
+
+fn unavailable_ocr_reason(models: &Path) -> Option<String> {
+    let missing: Vec<_> = OCR_MODELS.iter().filter(|name| !models.join(name).exists()).copied().collect();
+    if !missing.is_empty() {
+        return Some(format!("Missing reader files: {}", missing.join(", ")));
+    }
+    OCR_MODELS.iter().find_map(|name| {
+        match std::fs::metadata(models.join(name)) {
+            Ok(metadata) if metadata.len() == 0 => Some(format!("Empty reader file: {name}")),
+            Err(error) => Some(format!("Reader file {name} cannot be read: {error}")),
+            _ => None,
+        }
+    })
+}
+
+/// Attach the selected reader if it opens. A missing or unreadable optional
+/// reader turns rescue off with a notice and keeps the bare gate available.
+fn open_gate_with_ocr(models: &Path, preference: Preference) -> Result<ScriptGate, String> {
     let gate = ScriptGate::open(&models.join(GATE_MODEL), &models.join(GATE_LABELS), preference)
         .map_err(|e| e.to_string())?;
-    if !OCR_MODELS.iter().all(|name| models.join(name).exists()) {
+    if let Some(reason) = unavailable_ocr_reason(models) {
+        events::notice(
+            "notice.run.ocrRescueUnavailable",
+            serde_json::json!({ "reason": reason }),
+            "warn",
+        );
         return Ok(gate);
     }
     match cleaner_core::gate::Ocr::open(
@@ -1500,9 +1679,12 @@ fn open_gate(models: &Path, preference: Preference) -> Result<ScriptGate, String
     ) {
         Ok(ocr) => Ok(gate.with_ocr(ocr)),
         Err(error) => {
-            // Optional, so a corrupt download costs the rescue and not the
-            // run; said on stderr so the loss is at least findable.
             eprintln!("manga-cleaner: the Japanese text reader could not be opened, cleaning without it: {error}");
+            events::notice(
+                "notice.run.ocrRescueUnavailable",
+                serde_json::json!({ "reason": error.to_string().chars().take(180).collect::<String>() }),
+                "warn",
+            );
             Ok(gate)
         }
     }
@@ -1591,8 +1773,14 @@ impl Cleaner for Pipeline {
         // The run's provider, from the detector's session - which is opened
         // here rather than at the first segment because this is where the name
         // is needed, and the first segment wants it anyway.
-        let provider =
-            format!("{:?}", self.detector.get()?.selection().accelerator).to_lowercase();
+        #[cfg(test)]
+        let provider = if self.test_vision.is_some() {
+            "test".to_owned()
+        } else {
+            format!("{:?}", self.detector.get()?.selection().accelerator).to_lowercase()
+        };
+        #[cfg(not(test))]
+        let provider = format!("{:?}", self.detector.get()?.selection().accelerator).to_lowercase();
         // Rule 4's engine-context term is a property of the rung that could
         // run, and the ceiling is what decides that.
         let engine_context = if rung(ceiling) >= rung(Engine::Lama) {
@@ -1608,8 +1796,18 @@ impl Cleaner for Pipeline {
         }
         let mut previous = std::mem::take(&mut self.previous_strip_detections);
         let mut index = 0usize;
+        // A fresh edge box follows the normal path. Its result is withdrawn
+        // only if the next crop confirms that it was a clipped fragment.
+        // A clipped box can have consumed an index without producing a row.
+        // Only an appended row has a position that a continuation may remove.
+        let mut clipped_adopted = Vec::<(Rect, Option<usize>, Option<usize>)>::new();
+        let page_segments = context.page_segments();
+        let first_segment = page_segments.first().map(|segment| segment.index);
+        let last_segment = page_segments.last().map(|segment| segment.index);
+        let (page_x, page_y) = context.origin();
 
-        for segment in context.page_segments() {
+        for segment in page_segments {
+            let mut awaiting_continuation = std::mem::take(&mut clipped_adopted);
             let window = detection_window(context, segment);
             let requested = window.requested;
             let rect = window.rect;
@@ -1632,13 +1830,7 @@ impl Cleaner for Pipeline {
             let crop = &bounded.raster;
             let (crop_x, crop_y) = bounded.origin;
 
-            let session = self.balloons.get()?;
-            let boxes = session.detect(crop);
-            let balloons = ran(boxes, &*session, &accel::BALLOON, &mut self.fault)?;
-
-            let session = self.detector.get()?;
-            let output = session.detect(crop);
-            let mut detection = ran(output, &*session, &accel::DETECTOR, &mut self.fault)?;
+            let (balloons, mut detection) = self.detect_segment(crop, segment.index)?;
             let mut regions = build_regions_separated(detection.boxes.clone(), crop.width, crop.height, |a, b| {
                 cleaner_core::balloon::merge_crosses_a_balloon(crop, &detection.segmentation, a, b)
             });
@@ -1650,12 +1842,10 @@ impl Cleaner for Pipeline {
             // asks every other region.
             //
             // The balloon boxes and text regions are both in this bounded
-            // crop's coordinates. Rule 3 is what makes their overlap a filter
-            // rather than a clip: a segment's detection
-            // range runs past the next segment's start, so a box straddling a
-            // cut is whole in one of the two crops and is adopted there, by
-            // whichever segment `owned_by` gives it to below. A box clipped to
-            // this crop would be a different box.
+            // crop's coordinates. The detection overlap makes ordinary boxes
+            // whole in one crop. An adopted box that reaches a crop edge can
+            // be taller than that overlap. A confirmed continuation replaces
+            // its normal result with one held review row.
             let in_crop = balloons.clone();
             let median = cleaner_core::detect::median_box_area(&detection.boxes);
             let adopted = cleaner_core::balloon::adopt_uncovered_text(
@@ -1666,6 +1856,34 @@ impl Cleaner for Pipeline {
                 median,
             );
             cleaner_core::balloon::seed_adopted_text(crop, &mut detection.segmentation, &adopted);
+            let adopted_rects: Vec<Rect> = adopted.iter().map(|region| region.masking).collect();
+            // Each current box consumes at most one prior. Every other prior
+            // keeps its normal result, or its already confirmed review row.
+            let mut matched_priors = Vec::with_capacity(adopted_rects.len());
+            let mut withdrawn = Vec::new();
+            for rect in &adopted_rects {
+                let in_strip = Rect::new(rect.x + crop_x, rect.y + crop_y, rect.w, rect.h);
+                let prior = awaiting_continuation.iter()
+                    .position(|(whole, _, _)| clipped_continuation(whole, &in_strip, crop_y))
+                    .map(|position| awaiting_continuation.remove(position));
+                if let Some((_, _, Some(position))) = prior {
+                    withdrawn.push(position);
+                }
+                matched_priors.push(prior.map(|(whole, region_index, _)| (whole, region_index)));
+            }
+            // Remove later results first so earlier outcome positions remain valid.
+            withdrawn.sort_unstable_by_key(|position| std::cmp::Reverse(*position));
+            for position in withdrawn {
+                outcome.regions.remove(position);
+            }
+            for (whole, region_index, outcome_position) in awaiting_continuation {
+                if region_index.is_some() && outcome_position.is_none() {
+                    outcome.regions.push(RegionOutcome::Untouched {
+                        bbox: Rect::new(whole.x - page_x, whole.y - page_y, whole.w, whole.h),
+                        reason: "review.reason.gateSkippedLowConfidence".into(),
+                    });
+                }
+            }
             regions.extend(adopted);
             // Sorted rather than appended, because `region_id` names a region
             // by its index in this list: appending would give the adopted
@@ -1692,6 +1910,29 @@ impl Cleaner for Pipeline {
             for region in regions.iter() {
                 let strip_rect = Rect::new(region.masking.x + crop_x, region.masking.y + crop_y,
                     region.masking.w, region.masking.h);
+                if let Some(adopted_index) = adopted_rects.iter()
+                    .position(|rect| *rect == region.masking) {
+                    if let Some((prior, prior_index)) = matched_priors[adopted_index] {
+                        let whole = rect_hull(prior, strip_rect);
+                        if region.masking.bottom() == crop.height as i64
+                            && Some(segment.index) != last_segment {
+                            clipped_adopted.push((whole, prior_index, None));
+                        } else {
+                            outcome.regions.push(RegionOutcome::Untouched {
+                                bbox: Rect::new(whole.x - page_x, whole.y - page_y, whole.w, whole.h),
+                                reason: "review.reason.gateSkippedLowConfidence".into(),
+                            });
+                            if prior_index.is_none() { index += 1; }
+                        }
+                        continue;
+                    }
+                }
+                let clipped_position = if adopted_rects.contains(&region.masking)
+                    && region.masking.bottom() == crop.height as i64
+                        && Some(segment.index) != last_segment {
+                    clipped_adopted.push((strip_rect, None, None));
+                    Some(clipped_adopted.len() - 1)
+                } else { None };
                 if !owned_by(&globals, strip_rect, segment.index) {
                     // Some other segment's work. A box in this segment's
                     // detection overlap is whole here *and* whole there, and
@@ -1699,31 +1940,50 @@ impl Cleaner for Pipeline {
                     // it.
                     continue;
                 }
+                if adopted_rects.contains(&region.masking) && region.masking.y == 0
+                    && Some(segment.index) != first_segment {
+                    let region_index = index;
+                    outcome.regions.push(RegionOutcome::Untouched {
+                        bbox: Rect::new(strip_rect.x - page_x, strip_rect.y - page_y,
+                            strip_rect.w, strip_rect.h),
+                        reason: "review.reason.gateSkippedLowConfidence".into(),
+                    });
+                    index += 1;
+                    if let Some(position) = clipped_position {
+                        clipped_adopted[position].1 = Some(region_index);
+                        clipped_adopted[position].2 = Some(outcome.regions.len() - 1);
+                    }
+                    continue;
+                }
                 let started = Instant::now();
-                let id = region_id(page_id, index);
-                let order = index as u32;
+                let region_index = index;
+                let id = region_id(page_id, region_index);
+                let order = region_index as u32;
                 index += 1;
+                if let Some(position) = clipped_position {
+                    clipped_adopted[position].1 = Some(region_index);
+                }
 
                 // Everything the manifest records is in **page** coordinates,
                 // so a bbox reported to the seam means the same thing whether
                 // the page was one segment or six.
-                let (page_x, page_y) = context.origin();
                 let on_page = Rect::new(strip_rect.x - page_x, strip_rect.y - page_y,
                     strip_rect.w, strip_rect.h);
 
                 let detected = cleaner_core::balloon::detected(region.masking, &balloons);
                 let inside = detected.inside();
-                let outside = self.outside;
-                let session = self.gate.get()?;
-                let judged =
-                    session.judge(crop, &detection.segmentation, region, detected, outside);
-                let verdict = ran(judged, &*session, &accel::SCRIPT_ID, &mut self.fault)?;
-                if !verdict.cleans() {
-                    if let Some(reason) = verdict.reason_key() {
-                        outcome.regions.push(RegionOutcome::Untouched {
-                            bbox: on_page,
-                            reason: reason.to_owned(),
-                        });
+                let verdict = self.judge_region(crop, &detection.segmentation, region, detected)?;
+                if !self.selection.allows(&verdict) {
+                    let reason = verdict.reason_key().unwrap_or(match verdict {
+                        Verdict::OptedIn => "review.reason.outsideLanguageUnverified",
+                        _ => "review.reason.languageSkipped",
+                    });
+                    outcome.regions.push(RegionOutcome::Untouched {
+                        bbox: on_page,
+                        reason: reason.to_owned(),
+                    });
+                    if let Some(position) = clipped_position {
+                        clipped_adopted[position].2 = Some(outcome.regions.len() - 1);
                     }
                     continue;
                 }
@@ -1814,6 +2074,9 @@ impl Cleaner for Pipeline {
                             bbox: on_page,
                             reason: reason.to_owned(),
                         });
+                        if let Some(position) = clipped_position {
+                            clipped_adopted[position].2 = Some(outcome.regions.len() - 1);
+                        }
                         continue;
                     }
                     Attempt::Cleaned(made, verdict) => (*made, verdict),
@@ -1864,11 +2127,22 @@ impl Cleaner for Pipeline {
                         None
                     },
                 ));
+                if let Some(position) = clipped_position {
+                    clipped_adopted[position].2 = Some(outcome.regions.len() - 1);
+                }
             }
             // Rule 6's shape at the segment scale: the crop, its segmentation
             // and its edge map go here, and only the rectangles survive into
             // the next iteration.
             previous = found;
+        }
+        for (whole, region_index, outcome_position) in clipped_adopted {
+            if region_index.is_some() && outcome_position.is_none() {
+                outcome.regions.push(RegionOutcome::Untouched {
+                    bbox: Rect::new(whole.x - page_x, whole.y - page_y, whole.w, whole.h),
+                    reason: "review.reason.gateSkippedLowConfidence".into(),
+                });
+            }
         }
         self.previous_strip_detections = previous;
         self.previous_placement = Some(context.placement);
@@ -2170,6 +2444,24 @@ fn owned_by(globals: &[GlobalBox], rect: Rect, segment: usize) -> bool {
         })
         .map(|global| global.owner == segment)
         .unwrap_or(true)
+}
+
+fn clipped_continuation(upper: &Rect, lower: &Rect, lower_crop_top: i64) -> bool {
+    let shared_width = (upper.right().min(lower.right()) - upper.x.max(lower.x)).max(0);
+    let shared_height = (upper.bottom().min(lower.bottom()) - upper.y.max(lower.y)).max(0);
+    let x_union = upper.right().max(lower.right()) - upper.x.min(lower.x);
+    shared_width * 2 >= upper.w.min(lower.w) as i64
+        && (shared_height * 2 >= upper.h.min(lower.h) as i64
+            || (shared_height >= strip::DETECTION_OVERLAP as i64 * 3 / 4
+                && lower.y == lower_crop_top
+                && shared_width * 4 >= x_union * 3))
+}
+
+fn rect_hull(a: Rect, b: Rect) -> Rect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    Rect::new(x, y, (a.right().max(b.right()) - x) as u32,
+        (a.bottom().max(b.bottom()) - y) as u32)
 }
 
 /// A mask fitted in a segment crop's coordinates, in the page's.
@@ -2530,8 +2822,9 @@ fn reset_page(job: &mut Job, source_idx: usize, page_id: &str) {
 /// Whether an untouched region's reason is the gate holding it back, rather
 /// than a route nothing would run. One test, used where a region is counted and
 /// again where it is uncounted.
-fn is_gate_skip(reason: &str) -> bool {
+pub(crate) fn is_gate_skip(reason: &str) -> bool {
     reason.contains("gateSkipped")
+        || matches!(reason, "review.reason.languageSkipped" | "review.reason.outsideLanguageUnverified")
 }
 
 /// The queue a scope asks for, in order.
@@ -2944,6 +3237,7 @@ fn page_or_stub(entry: &PlanEntry, page_id: &str, job: &Job) -> ApiPage {
         id: page_id.to_owned(),
         chapter_id: entry.chapter_id.clone(),
         index: entry.page_index as u32,
+        source_index: entry.source_idx,
         number: entry.page_index as u32 + 1,
         file: String::new(),
         source_sha: String::new(),
@@ -3080,20 +3374,8 @@ fn queued(entries: &[PlanEntry]) -> Vec<QueuedPage> {
 /// A thread of its own rather than `spawn_blocking`: a run over a 200-page
 /// chapter occupies its worker for minutes, and the blocking pool is what every
 /// other command in this crate resolves on ([`crate::library::blocking`]).
-pub(crate) fn start(
-    app: &tauri::AppHandle,
-    scope: &str,
-    chapter_id: &str,
-    page_index: Option<u32>,
-    engine_ceiling: Option<String>,
-    picks: Picks,
-    outside: OutsideText,
-) -> Result<RunHandle, String> {
-    start_with_color(app, scope, chapter_id, page_index, engine_ceiling, picks, outside, None)
-}
-
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn start_with_color(
+pub(crate) fn start_with_selection(
     app: &tauri::AppHandle,
     scope: &str,
     chapter_id: &str,
@@ -3102,7 +3384,13 @@ pub(crate) fn start_with_color(
     picks: Picks,
     outside: OutsideText,
     bubble_color: Option<[u8; 3]>,
+    selection: RunSelection,
+    detection_snapshot: Option<serde_json::Value>,
 ) -> Result<RunHandle, String> {
+    if let Some(key) = selection.empty_notice() {
+        events::notice(key, serde_json::json!({}), "warn");
+        return Ok(RunHandle { run_id: None, pages: Vec::new(), already_running: None });
+    }
     {
         let guard = active().lock().map_err(|e| e.to_string())?;
         if let Some(run) = guard.as_ref() {
@@ -3172,6 +3460,7 @@ pub(crate) fn start_with_color(
         Ok(pipeline) => pipeline
             .with_picks(picks)
             .with_outside(outside)
+            .with_selection(selection)
             .with_bubble_color(bubble_color),
         Err(OpenError::MissingModel { .. }) => {
             events::notice("notice.run.modelsMissing", serde_json::json!({}), "warn");
@@ -3210,7 +3499,9 @@ pub(crate) fn start_with_color(
         already_running: None,
     };
     let worker = Worker { run_id, chapter_id: chapter_id.to_owned(), cancel, finished, outcome };
-    let settings_snapshot = settings.clone();
+    let settings_snapshot = run_settings_snapshot(
+        &settings, detection_snapshot, &pipeline, engine_ceiling.as_deref(), scope, page_index,
+    );
     std::thread::spawn(move || {
         let mut cleaner = pipeline;
         // The settings a job ran under, recorded on the job it ran over. Under
@@ -3228,6 +3519,36 @@ pub(crate) fn start_with_color(
         worker.run(&entries, &mut cleaner, ceiling, &|event| events::emit(&event));
     });
     Ok(handle)
+}
+
+fn run_settings_snapshot(
+    settings: &serde_json::Value,
+    detection_snapshot: Option<serde_json::Value>,
+    pipeline: &Pipeline,
+    engine_ceiling: Option<&str>,
+    scope: &str,
+    page_index: Option<u32>,
+) -> serde_json::Value {
+    let mut settings_snapshot = settings.clone();
+    if !settings_snapshot.is_object() { settings_snapshot = serde_json::json!({}); }
+    if let Some(snapshot) = detection_snapshot {
+        settings_snapshot["runDetection"] = snapshot;
+    }
+    settings_snapshot["runOcrRescue"] = serde_json::json!(pipeline.selection.ocr_rescue);
+    settings_snapshot["runEngineCeiling"] = serde_json::json!(engine_ceiling);
+    settings_snapshot["runScope"] = serde_json::json!(scope);
+    settings_snapshot["runPageIndex"] = serde_json::json!(page_index);
+    settings_snapshot["runGeometryPolicy"] = serde_json::json!("legacy");
+    settings_snapshot["runTextPolicy"] = serde_json::json!("legacy_gate");
+    settings_snapshot["runBubbleEngine"] = serde_json::json!(pick_name(pipeline.picks.unwrap_or_default().bubble));
+    settings_snapshot["runOutsideEngine"] = serde_json::json!(pick_name(pipeline.picks.unwrap_or_default().outside));
+    settings_snapshot["runOutsideBubbles"] = serde_json::json!(if pipeline.outside == OutsideText::Clean { "clean" } else { "review" });
+    if let Some(color) = pipeline.bubble_color {
+        settings_snapshot["runBubbleColor"] = serde_json::json!(format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2]));
+    } else {
+        settings_snapshot["runBubbleColor"] = serde_json::Value::Null;
+    }
+    settings_snapshot
 }
 
 /// The handles the thread that owns a run needs to finish it and hand the slot
@@ -3354,6 +3675,55 @@ fn release(finished: &Arc<(Mutex<bool>, Condvar)>) {
     condvar.notify_all();
 }
 
+struct CapturedRunPolicy {
+    selection: RunSelection,
+    detection: Option<serde_json::Value>,
+    engine_ceiling: Option<String>,
+    scope: String,
+    page_index: Option<u32>,
+    picks: Picks,
+    outside: OutsideText,
+    bubble_color: Option<[u8; 3]>,
+}
+
+fn captured_run_policy(snapshot: &serde_json::Value) -> Result<CapturedRunPolicy, String> {
+    if snapshot.get("runGeometryPolicy").and_then(|v| v.as_str())
+        .is_some_and(|mode| mode != "legacy")
+        || snapshot.get("runTextPolicy").and_then(|v| v.as_str())
+            .is_some_and(|policy| policy != "legacy_gate")
+    {
+        return Err("This interrupted workflow cannot be resumed as legacy cleaning".into());
+    }
+    let detection = snapshot.get("runDetection").filter(|value| !value.is_null()).cloned();
+    let selection = RunSelection::from_args(
+        detection.as_ref(),
+        snapshot.get("runOcrRescue").and_then(|value| value.as_bool()),
+    )?;
+    let scope = snapshot.get("runScope").and_then(|value| value.as_str()).unwrap_or("chapter");
+    if !matches!(scope, "chapter" | "project" | "page") {
+        return Err("This interrupted workflow has an unknown run scope".into());
+    }
+    Ok(CapturedRunPolicy {
+        selection,
+        detection,
+        engine_ceiling: snapshot.get("runEngineCeiling")
+            .and_then(|value| value.as_str())
+            .or_else(|| snapshot.get("engineCeiling").and_then(|value| value.as_str()))
+            .map(str::to_owned),
+        scope: scope.to_owned(),
+        page_index: snapshot.get("runPageIndex")
+            .and_then(|value| value.as_u64()).and_then(|value| u32::try_from(value).ok()),
+        picks: Picks::from_args(
+            snapshot.get("runBubbleEngine").and_then(|value| value.as_str()),
+            snapshot.get("runOutsideEngine").and_then(|value| value.as_str()),
+        ),
+        outside: OutsideText::from_arg(
+            snapshot.get("runOutsideBubbles").and_then(|value| value.as_str()),
+        ),
+        bubble_color: parse_color_hex(snapshot.get("runBubbleColor").and_then(|value| value.as_str())),
+    })
+}
+
 /* ------------------------------------------------------------------ */
 /* Commands                                                            */
 /* ------------------------------------------------------------------ */
@@ -3383,12 +3753,23 @@ pub async fn run_clean(
     outside_engine: Option<String>,
     outside_bubbles: Option<String>,
     bubble_color: Option<String>,
+    detection: Option<serde_json::Value>,
+    geometry_policy: Option<String>,
+    text_policy: Option<String>,
+    ocr_rescue: Option<bool>,
 ) -> Result<RunHandle, String> {
     crate::library::blocking(move || {
+        if !matches!(geometry_policy.as_deref(), None | Some("legacy")) {
+            return Err("Text-shaped cleaning requires the prepared mask review workflow".to_owned());
+        }
+        if !matches!(text_policy.as_deref(), None | Some("legacy_gate")) {
+            return Err("All-text cleaning requires the RT-DETR + SAM-TS review workflow".to_owned());
+        }
+        let selection = RunSelection::from_args(detection.as_ref(), ocr_rescue)?;
         let picks = Picks::from_args(bubble_engine.as_deref(), outside_engine.as_deref());
         let outside = OutsideText::from_arg(outside_bubbles.as_deref());
         let parsed_color = parse_color_hex(bubble_color.as_deref());
-        start_with_color(
+        start_with_selection(
             &app,
             scope.as_deref().unwrap_or("chapter"),
             &chapter_id,
@@ -3397,6 +3778,8 @@ pub async fn run_clean(
             picks,
             outside,
             parsed_color,
+            selection,
+            detection,
         )
     })
     .await
@@ -3500,12 +3883,14 @@ pub async fn resume_job(
         // its resume point is - taking the project's would send the editor to a
         // page of the wrong chapter.
         let mut resumed_from = interrupted.page_index;
+        let mut run_snapshot = serde_json::Value::Null;
         {
             let job_path = library.job_path(&project_id, &chapter_id);
             // Read, verify, drop, flush - one read-modify-write, so it is held
             // for the whole of it and released before `start` takes it again.
             let _lock = lock_job(&job_path);
             if let Ok(mut job) = Job::open(&job_path) {
+                run_snapshot = job.project.settings.clone();
                 if let Some(at) = job.project.interrupted_at {
                     resumed_from = at;
                 }
@@ -3514,20 +3899,22 @@ pub async fn resume_job(
             }
         }
 
-        // A resume carries no picks of its own: `resumeJob` names a chapter and
-        // nothing else, so it runs on the defaults rather than on whatever the
-        // tool window happened to hold when the job was interrupted. The same
-        // for the outside-bubble row: a resume reviews that text, whatever the
-        // interrupted run was told.
-        let handle = start(
+        // Resume the captured run policy. Defaults here would silently clean
+        // languages skipped before an interruption.
+        let policy = captured_run_policy(&run_snapshot)?;
+        let handle = start_with_selection(
             &app,
-            "chapter",
+            &policy.scope,
             &chapter_id,
-            None,
-            None,
-            Picks::default(),
-            OutsideText::default(),
+            policy.page_index,
+            policy.engine_ceiling,
+            policy.picks,
+            policy.outside,
+            policy.bubble_color,
+            policy.selection,
+            policy.detection,
         )?;
+        if !resume_started(&handle) { return Ok(None); }
         events::notice(
             "notice.job.resumed",
             serde_json::json!({ "page": resumed_from + 1 }),
@@ -3542,6 +3929,10 @@ pub async fn resume_job(
         }))
     })
     .await
+}
+
+fn resume_started(handle: &RunHandle) -> bool {
+    handle.run_id.is_some() && handle.already_running != Some(true)
 }
 
 #[cfg(test)]

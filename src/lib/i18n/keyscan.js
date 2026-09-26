@@ -32,6 +32,7 @@ export const NAMESPACES = Object.freeze([
   'accel',
   'app',
   'canvas',
+  'cloud',
   'decline',
   'diagnostics',
   'editor',
@@ -56,6 +57,7 @@ export const NAMESPACES = Object.freeze([
   'time',
   'tools',
   'update',
+  'workflow',
 ])
 
 const NAMESPACE_SET = new Set(NAMESPACES)

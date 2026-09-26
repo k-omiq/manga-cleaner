@@ -46,7 +46,10 @@ use cleaner_core::cloud_wire::{
     PROTOCOL_VERSION,
 };
 use cleaner_core::engines::flux::wire_sampling;
-use cleaner_core::engines::render::{CloudProvider, ExecutionTarget, PreparedRender, RenderRecipe};
+#[cfg(test)]
+use cleaner_core::engines::render::PreparedRender;
+use cleaner_core::engines::render::{CloudProvider, ExecutionTarget, RenderRecipe};
+#[cfg(test)]
 use cleaner_core::fit::{self, EdgeMap};
 use cleaner_core::ingest::sha256_hex;
 use cleaner_core::patch::{CloudRecord, Engine};
@@ -149,6 +152,7 @@ impl InferenceServiceError {
             Self::LocalTargetNotAllowed => "target_invalid",
             Self::ProfileNotFound(..) => "profile_missing",
             Self::CredentialMissing(_) => "credential_missing",
+            Self::Grant(GrantError::ScopeMismatch { field: "input_sha256" | "predecessors_sha256" }) => "region_changed",
             Self::Grant(_) => "consent_invalid",
             Self::Consent(err) => consent_code(err),
             Self::Journal(err) => journal_code(err),
@@ -186,9 +190,9 @@ fn consent_code(err: &ConsentError) -> &'static str {
         ConsentError::LocalTargetNotAllowed => "target_invalid",
         ConsentError::ProfileNotFound(..) => "profile_missing",
         ConsentError::InvalidEndpoint(_) => "endpoint_invalid",
-        ConsentError::RegionNotFound(_) | ConsentError::PageNotFound(..) | ConsentError::PageMismatch => {
-            "region_not_found"
-        }
+        ConsentError::RegionNotFound(_)
+        | ConsentError::PageNotFound(..)
+        | ConsentError::PageMismatch => "region_not_found",
         ConsentError::SourceImageError
         | ConsentError::RenderPrepareFailed(_)
         | ConsentError::UnsupportedNewRegion(_) => "region_unsupported",
@@ -679,9 +683,9 @@ impl InferenceService {
         // under this id is the one the interface is watching, and a `failed`
         // from here would be read as its end.
         let Some(live) = LiveRender::register(&attempt_id) else {
-            return Err(InferenceServiceError::Journal(JournalError::AttemptLocked {
-                attempt_id,
-            }));
+            return Err(InferenceServiceError::Journal(
+                JournalError::AttemptLocked { attempt_id },
+            ));
         };
         let reporter = PhaseReporter::new(
             self.progress.as_ref(),
@@ -759,6 +763,8 @@ impl InferenceService {
             source_hash,
             mask_hash,
             revision,
+            input_sha256,
+            predecessors_sha256,
             source_idx,
         ) = {
             let _lock = run::lock_job(job_path);
@@ -795,6 +801,14 @@ impl InferenceService {
                     ))
                 })?;
 
+            if record.geometry_policy == cleaner_core::text_shape::GeometryPolicy::TextShape
+                || job.project.text_shape_plans.iter().any(|plan| plan.region_id == region_id)
+            {
+                return Err(InferenceServiceError::Consent(ConsentError::RenderPrepareFailed(
+                    "cloud FLUX does not support text-shaped write plans".into(),
+                )));
+            }
+
             if record.source_idx != source_idx {
                 return Err(InferenceServiceError::Consent(ConsentError::PageMismatch));
             }
@@ -810,15 +824,12 @@ impl InferenceService {
                 ));
             }
 
-            let noise = fit::page_noise_sigma(&page);
-            let edges = EdgeMap::sobel(&page);
-            let fitted = fit::fit(&page, &seed, 1.0, noise, &edges, true);
-
-            let prepared = PreparedRender::prepare(&page, &fitted).map_err(|e| {
-                InferenceServiceError::Consent(ConsentError::RenderPrepareFailed(e.to_string()))
-            })?;
-
-            let crop_bounds = prepared.crop();
+            let cloud = crate::underlay::prepare_cloud(&job, source_idx, &page, record, &patch)
+                .map_err(|e| {
+                    InferenceServiceError::Consent(ConsentError::RenderPrepareFailed(e))
+                })?;
+            let prepared = &cloud.prepared;
+            let crop_bounds = cloud.crop_bounds;
             let crop_png = encode_rgb8_png(crop_bounds.w, crop_bounds.h, prepared.image_rgb8())?;
             let crop_sha256 = sha256_hex(&crop_png);
 
@@ -838,6 +849,8 @@ impl InferenceService {
                 source_hash,
                 mask_hash,
                 revision,
+                cloud.input.digest,
+                cloud.input.predecessors,
                 source_idx,
             )
         };
@@ -849,6 +862,7 @@ impl InferenceService {
 
         // 3. Exact immutable GrantScope construction
         let scope = GrantScope {
+            capability: crate::inference::policy::FLUX_CAPABILITY.to_string(),
             provider,
             profile_id: profile_id.to_string(),
             canonical_endpoint_fingerprint: canonical_endpoint_fingerprint.clone(),
@@ -859,6 +873,8 @@ impl InferenceService {
             crop_bounds,
             mask_hash: mask_hash.clone(),
             revision,
+            input_sha256: input_sha256.clone(),
+            predecessors_sha256: predecessors_sha256.clone(),
             recipe: recipe.clone(),
             region_ids: vec![region_id.to_string()],
         };
@@ -910,6 +926,8 @@ impl InferenceService {
             source_image_hash: source_hash.clone(),
             region_id: region_id.to_string(),
             region_revision: revision,
+            input_sha256: Some(input_sha256),
+            predecessors_sha256: Some(predecessors_sha256),
             crop_sha256: crop_sha256.clone(),
             hint_sha256: hint_sha256.clone(),
             request_digest,
@@ -935,9 +953,16 @@ impl InferenceService {
         }
 
         // 5. Consume grant at the last safe point before marking Dispatching and network dispatch
-        if let Err(e) = self.resolve_grants().validate_and_consume(grant_nonce, &scope) {
+        if let Err(e) = self
+            .resolve_grants()
+            .validate_and_consume(grant_nonce, &scope)
+        {
             let _ = self.journal.abort_intent_no_dispatch(&guard);
-            return Err(InferenceServiceError::Grant(e));
+            return match e {
+                GrantError::ScopeMismatch { field: "input_sha256" | "predecessors_sha256" } =>
+                    Err(InferenceServiceError::StaleAttachment("underlay changed before dispatch".into())),
+                other => Err(InferenceServiceError::Grant(other)),
+            };
         }
 
         // 6. Mark Dispatching immediately before network dispatch
@@ -1048,7 +1073,9 @@ impl InferenceService {
                         if let Ok(guard) = self.lock_attempt(attempt_id) {
                             let _ = self.journal.record_cancelled(&guard);
                         }
-                        return Err(InferenceServiceError::RemoteJobCancelled(handle.to_string()));
+                        return Err(InferenceServiceError::RemoteJobCancelled(
+                            handle.to_string(),
+                        ));
                     }
                 }
             }
@@ -1059,7 +1086,9 @@ impl InferenceService {
     /// Whether another command has recorded a cancel for this attempt.
     fn cancel_recorded(&self, attempt_id: &str) -> bool {
         matches!(
-            self.journal.get_record(attempt_id).map(|record| record.phase),
+            self.journal
+                .get_record(attempt_id)
+                .map(|record| record.phase),
             Ok(AttemptPhase::CancelRequested { .. })
         )
     }
@@ -1085,7 +1114,10 @@ impl InferenceService {
         }
         let _ = client.cancel_job(handle, req_meta);
         for _ in 0..CANCEL_CONFIRM_POLLS {
-            match client.get_job_status(handle, req_meta).map(|status| status.status) {
+            match client
+                .get_job_status(handle, req_meta)
+                .map(|status| status.status)
+            {
                 Ok(JobExecutionStatus::Cancelled) => {
                     if let Ok(guard) = self.lock_attempt(attempt_id) {
                         let _ = self.journal.record_cancelled(&guard);
@@ -1199,10 +1231,12 @@ impl InferenceService {
                 *reported_cost_usd,
             ),
             other => {
-                return Err(InferenceServiceError::Journal(JournalError::InvalidTransition {
-                    current: format!("{other:?}"),
-                    attempted: "attach_cached".into(),
-                }))
+                return Err(InferenceServiceError::Journal(
+                    JournalError::InvalidTransition {
+                        current: format!("{other:?}"),
+                        attempted: "attach_cached".into(),
+                    },
+                ))
             }
         };
 
@@ -1214,11 +1248,14 @@ impl InferenceService {
             source_image_hash: record.source_image_hash.clone(),
             region_id: record.region_id.clone(),
             region_revision: record.region_revision,
+            input_sha256: record.input_sha256.clone(),
+            predecessors_sha256: record.predecessors_sha256.clone(),
             crop_sha256: record.crop_sha256.clone(),
             hint_sha256: record.hint_sha256.clone(),
         };
         // A no-op for an attempt already pending under this patch id.
-        self.journal.prepare_attachment(guard, &snapshot, &patch_id)?;
+        self.journal
+            .prepare_attachment(guard, &snapshot, &patch_id)?;
         if let Some(region) = attached {
             self.journal.confirm_committed(guard, &patch_id)?;
             return Ok((patch_id, region));
@@ -1247,6 +1284,7 @@ impl InferenceService {
             reported_cost_usd,
             record.width,
             record.height,
+            record.page_index,
         )?;
 
         self.journal.confirm_committed(guard, &patch_id)?;
@@ -1275,12 +1313,30 @@ impl InferenceService {
             .ok_or_else(|| {
                 InferenceServiceError::StaleAttachment("region no longer in chapter".into())
             })?;
+        if !patch.visible {
+            return Err(InferenceServiceError::StaleAttachment(
+                "region was deleted or hidden".into(),
+            ));
+        }
         let source_idx = match (source_idx, record.page_index) {
-            (Some(idx), _) => idx,
-            (None, Some(page)) => Library::resolve_page(&job.project, page as usize)
-                .ok_or_else(|| {
+            (Some(idx), Some(page)) => {
+                let mapped =
+                    Library::resolve_page(&job.project, page as usize).ok_or_else(|| {
+                        InferenceServiceError::StaleAttachment("page no longer in chapter".into())
+                    })?;
+                if mapped != idx {
+                    return Err(InferenceServiceError::StaleAttachment(
+                        "page mapping changed".into(),
+                    ));
+                }
+                idx
+            }
+            (Some(idx), None) => idx,
+            (None, Some(page)) => {
+                Library::resolve_page(&job.project, page as usize).ok_or_else(|| {
                     InferenceServiceError::StaleAttachment("page no longer in chapter".into())
-                })?,
+                })?
+            }
             (None, None) => patch.source_idx,
         };
         let carries_attempt = patch
@@ -1322,10 +1378,18 @@ impl InferenceService {
         reported_cost_usd: Option<f64>,
         _page_w: u32,
         _page_h: u32,
+        page_index: Option<u32>,
     ) -> Result<ApiRegion, InferenceServiceError> {
         let _lock = run::lock_job(job_path);
         let mut job =
             Job::open(job_path).map_err(|e| InferenceServiceError::JobManifest(e.to_string()))?;
+        if let Some(page_index) = page_index {
+            if Library::resolve_page(&job.project, page_index as usize) != Some(source_idx) {
+                return Err(InferenceServiceError::StaleAttachment(
+                    "page mapping changed".into(),
+                ));
+            }
+        }
 
         // Re-verify snapshot on disk before mutating project
         let cur_source_path = job
@@ -1345,9 +1409,22 @@ impl InferenceService {
             .find(|r| r.id == region_id)
             .ok_or_else(|| InferenceServiceError::JobManifest("region record missing".into()))?;
 
+        if cur_record.geometry_policy == cleaner_core::text_shape::GeometryPolicy::TextShape
+            || job.project.text_shape_plans.iter().any(|plan| plan.region_id == region_id)
+        {
+            return Err(InferenceServiceError::StaleAttachment(
+                "text-shaped support cannot be attached through the legacy cloud path".into(),
+            ));
+        }
+
         if cur_record.source_idx != source_idx {
             return Err(InferenceServiceError::StaleAttachment(
                 "patch record source index mismatch".into(),
+            ));
+        }
+        if !cur_record.visible {
+            return Err(InferenceServiceError::StaleAttachment(
+                "region was deleted or hidden".into(),
             ));
         }
 
@@ -1372,18 +1449,42 @@ impl InferenceService {
             InferenceServiceError::Consent(ConsentError::RenderPrepareFailed(e.to_string()))
         })?;
 
-        let noise = fit::page_noise_sigma(&page);
-        let edges = EdgeMap::sobel(&page);
-        let fitted = fit::fit(&page, &cur_patch.mask, 1.0, noise, &edges, true);
-
-        let prepared = PreparedRender::prepare(&page, &fitted).map_err(|e| {
-            InferenceServiceError::Consent(ConsentError::RenderPrepareFailed(e.to_string()))
-        })?;
+        let cloud = crate::underlay::prepare_cloud(&job, source_idx, &page, cur_record, &cur_patch)
+            .map_err(|e| InferenceServiceError::Consent(ConsentError::RenderPrepareFailed(e)))?;
+        if snapshot
+            .input_sha256
+            .as_deref()
+            .is_some_and(|hash| hash != cloud.input.digest)
+            || snapshot
+                .predecessors_sha256
+                .as_deref()
+                .is_some_and(|hash| hash != cloud.input.predecessors)
+            || cloud.crop_bounds.w != _page_w
+            || cloud.crop_bounds.h != _page_h
+        {
+            return Err(InferenceServiceError::StaleAttachment(
+                "composited input changed".into(),
+            ));
+        }
+        let prepared = &cloud.prepared;
+        let crop_png =
+            encode_rgb8_png(prepared.crop().w, prepared.crop().h, prepared.image_rgb8())?;
+        let hint_png =
+            encode_gray8_png(prepared.crop().w, prepared.crop().h, prepared.hint_gray8())?;
+        if sha256_hex(&crop_png) != snapshot.crop_sha256
+            || sha256_hex(&hint_png) != snapshot.hint_sha256
+        {
+            return Err(InferenceServiceError::StaleAttachment(
+                "encoded crop or hint changed".into(),
+            ));
+        }
 
         let generated = decoded_crop.as_generated_crop();
-        let rendered = prepared.composite(&generated).map_err(|e| {
+        let mut rendered = prepared.composite(&generated).map_err(|e| {
             InferenceServiceError::Consent(ConsentError::RenderPrepareFailed(e.to_string()))
         })?;
+        rendered.mask.bounds.x += cloud.input.window.x + cloud.source_shift.0;
+        rendered.mask.bounds.y += cloud.input.window.y + cloud.source_shift.1;
 
         let cloud_record = CloudRecord {
             provider: match provider {
@@ -1405,11 +1506,22 @@ impl InferenceService {
         let mut updated_patch = cur_patch.clone();
         updated_patch.provenance.engine = Engine::Flux;
         updated_patch.provenance.cloud = Some(cloud_record);
+        updated_patch.provenance.params_snapshot["input_provenance"] = serde_json::json!({
+            "version": 1,
+            "input_sha256": cloud.input.digest,
+            "predecessors_sha256": cloud.input.predecessors,
+            "read_footprint": cleaner_core::mask::Rect::new(
+                cloud.input.window.x + cloud.source_shift.0,
+                cloud.input.window.y + cloud.source_shift.1,
+                cloud.input.window.w, cloud.input.window.h),
+        });
         updated_patch.pixels = rendered.pixels;
         updated_patch.mask = rendered.mask;
 
         job.complete_region(source_idx, &updated_patch, None)
             .map_err(|e| InferenceServiceError::JobManifest(e.to_string()))?;
+        crate::underlay::refresh_dependencies(&mut job, region_id)
+            .map_err(InferenceServiceError::JobManifest)?;
         crate::library::invalidate_manifest_cache(job_path);
 
         let (api_region, _) = crate::library::region_and_status(
@@ -1531,9 +1643,11 @@ impl InferenceService {
         poll_opts: &PollOptions,
     ) -> Result<ApiRegion, InferenceServiceError> {
         let Some(live) = LiveRender::register(attempt_id) else {
-            return Err(InferenceServiceError::Journal(JournalError::AttemptLocked {
-                attempt_id: attempt_id.to_string(),
-            }));
+            return Err(InferenceServiceError::Journal(
+                JournalError::AttemptLocked {
+                    attempt_id: attempt_id.to_string(),
+                },
+            ));
         };
         let record = self.journal.get_record(attempt_id)?;
         let chapter_id = record
@@ -1565,10 +1679,12 @@ impl InferenceService {
             AttemptPhase::Accepted { handle } => (handle.clone(), true),
             AttemptPhase::CancelRequested { handle } => (handle.clone(), false),
             other => {
-                return Err(InferenceServiceError::Journal(JournalError::InvalidTransition {
-                    current: format!("{other:?}"),
-                    attempted: "resume_cloud_render".into(),
-                }))
+                return Err(InferenceServiceError::Journal(
+                    JournalError::InvalidTransition {
+                        current: format!("{other:?}"),
+                        attempted: "resume_cloud_render".into(),
+                    },
+                ))
             }
         };
         reporter.enter(RenderPhase::Queued);
@@ -1620,10 +1736,12 @@ impl InferenceService {
                 AttemptPhase::Committed { patch_id, .. } => {
                     Ok(RecoveryDecision::AlreadyCommitted { patch_id })
                 }
-                other => Err(InferenceServiceError::Journal(JournalError::InvalidTransition {
-                    current: format!("{other:?}"),
-                    attempted: "recover_cloud_attempt".into(),
-                })),
+                other => Err(InferenceServiceError::Journal(
+                    JournalError::InvalidTransition {
+                        current: format!("{other:?}"),
+                        attempted: "recover_cloud_attempt".into(),
+                    },
+                )),
             },
             Err(InferenceServiceError::PollingTimeout(_)) => Ok(waiting),
             Err(
@@ -1640,8 +1758,8 @@ impl InferenceService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cleaner_core::cloud_decode::decode_result_crop;
     use crate::inference::config::validate_https_endpoint;
+    use cleaner_core::cloud_decode::decode_result_crop;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1716,6 +1834,44 @@ mod tests {
         (manifest, bounds)
     }
 
+    #[test]
+    fn text_shaped_region_is_refused_before_cloud_dispatch_or_target_mutation() {
+        let scratch = test_scratch("text-shape-dispatch-refusal");
+        let (manifest, _) = setup_test_job(&scratch, "reg-1");
+        let config = test_config();
+        let grants = Arc::new(GrantService::new());
+        let consent = Arc::new(ConsentService::new_isolated(Arc::clone(&grants)));
+        let target = ExecutionTarget::Modal { profile_id: "modal-prof-1".into() };
+        let recipe = RenderRecipe::new("sdnq-v1", "1.0.0", "flux-schnell",
+            "0123456789abcdef0123456789abcdef01234567", false);
+        let intent = OperationIntent::CleanAnyway;
+        let proposal = consent.prepare_proposal(PrepareProposalRequest {
+            chapter_id: "c1".into(), page_index: 0, region_id: Some("reg-1".into()),
+            target: target.clone(), recipe: recipe.clone(), intent: intent.clone(),
+        }, &config, true, &manifest).unwrap();
+        let grant = consent.confirm_proposal(ConfirmProposalOptions {
+            proposal_id: &proposal.proposal_id, intent: &intent, config: &config,
+            cloud_allowed: true, job_path: &manifest,
+            grant_ttl: Duration::from_secs(60), max_attempts: 1,
+        }).unwrap();
+        let mut job = Job::open(&manifest).unwrap();
+        job.project.patches[0].geometry_policy = cleaner_core::text_shape::GeometryPolicy::TextShape;
+        job.flush().unwrap();
+        let before = std::fs::read(&manifest).unwrap();
+        let service = InferenceService::new_isolated(
+            scratch.join("journal"), cleaner_core::cloud_wire::provisional_fixture_limits(),
+            consent, Arc::clone(&grants), Arc::new(SecretManager::new_in_memory()),
+        );
+        let result = service.execute_cloud_render(&grant.nonce, &manifest, 0, "reg-1",
+            &target, &recipe, &intent, &config, true, &PollOptions::default());
+        assert!(matches!(result,
+            Err(InferenceServiceError::Consent(ConsentError::RenderPrepareFailed(reason)))
+            if reason.contains("text-shaped")));
+        assert_eq!(grants.get_grant(&grant.nonce).unwrap().attempts_used, 0);
+        assert!(service.journal().list_attempt_ids().unwrap().is_empty());
+        assert_eq!(std::fs::read(&manifest).unwrap(), before);
+    }
+
     fn test_config() -> InferenceConfig {
         let mut cfg = InferenceConfig::default();
         let (origin, origin_fp) = validate_https_endpoint("https://modal.run/mc/v1").unwrap();
@@ -1732,6 +1888,52 @@ mod tests {
             },
         );
         cfg
+    }
+
+    #[test]
+    fn changed_predecessor_inside_read_window_refuses_paid_dispatch_and_preserves_grant() {
+        let scratch = test_scratch("changed-predecessor-before-dispatch");
+        let (manifest, _) = setup_test_job(&scratch, "reg-1");
+        let config = test_config();
+        let grants = Arc::new(GrantService::new());
+        let consent = Arc::new(ConsentService::new_isolated(Arc::clone(&grants)));
+        let target = ExecutionTarget::Modal { profile_id: "modal-prof-1".into() };
+        let recipe = RenderRecipe::new("sdnq-v1", "1.0.0", "flux-schnell",
+            "0123456789abcdef0123456789abcdef01234567", false);
+        let intent = OperationIntent::CleanAnyway;
+        let proposal = consent.prepare_proposal(PrepareProposalRequest {
+            chapter_id: "chapter".into(), page_index: 0, region_id: Some("reg-1".into()),
+            target: target.clone(), recipe: recipe.clone(), intent: intent.clone(),
+        }, &config, true, &manifest).unwrap();
+        let grant = consent.confirm_proposal(ConfirmProposalOptions {
+            proposal_id: &proposal.proposal_id, intent: &intent, config: &config,
+            cloud_allowed: true, job_path: &manifest, grant_ttl: Duration::from_secs(60),
+            max_attempts: 1,
+        }).unwrap();
+        let mut job = Job::open(&manifest).unwrap();
+        let mut earlier = job.load_patch(&job.project.patches[0]).unwrap();
+        earlier.id = "earlier".into();
+        earlier.order = 0;
+        earlier.mask = Mask::filled(Rect::new(0, 0, 16, 16));
+        earlier.ink = earlier.mask.clone();
+        earlier.pixels.width = 16;
+        earlier.pixels.height = 16;
+        earlier.pixels.data = vec![100; 16 * 16];
+        job.complete_region(0, &earlier, None).unwrap();
+        let endpoint = CloudEndpointTarget::new_test_target(CloudProvider::Modal,
+            "modal-prof-1", "http://127.0.0.1:1/mc/v1").unwrap();
+        let credential = BoundRuntimeCredential::new(&endpoint, RuntimeCredential::ModalProxy {
+            token_id: "tid".into(), token_secret: SecretValue::new("tsec"),
+        }).unwrap();
+        let client = CloudHttpClient::new_test_client(endpoint, credential,
+            reqwest::blocking::Client::new());
+        let service = InferenceService::new_isolated(scratch.join("journal"),
+            cleaner_core::cloud_wire::provisional_fixture_limits(), consent,
+            Arc::clone(&grants), Arc::new(SecretManager::new_in_memory())).with_custom_client(client);
+        let result = service.execute_cloud_render(&grant.nonce, &manifest, 0, "reg-1",
+            &target, &recipe, &intent, &config, true, &PollOptions::default());
+        assert!(matches!(result, Err(InferenceServiceError::StaleAttachment(_))));
+        assert_eq!(grants.get_grant(&grant.nonce).unwrap().attempts_used, 0);
     }
 
     fn test_crop_bounds(manifest: &Path, region_id: &str) -> Rect {
@@ -2275,6 +2477,8 @@ mod tests {
                 .into(),
             region_id: "reg-1".into(),
             region_revision: 10,
+            input_sha256: None,
+            predecessors_sha256: None,
             crop_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
             hint_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
             request_digest: request_digest.clone(),
@@ -2326,6 +2530,33 @@ mod tests {
         });
 
         let crop_bounds = test_crop_bounds(&manifest, "reg-1");
+        let job = Job::open(&manifest).unwrap();
+        let bytes = std::fs::read(job.source_path(0).unwrap()).unwrap();
+        let raw = cleaner_core::image::decode(&bytes).unwrap();
+        let patch_record = job
+            .project
+            .patches
+            .iter()
+            .find(|p| p.id == "reg-1")
+            .unwrap();
+        let patch = job.load_patch(patch_record).unwrap();
+        let cloud = crate::underlay::prepare_cloud(&job, 0, &raw, patch_record, &patch).unwrap();
+        let image_hash = sha256_hex(
+            &encode_rgb8_png(
+                cloud.prepared.crop().w,
+                cloud.prepared.crop().h,
+                cloud.prepared.image_rgb8(),
+            )
+            .unwrap(),
+        );
+        let hint_hash = sha256_hex(
+            &encode_gray8_png(
+                cloud.prepared.crop().w,
+                cloud.prepared.crop().h,
+                cloud.prepared.hint_gray8(),
+            )
+            .unwrap(),
+        );
 
         let _endpoint_url = format!("http://127.0.0.1:{port}/mc/v1");
         let config = test_config();
@@ -2386,8 +2617,8 @@ mod tests {
             seed: 42,
             steps: 4,
             guidance_scaled: 350,
-            image_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
-            hint_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            image_sha256: image_hash.clone(),
+            hint_sha256: hint_hash.clone(),
             request_digest: String::new(),
         };
         let request_digest = compute_request_digest(&req_meta);
@@ -2414,8 +2645,10 @@ mod tests {
             source_image_hash: source_hash.clone(),
             region_id: "reg-1".into(),
             region_revision: revision,
-            crop_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
-            hint_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            input_sha256: None,
+            predecessors_sha256: None,
+            crop_sha256: image_hash,
+            hint_sha256: hint_hash,
             request_digest: request_digest.clone(),
             chapter_id: Some("chapter-1".into()),
             page_index: Some(0),
@@ -2556,6 +2789,8 @@ mod tests {
             source_image_hash: source_hash.clone(),
             region_id: "reg-1".into(),
             region_revision: original_revision,
+            input_sha256: None,
+            predecessors_sha256: None,
             crop_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
             hint_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
             request_digest: request_digest.clone(),
@@ -2621,6 +2856,8 @@ mod tests {
             source_image_hash: source_hash.clone(),
             region_id: "reg-1".into(),
             region_revision: original_revision,
+            input_sha256: None,
+            predecessors_sha256: None,
             crop_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
             hint_sha256: "0000000000000000000000000000000000000000000000000000000000000000".into(),
         };
@@ -2649,6 +2886,7 @@ mod tests {
             None,
             crop_bounds.w,
             crop_bounds.h,
+            Some(0),
         );
 
         assert!(matches!(
@@ -2659,6 +2897,101 @@ mod tests {
         // Cached result PNG is preserved intact in the journal directory for review
         let cached_png = service.journal.read_cached_png(&guard).unwrap();
         assert_eq!(cached_png, res_png);
+    }
+
+    #[test]
+    fn changed_predecessor_rejects_paid_result_without_mutating_target() {
+        let scratch = test_scratch("stale-predecessor-attachment");
+        let (manifest, _) = setup_test_job(&scratch, "reg-1");
+        let service = InferenceService::new_isolated(
+            scratch.join("journal"),
+            cleaner_core::cloud_wire::provisional_fixture_limits(),
+            Arc::new(ConsentService::new_isolated(Arc::new(GrantService::new()))),
+            Arc::new(GrantService::new()),
+            Arc::new(SecretManager::new_in_memory()),
+        );
+        let mut job = Job::open(&manifest).unwrap();
+        let record = job
+            .project
+            .patches
+            .iter()
+            .find(|r| r.id == "reg-1")
+            .unwrap();
+        let patch = job.load_patch(record).unwrap();
+        let source_bytes = std::fs::read(job.source_path(0).unwrap()).unwrap();
+        let source_hash = sha256_hex(&source_bytes);
+        let raw = cleaner_core::image::decode(&source_bytes).unwrap();
+        let (revision, _) =
+            compute_region_revision_hash(&source_hash, record, &patch.mask, &patch.ink);
+        let cloud = crate::underlay::prepare_cloud(&job, 0, &raw, record, &patch).unwrap();
+        let crop = cloud.prepared.crop();
+        let snapshot = ProjectRegionSnapshot {
+            source_image_hash: source_hash,
+            region_id: "reg-1".into(),
+            region_revision: revision,
+            input_sha256: Some(cloud.input.digest.clone()),
+            predecessors_sha256: Some(cloud.input.predecessors.clone()),
+            crop_sha256: sha256_hex(
+                &encode_rgb8_png(crop.w, crop.h, cloud.prepared.image_rgb8()).unwrap(),
+            ),
+            hint_sha256: sha256_hex(
+                &encode_gray8_png(crop.w, crop.h, cloud.prepared.hint_gray8()).unwrap(),
+            ),
+        };
+        let mut a = patch.clone();
+        a.id = "earlier".into();
+        a.order = 0;
+        a.mask = Mask::filled(Rect::new(90, 90, 16, 16));
+        a.ink = a.mask.clone();
+        a.pixels.width = 16;
+        a.pixels.height = 16;
+        a.pixels.data = vec![255; 16 * 16];
+        job.complete_region(0, &a, None).unwrap();
+        let decoded =
+            DecodedResultCrop::new(crop.w, crop.h, vec![255; (crop.w * crop.h * 3) as usize])
+                .unwrap();
+        let recipe = RenderRecipe::new(
+            "sdnq-v1",
+            "1.0.0",
+            "flux-schnell",
+            "0123456789abcdef0123456789abcdef01234567",
+            false,
+        );
+        let result = service.attach_patch_to_project(
+            &manifest,
+            0,
+            "reg-1",
+            &snapshot,
+            &decoded,
+            &recipe,
+            CloudProvider::Modal,
+            "modal-prof-1",
+            "handle",
+            "job",
+            "attempt",
+            "request",
+            "result",
+            None,
+            crop.w,
+            crop.h,
+            Some(0),
+        );
+        assert!(matches!(
+            result,
+            Err(InferenceServiceError::StaleAttachment(_))
+        ));
+        let after = Job::open(&manifest).unwrap();
+        let target = after
+            .project
+            .patches
+            .iter()
+            .find(|r| r.id == "reg-1")
+            .unwrap();
+        assert_eq!(
+            after.load_patch(target).unwrap().pixels.data,
+            patch.pixels.data
+        );
+        assert!(target.provenance.cloud.is_none());
     }
 
     /// Unit Test: Local client construction failure (e.g. missing credentials) leaves grant unconsumed and retryable.
@@ -2736,14 +3069,19 @@ mod tests {
             &PollOptions::default(),
         );
 
-        assert!(matches!(res, Err(InferenceServiceError::CredentialMissing(_))));
+        assert!(matches!(
+            res,
+            Err(InferenceServiceError::CredentialMissing(_))
+        ));
 
         // Grant attempt MUST NOT be consumed (attempts_used == 0)
         let grant_state = grant_service.get_grant(&grant.nonce).expect("grant exists");
         assert_eq!(grant_state.attempts_used, 0);
 
         // Grant is still usable / valid for a retry
-        assert!(grant_service.validate_and_consume(&grant.nonce, &grant.scope).is_ok());
+        assert!(grant_service
+            .validate_and_consume(&grant.nonce, &grant.scope)
+            .is_ok());
     }
 
     /// Unit Test: Local revalidation failure leaves grant unconsumed and retryable.
@@ -2765,7 +3103,8 @@ mod tests {
             origin_fp,
             SecretRole::Runtime,
         );
-        let compound = crate::inference::secrets::encode_modal_runtime_secret("tid", "tsec").unwrap();
+        let compound =
+            crate::inference::secrets::encode_modal_runtime_secret("tid", "tsec").unwrap();
         secret_mgr.store_secret(&key, compound, true).unwrap();
 
         let target = ExecutionTarget::Modal {
@@ -2811,7 +3150,12 @@ mod tests {
         // Mutate the local disk state (e.g. empty mask) to cause local revalidation to fail
         {
             let mut job = Job::open(&manifest).unwrap();
-            let patch_rec = job.project.patches.iter().find(|r| r.id == "reg-1").unwrap();
+            let patch_rec = job
+                .project
+                .patches
+                .iter()
+                .find(|r| r.id == "reg-1")
+                .unwrap();
             let mut patch = job.load_patch(patch_rec).unwrap();
             patch.mask = Mask::empty(bounds);
             job.complete_region(0, &patch, None).unwrap();
@@ -2846,7 +3190,9 @@ mod tests {
         assert_eq!(grant_state.attempts_used, 0);
 
         // Grant is still usable / unburned
-        assert!(grant_service.validate_and_consume(&grant.nonce, &grant.scope).is_ok());
+        assert!(grant_service
+            .validate_and_consume(&grant.nonce, &grant.scope)
+            .is_ok());
     }
 
     /// Unit Test: Network dispatch consumes exactly one attempt on the grant.
@@ -3173,7 +3519,8 @@ mod tests {
             origin_fp,
             SecretRole::Runtime,
         );
-        let compound = crate::inference::secrets::encode_modal_runtime_secret("tid", "tsec").unwrap();
+        let compound =
+            crate::inference::secrets::encode_modal_runtime_secret("tid", "tsec").unwrap();
         secret_mgr.store_secret(&key, compound, true).unwrap();
 
         let target = ExecutionTarget::Modal {
@@ -3273,7 +3620,8 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_cloud_render_rejects_page_reorder_and_patch_source_mismatch_before_intent_grant_network() {
+    fn test_execute_cloud_render_rejects_page_reorder_and_patch_source_mismatch_before_intent_grant_network(
+    ) {
         let scratch = test_scratch("exec-reorder-mismatch");
         let (manifest, _bounds) = setup_two_page_service_job(&scratch, "reg-reorder");
 
@@ -3290,7 +3638,8 @@ mod tests {
             origin_fp,
             SecretRole::Runtime,
         );
-        let compound = crate::inference::secrets::encode_modal_runtime_secret("tid", "tsec").unwrap();
+        let compound =
+            crate::inference::secrets::encode_modal_runtime_secret("tid", "tsec").unwrap();
         secret_mgr.store_secret(&key, compound, true).unwrap();
 
         let target = ExecutionTarget::Modal {
@@ -3451,7 +3800,12 @@ mod tests {
         Some(FakeRequest { method, path, body })
     }
 
-    fn fake_respond(stream: &mut std::net::TcpStream, status: &str, content_type: &str, body: &[u8]) {
+    fn fake_respond(
+        stream: &mut std::net::TcpStream,
+        status: &str,
+        content_type: &str,
+        body: &[u8],
+    ) {
         let head = format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
@@ -3547,9 +3901,12 @@ mod tests {
         }
 
         fn client(&self) -> CloudHttpClient {
-            let target =
-                CloudEndpointTarget::new_test_target(CloudProvider::Modal, "modal-prof-1", &self.endpoint)
-                    .unwrap();
+            let target = CloudEndpointTarget::new_test_target(
+                CloudProvider::Modal,
+                "modal-prof-1",
+                &self.endpoint,
+            )
+            .unwrap();
             let credential = BoundRuntimeCredential::new(
                 &target,
                 RuntimeCredential::ModalProxy {
@@ -3572,7 +3929,13 @@ mod tests {
                 return;
             };
             let job = format!("/mc/v1/jobs/{FAKE_HANDLE}");
-            let meta = || self.metadata.lock().unwrap().clone().expect("a submission first");
+            let meta = || {
+                self.metadata
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("a submission first")
+            };
             match (request.method.as_str(), request.path.as_str()) {
                 ("POST", "/mc/v1/jobs") => {
                     self.submits.fetch_add(1, Ordering::SeqCst);
@@ -3583,7 +3946,12 @@ mod tests {
                     let mut accepted = fake_job_identity(&submitted);
                     accepted["status"] = "pending".into();
                     *self.metadata.lock().unwrap() = Some(submitted);
-                    fake_respond(stream, "202 Accepted", "application/json", accepted.to_string().as_bytes());
+                    fake_respond(
+                        stream,
+                        "202 Accepted",
+                        "application/json",
+                        accepted.to_string().as_bytes(),
+                    );
                 }
                 ("POST", path) if path == format!("{job}/cancel") => {
                     self.cancels.fetch_add(1, Ordering::SeqCst);
@@ -3596,7 +3964,12 @@ mod tests {
                         "status": "cancel_requested",
                         "acknowledged": true,
                     });
-                    fake_respond(stream, "200 OK", "application/json", body.to_string().as_bytes());
+                    fake_respond(
+                        stream,
+                        "200 OK",
+                        "application/json",
+                        body.to_string().as_bytes(),
+                    );
                 }
                 ("GET", path) if path == format!("{job}/result") => {
                     self.results.fetch_add(1, Ordering::SeqCst);
@@ -3621,7 +3994,12 @@ mod tests {
                         body["result_digest"] = sha256_hex(&png).into();
                         body["result_bytes"] = png.len().into();
                     }
-                    fake_respond(stream, "200 OK", "application/json", body.to_string().as_bytes());
+                    fake_respond(
+                        stream,
+                        "200 OK",
+                        "application/json",
+                        body.to_string().as_bytes(),
+                    );
                 }
                 _ => fake_respond(stream, "404 Not Found", "application/json", b"{}"),
             }
@@ -3749,16 +4127,30 @@ mod tests {
         }
 
         fn last_event(&self) -> CloudAttemptProgress {
-            self.events.lock().unwrap().last().cloned().expect("an event")
+            self.events
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("an event")
         }
 
         fn phase_on_disk(&self, service: &InferenceService) -> AttemptPhase {
-            service.journal().get_record(&self.attempt_id()).unwrap().phase
+            service
+                .journal()
+                .get_record(&self.attempt_id())
+                .unwrap()
+                .phase
         }
 
         fn committed_patch(&self) -> Patch {
             let job = Job::open(&self.manifest).unwrap();
-            let record = job.project.patches.iter().find(|r| r.id == "reg-1").unwrap();
+            let record = job
+                .project
+                .patches
+                .iter()
+                .find(|r| r.id == "reg-1")
+                .unwrap();
             job.load_patch(record).unwrap()
         }
     }
@@ -3775,7 +4167,10 @@ mod tests {
     fn wait_for(counter: &AtomicUsize, at_least: usize) {
         let deadline = Instant::now() + Duration::from_secs(20);
         while counter.load(Ordering::SeqCst) < at_least {
-            assert!(Instant::now() < deadline, "the gateway never saw the request");
+            assert!(
+                Instant::now() < deadline,
+                "the gateway never saw the request"
+            );
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -3830,7 +4225,10 @@ mod tests {
             Some("0123456789abcdef0123456789abcdef01234567")
         );
         assert_eq!(cloud.cost, None);
-        assert!(matches!(fixture.phase_on_disk(&service), AttemptPhase::Committed { .. }));
+        assert!(matches!(
+            fixture.phase_on_disk(&service),
+            AttemptPhase::Committed { .. }
+        ));
     }
 
     #[test]
@@ -3850,7 +4248,9 @@ mod tests {
             assert_eq!(event.page_index, 0);
             assert_eq!(event.error_code, None);
         }
-        assert!(events.windows(2).all(|pair| pair[0].elapsed_ms <= pair[1].elapsed_ms));
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[0].elapsed_ms <= pair[1].elapsed_ms));
     }
 
     #[test]
@@ -3864,19 +4264,28 @@ mod tests {
         let outcome = thread::scope(|scope| {
             scope.spawn(|| {
                 wait_for(&gateway.seen.polls, 2);
-                assert!(request_render_cancel(&attempt_id), "the render was not live");
+                assert!(
+                    request_render_cancel(&attempt_id),
+                    "the render was not live"
+                );
             });
             fixture.render(&service, &fast_polls())
         });
 
-        assert!(matches!(outcome, Err(InferenceServiceError::Cancelled)), "{outcome:?}");
+        assert!(
+            matches!(outcome, Err(InferenceServiceError::Cancelled)),
+            "{outcome:?}"
+        );
         assert!(started.elapsed() < Duration::from_secs(10));
         let last = fixture.last_event();
         assert_eq!(last.phase, RenderPhase::Cancelled);
         assert_eq!(last.error_code, Some("cancelled"));
         assert_eq!(FakeGateway::count(&gateway.seen.submits), 1);
         assert_eq!(FakeGateway::count(&gateway.seen.cancels), 1);
-        assert!(matches!(fixture.phase_on_disk(&service), AttemptPhase::Cancelled { .. }));
+        assert!(matches!(
+            fixture.phase_on_disk(&service),
+            AttemptPhase::Cancelled { .. }
+        ));
         assert!(!is_render_live(&attempt_id));
     }
 
@@ -3906,10 +4315,48 @@ mod tests {
             fixture.render(&service, &fast_polls())
         });
 
-        assert!(matches!(outcome, Err(InferenceServiceError::Cancelled)), "{outcome:?}");
+        assert!(
+            matches!(outcome, Err(InferenceServiceError::Cancelled)),
+            "{outcome:?}"
+        );
         assert_eq!(fixture.last_event().phase, RenderPhase::Cancelled);
         assert_eq!(FakeGateway::count(&gateway.seen.cancels), 1);
-        assert!(matches!(fixture.phase_on_disk(&service), AttemptPhase::Cancelled { .. }));
+        assert!(matches!(
+            fixture.phase_on_disk(&service),
+            AttemptPhase::Cancelled { .. }
+        ));
+    }
+
+    #[test]
+    fn predecessor_change_mid_poll_stales_one_paid_job_without_attaching() {
+        let fixture = RenderFixture::new("predecessor-mid-poll");
+        let gateway = FakeGateway::start(JobScript::RunsUntilFinished);
+        let service = fixture.service(&gateway);
+        let outcome = thread::scope(|scope| {
+            scope.spawn(|| {
+                wait_for(&gateway.seen.polls, 2);
+                let mut job = Job::open(&fixture.manifest).unwrap();
+                let mut earlier = job.load_patch(&job.project.patches[0]).unwrap();
+                earlier.id = "earlier-mid-poll".into();
+                earlier.order = 0;
+                earlier.mask = Mask::filled(Rect::new(0, 0, 16, 16));
+                earlier.ink = earlier.mask.clone();
+                earlier.pixels.width = 16;
+                earlier.pixels.height = 16;
+                earlier.pixels.data = vec![100; 16 * 16];
+                job.complete_region(0, &earlier, None).unwrap();
+                gateway.finish();
+            });
+            fixture.render(&service, &fast_polls())
+        });
+        assert!(matches!(outcome, Err(InferenceServiceError::StaleAttachment(_))), "{outcome:?}");
+        assert_eq!(FakeGateway::count(&gateway.seen.submits), 1);
+        assert!(fixture.committed_patch().provenance.cloud.is_none());
+        // The journal's own snapshot passes `prepare_attachment`; the project
+        // re-read refuses the drift, so the result stays cached under a pending
+        // attachment that recovery will refuse the same way.
+        let phase = fixture.phase_on_disk(&service);
+        assert!(matches!(phase, AttemptPhase::AttachmentPending { .. }), "{phase:?}");
     }
 
     #[test]
@@ -3920,21 +4367,39 @@ mod tests {
 
         let outcome = fixture.render(&service, &fast_polls());
 
-        assert!(matches!(outcome, Err(InferenceServiceError::AmbiguousSubmission(_))), "{outcome:?}");
+        assert!(
+            matches!(outcome, Err(InferenceServiceError::AmbiguousSubmission(_))),
+            "{outcome:?}"
+        );
         let last = fixture.last_event();
         assert_eq!(last.phase, RenderPhase::Unknown);
         assert_eq!(last.error_code, Some("submission_unknown"));
         assert_eq!(
             fixture.take_phases(),
-            [RenderPhase::Preparing, RenderPhase::Submitting, RenderPhase::Unknown]
+            [
+                RenderPhase::Preparing,
+                RenderPhase::Submitting,
+                RenderPhase::Unknown
+            ]
         );
-        assert!(matches!(fixture.phase_on_disk(&service), AttemptPhase::Unknown { .. }));
+        assert!(matches!(
+            fixture.phase_on_disk(&service),
+            AttemptPhase::Unknown { .. }
+        ));
 
         // Neither recovery nor a second try with the same grant sends it again.
         let decision = service
-            .recover_cloud_attempt(&fixture.attempt_id(), &fixture.manifest, &fixture.config, &fast_polls())
+            .recover_cloud_attempt(
+                &fixture.attempt_id(),
+                &fixture.manifest,
+                &fixture.config,
+                &fast_polls(),
+            )
             .unwrap();
-        assert!(matches!(decision, RecoveryDecision::AmbiguousUnknown { .. }), "{decision:?}");
+        assert!(
+            matches!(decision, RecoveryDecision::AmbiguousUnknown { .. }),
+            "{decision:?}"
+        );
         assert!(fixture.render(&service, &fast_polls()).is_err());
         assert_eq!(FakeGateway::count(&gateway.seen.submits), 1);
     }
@@ -3953,9 +4418,15 @@ mod tests {
                 max_polls: 1000,
             };
             let outcome = fixture.render(&service, &short);
-            assert!(matches!(outcome, Err(InferenceServiceError::PollingTimeout(_))), "{outcome:?}");
+            assert!(
+                matches!(outcome, Err(InferenceServiceError::PollingTimeout(_))),
+                "{outcome:?}"
+            );
             assert_eq!(fixture.last_event().error_code, Some("poll_timeout"));
-            assert!(matches!(fixture.phase_on_disk(&service), AttemptPhase::Accepted { .. }));
+            assert!(matches!(
+                fixture.phase_on_disk(&service),
+                AttemptPhase::Accepted { .. }
+            ));
         }
         fixture.take_phases();
         gateway.finish();
@@ -3963,7 +4434,8 @@ mod tests {
         // Restart: a new service on the same journal finds the job accepted.
         let service = fixture.service(&gateway);
         let manifest = fixture.manifest.clone();
-        let chapter_path = move |chapter_id: &str| (chapter_id == "chapter").then(|| manifest.clone());
+        let chapter_path =
+            move |chapter_id: &str| (chapter_id == "chapter").then(|| manifest.clone());
         let (report, waits) =
             crate::inference::commands::recover_all_attempts(&service, &chapter_path);
         assert!(report.attached.is_empty() && report.needs_attention.is_empty());
@@ -3977,9 +4449,17 @@ mod tests {
 
         // The wait `reconcileCloudRecovery({apply: true})` starts for it.
         let decision = service
-            .recover_cloud_attempt(&fixture.attempt_id(), &fixture.manifest, &fixture.config, &fast_polls())
+            .recover_cloud_attempt(
+                &fixture.attempt_id(),
+                &fixture.manifest,
+                &fixture.config,
+                &fast_polls(),
+            )
             .unwrap();
-        assert!(matches!(decision, RecoveryDecision::AlreadyCommitted { .. }), "{decision:?}");
+        assert!(
+            matches!(decision, RecoveryDecision::AlreadyCommitted { .. }),
+            "{decision:?}"
+        );
         assert_eq!(
             fixture.take_phases(),
             [

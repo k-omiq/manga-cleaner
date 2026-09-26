@@ -176,9 +176,7 @@ def render(handle: str = "", context: Any = None) -> Dict[str, Any]:
 def gateway(context: Any = None):
     # Starlette ships with Beam's container runtime, which needs an app it can add
     # middleware and a lifespan to.
-    from starlette.applications import Starlette
-    from starlette.routing import Mount
-
+    from deploy.cloud.beam.routes import mount_gateway_app
     from deploy.cloud.common.api import CloudGateway
     from deploy.cloud.common.jobs import DispatchJobBackend
 
@@ -196,4 +194,4 @@ def gateway(context: Any = None):
         backend=DispatchJobBackend("beam", store, dispatcher, limits, clock=time.time),
         trust_edge_auth=True,
     )
-    return Starlette(routes=[Mount("/mc/v1", app=gateway_app.as_asgi_app())])
+    return mount_gateway_app(gateway_app.as_asgi_app())

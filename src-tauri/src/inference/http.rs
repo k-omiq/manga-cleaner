@@ -47,6 +47,8 @@ use cleaner_core::cloud_wire::{
     JobRequestMetadata, JobStatusResponse, ModelInfoResponse, ResultMetadata, ServiceLimits,
 };
 use cleaner_core::engines::render::CloudProvider;
+use cleaner_core::cloud_analysis_wire::{AnalysisCapabilities, AnalysisError, AnalysisRequest, AnalysisResult, MAX_RESPONSE_BYTES};
+use base64::Engine;
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, LOCATION};
 use reqwest::redirect::Policy;
@@ -125,6 +127,7 @@ pub enum HttpTransportError {
     #[error("cloud wire validation failed")]
     WireValidation,
 
+
     #[error("JSON deserialization error")]
     JsonDeserialization,
 
@@ -133,6 +136,19 @@ pub enum HttpTransportError {
 
     #[error("invalid or malicious job handle identifier")]
     InvalidHandle,
+}
+
+fn analysis_rejection_error(status: u16, body: &[u8], expected_digest: &str) -> HttpTransportError {
+    let Ok(rejection) = serde_json::from_slice::<AnalysisError>(body) else {
+        return HttpTransportError::WireValidation;
+    };
+    if rejection.validate().is_err()
+        || (rejection.request_digest.as_deref() != Some(expected_digest)
+            && !(rejection.request_digest.is_none() && matches!(status, 401 | 413 | 503)))
+    {
+        return HttpTransportError::WireValidation;
+    }
+    HttpTransportError::UnexpectedStatus { status }
 }
 
 /// Validate whether an IP address is a globally reachable public unicast address.
@@ -622,6 +638,52 @@ pub struct CloudHttpClient {
 }
 
 impl CloudHttpClient {
+    fn analysis_url(&self, route: &str) -> Url {
+        let mut url = self.target.base_url.clone();
+        url.set_path(&format!("/mc/analysis/v1/{route}"));
+        url
+    }
+
+    pub fn get_analysis_capabilities(&self) -> Result<AnalysisCapabilities, HttpTransportError> {
+        let capabilities: AnalysisCapabilities = self.send_get_json(
+            self.analysis_url("capabilities"), MAX_CONTROL_JSON_BYTES,
+        )?;
+        capabilities.validate().map_err(|_| HttpTransportError::WireValidation)?;
+        Ok(capabilities)
+    }
+
+    pub fn submit_analysis_tile(
+        &self,
+        request: &AnalysisRequest,
+        tile_png: &[u8],
+    ) -> Result<AnalysisResult, HttpTransportError> {
+        request.validate(tile_png).map_err(|_| HttpTransportError::WireValidation)?;
+        let envelope = serde_json::json!({
+            "metadata": request,
+            "tile_png_b64": base64::engine::general_purpose::STANDARD.encode(tile_png),
+        });
+        let body = serde_json::to_vec(&envelope).map_err(|_| HttpTransportError::WireValidation)?;
+        if body.len() > 8_000_000 { return Err(HttpTransportError::BodySizeLimitExceeded); }
+        let req = self.client.post(self.analysis_url("analyze"))
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json")
+            .body(body);
+        let response = self.attach_auth(req)?.send().map_err(|_| HttpTransportError::ConnectionError)?;
+        let status = response.status();
+        if status.is_redirection() || response.headers().contains_key(LOCATION) {
+            return Err(HttpTransportError::RedirectForbidden);
+        }
+        Self::verify_content_type(&response, "application/json")?;
+        let bytes = Self::read_bounded_body(response, MAX_RESPONSE_BYTES as u64)?;
+        if !status.is_success() {
+            return Err(analysis_rejection_error(status.as_u16(), &bytes, &request.request_digest));
+        }
+        let result: AnalysisResult = serde_json::from_slice(&bytes)
+            .map_err(|_| HttpTransportError::JsonDeserialization)?;
+        result.validate(request).map_err(|_| HttpTransportError::WireValidation)?;
+        Ok(result)
+    }
+
     /// Create a new hardened cloud HTTP client with a bound runtime credential.
     pub fn new(
         target: CloudEndpointTarget,
@@ -995,6 +1057,34 @@ impl CloudHttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn analysis_unauthorized_rejection_preserves_status() {
+        let body = include_bytes!("../../../deploy/cloud/fixtures/analysis_v1/unauthorized_error.json");
+        assert_eq!(
+            analysis_rejection_error(401, body, &"a".repeat(64)),
+            HttpTransportError::UnexpectedStatus { status: 401 },
+        );
+        assert_eq!(
+            analysis_rejection_error(400, body, &"a".repeat(64)),
+            HttpTransportError::WireValidation,
+        );
+        let unavailable = include_bytes!("../../../deploy/cloud/fixtures/analysis_v1/capability_unavailable_error.json");
+        assert_eq!(
+            analysis_rejection_error(503, unavailable, &"a".repeat(64)),
+            HttpTransportError::UnexpectedStatus { status: 503 },
+        );
+        let failed = include_bytes!("../../../deploy/cloud/fixtures/analysis_v1/inference_failed_error.json");
+        let digest = "1dffe149aed278e23eff1a782d51f896a3a1a658e78732f6173a1eb305e74255";
+        assert_eq!(
+            analysis_rejection_error(500, failed, digest),
+            HttpTransportError::UnexpectedStatus { status: 500 },
+        );
+        assert_eq!(
+            analysis_rejection_error(500, failed, &"a".repeat(64)),
+            HttpTransportError::WireValidation,
+        );
+    }
     use std::io::Write;
     use std::net::TcpListener;
 

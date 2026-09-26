@@ -7,6 +7,7 @@ payload parsing, authenticated control plane dispatch, and secure result streami
 from __future__ import annotations
 
 import asyncio
+import base64
 import email
 import email.policy
 import hmac
@@ -15,6 +16,7 @@ import logging
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 from deploy.cloud.common.contract import (
+    ANALYSIS_MAX_RESPONSE_BYTES,
     PROTOCOL_VERSION,
     CloudProvider,
     ContractValidationError,
@@ -33,6 +35,7 @@ from deploy.cloud.common.contract import (
     WarmupResponse,
     provisional_fixture_limits,
     validate_crop_payload,
+    validate_analysis_request,
     validate_recipe_compatibility,
     validate_worker_result,
 )
@@ -137,10 +140,12 @@ class CloudGateway:
         auto_execute: bool = True,
         backend: Optional[Any] = None,
         trust_edge_auth: bool = False,
+        analysis_worker: Optional[Any] = None,
     ):
         if isinstance(provider, str):
             provider = CloudProvider(provider.lower())
         self.provider = provider
+        self.analysis_worker = analysis_worker
         self.limits = limits or provisional_fixture_limits()
         self.model_info = model_info or get_default_model_info(self.provider.value, limits=self.limits)
         self.handle_registry = handle_registry or InMemoryHandleRegistry()
@@ -226,6 +231,8 @@ class CloudGateway:
 
         # 1. Enforce Authentication on all /mc/v1 routes
         if not self.check_auth(headers):
+            if path.startswith("/mc/analysis/v1/"):
+                return self._analysis_error(401, "unauthorized", "Authentication failed: missing or invalid credentials")
             err_body = {
                 "error_code": "unauthorized",
                 "message": "Authentication failed: missing or invalid credentials",
@@ -238,6 +245,18 @@ class CloudGateway:
 
         # 2. Route Dispatch
         try:
+            if path == "/mc/analysis/v1/capabilities" and method == "GET":
+                if self.analysis_worker is None:
+                    return self._analysis_error(503, "capability_unavailable", "Analysis is not configured")
+                try:
+                    capabilities = self.analysis_worker.capabilities()
+                except OSError:
+                    return self._analysis_error(503, "capability_unavailable", "Analysis graphs unavailable")
+                return 200, {"Content-Type": "application/json"}, json.dumps(capabilities).encode("utf-8")
+
+            if path == "/mc/analysis/v1/analyze" and method == "POST":
+                return self._route_analysis(headers, body)
+
             if method == "GET" and norm_path == "/health":
                 return self._route_health()
 
@@ -277,6 +296,9 @@ class CloudGateway:
             )
 
         except Exception as exc:
+            if path.startswith("/mc/analysis/v1/"):
+                logger.error("Internal analysis gateway error: %s", redact_text(str(exc)))
+                return self._analysis_error(500, "inference_failed", "Analysis request failed")
             err_msg = redact_text(str(exc))
             logger.error("Internal gateway error: %s", err_msg)
             err_payload = {
@@ -288,6 +310,55 @@ class CloudGateway:
                 {"Content-Type": "application/json"},
                 json.dumps(err_payload).encode("utf-8"),
             )
+
+    def _analysis_error(self, status: int, code: str, message: str, digest: Optional[str] = None) -> Tuple[int, Dict[str, str], bytes]:
+        payload = {"protocol_version": "1.0.0", "error_code": code, "message": message,
+                   "enqueued": False, "request_digest": digest}
+        return status, {"Content-Type": "application/json"}, json.dumps(payload).encode("utf-8")
+
+    @staticmethod
+    def _analysis_digest(metadata: Any) -> Optional[str]:
+        digest = metadata.get("request_digest") if type(metadata) is dict else None
+        if type(digest) is str and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
+            return digest
+        return None
+
+    def _route_analysis(self, headers: Dict[str, str], body: bytes) -> Tuple[int, Dict[str, str], bytes]:
+        if self.analysis_worker is None:
+            return self._analysis_error(503, "capability_unavailable", "Analysis is not configured")
+        content_type = {key.lower(): value for key, value in headers.items()}.get("content-type", "")
+        if len(body) > 8_000_000:
+            return self._analysis_error(413, "payload_too_large", "Analysis JSON must be bounded")
+        if content_type.split(";", 1)[0].strip().lower() != "application/json":
+            return self._analysis_error(400, "invalid_request", "Analysis Content-Type must be application/json")
+        metadata = None
+        try:
+            payload = json.loads(body)
+            if type(payload) is not dict or set(payload) != {"metadata", "tile_png_b64"}:
+                raise ContractValidationError("invalid analysis envelope")
+            metadata = payload["metadata"]
+            if type(payload["tile_png_b64"]) is not str:
+                raise ContractValidationError("invalid analysis tile encoding")
+            tile_png = base64.b64decode(payload["tile_png_b64"], validate=True)
+            validate_analysis_request(metadata, tile_png)
+        except (ValueError, TypeError, ContractValidationError):
+            return self._analysis_error(400, "invalid_request", "Invalid analysis request", self._analysis_digest(metadata))
+        except Exception as exc:
+            logger.error("Analysis request failed: %s", redact_text(str(exc)))
+            return self._analysis_error(500, "inference_failed", "Analysis inference failed", self._analysis_digest(metadata))
+
+        try:
+            from deploy.cloud.common.jobs import execute_analysis_job
+            result = execute_analysis_job(self.analysis_worker, metadata, tile_png)
+            mask = result.pop("mask_png")
+            result["mask_png_b64"] = base64.b64encode(mask).decode("ascii") if mask is not None else None
+            response = json.dumps(result, separators=(",", ":")).encode("utf-8")
+            if len(response) > ANALYSIS_MAX_RESPONSE_BYTES:
+                return self._analysis_error(500, "inference_failed", "Analysis response exceeded limit", metadata["request_digest"])
+            return 200, {"Content-Type": "application/json"}, response
+        except Exception as exc:
+            logger.error("Analysis inference failed: %s", redact_text(str(exc)))
+            return self._analysis_error(500, "inference_failed", "Analysis inference failed", self._analysis_digest(metadata))
 
     def _route_health(self) -> Tuple[int, Dict[str, str], bytes]:
         """GET /health - Authenticated control reachability."""
@@ -686,6 +757,12 @@ class CloudGateway:
                         content_length = int(v_str)
 
                 if content_length is not None and content_length > self.limits.max_multipart_bytes:
+                    if path.startswith("/mc/analysis/v1/"):
+                        status, _, err_payload = self._analysis_error(413, "payload_too_large", "Analysis JSON must be bounded")
+                        await send({"type": "http.response.start", "status": status,
+                                    "headers": [(b"content-type", b"application/json"), (b"x-content-type-options", b"nosniff")]})
+                        await send({"type": "http.response.body", "body": err_payload})
+                        return
                     err_payload = json.dumps({
                         "error_code": "payload_too_large",
                         "message": f"Payload size {content_length} exceeds maximum limit {self.limits.max_multipart_bytes}",
@@ -708,6 +785,12 @@ class CloudGateway:
                     chunk = message.get("body", b"")
                     body.extend(chunk)
                     if len(body) > self.limits.max_multipart_bytes:
+                        if path.startswith("/mc/analysis/v1/"):
+                            status, _, err_payload = self._analysis_error(413, "payload_too_large", "Analysis JSON must be bounded")
+                            await send({"type": "http.response.start", "status": status,
+                                        "headers": [(b"content-type", b"application/json"), (b"x-content-type-options", b"nosniff")]})
+                            await send({"type": "http.response.body", "body": err_payload})
+                            return
                         err_payload = json.dumps({
                             "error_code": "payload_too_large",
                             "message": f"Payload size exceeds maximum limit of {self.limits.max_multipart_bytes} bytes",

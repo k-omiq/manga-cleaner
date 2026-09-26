@@ -46,6 +46,7 @@ from provisioner.protocol import (
     ERR_ACTIONABLE_PERMISSION,
     ERR_EXECUTION_FAILED,
     ERR_EXECUTION_TIMEOUT,
+    ERR_ORPHANED_TOKEN,
     ERR_PROVIDER_UNAVAILABLE,
     ERR_VALIDATION,
     ProtocolError,
@@ -75,6 +76,7 @@ POLL_SECONDS = 5.0
 # The Modal client keeps retrying a server it cannot reach for about a minute, and the
 # desktop gives inspect and plan 60 s; sign-in gets less so the answer is ours.
 SIGN_IN_SECONDS = 40.0
+TOKEN_CREATE_INTENT_KEY = "proxy_issuance_pending"
 
 
 class _SignInTimeout(Exception):
@@ -534,6 +536,16 @@ class ModalDriver(BaseProviderDriver):
         errors = session.sdk.exception
         journal = ctx.journal
         tokens = session.workspace.proxy_tokens
+        if journal.get_state(TOKEN_CREATE_INTENT_KEY) and journal.get_resource("proxy_token") is None:
+            raise ProtocolError(
+                ERR_ORPHANED_TOKEN,
+                "A Modal proxy token may have been created before its ID was saved.",
+                actionable_guidance="Open the Modal dashboard and remove the proxy token created during this setup attempt.",
+                remedy_steps=[
+                    "Open Modal Settings, Proxy Auth Tokens, and remove the token created during this setup attempt.",
+                    "Use Cleanup for this installation, then start a new setup. Resume will stay blocked because the token ID is unknown.",
+                ],
+            )
         # One live runtime credential per installation: revoke the previous one first.
         old = journal.get_resource("proxy_token")
         if old is not None:
@@ -542,6 +554,7 @@ class ModalDriver(BaseProviderDriver):
             except errors.NotFoundError:
                 pass
             journal.remove_resource("proxy_token", old.name)
+        journal.set_state(**{TOKEN_CREATE_INTENT_KEY: True})
         issued = tokens.create()
         token_id = getattr(issued, "token_id", None)
         token_secret = getattr(issued, "token_secret", None)
@@ -557,6 +570,7 @@ class ModalDriver(BaseProviderDriver):
             "resource_id": credential["token_id"],
         }
         journal.save()
+        journal.set_state(**{TOKEN_CREATE_INTENT_KEY: None})
         if s.environment_name:
             try:
                 tokens.allow(credential["token_id"], s.environment_name)

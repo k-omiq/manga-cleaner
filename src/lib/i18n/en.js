@@ -148,13 +148,17 @@ export const en = {
         connect: {
           lead: 'Setup creates a private GPU endpoint in your own account. The provider bills you for it directly.',
           provider: 'Provider',
-          modalNote: 'Needs a token ID and a token secret.',
+          modalNote: 'Paste Modal’s token command or enter its ID and secret.',
           beamNote: 'Needs an API key.',
           modalTokenId: 'Modal token ID',
           modalTokenSecret: 'Modal token secret',
+          modalCommand: 'Paste Modal token command',
+          modalCommandOr: 'Or enter the token ID and secret separately.',
+          modalCommandInvalid: 'Paste the complete “modal token set” command, including its token ID, secret, and profile.',
+          modalCommandImported: 'Token imported from Modal profile “{profile}”.',
           beamToken: 'Beam API key',
           help: 'Where do I find this?',
-          helpModal: 'Sign in at modal.com, open Settings, then API Tokens, and create a new token. Modal shows the ID and the secret once, so copy both.',
+          helpModal: 'Sign in at modal.com, open Settings, then API Tokens, and create a new token. Copy the “modal token set” command and paste it here. The app reads it without running a shell.',
           helpBeam: 'Sign in at beam.cloud, open Settings, then API Keys, and create a key. Copy it when Beam shows it.',
           copyLink: 'Copy link',
           copied: 'Copied',
@@ -166,6 +170,9 @@ export const en = {
         },
         review: {
           lead: 'Setup will create these in your {providerKey} account:',
+          workspace: 'Workspace',
+          model: 'Cloud model',
+          modelNote: 'This version supports this cloud model. Choose the GPU and idle time below before you approve setup.',
           gpu: 'GPU',
           idle: 'Stay on after a render',
           idleOption: {
@@ -268,6 +275,7 @@ export const en = {
           planChanged: 'The plan changed after you reviewed it, so nothing was created. Start again to review the new plan.',
           platform: 'This account cannot run GPU endpoints yet. Check GPU access and billing with the provider.',
           unavailable: 'The provider could not be reached. Check your connection and try again.',
+          helperMissing: 'This Manga Cleaner installation is missing its cloud setup helper. Install a complete app build, then try again.',
           failed: 'Something went wrong during setup.',
           timeout: 'Setup took too long and was stopped.',
           secretStore: 'The access token could not be saved in this computer’s keychain. Resume creates a new one.',
@@ -275,7 +283,17 @@ export const en = {
           cancelled: 'You stopped setup.',
           request: 'The app and its setup helper did not understand each other. Update the app and try again.',
           cleanup: 'Some resources could not be deleted. Try again, or delete them in your provider’s dashboard.',
+          orphanedToken: 'Setup may have created a Modal access token without recording its ID, so it cannot resume safely.',
           generic: 'Setup did not finish.',
+        },
+        // The way out of `orphanedToken`, in order. Catalogue text only: the
+        // helper sends its own steps, which are never shown for the reason
+        // `error` gives.
+        orphaned: {
+          heading: 'To recover',
+          dashboard: 'Sign in at modal.com, open Settings, then Proxy Auth Tokens, and remove the token this setup created. Resume stays blocked, because the app does not know that token’s ID.',
+          cleanup: 'Press Clean up to delete the rest of what this setup created.',
+          again: 'Start a new setup from Settings, Cloud.',
         },
       },
     },
@@ -309,16 +327,153 @@ export const en = {
       // option so the picker does not show a different model than the one set.
       missing: '{id} (not found)',
     },
+    // Settings > Detection, drawn as a capability graph: what each model is
+    // for, which workflow needs it, and what removing it stops. Setup reuses
+    // the lines that describe the same choice.
+    detection: {
+      languages: 'Source languages',
+      languagesAllText: 'Source-language choices apply only to legacy filtering. All-text review does not read the language.',
+      download: 'Download {bytes:memory}',
+      capability: {
+        findRegions: 'Find regions',
+        findRegionsNote: 'Locate lettering and speech bubbles on the page.',
+        shapeMask: 'Shape the removal mask',
+        shapeMaskNote: 'Turn found lettering into the exact pixels a clean may change. Only the optional text-shaped review uses it.',
+        sfx: 'Optional SFX finder',
+        sfxNote: 'Would group sound effects drawn outside speech bubbles. Not part of this version.',
+        japanese: 'Optional Japanese filtering and rescue',
+        japaneseNote: 'Legacy filtering needs script filtering to keep only the languages you clean. OCR rescue is an extra you can turn on.',
+        japaneseNoteAllText: 'All-text review never uses these. You can still check or delete the files here.',
+      },
+      model: {
+        rtFull: 'Full region finder',
+        samTs: 'Lettering mask',
+        coo: 'SFX finder',
+      },
+      role: {
+        ctd: 'Finds lettering for legacy cleaning.',
+        rtSmall: 'Finds speech bubbles for legacy cleaning, and regions for the review’s small whole-page profile.',
+        rtFull: 'Optional. Finds regions for the review’s full two-tile profile. Local import only, never an app download.',
+        samTs: 'Draws lettering pixels for the text-shaped review, with no OCR. Local import only, never an app download.',
+        coo: 'Excluded. Its published terms do not clear redistribution or commercial use, so the app has no download, import or run path for it.',
+        scriptGate: 'Keeps legacy cleaning to the languages you choose. All-text review never opens it.',
+        mangaOcr: 'Reads Japanese the script filter could not decide on. Never needed for cleaning.',
+      },
+      // Under the OCR rescue switch, only while it is on and cannot run.
+      rescue: {
+        skipped: 'Japanese is skipped, so the rescue has nothing to read.',
+        missing: 'The rescue files are not installed, so the rescue will not run.',
+        size: 'Adds a {bytes:memory} download.',
+      },
+      // One line under the policy: whether the selected workflow can run.
+      ready: {
+        nothing: 'Every language is skipped, so legacy cleaning removes nothing.',
+        legacy: 'Legacy cleaning has every model it needs.',
+        legacyMissing: 'Legacy cleaning needs {bytes:memory} of downloads before it can run.',
+        allText: 'Text-shaped review has every model it needs. Auto clean opens it from the editor.',
+        allTextMissing: 'Text-shaped review needs {bytes:memory} of downloads.',
+        allTextImport: 'Text-shaped review needs the SAM-TS-L graphs. Import them under Shape the removal mask.',
+        allTextSamMismatch: 'The SAM-TS-L graphs failed their checksum, so text-shaped review cannot use them. Import them again under Shape the removal mask.',
+        // Free memory changes, so this says what to do rather than what is missing.
+        allTextMemory: 'SAM-TS-L needs about 10 GB of free memory, and this computer has less free right now. Close other apps, then open the review.',
+        // After the line above, so "it" is the workflow that line names. A
+        // native run refuses to start without the runtime, so the row is not
+        // complete while one of these shows.
+        runtime: 'It cannot run until the engine runtime, ONNX Runtime, is installed. Download it in Performance.',
+        runtimeDownloading: 'It can run once the engine runtime, ONNX Runtime, finishes downloading.',
+        runtimeUnavailable: 'It cannot run here: the engine runtime, ONNX Runtime, has no build for this computer.',
+        // Installed is a file found; a run also has to load it. `reasonKey`
+        // is a `diagnostics.runtime.*` sentence, which names the remedy where
+        // there is one outside this app.
+        runtimeUnloadable: 'It cannot run until the engine runtime loads. {reasonKey}.',
+        runtimeChecking: 'Checking that the engine runtime, ONNX Runtime, loads on this computer.',
+        runtimeUnchecked: 'Whether the engine runtime, ONNX Runtime, loads on this computer could not be checked. Reopen Settings to check again.',
+        openPerformance: 'Open Performance',
+      },
+      review: {
+        summary: 'Text-shaped review',
+        optional: 'Optional mode',
+        note: 'Analyses one page with RT-DETR and SAM-TS-L and writes only the pixels you approve. Legacy cleaning stays the default.',
+      },
+      sam: {
+        memory: 'Needs about 10 GB of free memory to run.',
+        chooserTitle: 'Folder with both SAM-TS-L graphs',
+      },
+      rtFull: {
+        chooserTitle: 'The pinned full RT-DETR v2 detector.onnx',
+      },
+      // Setup's detection step.
+      setupReview: 'The optional text-shaped review is set up later, in Settings > Detection, by importing its model graphs.',
+      setupAllText: 'Automatic cleaning is set to all-text review. These choices apply when you switch back to legacy filtering in Settings.',
+    },
+    cleaning: {
+      capability: {
+        rebuild: 'Rebuild background',
+        rebuildNote: 'Redraw the art under removed text.',
+      },
+      role: {
+        lama: 'Redraws screentone and texture under removed text whenever a clean uses LaMa.',
+      },
+    },
     // The weights and the ONNX Runtime are not bundled: they are downloaded
     // after install. Everything here is about
     // *files on this machine*, so the copy names sizes and folders and never
     // talks about "AI" - the reader is deciding what to spend disk on.
     models: {
-      // Over the file rows in Detection and Cleaning.
-      heading: 'Files',
+      // Over catalogue rows no capability claims: a weight the backend added
+      // before the capability table knew it still has a place to be managed.
+      heading: 'Other files',
+      // One logical row per multi-file model. The download notices name a
+      // group failure with the same key.
+      groups: {
+        scriptGate: 'Script filtering',
+        mangaOcr: 'Japanese OCR rescue',
+      },
+      fileCount: {
+        one: '{count} file',
+        other: '{count} files',
+      },
+      // The expandable block under a model row: component files, their exact
+      // identity, and per-file Check and Delete for troubleshooting.
+      details: 'File details',
+      revision: 'Revision {revision}',
+      revisionUnavailable: 'No upstream revision is recorded. The pinned SHA-256 is the exact identity.',
+      importPair: 'Import both graphs together from an export you obtained yourself.',
+      groupMismatch: 'At least one file did not match its pinned digest.',
+      // Beside a single file's Delete in File details, held because another
+      // workflow shares the file and the selected one uses it now.
+      fileShared: 'Another workflow shares this file, and the selected policy uses it now. To remove it anyway, use Delete on the row above, which names what stops.',
+      // A removal names what it stops before it happens. The shared speech
+      // bubble finder is never removed with another model.
+      remove: {
+        keep: 'Keep',
+        inUse: 'Automatic cleaning uses it now.',
+        ctd: 'Delete the text finder? Legacy automatic cleaning stops working until you download it again.',
+        rtSmall: 'Delete the speech bubble finder? Legacy automatic cleaning and the text-shaped review’s small whole-page profile stop working until you download it again.',
+        rtFull: 'Delete the imported full region finder? The text-shaped review’s full two-tile profile stops working until you import it again.',
+        samTs: 'Delete the imported SAM-TS-L graphs? The text-shaped review cannot draw lettering masks until you import them again.',
+        scriptGate: 'Delete script filtering, both files? Legacy automatic cleaning stops working until you download it again. The speech bubble finder is kept.',
+        mangaOcr: 'Delete the Japanese OCR rescue, all three files? Legacy cleaning keeps running without the rescue. The speech bubble finder is kept.',
+        lama: 'Delete the redraw model? LaMa redraw stops working until you download it again.',
+        // Not `other`: that name would read the block as plural forms.
+        file: 'Delete {name}? Anything that needs it stops working until you download it again.',
+      },
       status: {
         installed: 'Installed',
         missing: 'Not installed',
+        // A model row whose files are only partly here.
+        someInstalled: '{installed} of {total} files installed',
+        // Said beside a missing model the selected workflow needs, in words
+        // as well as colour.
+        neededNow: 'needed now',
+        // SAM-TS-L and the full RT-DETR graph: local import only.
+        importToEnable: 'Import to enable',
+        imported: 'Imported',
+        verified: 'SHA-256 verified',
+        checking: 'Checking…',
+        readinessUnavailable: 'Readiness unavailable',
+        // COO: excluded from the desktop path.
+        excluded: 'Not available',
         downloading: 'Downloading…',
         downloadingPercent: 'Downloading {percent}%',
         // The check found different bytes under the right name. Not the same
@@ -345,6 +500,8 @@ export const en = {
         // checksum. Seconds of work on the larger models, which is why it is a
         // button rather than something that happens every time this opens.
         verify: 'Check',
+        // Opens a file chooser for a local, hash-checked import.
+        import: 'Import…',
       },
       runtime: {
         label: 'Engine runtime',
@@ -893,6 +1050,8 @@ export const en = {
       redoCommand: 'Redo {commandKey}',
       runOnPage: 'Run on page',
       runOnProject: 'Run on project',
+      textShapeReview: 'Text-shaped review',
+      reviewText: 'Review text masks',
       cancelRun: 'Cancel run',
     },
     readout: {
@@ -1029,6 +1188,8 @@ export const en = {
   /* ================================================================== */
   review: {
     reason: {
+      inputChanged: 'An earlier edit changed what this layer read',
+      inputUnknown: 'An earlier edit may have changed what this layer read',
       fittingReconstructed: 'Fitting failed, so a model reconstructed the area',
       unusuallyLarge: 'Unusually large for this page',
       declined: 'Every engine failed the quality check, so the original text was left alone',
@@ -1040,6 +1201,9 @@ export const en = {
       // Distinct from `low-confidence` because
       // reporting a confident refusal as an uncertain one is backwards.
       gateSkippedNotJapanese: 'Not Chinese, Japanese, or Korean; left as it was',
+      languageSkipped: 'Held because this language was skipped in the run settings',
+      outsideLanguageUnverified: 'Held because outside-bubble text could not be checked against the selected languages',
+      maskNeedsCorrection: 'The text-shaped mask needs correction before it can be applied',
       cloudAccepted: 'A cloud request was accepted, so check it against the page',
       cloudRejectedSafetyFilter: 'the provider’s safety filter refused it',
       cloudRejectedTransportError: 'the request never completed',
@@ -1335,8 +1499,17 @@ export const en = {
     },
     detector: {
       ctdRtdetr: 'CTD finds text, RT-DETR finds bubbles',
-      ctdRtdetrOcr: 'Adds manga-ocr to rescue unclear Japanese',
-      rtdetrCoo: 'RT-DETR finds text, COO sound effects, SAM-TS the mask',
+    },
+    workflow: {
+      policy: 'Automatic cleaning text policy',
+      legacyGate: 'Legacy script filtering',
+      allText: 'All text · open text-shaped review',
+      // Under the policy picker, one per policy.
+      policyDescriptionLegacy: 'Legacy filtering finds lettering with CTD and RT-DETR, and a script filter keeps the removal to the languages you choose below.',
+      policyDescriptionAllText: 'All text uses local RT-DETR and SAM-TS review with no recognition. Each component requires exact write-support approval.',
+      ocrRescue: 'Use optional Japanese OCR rescue',
+      ocrRescueDescription: 'Only rescues uncertain Japanese script decisions in legacy filtering. It never runs in all-text review.',
+      ratingsNote: 'Engine ratings are provisional estimates, not measurements from one shared benchmark.',
     },
     cleaner: {
       lamaManga: 'Fast redraw tuned for manga tone',
@@ -1506,6 +1679,17 @@ export const en = {
   /* masks - the Layers & review window                                  */
   /* ================================================================== */
   masks: {
+    // A layer whose input an earlier edit changed. Rebuild is Try again under
+    // another name and carries `action.retryHint`. Undo is the editor's global
+    // undo, so its label says "last action" and its tooltip names the action
+    // (`editor.action.undoCommand`); it is not scoped to the edit that caused
+    // the review.
+    dependency: {
+      keep: 'Keep result',
+      keepHint: 'Keep this layer as it is and mark it reviewed',
+      rebuild: 'Rebuild from lower layers',
+      undoLast: 'Undo last action',
+    },
     filter: {
       needsReview: 'Needs review',
       hint: 'Show only the regions that need review (R)',
@@ -1594,9 +1778,18 @@ export const en = {
       deleteRegion: 'Dismiss',
       deleteRegionHint: 'Take this off the list and leave the page as it is',
       retry: 'Try again',
-      retryHint: 'Clean this area again with the same setting',
+      // Try again and Clean with *replace* this layer's result and read only
+      // the layers below it; a new stroke reads the page as shown and refines
+      // it (docs/repeated-inpaint-plan.md, "Editing behavior"). `rerunNote`
+      // sits under the picker so the difference is visible without a hover.
+      retryHint: 'Replace this layer, cleaning again from the layers below it',
+      rerunNote: 'Try again replaces this layer. A new stroke refines what you see now.',
+      // Paint and clone strokes are copied pixels with nothing to run again
+      // (`model/masks.js#reRunnable`). The disabled Try again says so, as its
+      // tooltip and as a line in the expanded row.
+      retryBlocked: 'Try again is not available for paint and clone strokes. Paint over it or delete it.',
       engine: 'Clean with',
-      engineHint: 'Clean this area again with a different setting',
+      engineHint: 'Replace this layer using another engine, from the layers below it',
       showOnPage: 'Show on page',
       cleanAnyway: 'Clean anyway',
     },
@@ -1873,6 +2066,8 @@ export const en = {
       },
       cancelled: 'Auto clean cancelled. The pages already cleaned are kept.',
       nothingInScope: 'Nothing to clean in this scope.',
+      allLanguagesSkipped: 'All source languages are skipped. Select a language to clean.',
+      ocrRescueUnavailable: 'Japanese OCR rescue is off for this run: {reason}',
       // The run could not start because the weights are not on this machine.
       // A notice rather than an error now that there is somewhere to send the
       // reader: before Settings › Models existed, this was a rejected promise
@@ -1923,6 +2118,17 @@ export const en = {
       noSpace:
         'There is not enough free disk space for that download: {needed:memory} needed, {free:memory} free. Free some space and press Download again.',
     },
+
+    // A model download that failed while no screen showing its row was open
+    // (`api/model-download-notices.js`). `{nameKey}` is the name Settings gives
+    // that row: a file group's, the runtime's, or a file's `models.kind.*`,
+    // never the raw id. `{error}` is the backend's own reason, verbatim.
+    download: {
+      failed: '{nameKey} could not be downloaded: {error}. Try again from Settings.',
+      // The id matched no row this build knows, or the catalogue could not be
+      // read to name it.
+      failedUnnamed: 'A model could not be downloaded: {error}. Try again from Settings.',
+    },
     chapter: {
       emptyResult: 'No text found across {pages} pages. Nothing to clean.',
       added: 'Ch. {chapter} added to {project}.',
@@ -1957,6 +2163,8 @@ export const en = {
     },
     library: {
       changeFailed: 'That change could not be saved. The library is as it was.',
+      ingestInsufficientSpace: 'Not enough free space to import this chapter.',
+      ingestSpaceUnknown: 'Could not check free space for this chapter import.',
     },
     history: {
       saveFailed: 'Could not save undo history. Undo may not work after a restart.',
@@ -2119,6 +2327,10 @@ export const en = {
         'PSD cannot carry an indexed-colour page or one below 8 bits, and converting would change pixels you did not ask to change. Nothing was written. Export PNG, which carries them as they are.',
       refusedLayeredSize:
         'A page here is over 30 000 pixels on a side, which is more than a PSD can hold. Nothing was written. Export PNG or TIFF, which have no such limit.',
+      refusedLayeredFileSize:
+        'This PSD would exceed its 2 GB file size limit. Nothing was written. Export PNG or TIFF instead.',
+      refusedLayeredCount:
+        'This page has more layers than a PSD can hold. Nothing was written. Export a flattened PNG or TIFF instead.',
       refusedDestination:
         'That destination is not somewhere this export can write. Nothing was written. Choose a new folder, or give a full path from the top of the disk.',
       refusedStitchPaginated:
@@ -2170,6 +2382,401 @@ export const en = {
       available: 'Update available',
       availableTag: 'Update available: {version}',
       updateTo: 'Update to v{version}',
+    },
+  },
+
+  /* ================================================================== */
+  /* workflow - the text-shaped review, and the same analysis without a  */
+  /* chapter in Settings. Refusals are named outcomes, never the         */
+  /* backend's own sentence: see `src/lib/dialogs/workflowoutcome.js`.  */
+  /* ================================================================== */
+  workflow: {
+    title: {
+      review: 'Text-shaped review',
+      independent: 'Independent model analysis',
+    },
+    intro: {
+      review: 'Finds lettering pixels on one page for you to review. Nothing is erased until you approve a component. No OCR and no language check. Nothing leaves this computer unless you choose cloud analysis and confirm what is sent.',
+      independent: 'Reviews model evidence in original page coordinates. Analysis erases nothing and starts no cloud job. The legacy cleaner above is unchanged.',
+    },
+    rule: {
+      writesW: 'Apply writes only the orange W pixels. Nothing else on the page changes.',
+      refine: 'A new correction refines this component’s current plan. Try again in Layers replaces the patch, rebuilt from the layers below it.',
+      reviewOnly: 'CPU and JPEG results are review-only. Writing needs a PNG page and the qualified GPU setup.',
+    },
+    field: {
+      page: 'Chapter page',
+      pageOption: 'Page {number}',
+      workflow: 'Workflow',
+      rtProfile: 'RT model and page layout',
+      rtBackend: 'RT backend',
+      samBackend: 'SAM backend',
+      source: 'Source page',
+      sourcePlaceholder: 'Absolute image path',
+      padding: 'Padding (source px)',
+      brush: 'Brush radius (source px)',
+      correction: 'Correction',
+      zoom: 'Zoom',
+    },
+    aria: {
+      padding: 'Padding in source pixels',
+      brush: 'Correction brush radius in source pixels',
+      correction: 'Mask correction mode',
+      zoom: 'Preview zoom',
+      canvas: 'Source page mask correction canvas. Arrow keys move the cursor. Enter selects the component under it, or paints in Add or Remove mode.',
+      preview: 'Source pixel mask preview',
+      image: 'Source page under review',
+      candidates: 'Review candidates',
+      legend: 'Preview legend',
+    },
+    preset: {
+      regions: 'Regions only: RT-DETR text and bubble boxes',
+      mask: 'Mask only: SAM-TS-L lettering pixels, no RT-DETR',
+      textShape: 'Text-shaped review: RT-DETR context with the SAM mask',
+    },
+    rtProfile: {
+      full: 'Full FP32, two vertical tiles',
+      small: 'Small INT8, whole page',
+    },
+    backend: {
+      cpu: 'CPU',
+      webgpu: 'WebGPU',
+      canWrite: '{name} · can write',
+      reviewOnly: '{name} · review only',
+      unavailable: '{name} · unavailable',
+      qualified: '{name} · qualified',
+      unqualified: '{name} · unqualified',
+    },
+    action: {
+      analyze: 'Analyze for review',
+      cancel: 'Cancel analysis',
+      prepare: 'Prepare write preview',
+      rebuild: 'Rebuild preview',
+      reanalyze: 'Analyze again',
+      clear: 'Clear corrections',
+      apply: 'Apply approved component',
+      choosePage: 'Choose page',
+      importFullRt: 'Import full RT graph',
+      removeFullRt: 'Remove full RT graph',
+      importSam: 'Import SAM graphs',
+      removeSam: 'Remove SAM graphs',
+      verifySam: 'Verify SAM graphs',
+      refresh: 'Refresh readiness',
+      zoomFit: 'Fit',
+      zoomActual: '1:1',
+      zoomComponent: 'Zoom to component',
+    },
+    zoom: {
+      fitLabel: 'Fit the page to the view',
+      actualLabel: '1:1, one source pixel per screen point',
+      value: '{percent}%',
+    },
+    status: {
+      analyzingPage: 'Analyzing page {page} locally…',
+      analyzing: 'Analyzing locally…',
+      cancelling: 'Cancelling…',
+      working: 'Working locally…',
+    },
+    model: {
+      section: 'Models and backends',
+      rt: 'RT-DETR-v2',
+      sam: 'SAM-TS-L',
+      write: 'Component write',
+      coo: 'COO MTSv3 SFX finder',
+      runtime: 'ONNX Runtime',
+    },
+    cap: {
+      rtFull: 'Full tiled graph: {statusKey}',
+      rtSmall: 'Small whole-page graph: {statusKey}',
+      samState: '{statusKey}. {memoryKey}. Mask only, no OCR.',
+      writeQualified: 'Qualified here: WebGPU analysis of a PNG page can prepare approved writes.',
+      writeReviewOnly: 'Review only on this computer.',
+      cooAbsent: 'Not included: its model rights are unresolved.',
+      runtimeInstalled: 'Installed',
+      runtimeMissing: 'Install it in Performance before analysis.',
+    },
+    state: {
+      verified: 'SHA-256 verified',
+      missing: 'missing',
+      installLater: 'install it under Models',
+      unverified: 'Verification pending or failed',
+      samMissing: 'Graphs missing',
+      memoryReady: 'Memory available',
+      memoryShort: 'Needs 10 GB of process memory',
+    },
+    detail: {
+      rtIdentity: 'Full RT-DETR identity and file',
+      rtFile: 'Revision {revision}. {name}, {size} MB, SHA-256 {sha}.',
+      samIdentity: 'SAM-TS-L identity and files',
+      samRevision: 'Revision {revision}. Import both graphs together from an export you obtained yourself.',
+      samFile: '{name}, {size} MB, SHA-256 {sha}',
+      backends: 'Backend availability and validation',
+      backendRow: '{family} {name}: {platform}, {statusKey}. {note}',
+      qualified: 'qualified',
+      unqualified: 'unqualified',
+      technical: 'Technical detail',
+      provenance: 'Analysis details',
+      sourceSha: 'Source SHA-256',
+      maskSha: 'Unchanged SAM mask SHA-256',
+      models: 'Models',
+      modelsValue: 'RT {rtProfile} on {rtBackend}, SAM on {samBackend}',
+      timings: 'Timings',
+      timingsValue: 'Cold load: RT {rtLoad} ms, SAM {samLoad} ms. Page: SAM {samPage} ms, RT {rtPage} ms.',
+      nodes: 'ORT assignment',
+      nodesValue: 'WebGPU nodes: encoder {encoder}, head {head}. CPU fallback: encoder {cpuEncoder}, head {cpuHead}.',
+      off: 'off',
+    },
+    result: {
+      components: { zero: 'No components', one: '1 component', other: '{count} components' },
+      regions: { zero: 'No detector boxes', one: '1 detector box', other: '{count} detector boxes' },
+      uncertain: { zero: 'None uncertain', one: '1 uncertain', other: '{count} uncertain' },
+      canWrite: 'Analyzed on WebGPU. Components can be prepared for writing.',
+    },
+    list: {
+      components: 'Components',
+      regions: 'Detector boxes',
+      pixels: '{count} px',
+    },
+    tag: {
+      bubble: 'Bubble',
+      text: 'Text box',
+      noBox: 'No detector box',
+      held: 'Held',
+      uncertain: 'Uncertain',
+      written: 'Written',
+      contextOnly: 'Context only',
+      noMask: 'No SAM pixels',
+    },
+    regionKind: {
+      bubbleContext: 'Bubble box',
+      textBubble: 'Text in bubble',
+      textFree: 'Free text',
+    },
+    panel: {
+      empty: 'Select a component in the list, or click it on the page.',
+      region: 'Detector boxes only locate text. They cannot be written.',
+      uncertain: 'Uncertain: the model marks this component for review. Check the tint against the page before approving.',
+    },
+    permission: {
+      label: 'Allow components outside speech bubbles',
+      help: 'Off by default. Applies to this review only; the Auto clean setting stays as it is.',
+    },
+    correction: {
+      inspect: 'Inspect',
+      add: 'Add pixels',
+      remove: 'Remove pixels',
+      pending: 'Pending: {added} px to add, {removed} px to remove. Not in W until the preview is prepared.',
+    },
+    write: {
+      summary: 'W: {count} source px, padding {padding} px',
+      identity: 'Plan identity',
+      plan: 'Plan',
+      support: 'Support SHA-256',
+      source: 'Source',
+      underlay: 'Underlay',
+      renderer: 'Renderer',
+      approve: 'I approve writing exactly the orange pixels (W) of {component} on page {page}.',
+    },
+    legend: {
+      evidence: 'SAM mask',
+      write: 'W, will be written',
+      add: 'Pending add',
+      remove: 'Pending remove',
+      locator: 'Box, locator only',
+    },
+    outcome: {
+      cancelled: 'Analysis cancelled',
+      unavailable: 'Needs the desktop app',
+      modelMissing: 'Model missing',
+      notReady: 'Not ready to analyze',
+      modelFailed: 'Model failed',
+      memory: 'Not enough memory',
+      sourceLimit: 'Page cannot be analyzed',
+      undiscovered: 'Nothing found',
+      held: 'Held by policy',
+      declined: 'Review only',
+      needsCorrection: 'Mask needs correction',
+      stale: 'Preview out of date',
+      expired: 'Analysis out of date',
+      badReconstruction: 'Fill could not be rebuilt',
+      applied: 'Written to page {page}',
+      failed: 'Something went wrong',
+      cooAbsent: 'SFX finder not included.',
+      invalidRequest: 'Request not accepted',
+      wrongModel: 'Wrong model file',
+      sourceUnreadable: 'Page file unavailable',
+      exhausted: 'Page edit limit reached',
+      existingGeometry: 'Region uses box geometry',
+      unconfirmed: 'Written, not shown yet',
+      system: 'System refused the request',
+    },
+    explain: {
+      cancelled: 'Nothing was saved. Analyze again when you are ready.',
+      unavailable: 'Model review runs only in the desktop app.',
+      modelMissing: 'A required model is missing or failed its checksum. Open Models and backends to import or verify it.',
+      modelFailed: 'The model stopped before finishing this page. Nothing was written. Try again, or analyze on the CPU.',
+      memory: 'SAM needs about 10 GB of free memory. Close other apps, then analyze again.',
+      sourceLimit: 'Review previews are limited to 20 MB and 24 megapixels, in PNG, JPEG, GIF, WebP or BMP.',
+      longstrip: 'Text-shaped review needs a paginated chapter. Long strips are not supported yet.',
+      undiscovered: 'No lettering components or detector boxes on this page. Nothing will be written.',
+      held: 'This component is outside every speech bubble. Turn on Allow components outside speech bubbles to prepare it.',
+      stale: 'The page, its lower layers or the plan changed since this preview. Rebuild it before approving.',
+      expired: 'The page or the model changed since this analysis. Analyze the page again.',
+      badReconstruction: 'Not enough surrounding pixels to rebuild this area. Nothing was written. Add padding or correct the mask, then prepare again.',
+      applied: 'The fill is not previewed here. Check it on the page, and use Undo if it looks wrong.',
+      cooAbsent: 'The optional COO finder is excluded while its model rights are unresolved. Sound effects rely on the SAM mask alone.',
+      geometry: 'The page file changed size since it was imported, or it is over 24 megapixels. Nothing was sent.',
+      tile: 'Part of this page is too large to upload as one tile. Nothing was sent.',
+      invalidRequest: 'The review sent a request this version does not accept. Close the review, open it again and analyze.',
+      wrongModel: 'The chosen file is not the pinned model. Nothing was imported. Choose the exact file from the model’s published release.',
+      sourceUnreadable: 'The chapter’s source file for this page is missing or cannot be read. Check the chapter’s files, then analyze again.',
+      exhausted: 'This page holds too many edits to add another. Nothing was written.',
+      existingGeometry: 'An edit with this component’s id already exists with box geometry. Delete it in Layers, then prepare again.',
+      unconfirmed: 'The component was written, but the page could not be reloaded. Close and reopen the chapter to see it.',
+      system: 'The computer could not supply something the review needs. Nothing was sent or written. Try again.',
+    },
+    declined: {
+      regions: 'Regions only finds detector boxes. Boxes locate text but cannot be written.',
+      cpu: 'Analyzed on the CPU. Analyze on WebGPU to write components.',
+      jpeg: 'This page is a JPEG. Component writes need a PNG source.',
+      format: 'This page’s image format cannot be written. Component writes need a PNG source.',
+      indexed: 'This PNG uses an indexed palette, which component writes cannot fill.',
+      sub8Bit: 'This PNG has under 8 bits per channel, which component writes cannot fill.',
+      host: 'This computer or runtime is not qualified for component writes.',
+      provider: 'Part of the model fell back to the CPU during analysis, so this result is review-only.',
+      longstrip: 'Component writes need a paginated chapter. Long strips are review-only.',
+      box: 'Detector boxes locate text but cannot be written. Select a SAM component.',
+    },
+    correctionReason: {
+      empty: 'No write pixels are left. Add pixels or clear corrections.',
+      overlap: 'This component overlaps an edit already on the page. Remove that edit, or use the editor’s mask tools.',
+      tooLarge: 'The correction is larger than the 16 megapixel plan limit. Clear it and paint a smaller area.',
+    },
+    failure: {
+      prepare: 'Could not prepare the preview. Nothing was written.',
+      apply: 'Could not apply the component. Nothing was written.',
+      load: 'Could not load this component’s saved correction.',
+      models: 'Could not change the installed models.',
+      refresh: 'Could not read model readiness.',
+    },
+    ready: {
+      runtime: 'Install ONNX Runtime in Settings, Performance, before analysis.',
+      // After it, a `diagnostics.runtime.*` sentence that names the remedy.
+      runtimeUnloadable: 'ONNX Runtime is installed but does not load. {reasonKey}.',
+      runtimeChecking: 'Checking that ONNX Runtime loads on this computer…',
+      runtimeUnchecked: 'Could not check that ONNX Runtime loads on this computer. Press Refresh readiness under Models and backends to check again.',
+      rt: 'The RT-DETR graph for this layout is not installed. Import it under Models and backends.',
+      sam: 'SAM-TS-L is not installed. Import both graphs under Models and backends.',
+      samUnverified: 'SAM-TS-L is not verified yet. Verify it under Models and backends.',
+      memory: 'SAM needs about 10 GB of free memory.',
+      backend: 'The selected backend is not available on this computer.',
+    },
+    dialog: {
+      chooseImage: 'Choose a comic page',
+      samFolder: 'Select the folder that holds both SAM-TS-L ONNX graphs',
+      rtFile: 'Select the pinned full RT-DETR-v2 detector.onnx graph',
+    },
+  },
+  cloud: {
+    analysis: {
+      title: 'Cloud GPU',
+      disclosure: '{pages} as {tiles}: {pixels} pixels, {bytes} bytes encoded ({size:memory}). The surrounding art is included, not only the lettering.',
+      pages: { one: '1 page', other: '{count} pages' },
+      tiles: { one: '1 tile', other: '{count} tiles' },
+      costUnknown: 'Estimated cost unknown',
+      costEstimate: 'Estimated {cost:currency}',
+      costNote: 'The provider bills your account for the GPU time used.',
+      rights: 'I have the rights to send these page pixels to this provider for analysis.',
+      retention: 'I have reviewed and accept this provider’s retention, human review, and training terms for these uploads.',
+      reviewOnly: 'Cloud results are for review. They cannot prepare a component write.',
+      capabilityMissing: 'This cloud GPU does not offer the selected analysis model. Nothing was sent.',
+      stale: 'The page or its visible edits changed. No further tiles were sent.',
+      unknown: 'The last tile may have run. It will not be sent again automatically. Check the provider before starting a new analysis.',
+      unknownCancelRequested: 'Cancel was requested while a tile was out. That tile may have run. It will not be sent again automatically. Check the provider before starting a new analysis.',
+      cancelled: 'Cloud analysis cancelled. Remaining tiles were not sent.',
+      capability: {
+        label: 'Cloud model',
+        sam: 'SAM text mask',
+        rt: 'RT text regions',
+        notOffered: '{name}, not offered',
+        invalid: 'This cloud GPU’s model list could not be read. Nothing was sent. Update the cloud worker, then try again.',
+        notConfigured: 'This cloud GPU has no analysis models set up. Nothing was sent.',
+        limits: 'This page needs larger tiles than this cloud GPU accepts. Nothing was sent.',
+        modelChanged: 'The cloud GPU’s model changed after you reviewed it. Nothing was sent. Review the page again to see the new model.',
+      },
+      entry: {
+        action: 'Analyze with cloud GPU',
+        target: '{name} on {providerKey}',
+        note: 'This page only, after you review exactly what is sent.',
+      },
+      unavailable: {
+        noTarget: 'To analyze on a cloud GPU, choose a Modal or Beam endpoint in Settings.',
+        noSecret: 'The selected cloud endpoint has no stored key. Add it in Settings to analyze on a cloud GPU.',
+      },
+      status: {
+        checking: 'Checking what {name} offers…',
+        preparing: 'Preparing the upload review…',
+        progress: '{done} of {total} tiles analyzed on {name}',
+        cancelling: 'Cancelling. A tile already sent may still be billed.',
+      },
+      consent: {
+        heading: 'Send page {page} to your cloud GPU?',
+        what: 'What is sent',
+        where: 'Where it goes',
+        whereValue: '{name}, your endpoint on {providerKey}',
+        model: 'Model',
+        modelValue: '{capabilityKey}, revision {revision}',
+        graphs: 'Graph SHA-256 {graphs}',
+        identity: 'Full model identity',
+        revision: 'Revision',
+        graph: 'Graph SHA-256',
+        cost: 'Cost',
+        result: 'Result',
+        expires: 'This review is valid until {time}.',
+        confirm: 'Send to cloud GPU',
+        cancel: 'Cancel',
+      },
+      progressLabel: 'Cloud analysis progress',
+      cancel: 'Cancel cloud analysis',
+      source: 'Cloud evidence from {name}',
+      provenance: '{capabilityKey} on {name}, {providerKey}',
+      noImage: 'This result has no page image. Its boxes and components are drawn on a blank page.',
+      outcome: {
+        cloudDisabled: 'Cloud engines are off',
+        cloudProfile: 'Cloud endpoint unavailable',
+        capabilityMissing: 'Model not offered',
+        consentRequired: 'Consent needed',
+        proposalExpired: 'Upload review expired',
+        proposalConsumed: 'Upload review already used',
+        proposalLimit: 'Too many upload reviews open',
+        cancelled: 'Cloud analysis cancelled',
+        stale: 'Page changed during analysis',
+        unknown: 'Last tile state unknown',
+        invalid: 'Unusable cloud result',
+      },
+      explain: {
+        cloudDisabled: 'Allow cloud engines in Settings to analyze on a cloud GPU. Nothing was sent.',
+        proposalExpired: 'An upload review is valid for 5 minutes. Nothing was sent. Review the page again.',
+        proposalConsumed: 'This upload review was already used. Review the page again to start a new analysis.',
+        proposalLimit: 'Finish or cancel other cloud analyses first. Nothing was sent.',
+        upload: 'This page needs more tiles than one cloud analysis may send. Nothing was sent.',
+        invalid: 'The cloud GPU returned a result this app cannot use. Nothing was added to the review. Tiles already analyzed may be billed.',
+      },
+      profile: {
+        inactive: 'The selected cloud endpoint changed. Nothing was sent. Choose it again in Settings.',
+        missing: 'This cloud endpoint no longer exists. Nothing was sent.',
+        credential: 'This cloud endpoint has no usable key. Nothing was sent. Add the key in Settings.',
+        config: 'This cloud endpoint’s settings are invalid. Nothing was sent. Check it in Settings.',
+      },
+      consentRequired: {
+        rights: 'Confirm that you have the rights to send these page pixels. Nothing was sent.',
+        retention: 'Accept the provider’s retention and training terms first. Nothing was sent.',
+      },
+      failure: {
+        capabilities: 'Could not read what this cloud GPU offers. Nothing was sent.',
+        propose: 'Could not prepare the upload review. Nothing was sent.',
+        confirm: 'The cloud analysis stopped. Nothing was added to the review. Tiles already sent may be billed.',
+      },
     },
   },
 }

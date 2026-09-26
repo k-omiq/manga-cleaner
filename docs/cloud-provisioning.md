@@ -118,6 +118,8 @@ The script then smoke tests the binary offline: `--self-check` imports both SDKs
 
 `provisioner/requirements.lock` hash-pins all 74 packages, resolved for Python 3.11+ on every platform, from `modal[api-proxy-support]==1.5.5`, `beam-client==0.2.211`, `beta9==0.1.268` and `pyinstaller==6.22.3`. The proxy extra is there because Modal needs `python-socks` and `aiohttp-socks` whenever a proxy is set, a macOS system proxy included. The release workflow runs `python -m pip install --require-hashes -r provisioner/requirements.lock` on macOS and Windows, then the build script for the target.
 
+The Rust release build checks that `bundle.externalBin` names the helper and that the target-specific binary exists. After bundling, the release workflow runs the helper's self-check from inside the macOS `.app` and checks that the Windows NSIS installer contains `manga-cleaner-provisioner.exe`. A missing helper therefore fails the release before publication. The release matrix currently covers macOS Apple Silicon and Windows x64; Linux packaging has no frozen helper target yet.
+
 ## 8. Tests
 
 ```sh

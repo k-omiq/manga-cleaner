@@ -239,6 +239,9 @@
  * @property {'match-surround'|'reconstruct'|'solid'} fillMode
  * @property {number} elapsedMs
  * @property {boolean} fittingReconstructed - planar fit failed and a model reconstructed the area
+ * @property {'changed'|'unknown'|null} [dependencyReview] - earlier visible input changed after this result
+ * @property {string|null} [maskQualityState] - a saved text-shaped result that still needs mask correction
+ * @property {string|number|null} [textShapePatchRevision] - immutable text-shaped patch revision restored by history
  * @property {CloudOutcome|null} cloudOutcome - legacy; null on every mask made today
  * @property {Provenance} provenance
  */
@@ -255,7 +258,7 @@
  * @property {{x: number, y: number, w: number, h: number}} bbox
  * @property {'auto'|'hand'} source
  * @property {'pending'|'cleaned'|'declined'|'gate-skipped'} outcome
- * @property {'low-confidence'|'outside-bubble'|'not-japanese'|null} gateSkipCause - `not-japanese` is a *confident* refusal: the gate read the script and it was not CJK
+ * @property {'low-confidence'|'outside-bubble'|'not-japanese'|'language-skipped'|'outside-language-unverified'|null} gateSkipCause - `not-japanese` is a *confident* refusal: the gate read the script and it was not CJK
  * @property {string|null} declineReason
  * @property {boolean} unusuallyLarge
  * @property {Mask|null} mask - null unless outcome === 'cleaned'

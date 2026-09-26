@@ -56,19 +56,20 @@
 //! fill mode and the interface asks for the cloud render on it next. Automatic
 //! runs never reach the cloud at all.
 
-use std::path::PathBuf;
 use std::borrow::Cow;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use cleaner_core::accel::Preference;
-use cleaner_core::detect::{Detector, build_regions_separated};
+use cleaner_core::detect::{build_regions_separated, Detector};
 use cleaner_core::engines::flux;
 use cleaner_core::engines::model::Error as ModelError;
 use cleaner_core::engines::render::{ExecutionTarget, RenderRecipe};
 use cleaner_core::fit::{self, EdgeMap, Fitted};
-use cleaner_core::image::{Raster, decode};
+use cleaner_core::image::{decode, Raster};
 use cleaner_core::ingest::sha256_hex;
 use cleaner_core::mask::{Mask, Rect};
 use cleaner_core::memory;
@@ -76,9 +77,14 @@ use cleaner_core::patch::{Engine, Patch, Provenance};
 use cleaner_core::project::{Job, PatchRecord};
 use cleaner_core::quality;
 use cleaner_core::sidecar::{self, Backend, Budget};
+use cleaner_core::text_shape::{GeometryPolicy, MaskRaster, MASK_PLAN_VERSION};
+#[cfg(test)]
+use cleaner_core::text_shape::MaskPlan;
 
 use crate::inference::consent::OperationIntent;
-use crate::inference::service::{attempt_id_for_nonce, CloudAttemptProgress, PollOptions, RenderPhase};
+use crate::inference::service::{
+    attempt_id_for_nonce, CloudAttemptProgress, PollOptions, RenderPhase,
+};
 use crate::library::{ApiMask, ApiRegion, Bbox, Library, LibraryError};
 use crate::run::{self, EnginePick, Picks};
 
@@ -267,19 +273,26 @@ pub fn sidecar_status_from(
     let roots = sidecar::search_paths_from(explicit, app_data);
     match sidecar::find_within(&roots) {
         // Nothing installed: nothing to offer and nothing to say.
-        None => SidecarStatus { available: false, reason_key: None },
+        None => SidecarStatus {
+            available: false,
+            reason_key: None,
+        },
         // The *chosen* backend's platform question, not the platform's own -
         // since `sdnq` there is no platform without a backend, and what can still
         // be refused here is a user who selected one that cannot run.
         Some(_) => match sidecar::hardware::platform_decline_for(flux_backend(backend)) {
-            Some(decline) => {
-                SidecarStatus { available: false, reason_key: Some(decline.reason_key()) }
-            }
+            Some(decline) => SidecarStatus {
+                available: false,
+                reason_key: Some(decline.reason_key()),
+            },
             None if memory::room().is_none() => SidecarStatus {
                 available: false,
                 reason_key: Some("decline.reason.sidecarUnknownMachine"),
             },
-            None => SidecarStatus { available: true, reason_key: None },
+            None => SidecarStatus {
+                available: true,
+                reason_key: None,
+            },
         },
     }
 }
@@ -315,9 +328,9 @@ pub fn parse_model_dir_name(name: &str) -> (String, String) {
 
     if quant.is_none() {
         let known_quants = [
-            "-q4_k_m", "-q4_k_s", "-q5_k_m", "-q5_k_s", "-q8_0", "-q4_0", "-q4_1", "-q5_0", "-q5_1",
-            "-int4", "-int8", "-4bit", "-8bit", "-bf16", "-fp16", "-fp8", "-fp32",
-            "-q4", "-q8", "-q5", "-q6", "-q2", "-q3",
+            "-q4_k_m", "-q4_k_s", "-q5_k_m", "-q5_k_s", "-q8_0", "-q4_0", "-q4_1", "-q5_0",
+            "-q5_1", "-int4", "-int8", "-4bit", "-8bit", "-bf16", "-fp16", "-fp8", "-fp32", "-q4",
+            "-q8", "-q5", "-q6", "-q2", "-q3",
         ];
         for k_quant in known_quants {
             if let Some(b) = base.strip_suffix(k_quant) {
@@ -438,14 +451,23 @@ fn page_index_in(chapter_id: &str, region_id: &str) -> Option<usize> {
     digits.parse::<usize>().ok()?.checked_sub(1)
 }
 
-pub(crate) fn locate_region(library: &Library, region_id: &str) -> Result<Option<Located>, LibraryError> {
+pub(crate) fn locate_region(
+    library: &Library,
+    region_id: &str,
+) -> Result<Option<Located>, LibraryError> {
     let index = library.index()?;
     let Some(chapter_id) = crate::library::chapter_holding(&index, region_id) else {
         return Ok(None);
     };
-    let Some(page_index) = page_index_in(&chapter_id, region_id) else { return Ok(None) };
+    let Some(page_index) = page_index_in(&chapter_id, region_id) else {
+        return Ok(None);
+    };
     let job_path = library.resolve_chapter(&chapter_id)?;
-    Ok(Some(Located { chapter_id, job_path, page_index }))
+    Ok(Some(Located {
+        chapter_id,
+        job_path,
+        page_index,
+    }))
 }
 
 pub(crate) fn locate_page(
@@ -454,7 +476,11 @@ pub(crate) fn locate_page(
     page_index: usize,
 ) -> Result<Option<Located>, LibraryError> {
     let job_path = library.resolve_chapter(chapter_id)?;
-    Ok(Some(Located { chapter_id: chapter_id.to_owned(), job_path, page_index }))
+    Ok(Some(Located {
+        chapter_id: chapter_id.to_owned(),
+        job_path,
+        page_index,
+    }))
 }
 
 /* ------------------------------------------------------------------ */
@@ -476,6 +502,10 @@ enum Geometry {
     /// the same set of pixels with a different engine, and re-deriving the
     /// geometry would quietly move it.
     Stored,
+    /// An accepted, persisted text-shaped preview. Its identity is checked
+    /// again after reading the exact lower composite, before any renderer runs.
+    #[allow(dead_code)]
+    Prepared(String),
     /// Whatever the detector finds under this rectangle - the case a region the
     /// gate held back is in, where all the manifest kept is the box.
     ///
@@ -500,6 +530,7 @@ enum Choice {
 /// One region edit, before anything has been opened.
 struct Plan {
     region_id: String,
+    expected_source: Option<(usize, String)>,
     geometry: Geometry,
     choice: Choice,
     /// `hand` or `auto`, for the params snapshot - the one word that separates
@@ -567,6 +598,8 @@ struct Bench {
     /// residency cache after it. See [`Bench::flux`].
     flux: Option<flux::Inpainter>,
     flux_key: Option<cleaner_core::residency::Key>,
+    #[cfg(test)]
+    detected_seed: Option<Mask>,
 }
 
 impl Bench {
@@ -601,6 +634,8 @@ impl Bench {
             sidecar_override,
             flux_model,
             flux_backend,
+            #[cfg(test)]
+            detected_seed: None,
         }
     }
 
@@ -623,6 +658,10 @@ impl Bench {
     /// and it is what stops six clicks on one page being six full-page
     /// detections ([`cleaner_core::detect::detect_page`]).
     fn text_under(&mut self, page: &Raster, box_: Rect, source: &str) -> Option<(Mask, f32)> {
+        #[cfg(test)]
+        if let Some(seed) = self.detected_seed.as_ref() {
+            return Some((seed.clone(), 1.0));
+        }
         let detector = self.detector()?;
         let detection = match cleaner_core::detect::detect_page(detector, source, page) {
             Ok(detection) => detection,
@@ -646,10 +685,13 @@ impl Bench {
                 return None;
             }
         };
-        let regions = build_regions_separated(detection.boxes.clone(), page.width, page.height, |a, b| {
-            cleaner_core::balloon::merge_crosses_a_balloon(page, &detection.segmentation, a, b)
-        });
-        let region = regions.into_iter().max_by_key(|region| overlap(region.masking, box_))?;
+        let regions =
+            build_regions_separated(detection.boxes.clone(), page.width, page.height, |a, b| {
+                cleaner_core::balloon::merge_crosses_a_balloon(page, &detection.segmentation, a, b)
+            });
+        let region = regions
+            .into_iter()
+            .max_by_key(|region| overlap(region.masking, box_))?;
         if overlap(region.masking, box_) == 0 {
             return None;
         }
@@ -686,7 +728,10 @@ impl Bench {
         fitted: &Fitted,
     ) -> Result<(run::Made, quality::Assessment), &'static str> {
         let env_var = std::env::var("MANGA_CLEANER_SIDECAR").ok();
-        let explicit = self.sidecar_override.as_deref().filter(|s| !s.is_empty())
+        let explicit = self
+            .sidecar_override
+            .as_deref()
+            .filter(|s| !s.is_empty())
             .or_else(|| env_var.as_deref().filter(|s| !s.is_empty()));
         let roots = sidecar::search_paths_from(explicit, self.app_data.as_deref());
         let Some(install) = sidecar::find_within(&roots) else {
@@ -828,9 +873,11 @@ fn edit(app: &tauri::AppHandle, located: &Located, plan: Plan) -> Result<Outcome
     }
 
     let mut bench = Bench::open(app);
-    let stored = crate::settings::read(app)
-        .ok()
-        .and_then(|s| s.get("engineCeiling").and_then(|v| v.as_str()).map(str::to_owned));
+    let stored = crate::settings::read(app).ok().and_then(|s| {
+        s.get("engineCeiling")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    });
     let ceiling = run::effective_ceiling(None, stored.as_deref());
     edit_with_bench(&mut bench, ceiling, located, plan)
 }
@@ -839,7 +886,23 @@ fn edit_with_bench(
     bench: &mut Bench,
     ceiling: Engine,
     located: &Located,
+    plan: Plan,
+) -> Result<Outcome, String> {
+    edit_with_bench_render(bench, ceiling, located, plan, None)
+}
+
+/// The test renderer observes the same fitted input that a real rung receives.
+/// It is kept at this seam so a regression can capture the actual image and
+/// mask, rather than merely testing a compositor helper in isolation.
+/// A stand-in renderer the tests hand in to capture the exact raster and fit.
+type TestRenderer<'a> = &'a mut dyn FnMut(&Raster, &Fitted) -> run::Made;
+
+fn edit_with_bench_render(
+    bench: &mut Bench,
+    ceiling: Engine,
+    located: &Located,
     mut plan: Plan,
+    mut test_renderer: Option<TestRenderer<'_>>,
 ) -> Result<Outcome, String> {
     let _lock = run::lock_job(&located.job_path);
     // Read-only from here: the manifest is mutated in `commit`, which takes the
@@ -848,15 +911,92 @@ fn edit_with_bench(
     let Some(source_idx) = Library::resolve_page(&job.project, located.page_index) else {
         return Ok(Outcome::NotFound);
     };
-    let Some(path) = job.source_path(source_idx) else { return Ok(Outcome::NotFound) };
+    let Some(path) = job.source_path(source_idx) else {
+        return Ok(Outcome::NotFound);
+    };
     let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let anchor_page = decode(&bytes).map_err(|e| e.to_string())?;
     // The source's digest, computed once: it goes into this patch's provenance
     // below, and it is the key the page's detection is remembered under
     // ([`cleaner_core::detect::detect_page`]).
     let source_sha256 = sha256_hex(&bytes);
-    let existing: Option<PatchRecord> =
-        job.project.patches.iter().find(|record| record.id == plan.region_id).cloned();
+    if plan
+        .expected_source
+        .as_ref()
+        .is_some_and(|(expected_idx, expected_sha)| {
+            *expected_idx != source_idx
+                || expected_sha != &source_sha256
+                || job
+                    .project
+                    .sources
+                    .get(source_idx)
+                    .map(|source| &source.sha256)
+                    != Some(expected_sha)
+        })
+    {
+        return Ok(Outcome::NotFound);
+    }
+    let existing: Option<PatchRecord> = job
+        .project
+        .patches
+        .iter()
+        .find(|record| record.id == plan.region_id)
+        .cloned();
+    let prepared_text = match &plan.geometry {
+        Geometry::Prepared(expected) => {
+            if job.text_shape_correction(&plan.region_id).is_some() {
+                return Ok(Outcome::Refused("decline.reason.rungUnavailable"));
+            }
+            let Some((mask_plan, prepared)) = job
+                .load_text_shape_plan(&plan.region_id)
+                .map_err(|e| e.to_string())?
+            else {
+                return Ok(Outcome::Refused("decline.reason.rungUnavailable"));
+            };
+            if prepared.identity.identity_sha256 != *expected {
+                return Ok(Outcome::Refused("decline.reason.rungUnavailable"));
+            }
+            Some((mask_plan, prepared))
+        }
+        Geometry::Stored
+            if existing
+                .as_ref()
+                .is_some_and(|record| record.geometry_policy == GeometryPolicy::TextShape) =>
+        {
+            let identity = existing
+                .as_ref()
+                .and_then(|record| record.text_shape_plan_identity.as_deref())
+                .ok_or("text-shaped patch is missing its prepared plan identity")?;
+            let Some(stored) = job
+                .load_text_shape_plan_identity(&plan.region_id, identity)
+                .map_err(|e| e.to_string())?
+            else {
+                return Ok(Outcome::Refused("decline.reason.rungUnavailable"));
+            };
+            Some(stored)
+        }
+        _ => None,
+    };
+    if prepared_text
+        .as_ref()
+        .is_some_and(|(_, prepared)| prepared.identity.source_sha256 != source_sha256)
+    {
+        return Ok(Outcome::Refused("decline.reason.rungUnavailable"));
+    }
+    if let Some((mask_plan, prepared)) = prepared_text.as_ref() {
+        if prepared
+            .verify_against(mask_plan, anchor_page.width, anchor_page.height)
+            .is_err()
+        {
+            return Ok(Outcome::Refused("decline.reason.rungUnavailable"));
+        }
+        plan.requested = Some(prepared.write_support.bounds);
+    }
+    if matches!(&plan.geometry, Geometry::Stored | Geometry::Prepared(_))
+        && existing.as_ref().is_some_and(|record| !record.visible)
+    {
+        return Ok(Outcome::NotFound);
+    }
 
     // A hand gesture may continue past the anchor page in longstrip mode. Read
     // only the native decode window surrounding it, then run the ordinary edit
@@ -865,14 +1005,23 @@ fn edit_with_bench(
     // the representation StripPatch already knows how to split for export.
     let strip = run::strip_of(&job.project);
     let anchor = strip.pages().get(located.page_index).copied();
-    let requested = plan.requested.map(|target| manual_requested(target, plan.paint.as_ref(), anchor));
+    let requested = plan
+        .requested
+        .map(|target| manual_requested(target, plan.paint.as_ref(), anchor));
     let crosses = requested.zip(anchor).filter(|(r, p)| {
         r.x < 0 || r.y < 0 || r.right() > p.width as i64 || r.bottom() > p.height as i64
+    });
+    // An AI stroke near a join can read the other page even when its write
+    // mask stays on the anchor page. Read that context in strip coordinates.
+    let strip_read = crosses.or_else(|| {
+        (plan.paint.is_none())
+            .then_some(requested.zip(anchor))
+            .flatten()
     });
     let mut patch_shift = (0i64, 0i64);
     let window_page;
     let page = if job.project.strip.mode == cleaner_core::project::StripMode::Longstrip {
-        if let Some((requested, anchor)) = crosses {
+        if let Some((requested, anchor)) = strip_read {
             let global = Rect::new(
                 requested.x + anchor.x_offset,
                 requested.y + anchor.y_offset,
@@ -880,10 +1029,46 @@ fn edit_with_bench(
                 requested.h,
             );
             let mut joins = cleaner_core::strip::Joins::unchecked(strip.joins());
-            for join in 0..strip.joins() { joins.set(join, cleaner_core::strip::JoinState::Verified); }
-            let context = if plan.paint.is_some() { cleaner_core::strip::EngineContext::None }
-                else { cleaner_core::strip::EngineContext::Local };
-            let window = cleaner_core::strip::decode_window(&strip, &joins, global, 1.0, context);
+            for join in 0..strip.joins() {
+                joins.set(join, cleaner_core::strip::JoinState::Verified);
+            }
+            // The native strip reader must include more than the bounded
+            // composite's 768 px margin, so a crop edge never masquerades as
+            // a source-page edge during model padding.
+            let decode_bounds = if plan.paint.is_none() {
+                Rect::new(
+                    global.x.saturating_sub(1024),
+                    global.y.saturating_sub(1024),
+                    global.w.saturating_add(2048),
+                    global.h.saturating_add(2048),
+                )
+            } else {
+                global
+            };
+            let window = if plan.paint.is_none() {
+                // `decode_window` expands once more and its clamp cannot pick
+                // an anchor if both ends lie beyond a short whole strip.
+                let x = decode_bounds.x.max(0);
+                let y = decode_bounds.y.max(0);
+                let right = decode_bounds.right().min(strip.width() as i64);
+                let bottom = decode_bounds.bottom().min(strip.height() as i64);
+                let requested =
+                    Rect::new(x, y, (right - x).max(0) as u32, (bottom - y).max(0) as u32);
+                let rect = strip.clamp(requested, &joins);
+                cleaner_core::strip::DecodeWindow {
+                    rect,
+                    requested,
+                    pad: cleaner_core::strip::EdgePad::None,
+                }
+            } else {
+                cleaner_core::strip::decode_window(
+                    &strip,
+                    &joins,
+                    decode_bounds,
+                    1.0,
+                    cleaner_core::strip::EngineContext::None,
+                )
+            };
             // Refuse pathological chapter-scale gestures. Normal edits remain
             // a small context window even when they straddle a join.
             const MAX_MANUAL_WINDOW_PIXELS: u64 = 4096 * 4096;
@@ -896,15 +1081,30 @@ fn edit_with_bench(
                 }
                 let source = Library::resolve_page(&job.project, position)
                     .ok_or_else(|| format!("strip page {position} is missing"))?;
-                let path = job.source_path(source)
+                let path = job
+                    .source_path(source)
                     .ok_or_else(|| format!("strip page {position} has no source"))?;
                 let data = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
                 decode(&data).map(Cow::Owned).map_err(|e| e.to_string())
             })?;
-            patch_shift = (read.origin.0 - anchor.x_offset, read.origin.1 - anchor.y_offset);
-            let local = Rect::new(global.x - read.origin.0, global.y - read.origin.1, global.w, global.h);
-            if matches!(plan.geometry, Geometry::Stored) {
-                let Some(record) = existing.as_ref() else { return Ok(Outcome::NotFound) };
+            patch_shift = (
+                read.origin.0 - anchor.x_offset,
+                read.origin.1 - anchor.y_offset,
+            );
+            let local = Rect::new(
+                global.x - read.origin.0,
+                global.y - read.origin.1,
+                global.w,
+                global.h,
+            );
+            if prepared_text.is_some() {
+                // Keep the accepted support in anchor-page coordinates until
+                // the common translation below; a strip window is only a
+                // renderer coordinate system, never a new mask authority.
+            } else if matches!(plan.geometry, Geometry::Stored) {
+                let Some(record) = existing.as_ref() else {
+                    return Ok(Outcome::NotFound);
+                };
                 let mut mask = job.load_patch(record).map_err(|e| e.to_string())?.mask;
                 mask.bounds.x += anchor.x_offset - read.origin.0;
                 mask.bounds.y += anchor.y_offset - read.origin.1;
@@ -916,8 +1116,10 @@ fn edit_with_bench(
                 let map = |x: f64, y: f64| {
                     let gx = x / 100.0 * anchor.width as f64 + anchor.x_offset as f64;
                     let gy = y / 100.0 * anchor.height as f64 + anchor.y_offset as f64;
-                    ((gx - read.origin.0 as f64) / read.raster.width as f64 * 100.0,
-                     (gy - read.origin.1 as f64) / read.raster.height as f64 * 100.0)
+                    (
+                        (gx - read.origin.0 as f64) / read.raster.width as f64 * 100.0,
+                        (gy - read.origin.1 as f64) / read.raster.height as f64 * 100.0,
+                    )
                 };
                 for point in &mut paint.points {
                     (point.x, point.y) = map(point.x, point.y);
@@ -943,7 +1145,8 @@ fn edit_with_bench(
                         point.x = (gx - read.origin.0 as f64) / read.raster.width as f64 * 100.0;
                         point.y = (gy - read.origin.1 as f64) / read.raster.height as f64 * 100.0;
                     }
-                    if let Some(mask) = stroke_mask(&stroke, read.raster.width, read.raster.height) {
+                    if let Some(mask) = stroke_mask(&stroke, read.raster.width, read.raster.height)
+                    {
                         plan.geometry = Geometry::Painted(mask);
                     }
                 } else if let Some(mut shape) = plan.drawn.take() {
@@ -960,8 +1163,12 @@ fn edit_with_bench(
             }
             window_page = read.raster;
             &window_page
-        } else { &anchor_page }
-    } else { &anchor_page };
+        } else {
+            &anchor_page
+        }
+    } else {
+        &anchor_page
+    };
 
     // **The paint branch, and it is here rather than beside the `solid` fill.**
     //
@@ -980,15 +1187,34 @@ fn edit_with_bench(
         let paint_context = (job.project.strip.mode == cleaner_core::project::StripMode::Longstrip)
             .then_some(StripPaintContext {
                 strip: &strip,
-                origin: (anchor.map_or(0, |p| p.x_offset) + patch_shift.0,
-                         anchor.map_or(0, |p| p.y_offset) + patch_shift.1),
+                order: &job.project.strip.order,
+                origin: (
+                    anchor.map_or(0, |p| p.x_offset) + patch_shift.0,
+                    anchor.map_or(0, |p| p.y_offset) + patch_shift.1,
+                ),
             });
-        let (mut made, dabs) = match paint_patch(&job, source_idx, page, paint, order, paint_context) {
-            Ok(pair) => pair,
-            Err(reason) => return Ok(Outcome::Refused(reason)),
-        };
+        let (mut made, dabs, read_window) =
+            match paint_patch(&job, source_idx, page, paint, order, paint_context) {
+                Ok(pair) => pair,
+                Err(reason) => return Ok(Outcome::Refused(reason)),
+            };
+        let strip_space = paint_context.map(|context| crate::underlay::StripSpace {
+            strip: context.strip,
+            origin: context.origin,
+        });
+        let input = crate::underlay::read_exact(
+            &job, source_idx, page, read_window, order, strip_space,
+        )?;
         translate_made(&mut made, patch_shift);
-        let snapshot = paint_snapshot(&plan, paint, made.engine, dabs, started.elapsed());
+        let mut snapshot = paint_snapshot(&plan, paint, made.engine, dabs, started.elapsed());
+        // Brush, clone and shape all composite a surface, including opaque
+        // strokes that preserve existing alpha. Their footprint is never unknown.
+        snapshot["input_provenance"] = serde_json::json!({
+            "version": 1, "input_sha256": input.digest,
+            "predecessors_sha256": input.predecessors,
+            "read_footprint": crate::underlay::page_rect(read_window,
+                Rect::new(patch_shift.0, patch_shift.1, 0, 0)),
+        });
         return commit(
             located,
             job,
@@ -999,6 +1225,7 @@ fn edit_with_bench(
             snapshot,
             source_sha256,
             order,
+            None,
         );
     }
 
@@ -1008,8 +1235,26 @@ fn edit_with_bench(
         // and nothing is squared off: that is the whole point of carrying it.
         Geometry::Painted(mask) => (mask, 1.0, true),
         Geometry::Stored => {
-            let Some(record) = existing.as_ref() else { return Ok(Outcome::NotFound) };
-            let mask = job.load_patch(record).map_err(|e| e.to_string())?.mask;
+            if let Some((_, prepared)) = prepared_text.as_ref() {
+                let mut mask = prepared.write_support.to_mask();
+                mask.bounds.x -= patch_shift.0;
+                mask.bounds.y -= patch_shift.1;
+                (mask, 1.0, true)
+            } else {
+                let Some(record) = existing.as_ref() else {
+                    return Ok(Outcome::NotFound);
+                };
+                let mask = job.load_patch(record).map_err(|e| e.to_string())?.mask;
+                (mask, 1.0, true)
+            }
+        }
+        Geometry::Prepared(_) => {
+            let Some((_, prepared)) = prepared_text.as_ref() else {
+                return Ok(Outcome::Refused("decline.reason.rungUnavailable"));
+            };
+            let mut mask = prepared.write_support.to_mask();
+            mask.bounds.x -= patch_shift.0;
+            mask.bounds.y -= patch_shift.1;
             (mask, 1.0, true)
         }
         Geometry::Detected(rect) => match bench.text_under(page, rect, &source_sha256) {
@@ -1021,12 +1266,77 @@ fn edit_with_bench(
         return Ok(Outcome::Refused("decline.reason.rungUnavailable"));
     }
 
+    let order = existing
+        .as_ref()
+        .map(|record| record.order)
+        .unwrap_or_else(|| next_order(&job, source_idx));
+    let strip_space = (job.project.strip.mode == cleaner_core::project::StripMode::Longstrip)
+        .then_some(crate::underlay::StripSpace {
+            strip: &strip,
+            origin: (
+                anchor.map_or(0, |p| p.x_offset) + patch_shift.0,
+                anchor.map_or(0, |p| p.y_offset) + patch_shift.1,
+            ),
+        });
+    let input = crate::underlay::read(
+        &job,
+        source_idx,
+        page,
+        seed.bounds,
+        order,
+        strip_space,
+    )?;
+    let raw_page = page;
+    let page = &input.image;
+    let seed = crate::underlay::local_mask(&seed, input.window);
+    let input_shift = (input.window.x, input.window.y);
+
+    if let Some((mask_plan, prepared)) = prepared_text.as_ref() {
+        if mask_plan.source_sha256 != source_sha256
+            || lower_composite_revision(&input) != prepared.identity.lower_composite_sha256
+            || prepared.identity.support_sha256
+                != cleaner_core::text_shape::support_sha256(&prepared.write_support)
+        {
+            return Ok(Outcome::Refused("decline.reason.rungUnavailable"));
+        }
+    }
+
     let noise = fit::page_noise_sigma(page);
     let edges = EdgeMap::sobel(page);
-    let fitted = fit::fit(page, &seed, scale, noise, &edges, manual);
+    let mut fitted = fit::fit(page, &seed, scale, noise, &edges, manual);
+    if let Some((_, prepared)) = prepared_text.as_ref() {
+        let mut hole = prepared.model_hole.to_mask();
+        hole.bounds.x -= patch_shift.0 + input_shift.0;
+        hole.bounds.y -= patch_shift.1 + input_shift.1;
+        fitted.ink = hole;
+    }
+    let applied = cleaner_core::engines::model::applied_mask(&fitted, page.width, page.height);
+    for tile in cleaner_core::engines::model::plan(applied.bounds) {
+        crate::underlay::require_footprint(&input, tile, raw_page)?;
+    }
+    crate::underlay::require_footprint(
+        &input,
+        cleaner_core::engines::render::crop_for(applied.bounds),
+        raw_page,
+    )?;
+
+    if let Choice::Exact(engine) = plan.choice {
+        let applicable = match engine {
+            Engine::Denoise => cleaner_core::engines::denoise::applies(page),
+            Engine::Lama => cleaner_core::engines::lama::applies(page),
+            _ => true,
+        };
+        if !applicable {
+            return Ok(Outcome::Refused("decline.reason.rungUnavailable"));
+        }
+    }
 
     let started = Instant::now();
-    let (mut made, verdict) = if plan.fill_mode == Some("solid") {
+    let (mut made, mut verdict) = if let Some(renderer) = test_renderer.as_mut() {
+        let made = renderer(page, &fitted);
+        let verdict = quality::assess(page, &made.mask, &made.pixels, noise);
+        (made, verdict)
+    } else if plan.fill_mode == Some("solid") {
         let pixels = cleaner_core::engines::fill::render_solid(page, &fitted);
         let made = run::Made {
             engine: Engine::Fill,
@@ -1069,10 +1379,43 @@ fn edit_with_bench(
         }
     };
 
-    translate_made(&mut made, patch_shift);
+    if let Some((_, prepared)) = prepared_text.as_ref() {
+        let mut base = prepared.corrected_base.to_mask();
+        base.bounds.x -= patch_shift.0 + input_shift.0;
+        base.bounds.y -= patch_shift.1 + input_shift.1;
+        let mut alpha = prepared.blend_alpha.clone();
+        if let Some(alpha) = alpha.as_mut() {
+            alpha.bounds.x -= patch_shift.0 + input_shift.0;
+            alpha.bounds.y -= patch_shift.1 + input_shift.1;
+        }
+        made = bound_text_shape_output(page, made, &seed, &base, alpha.as_ref())?;
+        verdict = quality::assess(page, &made.mask, &made.pixels, noise);
+    }
+    translate_made(
+        &mut made,
+        (patch_shift.0 + input_shift.0, patch_shift.1 + input_shift.1),
+    );
     let pad = made.pad;
-    let mut snapshot = run::params_snapshot(made.engine, &fitted, started.elapsed(), pad, made.tiles, &verdict);
+    let mut snapshot = run::params_snapshot(
+        made.engine,
+        &fitted,
+        started.elapsed(),
+        pad,
+        made.tiles,
+        &verdict,
+    );
     snapshot["source"] = serde_json::json!(plan.source);
+    snapshot["input_provenance"] = serde_json::json!({
+        "version": 1, "input_sha256": input.digest, "predecessors_sha256": input.predecessors,
+        "read_footprint": crate::underlay::page_rect(input.window,
+            Rect::new(patch_shift.0, patch_shift.1, 0, 0)),
+    });
+    if let Some((_, prepared)) = prepared_text.as_ref() {
+        snapshot["geometry_policy"] = serde_json::json!("text_shape");
+        snapshot["mask_plan_version"] = serde_json::json!(MASK_PLAN_VERSION);
+        snapshot["plan_identity_sha256"] = serde_json::json!(prepared.identity.identity_sha256);
+        snapshot["write_support_sha256"] = serde_json::json!(prepared.identity.support_sha256);
+    }
     if let Some(tool) = plan.tool.as_deref() {
         snapshot["tool"] = serde_json::json!(tool);
     }
@@ -1080,7 +1423,6 @@ fn edit_with_bench(
         snapshot["fill_mode"] = serde_json::json!(mode);
     }
 
-    let order = existing.as_ref().map(|record| record.order).unwrap_or_else(|| next_order(&job, source_idx));
     commit(
         located,
         job,
@@ -1091,7 +1433,409 @@ fn edit_with_bench(
         snapshot,
         source_sha256,
         order,
+        prepared_text
+            .as_ref()
+            .map(|(_, prepared)| prepared.identity.identity_sha256.as_str()),
     )
+}
+
+fn lower_composite_revision(input: &crate::underlay::Input) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"text_shape_lower_v1\0");
+    digest.update(input.digest.as_bytes());
+    digest.update(input.predecessors.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+/// A short-lived reference to the exact support artifact in the project
+/// sidecar. The reference is opaque to the UI; preview tiles and apply both
+/// reload the same versioned raster through the Job store.
+#[cfg(test)]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextShapePreview {
+    pub status: &'static str,
+    pub region_id: String,
+    pub plan_revision: u64,
+    pub identity_sha256: Option<String>,
+    pub support_sha256: Option<String>,
+    pub bounds: Option<Rect>,
+    pub preview_ref: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextShapeTile {
+    pub bounds: Rect,
+    /// Row-major 0/255 write permission, never a contour approximation.
+    pub bits: Vec<u8>,
+    pub support_sha256: String,
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn correction_preview(region_id: String, revision: u64, reason: String) -> TextShapePreview {
+    TextShapePreview {
+        status: "needs_mask_correction",
+        region_id,
+        plan_revision: revision,
+        identity_sha256: None,
+        support_sha256: None,
+        bounds: None,
+        preview_ref: None,
+        reason: Some(reason),
+    }
+}
+
+#[cfg(test)]
+fn prepared_input_for_page(
+    job: &Job,
+    located: &Located,
+    source_idx: usize,
+    anchor_page: &Raster,
+    support: Rect,
+    order: u32,
+) -> Result<(crate::underlay::Input, Rect), String> {
+    if job.project.strip.mode != cleaner_core::project::StripMode::Longstrip {
+        let input = crate::underlay::read(job, source_idx, anchor_page, support, order, None)?;
+        let context = input.window;
+        return Ok((input, context));
+    }
+    let strip = run::strip_of(&job.project);
+    let anchor = *strip
+        .pages()
+        .get(located.page_index)
+        .ok_or("strip anchor missing")?;
+    let global = Rect::new(
+        support.x + anchor.x_offset,
+        support.y + anchor.y_offset,
+        support.w,
+        support.h,
+    );
+    let decode_bounds = Rect::new(
+        global.x.saturating_sub(1024),
+        global.y.saturating_sub(1024),
+        global.w.saturating_add(2048),
+        global.h.saturating_add(2048),
+    );
+    let x = decode_bounds.x.max(0);
+    let y = decode_bounds.y.max(0);
+    let right = decode_bounds.right().min(strip.width() as i64);
+    let bottom = decode_bounds.bottom().min(strip.height() as i64);
+    let requested = Rect::new(x, y, (right - x).max(0) as u32, (bottom - y).max(0) as u32);
+    let mut joins = cleaner_core::strip::Joins::unchecked(strip.joins());
+    for join in 0..strip.joins() {
+        joins.set(join, cleaner_core::strip::JoinState::Verified);
+    }
+    let window = cleaner_core::strip::DecodeWindow {
+        rect: strip.clamp(requested, &joins),
+        requested,
+        pad: cleaner_core::strip::EdgePad::None,
+    };
+    if u64::from(window.rect.w) * u64::from(window.rect.h) > 4096 * 4096 {
+        return Err("strip preview context exceeds bounded read budget".into());
+    }
+    let read = cleaner_core::strip::read_window_borrowing(&strip, window, |position| {
+        if position == located.page_index {
+            return Ok(Cow::Borrowed(anchor_page));
+        }
+        let source = Library::resolve_page(&job.project, position)
+            .ok_or_else(|| format!("strip page {position} missing"))?;
+        let path = job.source_path(source).ok_or("strip source missing")?;
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        decode(&bytes).map(Cow::Owned).map_err(|e| e.to_string())
+    })?;
+    let local = Rect::new(
+        global.x - read.origin.0,
+        global.y - read.origin.1,
+        support.w,
+        support.h,
+    );
+    let input = crate::underlay::read(
+        job,
+        source_idx,
+        &read.raster,
+        local,
+        order,
+        Some(crate::underlay::StripSpace {
+            strip: &strip,
+            origin: read.origin,
+        }),
+    )?;
+    let context = Rect::new(
+        input.window.x + read.origin.0 - anchor.x_offset,
+        input.window.y + read.origin.1 - anchor.y_offset,
+        input.window.w,
+        input.window.h,
+    );
+    Ok((input, context))
+}
+
+/// Prepare synthetic or externally supplied lettering evidence at source
+/// resolution. M4 will feed this from an app segmenter; this command does not
+/// infer a mask from a detector rectangle. A page-sized JSON preview is never
+/// returned. The raster lives in the existing project sidecar.
+#[cfg(test)]
+#[allow(dead_code)]
+pub async fn prepare_text_shape(
+    app: tauri::AppHandle,
+    chapter_id: String,
+    page_index: u32,
+    region_id: Option<String>,
+    mut plan: MaskPlan,
+) -> Result<TextShapePreview, String> {
+    crate::library::blocking(move || {
+        let library = Library::for_app(&app)?;
+        let Some(located) = locate_page(&library, &chapter_id, page_index as usize)? else {
+            return Err("page not found".into());
+        };
+        let _lock = run::lock_job(&located.job_path);
+        let mut job = Job::open(&located.job_path).map_err(|e| e.to_string())?;
+        let source_idx = Library::resolve_page(&job.project, located.page_index)
+            .ok_or("page source not found")?;
+        let path = job
+            .source_path(source_idx)
+            .ok_or("page source path not found")?;
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        let raw = decode(&bytes).map_err(|e| e.to_string())?;
+        let source_sha = sha256_hex(&bytes);
+        if !plan.source_sha256.is_empty() && plan.source_sha256 != source_sha {
+            return Err("source revision changed before mask preparation".into());
+        }
+        let id = region_id.unwrap_or_else(|| {
+            let page_id = crate::library::page_id(&chapter_id, located.page_index);
+            mint_hand_id(&job, &page_id)
+        });
+        if page_index_in(&chapter_id, &id) != Some(located.page_index)
+            || (!plan.region_id.is_empty() && plan.region_id != id)
+        {
+            return Err("mask region identity does not belong to this page".into());
+        }
+        if let Some((old, _)) = job.load_text_shape_plan(&id).map_err(|e| e.to_string())? {
+            if plan.plan_revision <= old.plan_revision {
+                return Err("mask plan revision is stale".into());
+            }
+            if plan.base_revision == old.base_revision && plan.base_mask != old.base_mask {
+                return Err("base lettering mask changed without a base revision".into());
+            }
+            if plan.correction_revision == old.correction_revision
+                && (plan.additions != old.additions || plan.removals != old.removals)
+            {
+                return Err("mask corrections changed without a correction revision".into());
+            }
+        }
+        if job
+            .text_shape_correction(&id)
+            .is_some_and(|failed| plan.plan_revision <= failed.plan_revision)
+        {
+            return Err("mask plan revision is stale after correction review".into());
+        }
+        if plan.version != MASK_PLAN_VERSION {
+            return Err(format!(
+                "unsupported text-shaped plan version {}",
+                plan.version
+            ));
+        }
+        plan.region_id = id.clone();
+        plan.source_sha256 = source_sha;
+        plan.lower_composite_sha256 = "preparing".into();
+        plan.reading_context = provisional_text_shape_context(&plan);
+        let provisional = match plan.prepare(raw.width, raw.height) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let reason = error.to_string();
+                job.record_text_shape_correction(
+                    source_idx,
+                    &id,
+                    plan.plan_revision,
+                    plan.candidate_bounds,
+                    &reason,
+                )
+                .map_err(|error| error.to_string())?;
+                return Ok(correction_preview(id, plan.plan_revision, reason));
+            }
+        };
+        let order = job
+            .project
+            .patches
+            .iter()
+            .find(|record| record.id == id)
+            .map_or_else(|| next_order(&job, source_idx), |record| record.order);
+        let (input, context) = match prepared_input_for_page(
+            &job,
+            &located,
+            source_idx,
+            &raw,
+            provisional.write_support.bounds,
+            order,
+        ) {
+            Ok(pair) => pair,
+            Err(error) => {
+                job.record_text_shape_correction(
+                    source_idx,
+                    &id,
+                    plan.plan_revision,
+                    plan.candidate_bounds,
+                    &error,
+                )
+                .map_err(|failure| failure.to_string())?;
+                return Ok(correction_preview(id, plan.plan_revision, error));
+            }
+        };
+        plan.lower_composite_sha256 = lower_composite_revision(&input);
+        plan.reading_context = context;
+        let prepared = match plan.prepare(raw.width, raw.height) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let reason = error.to_string();
+                job.record_text_shape_correction(
+                    source_idx,
+                    &id,
+                    plan.plan_revision,
+                    plan.candidate_bounds,
+                    &reason,
+                )
+                .map_err(|error| error.to_string())?;
+                return Ok(correction_preview(id, plan.plan_revision, reason));
+            }
+        };
+        job.store_text_shape_plan(source_idx, &plan, &prepared)
+            .map_err(|e| e.to_string())?;
+        Ok(TextShapePreview {
+            status: "ready_for_preview",
+            region_id: id,
+            plan_revision: plan.plan_revision,
+            identity_sha256: Some(prepared.identity.identity_sha256.clone()),
+            support_sha256: Some(prepared.identity.support_sha256.clone()),
+            bounds: Some(prepared.write_support.bounds),
+            preview_ref: Some(format!(
+                "text-shape:{}:{}",
+                plan.plan_revision, prepared.identity.identity_sha256
+            )),
+            reason: None,
+        })
+    })
+    .await
+}
+
+#[cfg(test)]
+fn provisional_text_shape_context(plan: &MaskPlan) -> Rect {
+    if plan.base_mask.count() == 0 {
+        if plan.additions.count() > 0 {
+            plan.additions.bounds
+        } else {
+            plan.candidate_bounds
+        }
+    } else {
+        plan.base_mask.bounds
+    }
+}
+
+/// Return at most one 512x512 tile of the stored write-support raster. The
+/// caller must name the exact accepted identity, so an old preview cannot be
+/// displayed as though it belonged to a newer plan.
+#[cfg(test)]
+#[allow(dead_code)]
+pub async fn text_shape_preview_tile(
+    app: tauri::AppHandle,
+    region_id: String,
+    identity_sha256: String,
+    x: i64,
+    y: i64,
+    w: u32,
+    h: u32,
+) -> Result<TextShapeTile, String> {
+    crate::library::blocking(move || {
+        if w == 0 || h == 0 || w > 512 || h > 512 {
+            return Err("preview tile exceeds 512 pixels per axis".into());
+        }
+        let library = Library::for_app(&app)?;
+        let located = locate_region(&library, &region_id)?.ok_or("region not found")?;
+        let _lock = run::lock_job(&located.job_path);
+        let job = Job::open(&located.job_path).map_err(|e| e.to_string())?;
+        if job.text_shape_correction(&region_id).is_some() {
+            return Err("text-shaped preview needs mask correction".into());
+        }
+        let (_, prepared) = job
+            .load_text_shape_plan(&region_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("text-shaped plan not found")?;
+        if prepared.identity.identity_sha256 != identity_sha256 {
+            return Err("stale text-shaped preview".into());
+        }
+        let bounds = Rect::new(x, y, w, h);
+        let mut bits = vec![0; w as usize * h as usize];
+        for py in y..bounds.bottom() {
+            for px in x..bounds.right() {
+                if prepared.write_support.contains(px, py) {
+                    bits[(py - y) as usize * w as usize + (px - x) as usize] = 255;
+                }
+            }
+        }
+        Ok(TextShapeTile {
+            bounds,
+            bits,
+            support_sha256: prepared.identity.support_sha256,
+        })
+    })
+    .await
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub async fn apply_prepared_text_shape(
+    app: tauri::AppHandle,
+    region_id: String,
+    identity_sha256: String,
+    engine: String,
+) -> Result<ApplyResult, String> {
+    crate::library::blocking(move || {
+        let Some(engine) = named_rung(Some(&engine)) else {
+            return Ok(ApplyResult {
+                error_code: Some("unsupported_engine"),
+                ..ApplyResult::of("blocked")
+            });
+        };
+        // The existing cloud grant protocol has no prepared-support binding.
+        // Decline here rather than add an unreviewed authorization path.
+        if matches!(engine, Engine::Cloud | Engine::Paint | Engine::Clone) {
+            return Ok(ApplyResult {
+                error_code: Some("unsupported_engine"),
+                ..ApplyResult::of("blocked")
+            });
+        }
+        let library = Library::for_app(&app)?;
+        let Some(located) = locate_region(&library, &region_id)? else {
+            return Ok(ApplyResult::of("not-found"));
+        };
+        let plan = Plan {
+            region_id,
+            expected_source: None,
+            geometry: Geometry::Prepared(identity_sha256),
+            choice: Choice::Exact(engine),
+            source: "auto",
+            tool: None,
+            fill_mode: None,
+            clears_untouched: false,
+            paint: None,
+            requested: None,
+            stroke: None,
+            drawn: None,
+        };
+        match edit(&app, &located, plan)? {
+            Outcome::Cleaned(edited) => Ok(ApplyResult::applied(edited)),
+            Outcome::Refused(_) => Ok(ApplyResult {
+                error_code: Some("stale_or_unsafe_plan"),
+                ..ApplyResult::of("blocked")
+            }),
+            Outcome::NotFound => Ok(ApplyResult::of("not-found")),
+        }
+    })
+    .await
 }
 
 /// Include a clone stroke's sampling area in its bounded strip read. Clone
@@ -1101,7 +1845,11 @@ fn manual_requested(
     paint: Option<&PaintPlan>,
     anchor: Option<cleaner_core::strip::Placement>,
 ) -> Rect {
-    let Some(PaintPlan { kind: PaintKind::Clone { offset, .. }, .. }) = paint else {
+    let Some(PaintPlan {
+        kind: PaintKind::Clone { offset, .. },
+        ..
+    }) = paint
+    else {
         return target;
     };
     let Some(anchor) = anchor else { return target };
@@ -1119,11 +1867,370 @@ fn manual_requested(
 }
 
 fn translate_made(made: &mut run::Made, by: (i64, i64)) {
-    if by == (0, 0) { return; }
+    if by == (0, 0) {
+        return;
+    }
     made.mask.bounds.x += by.0;
     made.mask.bounds.y += by.1;
     made.ink.bounds.x += by.0;
     made.ink.bounds.y += by.1;
+}
+
+/// The last write boundary for a prepared text-shaped edit. Engines can read
+/// larger crops, grow an internal hole, or generate a larger raster, but this
+/// copies only the accepted W into a patch whose mask is exactly W. The source
+/// copy is the ordered lower composite captured above, so shrinking W reveals
+/// the right lower pixels when this region replaces its earlier patch.
+fn bound_text_shape_output(
+    below: &Raster,
+    mut made: run::Made,
+    support: &Mask,
+    corrected_base: &Mask,
+    blend_alpha: Option<&MaskRaster>,
+) -> Result<run::Made, String> {
+    let bounds = support.bounds;
+    if bounds.w == 0
+        || bounds.h == 0
+        || support.is_empty()
+        || bounds.x < 0
+        || bounds.y < 0
+        || bounds.right() > below.width as i64
+        || bounds.bottom() > below.height as i64
+    {
+        return Err("prepared write support is empty or outside the input".into());
+    }
+    if made.pixels.mode != below.mode
+        || made.pixels.depth != below.depth
+        || made.pixels.width != made.mask.bounds.w
+        || made.pixels.height != made.mask.bounds.h
+    {
+        return Err("engine output does not match the prepared source format".into());
+    }
+    let mut pixels = cleaner_core::engines::model::page_crop(below, bounds);
+    let alpha_channel = below.mode.alpha_channel();
+    for y in bounds.y..bounds.bottom() {
+        for x in bounds.x..bounds.right() {
+            if !support.contains(x, y) {
+                continue;
+            }
+            if !made.mask.contains(x, y) {
+                return Err("engine output does not cover approved write support".into());
+            }
+            let alpha = blend_alpha.map_or(255u32, |a| {
+                if a.bounds.contains(x, y) {
+                    a.bits[((y - a.bounds.y) as usize) * a.bounds.w as usize
+                        + (x - a.bounds.x) as usize] as u32
+                } else {
+                    0
+                }
+            });
+            let (sx, sy) = ((x - bounds.x) as u32, (y - bounds.y) as u32);
+            let (gx, gy) = (
+                (x - made.mask.bounds.x) as u32,
+                (y - made.mask.bounds.y) as u32,
+            );
+            for channel in 0..below.mode.samples() {
+                if alpha_channel == Some(channel) {
+                    continue;
+                }
+                let source = pixels.sample(sx, sy, channel) as u32;
+                let generated = made.pixels.sample(gx, gy, channel) as u32;
+                let value = (source * (255 - alpha) + generated * alpha + 127) / 255;
+                pixels.set_sample(sx, sy, channel, value as u16);
+            }
+        }
+    }
+    made.mask = support.clone();
+    made.ink = corrected_base.clone();
+    made.pixels = pixels;
+    Ok(made)
+}
+
+#[cfg(test)]
+mod text_shape_boundary_tests {
+    use super::*;
+    use cleaner_core::image::fixtures;
+
+    #[test]
+    fn every_enabled_local_engine_is_clamped_to_exact_support_on_fake_output() {
+        for fixture in ["l8", "rgba8", "l16"] {
+            let below = fixtures::by_name(fixture).raster;
+            let mut support = Mask::empty(Rect::new(10, 10, 20, 20));
+            support.set(12, 12, true);
+            support.set(27, 25, true);
+            support.set(22, 14, true);
+            let generated_bounds = support.bounds.grown(6, below.width, below.height);
+            let generated_mask = Mask::filled(generated_bounds);
+            let mut generated = cleaner_core::engines::model::page_crop(&below, generated_bounds);
+            let max = if below.depth == cleaner_core::image::BitDepth::Sixteen {
+                65535
+            } else {
+                255
+            };
+            for y in 0..generated.height {
+                for x in 0..generated.width {
+                    for channel in 0..below.mode.samples() {
+                        generated.set_sample(x, y, channel, max);
+                    }
+                }
+            }
+            for engine in [Engine::Fill, Engine::Denoise, Engine::Lama, Engine::Flux] {
+                let made = run::Made {
+                    engine,
+                    mask: generated_mask.clone(),
+                    ink: generated_mask.clone(),
+                    pixels: generated.clone(),
+                    provider: None,
+                    model_sha256: None,
+                    pad: cleaner_core::strip::EdgePad::None,
+                    tiles: None,
+                };
+                let bounded =
+                    bound_text_shape_output(&below, made, &support, &support, None).unwrap();
+                assert_eq!(
+                    bounded.mask, support,
+                    "{fixture} {engine:?} changed support"
+                );
+                for y in support.bounds.y..support.bounds.bottom() {
+                    for x in support.bounds.x..support.bounds.right() {
+                        if support.contains(x, y) {
+                            continue;
+                        }
+                        for channel in 0..below.mode.samples() {
+                            assert_eq!(
+                                bounded.pixels.sample(
+                                    (x - support.bounds.x) as u32,
+                                    (y - support.bounds.y) as u32,
+                                    channel
+                                ),
+                                below.sample(x as u32, y as u32, channel),
+                                "{fixture} {engine:?} leaked at {x},{y}"
+                            );
+                        }
+                    }
+                }
+                if let Some(alpha) = below.mode.alpha_channel() {
+                    for y in support.bounds.y..support.bounds.bottom() {
+                        for x in support.bounds.x..support.bounds.right() {
+                            assert_eq!(
+                                bounded.pixels.sample(
+                                    (x - support.bounds.x) as u32,
+                                    (y - support.bounds.y) as u32,
+                                    alpha
+                                ),
+                                below.sample(x as u32, y as u32, alpha)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_output_rejects_a_renderer_that_does_not_cover_w() {
+        let below = fixtures::by_name("l8").raster;
+        let support = Mask::filled(Rect::new(10, 10, 3, 3));
+        let too_small = Mask::filled(Rect::new(10, 10, 1, 1));
+        let made = run::Made {
+            engine: Engine::Lama,
+            mask: too_small.clone(),
+            ink: too_small.clone(),
+            pixels: cleaner_core::engines::model::page_crop(&below, too_small.bounds),
+            provider: None,
+            model_sha256: None,
+            pad: cleaner_core::strip::EdgePad::None,
+            tiles: None,
+        };
+        assert!(bound_text_shape_output(&below, made, &support, &support, None).is_err());
+    }
+
+    #[test]
+    fn a_new_preview_revision_rejects_the_old_identity_without_a_patch_write() {
+        use cleaner_core::image::{encode, Format};
+        use cleaner_core::ingest::source_ref;
+        use cleaner_core::project::{Project, StripMode};
+        use cleaner_core::text_shape::{MaskQualityState, MASK_PLAN_VERSION};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "mc-text-shape-stale-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(root.join("raws")).unwrap();
+        let raw = fixtures::by_name("l8").raster;
+        let bytes = encode(&raw, Format::Png).unwrap();
+        let source_path = root.join("raws/page.png");
+        std::fs::write(&source_path, &bytes).unwrap();
+        let source = source_ref(&source_path, &bytes).unwrap();
+        let manifest = root.join("job/chapter.mtclean");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        let mut job = Job::create(
+            &manifest,
+            Project::new(
+                manifest.parent().unwrap(),
+                "test",
+                StripMode::Single,
+                &[source],
+            ),
+        )
+        .unwrap();
+        let region_id = "chapter-p001-h1".to_string();
+        let mut base = Mask::empty(Rect::new(18, 18, 5, 5));
+        base.set(20, 20, true);
+        let empty = MaskRaster::from(Mask::empty(Rect::new(0, 0, 0, 0)));
+        let mut plan = MaskPlan {
+            version: MASK_PLAN_VERSION,
+            region_id: region_id.clone(),
+            source_sha256: sha256_hex(&bytes),
+            lower_composite_sha256: "pending".into(),
+            algorithm_id: "synthetic-test".into(),
+            model_id: None,
+            candidate_bounds: Rect::new(15, 15, 10, 10),
+            refinement_crop: Rect::new(10, 10, 20, 20),
+            base_revision: 1,
+            correction_revision: 0,
+            plan_revision: 1,
+            base_mask: MaskRaster::from(base),
+            additions: empty.clone(),
+            removals: empty,
+            padding_px: 2,
+            model_hole_margin_px: 5,
+            reading_context: Rect::new(18, 18, 5, 5),
+            blend_alpha: None,
+            quality: MaskQualityState::Ready,
+        };
+        let provisional = plan.prepare(raw.width, raw.height).unwrap();
+        let input = crate::underlay::read(&job, 0, &raw, provisional.write_support.bounds, 0, None)
+            .unwrap();
+        plan.lower_composite_sha256 = lower_composite_revision(&input);
+        plan.reading_context = input.window;
+        let accepted = plan.prepare(raw.width, raw.height).unwrap();
+        job.store_text_shape_plan(0, &plan, &accepted).unwrap();
+        let old_identity = accepted.identity.identity_sha256.clone();
+        plan.plan_revision = 2;
+        plan.padding_px = 5;
+        let newer = plan.prepare(raw.width, raw.height).unwrap();
+        job.store_text_shape_plan(0, &plan, &newer).unwrap();
+        drop(job);
+        let located = Located {
+            chapter_id: "chapter".into(),
+            job_path: manifest.clone(),
+            page_index: 0,
+        };
+        let models = root.join("no-models");
+        let mut bench = Bench {
+            app_data: None,
+            sidecar_override: None,
+            flux_model: None,
+            flux_backend: None,
+            detector: run::detector_on_demand(&models, Preference::CpuOnly),
+            rung2: run::Rung2::new(&models, Preference::CpuOnly),
+            flux: None,
+            flux_key: None,
+            detected_seed: None,
+        };
+        let edit_plan = Plan {
+            region_id: region_id.clone(),
+            expected_source: None,
+            geometry: Geometry::Prepared(old_identity),
+            choice: Choice::Exact(Engine::Fill),
+            source: "auto",
+            tool: None,
+            fill_mode: None,
+            clears_untouched: false,
+            paint: None,
+            requested: None,
+            stroke: None,
+            drawn: None,
+        };
+        let mut fake = |image: &Raster, fitted: &Fitted| run::Made {
+            engine: Engine::Fill,
+            mask: fitted.mask.clone(),
+            ink: fitted.ink.clone(),
+            pixels: cleaner_core::engines::fill::render(image, fitted),
+            provider: None,
+            model_sha256: None,
+            pad: cleaner_core::strip::EdgePad::None,
+            tiles: None,
+        };
+        assert!(matches!(
+            edit_with_bench_render(
+                &mut bench,
+                Engine::Fill,
+                &located,
+                edit_plan,
+                Some(&mut fake)
+            )
+            .unwrap(),
+            Outcome::Refused(_)
+        ));
+        assert!(Job::open(&manifest).unwrap().project.patches.is_empty());
+        // The latest preview also becomes stale when a newly visible lower
+        // patch changes its bounded read input before apply.
+        let mut job = Job::open(&manifest).unwrap();
+        let a_mask = Mask::filled(Rect::new(21, 20, 1, 1));
+        let mut a_pixels = cleaner_core::engines::model::page_crop(&raw, a_mask.bounds);
+        a_pixels.set_sample(0, 0, 0, if raw.sample(21, 20, 0) == 0 { 255 } else { 0 });
+        job.complete_region(
+            0,
+            &Patch {
+                id: "chapter-p001-h0".into(),
+                mask: a_mask.clone(),
+                ink: a_mask,
+                pixels: a_pixels,
+                order: 0,
+                visible: true,
+                provenance: Provenance {
+                    engine: Engine::Fill,
+                    engine_version: "fake".into(),
+                    model_sha256: None,
+                    execution_provider: "cpu".into(),
+                    params_snapshot: serde_json::json!({}),
+                    mask_sha256: "fake".into(),
+                    source_sha256: sha256_hex(&bytes),
+                    cloud: None,
+                    created: 0,
+                },
+            },
+            None,
+        )
+        .unwrap();
+        drop(job);
+        let latest_plan = Plan {
+            region_id: region_id.clone(),
+            expected_source: None,
+            geometry: Geometry::Prepared(newer.identity.identity_sha256),
+            choice: Choice::Exact(Engine::Fill),
+            source: "auto",
+            tool: None,
+            fill_mode: None,
+            clears_untouched: false,
+            paint: None,
+            requested: None,
+            stroke: None,
+            drawn: None,
+        };
+        assert!(matches!(
+            edit_with_bench_render(
+                &mut bench,
+                Engine::Fill,
+                &located,
+                latest_plan,
+                Some(&mut fake)
+            )
+            .unwrap(),
+            Outcome::Refused(_)
+        ));
+        assert!(!Job::open(&manifest)
+            .unwrap()
+            .project
+            .patches
+            .iter()
+            .any(|r| r.id == region_id));
+        std::fs::remove_dir_all(root).ok();
+    }
 }
 
 /// Write the patch and answer with the region - the half of an edit that is the
@@ -1145,6 +2252,7 @@ fn commit(
     snapshot: serde_json::Value,
     source_sha256: String,
     order: u32,
+    text_shape_identity: Option<&str>,
 ) -> Result<Outcome, String> {
     let mask_sha256 = run::mask_digest(&made.mask);
     let patch = Patch {
@@ -1153,8 +2261,7 @@ fn commit(
         ink: made.ink,
         pixels: made.pixels,
         order,
-        // A re-run of a deleted mask brings it back: the edit the user just
-        // asked for is one they expect to see.
+        // Stored-mask reruns of deleted layers are refused before rendering.
         visible: true,
         provenance: Provenance {
             engine: made.engine,
@@ -1174,7 +2281,12 @@ fn commit(
     if clears_untouched {
         clear_untouched(&mut job, source_idx, region_id);
     }
-    job.complete_region(source_idx, &patch, None).map_err(|e| e.to_string())?;
+    match text_shape_identity {
+        Some(identity) => job.complete_text_shape_region(source_idx, &patch, identity, None),
+        None => job.complete_region(source_idx, &patch, None),
+    }
+    .map_err(|e| e.to_string())?;
+    crate::underlay::refresh_dependencies(&mut job, region_id)?;
 
     Ok(
         match crate::library::region_and_status(
@@ -1183,9 +2295,10 @@ fn commit(
             source_idx,
             region_id,
         ) {
-            Some((region, page_status)) => {
-                Outcome::Cleaned(Edited { region, page_status })
-            }
+            Some((region, page_status)) => Outcome::Cleaned(Edited {
+                region,
+                page_status,
+            }),
             None => Outcome::NotFound,
         },
     )
@@ -1208,7 +2321,7 @@ fn paint_patch(
     paint: &PaintPlan,
     order: u32,
     strip_context: Option<StripPaintContext<'_>>,
-) -> Result<(run::Made, usize), &'static str> {
+) -> Result<(run::Made, usize, Rect), &'static str> {
     use cleaner_core::paint::{self, CloneMode, HealMode, PaintError, StrokePoint};
 
     if !paint::supports(page) {
@@ -1219,7 +2332,16 @@ fn paint_patch(
     // no spacing to walk. What it has is a mask and a colour, which is the
     // whole of the work.
     if let PaintKind::Shape { color, shape } = &paint.kind {
-        return shape_patch(job, source_idx, page, shape, *color, &paint.spec, order, strip_context);
+        return shape_patch(
+            job,
+            source_idx,
+            page,
+            shape,
+            *color,
+            &paint.spec,
+            order,
+            strip_context,
+        );
     }
 
     let (width, height) = (page.width as f64, page.height as f64);
@@ -1241,8 +2363,16 @@ fn paint_patch(
         PaintKind::Clone { offset, .. } => (offset.0 / 100.0 * width, offset.1 / 100.0 * height),
     };
 
-    let under = patches_under(job, source_idx, order, &points, paint.spec.size, offset, strip_context)
-        .map_err(|_| "decline.reason.rungUnavailable")?;
+    let under = patches_under(
+        job,
+        source_idx,
+        order,
+        &points,
+        paint.spec.size,
+        offset,
+        strip_context,
+    )
+    .map_err(|_| "decline.reason.rungUnavailable")?;
 
     let painted = match paint.kind {
         PaintKind::Brush { color } | PaintKind::Shape { color, .. } => {
@@ -1255,7 +2385,11 @@ fn paint_patch(
             &points,
             &paint.spec,
             offset,
-            if heal { CloneMode::Heal(HealMode::Soft) } else { CloneMode::Clone },
+            if heal {
+                CloneMode::Heal(HealMode::Soft)
+            } else {
+                CloneMode::Clone
+            },
         ),
     };
 
@@ -1292,6 +2426,7 @@ fn paint_patch(
             tiles: None,
         },
         painted.dabs,
+        painted.read_window,
     ))
 }
 
@@ -1324,10 +2459,11 @@ fn shape_patch(
     spec: &cleaner_core::paint::BrushSpec,
     order: u32,
     strip_context: Option<StripPaintContext<'_>>,
-) -> Result<(run::Made, usize), &'static str> {
+) -> Result<(run::Made, usize, Rect), &'static str> {
     // An empty mask is "there is no patch to make here", which is the sentence
     // `rungUnavailable` already carries for an empty seed.
-    let mask = shape_mask(shape, page.width, page.height).ok_or("decline.reason.rungUnavailable")?;
+    let mask =
+        shape_mask(shape, page.width, page.height).ok_or("decline.reason.rungUnavailable")?;
     let bounds = mask.bounds;
 
     let under = patches_over(job, source_idx, order, bounds, strip_context)
@@ -1377,6 +2513,7 @@ fn shape_patch(
         // No dabs: nothing was walked. The provenance says how many vertices
         // there were instead ([`paint_snapshot`]).
         0,
+        bounds,
     ))
 }
 
@@ -1395,9 +2532,18 @@ fn solid_levels(mode: cleaner_core::image::ColorMode, color: [u8; 3]) -> Vec<Opt
     match mode {
         ColorMode::Gray => vec![Some(grey)],
         ColorMode::GrayAlpha => vec![Some(grey), None],
-        ColorMode::Rgb => vec![Some(color[0] as u16), Some(color[1] as u16), Some(color[2] as u16)],
+        ColorMode::Rgb => vec![
+            Some(color[0] as u16),
+            Some(color[1] as u16),
+            Some(color[2] as u16),
+        ],
         ColorMode::Rgba => {
-            vec![Some(color[0] as u16), Some(color[1] as u16), Some(color[2] as u16), None]
+            vec![
+                Some(color[0] as u16),
+                Some(color[1] as u16),
+                Some(color[2] as u16),
+                None,
+            ]
         }
         // Unreachable: `paint::supports` refused these several lines up. A
         // colour is still better than a panic, and every sample gets one.
@@ -1415,6 +2561,7 @@ fn solid_levels(mode: cleaner_core::image::ColorMode, color: [u8; 3]) -> Vec<Opt
 #[derive(Clone, Copy)]
 struct StripPaintContext<'a> {
     strip: &'a cleaner_core::strip::Strip,
+    order: &'a [usize],
     /// Origin of the bounded raster in strip coordinates.
     origin: (i64, i64),
 }
@@ -1425,9 +2572,17 @@ fn patch_in_paint_space(
     context: Option<StripPaintContext<'_>>,
 ) -> Result<Option<Patch>, String> {
     let mut patch = job.load_patch(record).map_err(|e| e.to_string())?;
-    let Some(context) = context else { return Ok(Some(patch)) };
-    let Some(placed) = context.strip.pages().iter().find(|p| p.source_idx == record.source_idx)
-    else { return Ok(None) };
+    let Some(context) = context else {
+        return Ok(Some(patch));
+    };
+    let Some(placed) = context
+        .order
+        .iter()
+        .position(|&source| source == record.source_idx)
+        .and_then(|position| context.strip.pages().get(position))
+    else {
+        return Ok(None);
+    };
     let dx = placed.x_offset - context.origin.0;
     let dy = placed.y_offset - context.origin.1;
     patch.mask.bounds.x += dx;
@@ -1441,8 +2596,14 @@ fn record_box_in_paint_space(
     record: &PatchRecord,
     context: Option<StripPaintContext<'_>>,
 ) -> Option<Rect> {
-    let Some(context) = context else { return Some(record.bbox) };
-    let placed = context.strip.pages().iter().find(|p| p.source_idx == record.source_idx)?;
+    let Some(context) = context else {
+        return Some(record.bbox);
+    };
+    let placed = context
+        .order
+        .iter()
+        .position(|&source| source == record.source_idx)
+        .and_then(|position| context.strip.pages().get(position))?;
     Some(Rect::new(
         record.bbox.x + placed.x_offset - context.origin.0,
         record.bbox.y + placed.y_offset - context.origin.1,
@@ -1466,11 +2627,15 @@ fn patches_over(
         {
             continue;
         }
-        let Some(record_box) = record_box_in_paint_space(record, strip_context) else { continue };
+        let Some(record_box) = record_box_in_paint_space(record, strip_context) else {
+            continue;
+        };
         if !overlaps(record_box, box_of) {
             continue;
         }
-        if let Some(patch) = patch_in_paint_space(job, record, strip_context)? { patches.push(patch); }
+        if let Some(patch) = patch_in_paint_space(job, record, strip_context)? {
+            patches.push(patch);
+        }
     }
     Ok(patches)
 }
@@ -1508,8 +2673,12 @@ fn patches_under(
     let box_of = Rect::new(
         x0.min(x0 - offset.0).floor() as i64,
         y0.min(y0 - offset.1).floor() as i64,
-        (x1.max(x1 - offset.0) - x0.min(x0 - offset.0)).ceil().max(1.0) as u32,
-        (y1.max(y1 - offset.1) - y0.min(y0 - offset.1)).ceil().max(1.0) as u32,
+        (x1.max(x1 - offset.0) - x0.min(x0 - offset.0))
+            .ceil()
+            .max(1.0) as u32,
+        (y1.max(y1 - offset.1) - y0.min(y0 - offset.1))
+            .ceil()
+            .max(1.0) as u32,
     );
 
     let mut patches = Vec::new();
@@ -1520,11 +2689,15 @@ fn patches_under(
         {
             continue;
         }
-        let Some(record_box) = record_box_in_paint_space(record, strip_context) else { continue };
+        let Some(record_box) = record_box_in_paint_space(record, strip_context) else {
+            continue;
+        };
         if !overlaps(record_box, box_of) {
             continue;
         }
-        if let Some(patch) = patch_in_paint_space(job, record, strip_context)? { patches.push(patch); }
+        if let Some(patch) = patch_in_paint_space(job, record, strip_context)? {
+            patches.push(patch);
+        }
     }
     Ok(patches)
 }
@@ -1641,7 +2814,9 @@ fn next_order(job: &Job, _source_idx: usize) -> u32 {
 fn clear_untouched(job: &mut Job, source_idx: usize, region_id: &str) {
     let (mut gate_dropped, mut declined) = (0u32, 0u32);
     job.project.regions_untouched.retain(|record| {
-        if record.source_idx != source_idx || untouched_id(job_page_id(region_id), record.bbox) != region_id {
+        if record.source_idx != source_idx
+            || untouched_id(job_page_id(region_id), record.bbox) != region_id
+        {
             return true;
         }
         if record.reason.contains("gateSkipped") {
@@ -1684,12 +2859,20 @@ fn pixels_of(bbox: Bbox, width: u32, height: u32) -> Rect {
     let y = bbox.y / 100.0 * height as f64;
     let w = bbox.w / 100.0 * width as f64;
     let h = bbox.h / 100.0 * height as f64;
-    Rect::new(x.round() as i64, y.round() as i64, w.round().max(1.0) as u32, h.round().max(1.0) as u32)
+    Rect::new(
+        x.round() as i64,
+        y.round() as i64,
+        w.round().max(1.0) as u32,
+        h.round().max(1.0) as u32,
+    )
 }
 
 /// The page's size, without opening its pixels.
 fn page_size(job: &Job, source_idx: usize) -> Option<(u32, u32)> {
-    job.project.sources.get(source_idx).map(|source| (source.w, source.h))
+    job.project
+        .sources
+        .get(source_idx)
+        .map(|source| (source.w, source.h))
 }
 
 /// The stroke a round brush painted, as the seam carries it.
@@ -1728,7 +2911,12 @@ fn stroke_mask(stroke: &PaintedStroke, width: u32, height: u32) -> Option<Mask> 
     let points: Vec<(f64, f64)> = stroke
         .points
         .iter()
-        .map(|point| (point.x / 100.0 * width as f64, point.y / 100.0 * height as f64))
+        .map(|point| {
+            (
+                point.x / 100.0 * width as f64,
+                point.y / 100.0 * height as f64,
+            )
+        })
         .collect();
     let mask = Mask::from_stroke(&points, stroke.radius, width, height);
     (!mask.is_empty()).then_some(mask)
@@ -1802,7 +2990,12 @@ fn shape_mask(shape: &PaintedShape, width: u32, height: u32) -> Option<Mask> {
     let points: Vec<(f64, f64)> = shape
         .points
         .iter()
-        .map(|point| (point.x / 100.0 * width as f64, point.y / 100.0 * height as f64))
+        .map(|point| {
+            (
+                point.x / 100.0 * width as f64,
+                point.y / 100.0 * height as f64,
+            )
+        })
         .collect();
     if points.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
         return None;
@@ -1830,7 +3023,10 @@ fn shape_mask(shape: &PaintedShape, width: u32, height: u32) -> Option<Mask> {
     // The ellipse inscribed in the outline's own box, which is what the tool
     // drew: two dragged corners, and the ellipse that touches all four sides.
     let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
-    let (rx, ry) = (((x1 - x0) / 2.0).max(0.5) + feather, ((y1 - y0) / 2.0).max(0.5) + feather);
+    let (rx, ry) = (
+        ((x1 - x0) / 2.0).max(0.5) + feather,
+        ((y1 - y0) / 2.0).max(0.5) + feather,
+    );
 
     let mut mask = Mask::empty(bounds);
     for y in bounds.y..bounds.bottom() {
@@ -1880,7 +3076,11 @@ fn distance_to_outline(points: &[(f64, f64)], px: f64, py: f64) -> f64 {
         let len2 = ex * ex + ey * ey;
         // A degenerate edge is its own endpoint, which the neighbouring edges
         // already cover; measuring to the point is still the right answer.
-        let t = if len2 > 0.0 { (((px - ax) * ex + (py - ay) * ey) / len2).clamp(0.0, 1.0) } else { 0.0 };
+        let t = if len2 > 0.0 {
+            (((px - ax) * ex + (py - ay) * ey) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let (dx, dy) = (px - (ax + ex * t), py - (ay + ey * t));
         best = best.min(dx * dx + dy * dy);
         j = i;
@@ -1978,18 +3178,26 @@ impl PartialEq for PaintPoint {
 }
 
 fn number(params: &serde_json::Value, key: &str) -> Option<f64> {
-    params.get(key).and_then(serde_json::Value::as_f64).filter(|v| v.is_finite())
+    params
+        .get(key)
+        .and_then(serde_json::Value::as_f64)
+        .filter(|v| v.is_finite())
 }
 
 fn flag(params: &serde_json::Value, key: &str, fallback: bool) -> bool {
-    params.get(key).and_then(serde_json::Value::as_bool).unwrap_or(fallback)
+    params
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(fallback)
 }
 
 /// `#rrggbb` - and `#rgb`, because an `<input type="color">` is not the only
 /// thing that can fill this field. Anything else is black, which is the ink a
 /// manga cleaner reaches for and is a better answer than refusing the stroke.
 fn colour_of(text: Option<&str>) -> [u8; 3] {
-    let Some(hex) = text.map(|t| t.trim().trim_start_matches('#')) else { return [0, 0, 0] };
+    let Some(hex) = text.map(|t| t.trim().trim_start_matches('#')) else {
+        return [0, 0, 0];
+    };
     let pair = |at: usize, len: usize| -> Option<u8> {
         let slice = hex.get(at..at + len)?;
         let value = u8::from_str_radix(slice, 16).ok()?;
@@ -2023,7 +3231,15 @@ fn paint_points(params: &serde_json::Value, paint: Option<&serde_json::Value>) -
         .get("stroke")
         .and_then(|value| serde_json::from_value::<PaintedStroke>(value.clone()).ok())
         .map(|stroke| {
-            stroke.points.iter().map(|p| PaintPoint { x: p.x, y: p.y, p: half() }).collect()
+            stroke
+                .points
+                .iter()
+                .map(|p| PaintPoint {
+                    x: p.x,
+                    y: p.y,
+                    p: half(),
+                })
+                .collect()
         })
         .unwrap_or_default()
 }
@@ -2053,7 +3269,10 @@ fn paint_plan(tool: &str, params: &serde_json::Value) -> Option<PaintPlan> {
         // worth keeping.
         "cloneHeal" => {
             let offset = clone_offset(params)?;
-            PaintKind::Clone { heal: mode != Some("clone"), offset }
+            PaintKind::Clone {
+                heal: mode != Some("clone"),
+                offset,
+            }
         }
         // A shape filled with a colour. `solid` is Shapes' own word for it and
         // is deliberately not `fill`, which on that same row names rung 0 -
@@ -2090,7 +3309,11 @@ fn paint_plan(tool: &str, params: &serde_json::Value) -> Option<PaintPlan> {
     // fallback: the two spellings both appear on the wire, because `size`,
     // `hardness`, `opacity` and `flow` are ordinary tool params as well as
     // brush ones.
-    let from = |key: &str| paint.and_then(|p| number(p, key)).or_else(|| number(params, key));
+    let from = |key: &str| {
+        paint
+            .and_then(|p| number(p, key))
+            .or_else(|| number(params, key))
+    };
     let switch = |key: &str, fallback: bool| match paint {
         Some(block) if block.get(key).is_some() => flag(block, key, fallback),
         _ => flag(params, key, fallback),
@@ -2109,7 +3332,9 @@ fn paint_plan(tool: &str, params: &serde_json::Value) -> Option<PaintPlan> {
             })
             .unwrap_or(default.size)
             .clamp(1.0, 4096.0),
-        hardness: from("hardness").unwrap_or(default.hardness).clamp(0.0, 100.0),
+        hardness: from("hardness")
+            .unwrap_or(default.hardness)
+            .clamp(0.0, 100.0),
         flow: from("flow").unwrap_or(100.0).clamp(0.0, 100.0),
         opacity: from("opacity").unwrap_or(100.0).clamp(0.0, 100.0),
         spacing: from("spacing").unwrap_or(default.spacing),
@@ -2222,8 +3447,7 @@ fn engine_for_fill_mode(mode: &str) -> Engine {
 /// The cloud is not among them and neither is anything above rung 3a: this is
 /// the list `stronger` and `simpler` step along, and every rung in it is one
 /// this build can actually run.
-const MANUAL_RUNGS: [Engine; 4] =
-    [Engine::Fill, Engine::Denoise, Engine::Lama, Engine::Flux];
+const MANUAL_RUNGS: [Engine; 4] = [Engine::Fill, Engine::Denoise, Engine::Lama, Engine::Flux];
 
 fn step(current: Engine, up: bool) -> Engine {
     let at = MANUAL_RUNGS.iter().position(|engine| *engine == current);
@@ -2270,7 +3494,12 @@ fn named_rung(engine: Option<&str>) -> Option<Engine> {
 /// on this machine is a swap the user never chose. A cloud patch re-run with a
 /// local engine named (`named`, even FLUX, the engine it recorded), or stepped
 /// or cycled to another one, is that choice, and runs here.
-fn rerun_needs_cloud(target: Engine, current: Engine, is_cloud_provenance: bool, named: bool) -> bool {
+fn rerun_needs_cloud(
+    target: Engine,
+    current: Engine,
+    is_cloud_provenance: bool,
+    named: bool,
+) -> bool {
     target == Engine::Cloud || (is_cloud_provenance && target == current && !named)
 }
 
@@ -2295,9 +3524,9 @@ fn refuse(reason: &'static str) {
 fn explicit_remote_or_invalid_target(params: &serde_json::Value) -> bool {
     params.get("engine").and_then(|v| v.as_str()) == Some("cloud")
         || ["executionTarget", "target"].iter().any(|key| {
-            params.get(*key).is_some_and(|value| {
-                value != &serde_json::json!({"type":"local"})
-            })
+            params
+                .get(*key)
+                .is_some_and(|value| value != &serde_json::json!({"type":"local"}))
         })
 }
 
@@ -2406,6 +3635,10 @@ fn render_in_cloud(
 }
 
 /// `applyTool`.
+fn is_approved_component_region(region_id: &str) -> bool {
+    region_id.contains("-hreview-sam-")
+}
+
 #[tauri::command]
 pub async fn apply_tool(
     app: tauri::AppHandle,
@@ -2416,9 +3649,21 @@ pub async fn apply_tool(
     region_id: Option<String>,
 ) -> Result<ApplyResult, String> {
     crate::library::blocking(move || {
+        if region_id
+            .as_deref()
+            .is_some_and(is_approved_component_region)
+        {
+            return Ok(ApplyResult {
+                error_code: Some("unsupported_revision"),
+                ..ApplyResult::of("blocked")
+            });
+        }
         let params = params.unwrap_or(serde_json::Value::Null);
         let string = |key: &str| {
-            params.get(key).and_then(|value| value.as_str()).map(str::to_owned)
+            params
+                .get(key)
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
         };
 
         let has_cloud_target = explicit_remote_or_invalid_target(&params);
@@ -2432,24 +3677,51 @@ pub async fn apply_tool(
             });
         }
 
+        if (has_cloud_target || grant_nonce.is_some())
+            && region_id.as_ref().is_some_and(|id| {
+                let Ok(library) = Library::for_app(&app) else {
+                    return false;
+                };
+                let Ok(Some(located)) = locate_region(&library, id) else {
+                    return false;
+                };
+                let _lock = run::lock_job(&located.job_path);
+                Job::open(&located.job_path).ok().is_some_and(|job| {
+                    job.project
+                        .text_shape_plans
+                        .iter()
+                        .any(|plan| plan.region_id == *id)
+                })
+            })
+        {
+            return Ok(ApplyResult {
+                error_code: Some("use_prepared_text_shape"),
+                ..ApplyResult::of("blocked")
+            });
+        }
+
         if let Some(grant_nonce) = grant_nonce {
-            let Some(region_id) = region_id else { return Ok(ApplyResult::of("not-found")) };
+            let Some(region_id) = region_id else {
+                return Ok(ApplyResult::of("not-found"));
+            };
             let library = Library::for_app(&app)?;
             let Some(located) = locate_region(&library, &region_id)? else {
                 return Ok(ApplyResult::of("not-found"));
             };
-            return Ok(match render_in_cloud(&app, &located, &region_id, &params, &grant_nonce) {
-                CloudRender::Committed(region, page_status) => ApplyResult {
-                    mask: region.mask.clone(),
-                    region: Some(*region),
-                    page_status: Some(page_status),
-                    ..ApplyResult::of("applied")
+            return Ok(
+                match render_in_cloud(&app, &located, &region_id, &params, &grant_nonce) {
+                    CloudRender::Committed(region, page_status) => ApplyResult {
+                        mask: region.mask.clone(),
+                        region: Some(*region),
+                        page_status: Some(page_status),
+                        ..ApplyResult::of("applied")
+                    },
+                    CloudRender::Stopped(status, code) => ApplyResult {
+                        error_code: Some(code),
+                        ..ApplyResult::of(status)
+                    },
                 },
-                CloudRender::Stopped(status, code) => ApplyResult {
-                    error_code: Some(code),
-                    ..ApplyResult::of(status)
-                },
-            });
+            );
         }
 
         // A cloud engine with no grant: nothing is sent until the user has
@@ -2462,7 +3734,22 @@ pub async fn apply_tool(
         // Auto clean is a run trigger and not a per-region tool: it answers
         // with the queue, and every result arrives on the event channel.
         if tool == "autoClean" {
-            let Some(chapter_id) = chapter_id else { return Ok(ApplyResult::of("not-found")) };
+            let Some(chapter_id) = chapter_id else {
+                return Ok(ApplyResult::of("not-found"));
+            };
+            if !matches!(string("geometryPolicy").as_deref(), None | Some("legacy"))
+                || !matches!(string("textPolicy").as_deref(), None | Some("legacy_gate"))
+            {
+                return Ok(ApplyResult {
+                    error_code: Some("use_text_shape_review"),
+                    ..ApplyResult::of("blocked")
+                });
+            }
+            let detection = params.get("detection").filter(|value| !value.is_null()).cloned();
+            let selection = run::RunSelection::from_args(
+                detection.as_ref(),
+                params.get("ocrRescue").and_then(|value| value.as_bool()),
+            )?;
             let picks = Picks::from_args(
                 string("bubbleEngine").as_deref(),
                 string("outsideEngine").as_deref(),
@@ -2470,7 +3757,7 @@ pub async fn apply_tool(
             let scope = string("scope").unwrap_or_else(|| "page".to_owned());
             let outside =
                 cleaner_core::gate::OutsideText::from_arg(string("outsideBubbles").as_deref());
-            let handle = run::start(
+            let handle = run::start_with_selection(
                 &app,
                 &scope,
                 &chapter_id,
@@ -2478,6 +3765,9 @@ pub async fn apply_tool(
                 string("engineCeiling"),
                 picks,
                 outside,
+                run::parse_color_hex(string("bubbleColor").as_deref()),
+                selection,
+                detection,
             )?;
             return Ok(ApplyResult {
                 run_id: handle.run_id,
@@ -2486,11 +3776,29 @@ pub async fn apply_tool(
             });
         }
 
-        let Some(region_id) = region_id else { return Ok(ApplyResult::of("not-found")) };
+        let Some(region_id) = region_id else {
+            return Ok(ApplyResult::of("not-found"));
+        };
         let library = Library::for_app(&app)?;
         let Some(located) = locate_region(&library, &region_id)? else {
             return Ok(ApplyResult::of("not-found"));
         };
+
+        {
+            let _lock = run::lock_job(&located.job_path);
+            let job = Job::open(&located.job_path).map_err(|e| e.to_string())?;
+            if job
+                .project
+                .text_shape_plans
+                .iter()
+                .any(|row| row.region_id == region_id)
+            {
+                return Ok(ApplyResult {
+                    error_code: Some("use_prepared_text_shape"),
+                    ..ApplyResult::of("blocked")
+                });
+            }
+        }
 
         let bbox: Option<Bbox> = params
             .get("bbox")
@@ -2549,6 +3857,7 @@ pub async fn apply_tool(
             })),
         };
         let plan = Plan {
+            expected_source: None,
             region_id,
             geometry,
             choice,
@@ -2593,18 +3902,21 @@ fn fill_mode_key(mode: &str) -> &'static str {
 fn existing_geometry(located: &Located, region_id: &str) -> Result<Geometry, String> {
     let _lock = run::lock_job(&located.job_path);
     let job = Job::open(&located.job_path).map_err(|e| e.to_string())?;
-    if job.project.patches.iter().any(|record| record.id == region_id) {
+    if job
+        .project
+        .patches
+        .iter()
+        .any(|record| record.id == region_id)
+    {
         return Ok(Geometry::Stored);
     }
     let Some(source_idx) = Library::resolve_page(&job.project, located.page_index) else {
         return Ok(Geometry::Stored);
     };
     let page_id = job_page_id(region_id);
-    let found = job
-        .project
-        .regions_untouched
-        .iter()
-        .find(|record| record.source_idx == source_idx && untouched_id(page_id, record.bbox) == region_id);
+    let found = job.project.regions_untouched.iter().find(|record| {
+        record.source_idx == source_idx && untouched_id(page_id, record.bbox) == region_id
+    });
     Ok(match found {
         Some(record) => Geometry::Detected(record.bbox),
         None => Geometry::Stored,
@@ -2622,13 +3934,17 @@ fn untouched_reason(located: &Located, region_id: &str) -> Result<Option<String>
         .project
         .regions_untouched
         .iter()
-        .find(|record| record.source_idx == source_idx && untouched_id(page_id, record.bbox) == region_id)
+        .find(|record| {
+            record.source_idx == source_idx && untouched_id(page_id, record.bbox) == region_id
+        })
         .map(|record| record.reason.clone()))
 }
 
 fn untouched_fallback_pick(reason: Option<&str>) -> EnginePick {
     match reason {
-        Some(r) if r.contains("OutsideBubble") || r.contains("outside-bubble") => Picks::default().outside,
+        Some(r) if r.contains("OutsideBubble") || r.contains("outside-bubble") => {
+            Picks::default().outside
+        }
         _ => Picks::default().bubble,
     }
 }
@@ -2642,10 +3958,13 @@ fn untouched_fallback_pick(reason: Option<&str>) -> EnginePick {
 /// default for its fill mode, exactly as if no engine had been named, and the
 /// interface asks for consent and calls `applyTool` on the new region.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn create_region(
     app: tauri::AppHandle,
     chapter_id: String,
     page_index: u32,
+    expected_source_idx: Option<usize>,
+    expected_source_sha: Option<String>,
     bbox: Bbox,
     tool: String,
     params: Option<serde_json::Value>,
@@ -2681,7 +4000,9 @@ pub async fn create_region(
             let Some(source_idx) = Library::resolve_page(&job.project, located.page_index) else {
                 return Ok(None);
             };
-            let Some((w, h)) = page_size(&job, source_idx) else { return Ok(None) };
+            let Some((w, h)) = page_size(&job, source_idx) else {
+                return Ok(None);
+            };
             let page_id = crate::library::page_id(&chapter_id, located.page_index);
             (
                 mint_hand_id(&job, &page_id),
@@ -2708,7 +4029,14 @@ pub async fn create_region(
             })),
         };
 
+        let expected_source = match (expected_source_idx, expected_source_sha) {
+            (Some(index), Some(hash)) => Some((index, hash)),
+            (None, None) => None,
+            _ => return Ok(None),
+        };
+
         let plan = Plan {
+            expected_source,
             region_id,
             geometry: painted_geometry(rect, painted),
             choice,
@@ -2722,9 +4050,10 @@ pub async fn create_region(
             drawn,
         };
         match edit(&app, &located, plan)? {
-            Outcome::Cleaned(edited) => {
-                Ok(Some(CreatedRegion { region: edited.region, page_status: edited.page_status }))
-            }
+            Outcome::Cleaned(edited) => Ok(Some(CreatedRegion {
+                region: edited.region,
+                page_status: edited.page_status,
+            })),
             Outcome::Refused(reason) => {
                 refuse(reason);
                 Ok(None)
@@ -2746,7 +4075,20 @@ fn mint_hand_id(job: &Job, page_id: &str) -> String {
         .project
         .patches
         .iter()
-        .filter_map(|record| record.id.strip_prefix(&prefix))
+        .map(|record| record.id.as_str())
+        .chain(
+            job.project
+                .text_shape_plans
+                .iter()
+                .map(|record| record.region_id.as_str()),
+        )
+        .chain(
+            job.project
+                .text_shape_corrections
+                .iter()
+                .map(|record| record.region_id.as_str()),
+        )
+        .filter_map(|id| id.strip_prefix(&prefix))
         .filter_map(|suffix| suffix.parse::<u32>().ok())
         .max()
         .unwrap_or(0)
@@ -2768,17 +4110,61 @@ pub async fn rerun_mask(
     params: Option<serde_json::Value>,
 ) -> Result<Option<RerunResult>, String> {
     crate::library::blocking(move || {
-        let params = params.unwrap_or(serde_json::Value::Null);
-        let region_id = crate::library::region_of_mask(&mask_id).to_owned();
+        if is_approved_component_region(crate::library::region_of_mask(&mask_id)) {
+            return Err("Approved component edits are insertion-only; use Undo or Delete instead of replacing their saved mask".into());
+        }
         let library = Library::for_app(&app)?;
-        let Some(located) = locate_region(&library, &region_id)? else { return Ok(None) };
+        rerun_mask_at(&library, Some(&app), &mask_id, &kind, engine.as_deref(),
+            params.unwrap_or(serde_json::Value::Null), |located, plan| edit(&app, located, plan))
+    })
+    .await
+}
 
-        if let Some(grant_nonce) = grant_nonce_in(&params) {
-            if !crate::inference::cloud_allowed(&app) {
-                cloud_blocked();
-                return Ok(None);
-            }
-            return Ok(match render_in_cloud(&app, &located, &region_id, &params, &grant_nonce) {
+fn rerun_mask_at(
+    library: &Library,
+    app: Option<&tauri::AppHandle>,
+    mask_id: &str,
+    kind: &str,
+    engine: Option<&str>,
+    params: serde_json::Value,
+    mut apply: impl FnMut(&Located, Plan) -> Result<Outcome, String>,
+) -> Result<Option<RerunResult>, String> {
+    let region_id = crate::library::region_of_mask(mask_id).to_owned();
+    if is_approved_component_region(&region_id) {
+        return Err("Approved component edits are insertion-only; use Undo or Delete instead of replacing their saved mask".into());
+    }
+    let Some(located) = locate_region(library, &region_id)? else {
+        return Ok(None);
+    };
+
+    {
+        let _lock = run::lock_job(&located.job_path);
+        let job = Job::open(&located.job_path).map_err(|e| e.to_string())?;
+        let latest_plan = job.project.text_shape_plans.iter()
+            .filter(|plan| plan.region_id == region_id)
+            .max_by_key(|plan| plan.plan_revision);
+        let committed_identity = job.project.patches.iter()
+            .find(|record| record.id == region_id && record.geometry_policy == GeometryPolicy::TextShape)
+            .and_then(|record| record.text_shape_plan_identity.as_deref());
+        if latest_plan.is_some_and(|plan| committed_identity != Some(plan.identity.identity_sha256.as_str())) {
+            refuse("decline.reason.rungUnavailable");
+            return Ok(None);
+        }
+    }
+
+    let Some((current, current_fill, current_bbox, is_cloud_provenance)) =
+        rerun_current(&located, &region_id, kind)? else {
+            return Ok(None);
+        };
+
+    if let Some(grant_nonce) = grant_nonce_in(&params) {
+        if !app.is_some_and(crate::inference::cloud_allowed) {
+            cloud_blocked();
+            return Ok(None);
+        }
+        let app = app.expect("cloud permission requires an app");
+        return Ok(
+            match render_in_cloud(app, &located, &region_id, &params, &grant_nonce) {
                 CloudRender::Committed(region, page_status) => Some(RerunResult {
                     mask: region.mask.clone(),
                     region: *region,
@@ -2786,130 +4172,115 @@ pub async fn rerun_mask(
                     page_status,
                 }),
                 CloudRender::Stopped(..) => None,
-            });
-        }
+            },
+        );
+    }
 
-        // What the mask currently is. A re-run of a region with no patch is a
-        // re-run of nothing - the same `null` the seam gives for an id it
-        // cannot find.
-        let (current, current_fill, current_bbox, is_cloud_provenance) = {
-            let _lock = run::lock_job(&located.job_path);
-            let job = Job::open(&located.job_path).map_err(|e| e.to_string())?;
-            let Some(record) =
-                job.project.patches.iter().find(|record| record.id == region_id)
-            else {
-                return Ok(None);
-            };
-            let fill = record
-                .provenance
-                .params_snapshot
-                .get("fill_mode")
-                .and_then(|v| v.as_str())
-                .unwrap_or("match-surround")
-                .to_owned();
-            let is_cloud = record.provenance.cloud.is_some() || record.provenance.engine == Engine::Cloud;
-            (record.provenance.engine, fill, record.bbox, is_cloud)
+    // The one kind that is not an edit: the mask is kept exactly as it is
+    // and handed back to a tool. Maps mask origin to its tool and opens
+    // that tool instead, falling back to Content-aware fill when origin
+    // is unknown.
+    if kind == "reopenInTool" {
+        let Some((region, page_status)) = current_region(&located, &region_id)? else {
+            return Ok(None);
         };
+        let tool = existing_tool(&located, &region_id)?;
+        let tool_name = tool.as_deref().unwrap_or("contentAwareFill");
+        let label_key = tool_label_key(tool_name);
+        crate::events::notice(
+            "notice.mask.reopened",
+            serde_json::json!({ "toolKey": label_key }),
+            "info",
+        );
+        return Ok(Some(RerunResult {
+            mask: region.mask.clone(),
+            region,
+            reopen_tool: Some(match tool_name {
+                "brush" => "brush",
+                "shapes" => "shapes",
+                "aiMaskBrush" => "aiMaskBrush",
+                "cloneHeal" => "cloneHeal",
+                _ => "contentAwareFill",
+            }),
+            page_status,
+        }));
+    }
 
-        // The one kind that is not an edit: the mask is kept exactly as it is
-        // and handed back to a tool. Maps mask origin to its tool and opens
-        // that tool instead, falling back to Content-aware fill when origin
-        // is unknown.
-        if kind == "reopenInTool" {
-            let Some((region, page_status)) = current_region(&located, &region_id)? else {
-                return Ok(None);
-            };
-            let tool = existing_tool(&located, &region_id)?;
-            let tool_name = tool.as_deref().unwrap_or("contentAwareFill");
-            let label_key = tool_label_key(tool_name);
+    let (target, fill_mode) = match kind {
+        "cycleFill" => {
+            let next = next_fill_mode(&current_fill);
+            (engine_for_fill_mode(next), Some(next))
+        }
+        "stronger" => (step(current, true), None),
+        "simpler" => (step(current, false), None),
+        "engine" => (named_rung(engine).unwrap_or(current), None),
+        // `retry`, and anything a later interface adds: run what ran.
+        _ => (
+            current,
+            if current_fill == "solid" {
+                Some("solid")
+            } else {
+                None
+            },
+        ),
+    };
+
+    // Remote-provenance rerun must NOT silently rerun local. A grant took
+    // it to the cloud above; without one it goes nowhere.
+    if rerun_needs_cloud(target, current, is_cloud_provenance, kind == "engine") {
+        if app.is_some_and(crate::inference::cloud_allowed) {
+            refuse("decline.reason.rungUnavailable");
+        } else {
+            cloud_blocked();
+        }
+        return Ok(None);
+    }
+
+    let plan = Plan {
+        expected_source: None,
+        region_id: region_id.clone(),
+        geometry: Geometry::Stored,
+        choice: Choice::Exact(target),
+        // A re-run does not change whose edit it is: an automatic patch
+        // re-run by hand is still the automatic pass's region, with a
+        // different engine under it.
+        source: existing_source(&located, &region_id)?,
+        tool: existing_tool(&located, &region_id)?,
+        fill_mode,
+        // **A re-run re-runs a rung, and a stroke is not one.** The
+        // manifest keeps a painted patch's mask and pixels like any other's,
+        // but nothing in the record replays the gesture - the dab list never
+        // reached disk. So a re-run of a painted region falls through to the
+        // ladder, which is recorded rather than a silent behaviour.
+        paint: None,
+        clears_untouched: false,
+        requested: Some(current_bbox),
+        stroke: None,
+        drawn: None,
+    };
+    match apply(&located, plan)? {
+        Outcome::Cleaned(edited) => {
             crate::events::notice(
-                "notice.mask.reopened",
-                serde_json::json!({ "toolKey": label_key }),
+                rerun_notice(kind),
+                match fill_mode {
+                    Some(mode) => serde_json::json!({ "fillModeKey": fill_mode_label(mode) }),
+                    None => serde_json::json!({ "rungKey": target.rung_key() }),
+                },
                 "info",
             );
-            return Ok(Some(RerunResult {
-                mask: region.mask.clone(),
-                region,
-                reopen_tool: Some(match tool_name {
-                    "brush" => "brush",
-                    "shapes" => "shapes",
-                    "aiMaskBrush" => "aiMaskBrush",
-                    "cloneHeal" => "cloneHeal",
-                    _ => "contentAwareFill",
-                }),
-                page_status,
-            }));
+            Ok(Some(RerunResult {
+                mask: edited.region.mask.clone(),
+                region: edited.region,
+                reopen_tool: None,
+                page_status: edited.page_status,
+            }))
         }
-
-        let (target, fill_mode) = match kind.as_str() {
-            "cycleFill" => {
-                let next = next_fill_mode(&current_fill);
-                (engine_for_fill_mode(next), Some(next))
-            }
-            "stronger" => (step(current, true), None),
-            "simpler" => (step(current, false), None),
-            "engine" => (named_rung(engine.as_deref()).unwrap_or(current), None),
-            // `retry`, and anything a later interface adds: run what ran.
-            _ => (current, if current_fill == "solid" { Some("solid") } else { None }),
-        };
-
-        // Remote-provenance rerun must NOT silently rerun local. A grant took
-        // it to the cloud above; without one it goes nowhere.
-        if rerun_needs_cloud(target, current, is_cloud_provenance, kind == "engine") {
-            if crate::inference::cloud_allowed(&app) {
-                refuse("decline.reason.rungUnavailable");
-            } else {
-                cloud_blocked();
-            }
-            return Ok(None);
+        Outcome::Refused(reason) => {
+            refuse(reason);
+            Ok(None)
         }
-
-        let plan = Plan {
-            region_id: region_id.clone(),
-            geometry: Geometry::Stored,
-            choice: Choice::Exact(target),
-            // A re-run does not change whose edit it is: an automatic patch
-            // re-run by hand is still the automatic pass's region, with a
-            // different engine under it.
-            source: existing_source(&located, &region_id)?,
-            tool: existing_tool(&located, &region_id)?,
-            fill_mode,
-            // **A re-run re-runs a rung, and a stroke is not one.** The
-            // manifest keeps a painted patch's mask and pixels like any other's,
-            // but nothing in the record replays the gesture - the dab list never
-            // reached disk. So a re-run of a painted region falls through to the
-            // ladder, which is recorded rather than a silent behaviour.
-            paint: None,
-            clears_untouched: false,
-            requested: Some(current_bbox),
-            stroke: None,
-            drawn: None,
-        };
-        match edit(&app, &located, plan)? {
-            Outcome::Cleaned(edited) => {
-                crate::events::notice(
-                    rerun_notice(&kind),
-                    match fill_mode {
-                        Some(mode) => serde_json::json!({ "fillModeKey": fill_mode_label(mode) }),
-                        None => serde_json::json!({ "rungKey": target.rung_key() }),
-                    },
-                    "info",
-                );
-                Ok(Some(RerunResult {
-                    mask: edited.region.mask.clone(),
-                    region: edited.region,
-                    reopen_tool: None,
-                    page_status: edited.page_status,
-                }))
-            }
-            Outcome::Refused(reason) => {
-                refuse(reason);
-                Ok(None)
-            }
-            Outcome::NotFound => Ok(None),
-        }
-    })
-    .await
+        Outcome::NotFound => Ok(None),
+    }
 }
 
 /// Which notice a re-run leaves on the stack.
@@ -2943,7 +4314,12 @@ fn existing_tool(located: &Located, region_id: &str) -> Result<Option<String>, S
         .iter()
         .find(|record| record.id == region_id)
         .and_then(|record| {
-            record.provenance.params_snapshot.get("tool").and_then(|v| v.as_str()).map(str::to_owned)
+            record
+                .provenance
+                .params_snapshot
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
         }))
 }
 
@@ -2958,6 +4334,31 @@ fn tool_label_key(tool: &str) -> &'static str {
     }
 }
 
+fn retry_allowed(kind: &str, current: Engine) -> bool {
+    kind != "retry" || !matches!(current, Engine::Paint | Engine::Clone)
+}
+
+/// Read the committed patch before either the local or cloud re-run route.
+/// A saved paint or clone stroke has no gesture to replay on either route.
+fn rerun_current(
+    located: &Located,
+    region_id: &str,
+    kind: &str,
+) -> Result<Option<(Engine, String, Rect, bool)>, String> {
+    let _lock = run::lock_job(&located.job_path);
+    let job = Job::open(&located.job_path).map_err(|e| e.to_string())?;
+    let Some(record) = job.project.patches.iter().find(|record| record.id == region_id) else {
+        return Ok(None);
+    };
+    if !retry_allowed(kind, record.provenance.engine) {
+        return Ok(None);
+    }
+    let fill = record.provenance.params_snapshot.get("fill_mode")
+        .and_then(|v| v.as_str()).unwrap_or("match-surround").to_owned();
+    let is_cloud = record.provenance.cloud.is_some() || record.provenance.engine == Engine::Cloud;
+    Ok(Some((record.provenance.engine, fill, record.bbox, is_cloud)))
+}
+
 /// Whether the region being re-run was a hand edit or the automatic pass's.
 fn existing_source(located: &Located, region_id: &str) -> Result<&'static str, String> {
     let _lock = run::lock_job(&located.job_path);
@@ -2968,7 +4369,11 @@ fn existing_source(located: &Located, region_id: &str) -> Result<&'static str, S
         .iter()
         .find(|record| record.id == region_id)
         .and_then(|record| {
-            record.provenance.params_snapshot.get("source").and_then(|v| v.as_str())
+            record
+                .provenance
+                .params_snapshot
+                .get("source")
+                .and_then(|v| v.as_str())
         })
         .map(|source| if source == "hand" { "hand" } else { "auto" })
         .unwrap_or("auto"))
@@ -3018,68 +4423,104 @@ pub async fn clean_anyway(
     params: Option<serde_json::Value>,
 ) -> Result<Option<CleanedRegion>, String> {
     crate::library::blocking(move || {
-        let params = params.unwrap_or(serde_json::Value::Null);
-        let grant_nonce = grant_nonce_in(&params);
-        let has_cloud_target = engine.as_deref() == Some("cloud")
+        if is_approved_component_region(&region_id) {
+            return Err("Approved component edits are insertion-only; use Undo or Delete instead of replacing their saved mask".into());
+        }
+        let cloud_target = engine.as_deref() == Some("cloud")
             || named_rung(engine.as_deref()) == Some(Engine::Cloud)
-            || grant_nonce.is_some();
-
-        if has_cloud_target && !crate::inference::cloud_allowed(&app) {
+            || params.as_ref().and_then(grant_nonce_in).is_some();
+        if cloud_target && !crate::inference::cloud_allowed(&app) {
             cloud_blocked();
             return Ok(None);
         }
-
         let library = Library::for_app(&app)?;
-        let Some(located) = locate_region(&library, &region_id)? else { return Ok(None) };
+        clean_anyway_at(&library, Some(&app), &region_id, engine.as_deref(),
+            params.unwrap_or(serde_json::Value::Null), |located, plan| edit(&app, located, plan))
+    })
+    .await
+}
 
-        if let Some(grant_nonce) = grant_nonce {
-            return Ok(match render_in_cloud(&app, &located, &region_id, &params, &grant_nonce) {
+fn clean_anyway_at(
+    library: &Library,
+    app: Option<&tauri::AppHandle>,
+    region_id: &str,
+    engine: Option<&str>,
+    params: serde_json::Value,
+    mut apply: impl FnMut(&Located, Plan) -> Result<Outcome, String>,
+) -> Result<Option<CleanedRegion>, String> {
+    if is_approved_component_region(region_id) {
+        return Err("Approved component edits are insertion-only; use Undo or Delete instead of replacing their saved mask".into());
+    }
+    let grant_nonce = grant_nonce_in(&params);
+    let has_cloud_target = engine == Some("cloud")
+        || named_rung(engine) == Some(Engine::Cloud)
+        || grant_nonce.is_some();
+
+    if has_cloud_target && !app.is_some_and(crate::inference::cloud_allowed) {
+        cloud_blocked();
+        return Ok(None);
+    }
+
+    let Some(located) = locate_region(library, region_id)? else {
+        return Ok(None);
+    };
+
+    if let Some(grant_nonce) = grant_nonce {
+        let app = app.expect("cloud permission requires an app");
+        return Ok(
+            match render_in_cloud(app, &located, region_id, &params, &grant_nonce) {
                 CloudRender::Committed(region, page_status) => Some(CleanedRegion {
                     mask: region.mask.clone(),
                     region: *region,
                     page_status,
                 }),
                 CloudRender::Stopped(..) => None,
-            });
+            },
+        );
+    }
+
+    let plan = clean_anyway_plan(&located, region_id, engine)?;
+    match apply(&located, plan)? {
+        Outcome::Cleaned(edited) => {
+            crate::events::notice("notice.gate.cleanedAnyway", serde_json::json!({}), "info");
+            Ok(Some(CleanedRegion {
+                mask: edited.region.mask.clone(),
+                region: edited.region,
+                page_status: edited.page_status,
+            }))
         }
-
-        let geometry = existing_geometry(&located, &region_id)?;
-        let reason = untouched_reason(&located, &region_id)?;
-        let fallback = untouched_fallback_pick(reason.as_deref());
-
-        let choice = choice_for(engine.as_deref(), fallback);
-
-        let plan = Plan {
-            region_id: region_id.clone(),
-            geometry,
-            choice,
-            source: "auto",
-            tool: None,
-            fill_mode: None,
-            // `cleanAnyway` answers the gate, which nothing painted ever met.
-            paint: None,
-            clears_untouched: true,
-            requested: None,
-            stroke: None,
-            drawn: None,
-        };
-        match edit(&app, &located, plan)? {
-            Outcome::Cleaned(edited) => {
-                crate::events::notice("notice.gate.cleanedAnyway", serde_json::json!({}), "info");
-                Ok(Some(CleanedRegion {
-                    mask: edited.region.mask.clone(),
-                    region: edited.region,
-                    page_status: edited.page_status,
-                }))
-            }
-            Outcome::Refused(reason) => {
-                refuse(reason);
-                Ok(None)
-            }
-            Outcome::NotFound => Ok(None),
+        Outcome::Refused(reason) => {
+            refuse(reason);
+            Ok(None)
         }
+        Outcome::NotFound => Ok(None),
+    }
+}
+
+fn clean_anyway_plan(
+    located: &Located,
+    region_id: &str,
+    engine: Option<&str>,
+) -> Result<Plan, String> {
+    let geometry = existing_geometry(located, region_id)?;
+    let reason = untouched_reason(located, region_id)?;
+    let fallback = untouched_fallback_pick(reason.as_deref());
+    let choice = choice_for(engine, fallback);
+    Ok(Plan {
+        expected_source: None,
+        region_id: region_id.to_owned(),
+        geometry,
+        choice,
+        source: "auto",
+        tool: None,
+        fill_mode: None,
+        // `cleanAnyway` answers the gate, which nothing painted ever met.
+        paint: None,
+        clears_untouched: true,
+        requested: None,
+        stroke: None,
+        drawn: None,
     })
-    .await
 }
 
 /// Whether rung 3a can be offered on this machine.
@@ -3091,7 +4532,11 @@ pub async fn sidecar_available(app: tauri::AppHandle) -> Result<SidecarStatus, S
         let stored_path = setting_str(crate::settings::read(&app).ok().as_ref(), SIDECAR_PATH_KEYS);
         let explicit = stored_path.as_deref().filter(|s| !s.is_empty());
         let stored_backend = flux_backend_setting(&app);
-        Ok(sidecar_status_from(explicit, stored_backend.as_deref(), app_data.as_deref()))
+        Ok(sidecar_status_from(
+            explicit,
+            stored_backend.as_deref(),
+            app_data.as_deref(),
+        ))
     })
     .await
 }
@@ -3113,8 +4558,712 @@ pub async fn list_sidecar_models(app: tauri::AppHandle) -> Result<Vec<SidecarMod
 mod tests {
     use super::*;
 
+    fn command_fixture(name: &str, raw: &Raster) -> (PathBuf, Library, Located) {
+        use cleaner_core::image::{encode, Format};
+        use cleaner_core::project::StripMode;
+
+        let root = std::env::temp_dir().join(format!("mc-region-command-{name}-{}", std::process::id()));
+        let raws = root.join("raws");
+        std::fs::create_dir_all(&raws).unwrap();
+        std::fs::write(raws.join("page.png"), encode(raw, Format::Png).unwrap()).unwrap();
+        let library = Library::at(root.join("library"));
+        let project = library.create_project(name, StripMode::Single, Some(raws), None).unwrap();
+        let chapter = library.create_chapter(&project.id, "chapter", None, None)
+            .unwrap().created().unwrap();
+        let located = Located {
+            chapter_id: chapter.id.clone(),
+            job_path: library.resolve_chapter(&chapter.id).unwrap(),
+            page_index: 0,
+        };
+        (root, library, located)
+    }
+
+    fn edit_fixture(name: &str, raw: &Raster) -> (PathBuf, Located) {
+        use cleaner_core::image::{encode, Format};
+        use cleaner_core::ingest::source_ref;
+        use cleaner_core::project::{Project, StripMode};
+
+        let root = std::env::temp_dir().join(format!("mc-region-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("raws")).unwrap();
+        let bytes = encode(raw, Format::Png).unwrap();
+        let path = root.join("raws/page.png");
+        std::fs::write(&path, &bytes).unwrap();
+        let source = source_ref(&path, &bytes).unwrap();
+        let manifest = root.join("job/chapter.mtclean");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        Job::create(&manifest, Project::new(manifest.parent().unwrap(), "test",
+            StripMode::Single, &[source])).unwrap();
+        (root, Located { chapter_id: "chapter".into(), job_path: manifest, page_index: 0 })
+    }
+
+    fn fixture_plan(id: &str, geometry: Geometry, engine: Engine, bounds: Rect) -> Plan {
+        Plan {
+            expected_source: None,
+            region_id: id.into(),
+            geometry,
+            choice: Choice::Exact(engine),
+            source: "hand",
+            tool: Some("aiMaskBrush".into()),
+            fill_mode: None,
+            clears_untouched: false,
+            paint: None,
+            requested: Some(bounds),
+            stroke: None,
+            drawn: None,
+        }
+    }
+
+    fn white_predecessor(located: &Located, raw: &Raster, bounds: Rect) {
+        let mut job = Job::open(&located.job_path).unwrap();
+        let mut pixels = raw.clone();
+        pixels.width = bounds.w;
+        pixels.height = bounds.h;
+        pixels.data = vec![255; bounds.w as usize * bounds.h as usize
+            * raw.mode.samples() * usize::from(raw.depth.bits() / 8)];
+        let mask = Mask::filled(bounds);
+        job.complete_region(0, &Patch {
+            id: "a".into(), mask: mask.clone(), ink: mask, pixels,
+            order: 0, visible: true,
+            provenance: Provenance {
+                engine: Engine::Fill, engine_version: "fixture".into(),
+                model_sha256: None, execution_provider: "cpu".into(),
+                params_snapshot: serde_json::json!({}), mask_sha256: String::new(),
+                source_sha256: String::new(), cloud: None, created: 0,
+            },
+        }, None).unwrap();
+    }
+
+    #[test]
+    fn detected_region_reads_prior_visible_patch_and_records_input() {
+        let mut raw = cleaner_core::image::fixtures::by_name("l8").raster;
+        raw.width = 128;
+        raw.height = 128;
+        raw.data = vec![0; 128 * 128];
+        let (root, located) = edit_fixture("detected-underlay", &raw);
+        white_predecessor(&located, &raw, Rect::new(36, 36, 12, 12));
+        let bounds = Rect::new(42, 40, 12, 6);
+        let mut bench = test_bench(&root);
+        bench.detected_seed = Some(Mask::filled(bounds));
+        let mut seen = None;
+        let mut fake = |image: &Raster, fitted: &Fitted| {
+            seen = Some(image.sample(44, 40, 0));
+            run::Made {
+                engine: Engine::Fill, mask: fitted.mask.clone(), ink: fitted.ink.clone(),
+                pixels: cleaner_core::engines::fill::render_solid(image, fitted),
+                provider: None, model_sha256: None,
+                pad: cleaner_core::strip::EdgePad::None, tiles: None,
+            }
+        };
+        assert!(matches!(edit_with_bench_render(&mut bench, Engine::Fill, &located,
+            fixture_plan("b", Geometry::Detected(bounds), Engine::Fill, bounds),
+            Some(&mut fake)).unwrap(), Outcome::Cleaned(_)));
+        assert_eq!(seen, Some(255));
+        let job = Job::open(&located.job_path).unwrap();
+        let record = job.project.patches.iter().find(|p| p.id == "b").unwrap();
+        assert_eq!(record.provenance.params_snapshot["input_provenance"]["version"], 1);
+    }
+
+    #[test]
+    fn exact_engines_decline_unsupported_source_modes() {
+        for (name, engine) in [("indexed-p", Engine::Denoise),
+            ("bitonal", Engine::Denoise), ("indexed-p", Engine::Lama),
+            ("bitonal", Engine::Lama)] {
+            let raw = cleaner_core::image::fixtures::by_name(name).raster;
+            let (root, located) = edit_fixture(&format!("exact-{name}-{engine:?}"), &raw);
+            let bounds = Rect::new(22, 18, 8, 8);
+            let outcome = edit_with_bench(&mut test_bench(&root), Engine::Lama, &located,
+                fixture_plan("b", Geometry::Painted(Mask::filled(bounds)), engine, bounds)).unwrap();
+            assert!(matches!(outcome, Outcome::Refused("decline.reason.rungUnavailable")),
+                "{name} {engine:?}");
+            assert!(Job::open(&located.job_path).unwrap().project.patches.is_empty());
+        }
+    }
+
+    #[test]
+    fn retry_refuses_non_replayable_paint_and_clone_patches() {
+        let raw = cleaner_core::image::fixtures::by_name("l8").raster;
+        for engine in [Engine::Paint, Engine::Clone] {
+            let (_root, library, located) = command_fixture(&format!("retry-{engine:?}"), &raw);
+            let region_id = format!("{}-p001-h1", located.chapter_id);
+            let bounds = Rect::new(20, 20, 8, 8);
+            let mask = Mask::filled(bounds);
+            let mut pixels = raw.clone();
+            pixels.width = bounds.w;
+            pixels.height = bounds.h;
+            pixels.data = vec![255; 64 * raw.mode.samples()];
+            let patch = Patch {
+                id: region_id.clone(), mask: mask.clone(), ink: mask, pixels,
+                order: 0, visible: true,
+                provenance: Provenance {
+                    engine, engine_version: "fixture".into(), model_sha256: None,
+                    execution_provider: "cpu".into(), params_snapshot: serde_json::json!({}),
+                    mask_sha256: String::new(), source_sha256: String::new(),
+                    cloud: None, created: 0,
+                },
+            };
+            Job::open(&located.job_path).unwrap().complete_region(0, &patch, None).unwrap();
+            assert!(rerun_mask_at(&library, None, &region_id, "retry", None,
+                serde_json::Value::Null, |_, _| panic!("retry ran a non-replayable stroke"))
+                .unwrap().is_none());
+            let mut called = false;
+            let _ = rerun_mask_at(&library, None, &region_id, "engine", Some("fill"),
+                serde_json::Value::Null, |_, _| {
+                    called = true;
+                    Ok(Outcome::NotFound)
+                }).unwrap();
+            assert!(called);
+        }
+    }
+
+    #[test]
+    fn clean_anyway_held_back_region_reads_visible_hand_patch() {
+        let mut raw = cleaner_core::image::fixtures::by_name("l8").raster;
+        raw.width = 128;
+        raw.height = 128;
+        raw.data = vec![0; 128 * 128];
+        let (root, library, located) = command_fixture("clean-anyway-visible", &raw);
+        white_predecessor(&located, &raw, Rect::new(36, 36, 12, 12));
+        let bounds = Rect::new(42, 40, 12, 6);
+        Job::open(&located.job_path).unwrap().leave_untouched(0, bounds,
+            "review.reason.gateSkippedOutsideBubble").unwrap();
+        let region_id = untouched_id(&format!("{}-p001", located.chapter_id), bounds);
+        let mut bench = test_bench(&root);
+        bench.detected_seed = Some(Mask::filled(bounds));
+        let mut seen = None;
+        let mut renderer = |image: &Raster, fitted: &Fitted| {
+            seen = Some(image.sample(44, 40, 0));
+            run::Made {
+                engine: Engine::Fill, mask: fitted.mask.clone(), ink: fitted.ink.clone(),
+                pixels: cleaner_core::engines::fill::render_solid(image, fitted),
+                provider: None, model_sha256: None,
+                pad: cleaner_core::strip::EdgePad::None, tiles: None,
+            }
+        };
+        assert!(clean_anyway_at(&library, None, &region_id, Some("fill"),
+            serde_json::Value::Null, |located, plan| {
+                assert!(matches!(plan.geometry, Geometry::Detected(rect) if rect == bounds));
+                assert!(plan.clears_untouched);
+                edit_with_bench_render(&mut bench, Engine::Fill, located, plan, Some(&mut renderer))
+            }).unwrap().is_some());
+        assert_eq!(seen, Some(255));
+        let job = Job::open(&located.job_path).unwrap();
+        assert!(job.project.regions_untouched.is_empty());
+        assert!(job.project.patches.iter().any(|p| p.id == region_id));
+    }
+
+    #[test]
+    fn clone_source_dependency_tracks_visible_input_and_ignores_unrelated_change() {
+        let mut raw = cleaner_core::image::fixtures::by_name("l8").raster;
+        raw.width = 128;
+        raw.height = 128;
+        raw.data = vec![0; 128 * 128];
+        let (root, located) = edit_fixture("clone-provenance", &raw);
+        white_predecessor(&located, &raw, Rect::new(24, 34, 16, 16));
+        {
+            let mut job = Job::open(&located.job_path).unwrap();
+            let mut outside = job.load_patch(&job.project.patches[0]).unwrap();
+            outside.id = "outside".into();
+            outside.order = 1;
+            outside.mask.bounds = Rect::new(100, 100, 16, 16);
+            outside.ink.bounds = outside.mask.bounds;
+            job.complete_region(0, &outside, None).unwrap();
+        }
+        let target = Rect::new(64, 34, 16, 16);
+        let mut plan = fixture_plan("b", Geometry::Given(target), Engine::Clone, target);
+        plan.tool = Some("cloneHeal".into());
+        plan.paint = Some(PaintPlan {
+            kind: PaintKind::Clone { heal: false, offset: (40.0 / 128.0 * 100.0, 0.0) },
+            points: vec![PaintPoint { x: 72.0 / 128.0 * 100.0,
+                y: 42.0 / 128.0 * 100.0, p: 1.0 }],
+            spec: cleaner_core::paint::BrushSpec {
+                size: 12.0, pressure_size: false, ..Default::default()
+            },
+            alignment: "aligned",
+        });
+        assert!(matches!(edit_with_bench(&mut test_bench(&root), Engine::Fill,
+            &located, plan).unwrap(), Outcome::Cleaned(_)));
+        let mut job = Job::open(&located.job_path).unwrap();
+        let b = job.project.patches.iter().find(|p| p.id == "b").unwrap();
+        let footprint: Rect = serde_json::from_value(
+            b.provenance.params_snapshot["input_provenance"]["read_footprint"].clone()).unwrap();
+        assert!(footprint.x <= 32 && footprint.right() > 32);
+        assert!(footprint.x <= 72 && footprint.right() > 72);
+        assert!(job.load_patch(b).unwrap().pixels.data.contains(&255));
+        job.project.patches.iter_mut().find(|p| p.id == "outside").unwrap().visible = false;
+        job.flush().unwrap();
+        crate::underlay::refresh_dependencies(&mut job, "outside").unwrap();
+        assert_eq!(job.project.patches.iter().find(|p| p.id == "b").unwrap().review_state, None);
+        job.project.patches.iter_mut().find(|p| p.id == "a").unwrap().visible = false;
+        job.flush().unwrap();
+        crate::underlay::refresh_dependencies(&mut job, "a").unwrap();
+        assert_eq!(job.project.patches.iter().find(|p| p.id == "b").unwrap()
+            .review_state.as_deref(), Some("review.reason.inputChanged"));
+    }
+
+    #[test]
+    fn later_ai_stroke_reads_a_real_paint_patch() {
+        let mut raw = cleaner_core::image::fixtures::by_name("l8").raster;
+        raw.width = 128;
+        raw.height = 128;
+        raw.data = vec![0; 128 * 128];
+        let (root, located) = edit_fixture("real-paint-underlay", &raw);
+        let bounds = Rect::new(36, 36, 16, 16);
+        let shape = PaintedShape {
+            kind: ShapeKind::Rect,
+            points: vec![
+                StrokePoint { x: 28.125, y: 28.125 },
+                StrokePoint { x: 40.625, y: 28.125 },
+                StrokePoint { x: 40.625, y: 40.625 },
+                StrokePoint { x: 28.125, y: 40.625 },
+            ],
+            feather: 0.0,
+        };
+        let mut paint = fixture_plan("a", Geometry::Given(bounds), Engine::Fill, bounds);
+        paint.tool = Some("shapes".into());
+        paint.fill_mode = Some("solid");
+        paint.paint = Some(PaintPlan {
+            kind: PaintKind::Shape { color: [255, 255, 255], shape: shape.clone() },
+            points: Vec::new(),
+            spec: cleaner_core::paint::BrushSpec::default(),
+            alignment: "aligned",
+        });
+        paint.drawn = Some(shape);
+        let mut bench = test_bench(&root);
+        assert!(matches!(edit_with_bench(&mut bench, Engine::Fill, &located, paint).unwrap(),
+            Outcome::Cleaned(_)));
+        let painted = Job::open(&located.job_path).unwrap();
+        assert_eq!(painted.project.patches[0].provenance.engine, Engine::Paint);
+        assert_eq!(painted.project.patches[0].provenance.params_snapshot
+            ["input_provenance"]["version"], 1);
+        let patch = painted.load_patch(&painted.project.patches[0]).unwrap();
+        let point = (42, 42);
+        assert!(patch.mask.contains(point.0, point.1));
+        let visible = patch.pixels.sample((point.0 - patch.mask.bounds.x) as u32,
+            (point.1 - patch.mask.bounds.y) as u32, 0);
+        drop(painted);
+        let b = Rect::new(40, 40, 10, 10);
+        let mut seen = None;
+        let mut fake = |image: &Raster, fitted: &Fitted| {
+            seen = Some(image.sample(point.0 as u32, point.1 as u32, 0));
+            run::Made {
+                engine: Engine::Fill, mask: fitted.mask.clone(), ink: fitted.ink.clone(),
+                pixels: cleaner_core::engines::fill::render_solid(image, fitted),
+                provider: None, model_sha256: None,
+                pad: cleaner_core::strip::EdgePad::None, tiles: None,
+            }
+        };
+        assert!(matches!(edit_with_bench_render(&mut bench, Engine::Fill, &located,
+            fixture_plan("b", Geometry::Painted(Mask::filled(b)), Engine::Fill, b),
+            Some(&mut fake)).unwrap(), Outcome::Cleaned(_)));
+        assert_eq!(seen, Some(visible));
+        assert_ne!(seen, Some(raw.sample(point.0 as u32, point.1 as u32, 0)));
+    }
+
+    #[test]
+    fn rgba8_and_sixteen_bit_renderers_receive_visible_composite() {
+        for name in ["rgba8", "rgb16"] {
+            let raw = cleaner_core::image::fixtures::by_name(name).raster;
+            let (root, located) = edit_fixture(&format!("visible-{name}"), &raw);
+            white_predecessor(&located, &raw, Rect::new(20, 16, 12, 12));
+            let bounds = Rect::new(24, 20, 8, 8);
+            let job = Job::open(&located.job_path).unwrap();
+            let expected = crate::underlay::read(&job, 0, &raw, bounds, 1, None).unwrap();
+            drop(job);
+            let mut seen = None;
+            let mut fake = |image: &Raster, fitted: &Fitted| {
+                seen = Some(image.clone());
+                run::Made {
+                    engine: Engine::Fill, mask: fitted.mask.clone(), ink: fitted.ink.clone(),
+                    pixels: cleaner_core::engines::fill::render_solid(image, fitted),
+                    provider: None, model_sha256: None,
+                    pad: cleaner_core::strip::EdgePad::None, tiles: None,
+                }
+            };
+            assert!(matches!(edit_with_bench_render(&mut test_bench(&root), Engine::Fill,
+                &located, fixture_plan("b", Geometry::Painted(Mask::filled(bounds)),
+                    Engine::Fill, bounds), Some(&mut fake)).unwrap(), Outcome::Cleaned(_)));
+            assert_eq!(seen.unwrap().data, expected.image.data, "{name}");
+        }
+    }
+
+    #[test]
+    fn approved_component_id_is_reserved_for_insertion_only() {
+        assert!(is_approved_component_region(
+            "c1-p001-hreview-sam-00001-deadbeef"
+        ));
+        assert!(!is_approved_component_region("c1-p001-r1"));
+        assert!(!is_approved_component_region("c1-p001-h1"));
+    }
+
+    /// A removes the black lettering at x=40. B overlaps A, while its read
+    /// context also includes A's pixels that lie outside B's write mask.
+    /// Capture the exact raster and fitted mask handed to the renderer.
+    #[test]
+    fn a_later_ai_stroke_reads_the_visible_first_stroke() {
+        use cleaner_core::image::{encode, fixtures, Format};
+        use cleaner_core::ingest::source_ref;
+        use cleaner_core::project::{Project, StripMode};
+        let root = std::env::temp_dir().join(format!("mc-two-strokes-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("raws")).unwrap();
+        let mut raw = fixtures::by_name("l8").raster;
+        raw.width = 128;
+        raw.height = 128;
+        raw.data = vec![255; 128 * 128];
+        for y in 36..48 {
+            for x in 36..48 {
+                raw.set_sample(x, y, 0, 0);
+            }
+        }
+        let bytes = encode(&raw, Format::Png).unwrap();
+        let source_path = root.join("raws/page.png");
+        std::fs::write(&source_path, &bytes).unwrap();
+        let source = source_ref(&source_path, &bytes).unwrap();
+        let manifest = root.join("job/chapter.mtclean");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        let mut job = Job::create(
+            &manifest,
+            Project::new(
+                manifest.parent().unwrap(),
+                "test",
+                StripMode::Single,
+                &[source],
+            ),
+        )
+        .unwrap();
+        let a_mask = Mask::filled(Rect::new(36, 36, 12, 12));
+        let mut a_pixels = raw.clone();
+        a_pixels.width = 12;
+        a_pixels.height = 12;
+        a_pixels.data = vec![255; 12 * 12];
+        job.complete_region(
+            0,
+            &Patch {
+                id: "a".into(),
+                mask: a_mask.clone(),
+                ink: a_mask,
+                pixels: a_pixels,
+                order: 0,
+                visible: true,
+                provenance: Provenance {
+                    engine: Engine::Fill,
+                    engine_version: "fixture".into(),
+                    model_sha256: None,
+                    execution_provider: "cpu".into(),
+                    params_snapshot: serde_json::json!({}),
+                    mask_sha256: "fixture".into(),
+                    source_sha256: sha256_hex(&bytes),
+                    cloud: None,
+                    created: 0,
+                },
+            },
+            None,
+        )
+        .unwrap();
+        // Automatic, paint, and clone predecessors use the same ordered
+        // compositor; their producer rung cannot change the pixels B reads.
+        for engine in [Engine::Lama, Engine::Paint, Engine::Clone, Engine::Fill] {
+            let record = job.project.patches.iter().find(|p| p.id == "a").unwrap();
+            let mut a = job.load_patch(record).unwrap();
+            a.provenance.engine = engine;
+            job.complete_region(0, &a, None).unwrap();
+            let input =
+                crate::underlay::read(&job, 0, &raw, Rect::new(42, 40, 12, 6), 1, None).unwrap();
+            assert_eq!(
+                input.image.sample(
+                    (44 - input.window.x) as u32,
+                    (40 - input.window.y) as u32,
+                    0
+                ),
+                255
+            );
+        }
+        let located = Located {
+            chapter_id: "chapter".into(),
+            job_path: manifest,
+            page_index: 0,
+        };
+        let wrong_source = Plan {
+            expected_source: Some((1, sha256_hex(&bytes))),
+            region_id: "wrong-page".into(),
+            geometry: Geometry::Painted(Mask::filled(Rect::new(42, 40, 12, 6))),
+            choice: Choice::Exact(Engine::Fill),
+            source: "hand",
+            tool: Some("aiMaskBrush".into()),
+            fill_mode: None,
+            clears_untouched: false,
+            paint: None,
+            requested: Some(Rect::new(42, 40, 12, 6)),
+            stroke: None,
+            drawn: None,
+        };
+        let mut bench = test_bench(&root);
+        assert!(matches!(
+            edit_with_bench(&mut bench, Engine::Fill, &located, wrong_source).unwrap(),
+            Outcome::NotFound
+        ));
+        let plan = Plan {
+            expected_source: None,
+            region_id: "b".into(),
+            geometry: Geometry::Painted(Mask::filled(Rect::new(42, 40, 12, 6))),
+            choice: Choice::Exact(Engine::Fill),
+            source: "hand",
+            tool: Some("aiMaskBrush".into()),
+            fill_mode: None,
+            clears_untouched: false,
+            paint: None,
+            requested: Some(Rect::new(42, 40, 12, 6)),
+            stroke: None,
+            drawn: None,
+        };
+        let mut observed = None;
+        let mut fake = |image: &Raster, fitted: &Fitted| {
+            observed = Some((
+                image.sample(40, 40, 0),
+                image.sample(44, 40, 0),
+                fitted.mask.contains(44, 40),
+                fitted.mask.contains(40, 40),
+            ));
+            let mut pixels = cleaner_core::engines::fill::render_solid(image, fitted);
+            pixels.data.fill(100);
+            run::Made {
+                engine: Engine::Fill,
+                mask: fitted.mask.clone(),
+                ink: fitted.ink.clone(),
+                pixels,
+                provider: None,
+                model_sha256: None,
+                pad: cleaner_core::strip::EdgePad::None,
+                tiles: None,
+            }
+        };
+        assert!(matches!(
+            edit_with_bench_render(&mut bench, Engine::Fill, &located, plan, Some(&mut fake))
+                .unwrap(),
+            Outcome::Cleaned(_)
+        ));
+        assert_eq!(observed, Some((255, 255, true, false)));
+
+        let mut neighbor_seen = None;
+        let neighbor = Plan {
+            expected_source: None,
+            region_id: "neighbor".into(),
+            geometry: Geometry::Painted(Mask::filled(Rect::new(52, 38, 8, 8))),
+            choice: Choice::Exact(Engine::Fill),
+            source: "hand",
+            tool: Some("aiMaskBrush".into()),
+            fill_mode: None,
+            clears_untouched: false,
+            paint: None,
+            requested: Some(Rect::new(52, 38, 8, 8)),
+            stroke: None,
+            drawn: None,
+        };
+        let mut fake_neighbor = |image: &Raster, fitted: &Fitted| {
+            neighbor_seen = Some((image.sample(40, 40, 0), fitted.mask.contains(40, 40)));
+            let mut pixels = cleaner_core::engines::fill::render_solid(image, fitted);
+            pixels.data.fill(170);
+            run::Made {
+                engine: Engine::Fill,
+                mask: fitted.mask.clone(),
+                ink: fitted.ink.clone(),
+                pixels,
+                provider: None,
+                model_sha256: None,
+                pad: cleaner_core::strip::EdgePad::None,
+                tiles: None,
+            }
+        };
+        assert!(matches!(
+            edit_with_bench_render(
+                &mut bench,
+                Engine::Fill,
+                &located,
+                neighbor,
+                Some(&mut fake_neighbor)
+            )
+            .unwrap(),
+            Outcome::Cleaned(_)
+        ));
+        assert_eq!(
+            neighbor_seen,
+            Some((255, false)),
+            "A must reach B's neighboring context"
+        );
+
+        // A newer visible result covers B. Retry B must exclude both B's old
+        // output and that newer result, and read A at its stored order ceiling.
+        let mut job = Job::open(&located.job_path).unwrap();
+        let mut c = job
+            .load_patch(job.project.patches.iter().find(|p| p.id == "b").unwrap())
+            .unwrap();
+        c.id = "c".into();
+        c.order = 3;
+        c.pixels.data.fill(30);
+        job.complete_region(0, &c, None).unwrap();
+        let retry = Plan {
+            expected_source: None,
+            region_id: "b".into(),
+            geometry: Geometry::Stored,
+            choice: Choice::Exact(Engine::Fill),
+            source: "hand",
+            tool: Some("aiMaskBrush".into()),
+            fill_mode: None,
+            clears_untouched: false,
+            paint: None,
+            requested: Some(Rect::new(42, 40, 12, 6)),
+            stroke: None,
+            drawn: None,
+        };
+        let mut retry_seen = None;
+        let mut fake_retry = |image: &Raster, fitted: &Fitted| {
+            retry_seen = Some(image.sample(44, 40, 0));
+            let mut pixels = cleaner_core::engines::fill::render_solid(image, fitted);
+            pixels.data.fill(120);
+            run::Made {
+                engine: Engine::Fill,
+                mask: fitted.mask.clone(),
+                ink: fitted.ink.clone(),
+                pixels,
+                provider: None,
+                model_sha256: None,
+                pad: cleaner_core::strip::EdgePad::None,
+                tiles: None,
+            }
+        };
+        assert!(matches!(
+            edit_with_bench_render(
+                &mut bench,
+                Engine::Fill,
+                &located,
+                retry,
+                Some(&mut fake_retry)
+            )
+            .unwrap(),
+            Outcome::Cleaned(_)
+        ));
+        assert_eq!(retry_seen, Some(255));
+
+        let mut job = Job::open(&located.job_path).unwrap();
+        job.project
+            .patches
+            .iter_mut()
+            .find(|p| p.id == "b")
+            .unwrap()
+            .review_state = Some("review.reason.unusuallyLarge".into());
+        job.flush().unwrap();
+        crate::underlay::refresh_dependencies(&mut job, "a").unwrap();
+        assert_eq!(
+            job.project
+                .patches
+                .iter()
+                .find(|p| p.id == "b")
+                .unwrap()
+                .review_state
+                .as_deref(),
+            Some("review.reason.unusuallyLarge")
+        );
+        job.project
+            .patches
+            .iter_mut()
+            .find(|p| p.id == "a")
+            .unwrap()
+            .visible = false;
+        job.flush().unwrap();
+        crate::underlay::refresh_dependencies(&mut job, "a").unwrap();
+        assert_eq!(
+            job.project
+                .patches
+                .iter()
+                .find(|p| p.id == "b")
+                .unwrap()
+                .review_state
+                .as_deref(),
+            Some("review.reason.inputChanged")
+        );
+        assert_eq!(
+            job.project
+                .patches
+                .iter()
+                .find(|p| p.id == "b")
+                .unwrap()
+                .provenance
+                .params_snapshot["review_before_input_change"],
+            "review.reason.unusuallyLarge"
+        );
+        let deleted_retry = Plan {
+            expected_source: None,
+            region_id: "a".into(),
+            geometry: Geometry::Stored,
+            choice: Choice::Exact(Engine::Fill),
+            source: "hand",
+            tool: Some("aiMaskBrush".into()),
+            fill_mode: None,
+            clears_untouched: false,
+            paint: None,
+            requested: Some(Rect::new(36, 36, 12, 12)),
+            stroke: None,
+            drawn: None,
+        };
+        assert!(matches!(
+            edit_with_bench(&mut bench, Engine::Fill, &located, deleted_retry).unwrap(),
+            Outcome::NotFound
+        ));
+        assert!(
+            !Job::open(&located.job_path)
+                .unwrap()
+                .project
+                .patches
+                .iter()
+                .find(|p| p.id == "a")
+                .unwrap()
+                .visible
+        );
+        let hidden = Plan {
+            expected_source: None,
+            region_id: "after-hidden".into(),
+            geometry: Geometry::Painted(Mask::filled(Rect::new(36, 38, 4, 5))),
+            choice: Choice::Exact(Engine::Fill),
+            source: "hand",
+            tool: Some("aiMaskBrush".into()),
+            fill_mode: None,
+            clears_untouched: false,
+            paint: None,
+            requested: Some(Rect::new(36, 38, 4, 5)),
+            stroke: None,
+            drawn: None,
+        };
+        let mut hidden_seen = None;
+        let mut fake_hidden = |image: &Raster, fitted: &Fitted| {
+            hidden_seen = Some(image.sample(38, 40, 0));
+            let pixels = cleaner_core::engines::fill::render_solid(image, fitted);
+            run::Made {
+                engine: Engine::Fill,
+                mask: fitted.mask.clone(),
+                ink: fitted.ink.clone(),
+                pixels,
+                provider: None,
+                model_sha256: None,
+                pad: cleaner_core::strip::EdgePad::None,
+                tiles: None,
+            }
+        };
+        assert!(matches!(
+            edit_with_bench_render(
+                &mut bench,
+                Engine::Fill,
+                &located,
+                hidden,
+                Some(&mut fake_hidden)
+            )
+            .unwrap(),
+            Outcome::Cleaned(_)
+        ));
+        assert_eq!(hidden_seen, Some(0));
+        std::fs::remove_dir_all(root).ok();
+    }
+
     fn strip_edit_fixture(name: &str) -> (PathBuf, Located) {
-        use cleaner_core::image::{Format, encode, fixtures};
+        use cleaner_core::image::{encode, fixtures, Format};
         use cleaner_core::ingest::source_ref;
         use cleaner_core::project::{Project, StripMode};
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -3147,10 +5296,90 @@ mod tests {
             .collect::<Vec<_>>();
         let manifest = root.join("job/chapter.mtclean");
         std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-        let project = Project::new(manifest.parent().unwrap(), "test", StripMode::Longstrip, &sources);
+        let project = Project::new(
+            manifest.parent().unwrap(),
+            "test",
+            StripMode::Longstrip,
+            &sources,
+        );
         Job::create(&manifest, project).unwrap();
-        let located = Located { chapter_id: "chapter".into(), job_path: manifest, page_index: 0 };
+        let located = Located {
+            chapter_id: "chapter".into(),
+            job_path: manifest,
+            page_index: 0,
+        };
         (root, located)
+    }
+
+    #[test]
+    fn reordered_strip_paint_uses_source_placement() {
+        let (root, located) = strip_edit_fixture("reordered-paint");
+        let mut job = Job::open(&located.job_path).unwrap();
+        job.project.strip.order = vec![1, 0];
+        let bounds = Rect::new(5, 7, 3, 3);
+        let mask = Mask::filled(bounds);
+        let patch = Patch {
+            id: "lower".into(),
+            mask: mask.clone(),
+            ink: mask,
+            pixels: Raster {
+                width: 3, height: 3,
+                mode: cleaner_core::image::ColorMode::Gray,
+                depth: cleaner_core::image::BitDepth::Eight,
+                icc: None, palette: None, trns: None, srgb_intent: None,
+                data: vec![200; 9],
+            },
+            order: 0,
+            visible: true,
+            provenance: Provenance {
+                engine: Engine::Fill, engine_version: "fixture".into(),
+                model_sha256: None, execution_provider: "cpu".into(),
+                params_snapshot: serde_json::json!({}), mask_sha256: String::new(),
+                source_sha256: String::new(), cloud: None, created: 0,
+            },
+        };
+        job.complete_region(1, &patch, None).unwrap();
+        let strip = run::strip_of(&job.project);
+        let context = Some(StripPaintContext {
+            strip: &strip, order: &job.project.strip.order, origin: (0, 0),
+        });
+        let record = &job.project.patches[0];
+        assert_eq!(record_box_in_paint_space(record, context), Some(bounds));
+        assert_eq!(patch_in_paint_space(&job, record, context).unwrap().unwrap().mask.bounds, bounds);
+        assert_eq!(patches_over(&job, 1, 1, bounds, context).unwrap().len(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn additions_only_text_shape_has_provisional_reading_context() {
+        use cleaner_core::text_shape::{MaskQualityState, MaskRaster, MASK_PLAN_VERSION};
+        let empty = MaskRaster::from(Mask::empty(Rect::new(0, 0, 0, 0)));
+        let mut additions = Mask::empty(Rect::new(5, 6, 2, 2));
+        additions.set(5, 6, true);
+        let plan = MaskPlan {
+            version: MASK_PLAN_VERSION,
+            region_id: "chapter-p001-h1".into(),
+            source_sha256: "source".into(),
+            lower_composite_sha256: "preparing".into(),
+            algorithm_id: "fixture".into(),
+            model_id: None,
+            candidate_bounds: Rect::new(4, 5, 4, 4),
+            refinement_crop: Rect::new(4, 5, 4, 4),
+            base_revision: 1,
+            correction_revision: 1,
+            plan_revision: 1,
+            base_mask: empty.clone(),
+            additions: MaskRaster::from(additions),
+            removals: empty,
+            padding_px: 0,
+            model_hole_margin_px: 0,
+            reading_context: Rect::new(0, 0, 0, 0),
+            blend_alpha: None,
+            quality: MaskQualityState::Ready,
+        };
+        let mut provisional = plan.clone();
+        provisional.reading_context = provisional_text_shape_context(&plan);
+        assert!(provisional.prepare(20, 20).is_ok());
     }
 
     fn test_bench(root: &std::path::Path) -> Bench {
@@ -3164,7 +5393,106 @@ mod tests {
             rung2: run::Rung2::new(&models, Preference::CpuOnly),
             flux: None,
             flux_key: None,
+            detected_seed: None,
         }
+    }
+
+    #[test]
+    fn prepared_text_shape_near_a_strip_join_reads_the_same_lower_context_at_apply() {
+        use cleaner_core::text_shape::{MaskQualityState, MaskRaster, MASK_PLAN_VERSION};
+        let (root, located) = strip_edit_fixture("text-shape-near-join");
+        let mut job = Job::open(&located.job_path).unwrap();
+        let source_idx = Library::resolve_page(&job.project, located.page_index).unwrap();
+        let bytes = std::fs::read(job.source_path(source_idx).unwrap()).unwrap();
+        let raw = decode(&bytes).unwrap();
+        let mut base = Mask::empty(Rect::new(20, raw.height as i64 - 5, 3, 3));
+        base.set(21, raw.height as i64 - 4, true);
+        let empty = MaskRaster::from(Mask::empty(Rect::new(0, 0, 0, 0)));
+        let region_id = "chapter-p001-h1".to_string();
+        let mut mask_plan = MaskPlan {
+            version: MASK_PLAN_VERSION,
+            region_id: region_id.clone(),
+            source_sha256: sha256_hex(&bytes),
+            lower_composite_sha256: "pending".into(),
+            algorithm_id: "synthetic-test".into(),
+            model_id: None,
+            candidate_bounds: Rect::new(16, raw.height as i64 - 9, 12, 9),
+            refinement_crop: Rect::new(10, raw.height as i64 - 20, 30, 20),
+            base_revision: 1,
+            correction_revision: 0,
+            plan_revision: 1,
+            base_mask: MaskRaster::from(base),
+            additions: empty.clone(),
+            removals: empty,
+            padding_px: 2,
+            model_hole_margin_px: 5,
+            reading_context: Rect::new(20, raw.height as i64 - 5, 3, 3),
+            blend_alpha: None,
+            quality: MaskQualityState::Ready,
+        };
+        let provisional = mask_plan.prepare(raw.width, raw.height).unwrap();
+        let (input, context) = prepared_input_for_page(
+            &job,
+            &located,
+            source_idx,
+            &raw,
+            provisional.write_support.bounds,
+            0,
+        )
+        .unwrap();
+        assert!(
+            context.bottom() > raw.height as i64,
+            "the read context must include the next strip page"
+        );
+        mask_plan.lower_composite_sha256 = lower_composite_revision(&input);
+        mask_plan.reading_context = context;
+        let prepared = mask_plan.prepare(raw.width, raw.height).unwrap();
+        job.store_text_shape_plan(source_idx, &mask_plan, &prepared)
+            .unwrap();
+        drop(job);
+        let mut bench = test_bench(&root);
+        let mut fake = |page: &Raster, fitted: &Fitted| run::Made {
+            engine: Engine::Fill,
+            mask: fitted.mask.clone(),
+            ink: fitted.ink.clone(),
+            pixels: cleaner_core::engines::fill::render(page, fitted),
+            provider: None,
+            model_sha256: None,
+            pad: cleaner_core::strip::EdgePad::None,
+            tiles: None,
+        };
+        let plan = Plan {
+            expected_source: None,
+            region_id: region_id.clone(),
+            geometry: Geometry::Prepared(prepared.identity.identity_sha256.clone()),
+            choice: Choice::Exact(Engine::Fill),
+            source: "auto",
+            tool: None,
+            fill_mode: None,
+            clears_untouched: false,
+            paint: None,
+            requested: None,
+            stroke: None,
+            drawn: None,
+        };
+        assert!(matches!(
+            edit_with_bench_render(&mut bench, Engine::Fill, &located, plan, Some(&mut fake))
+                .unwrap(),
+            Outcome::Cleaned(_)
+        ));
+        let reopened = Job::open(&located.job_path).unwrap();
+        let row = reopened
+            .project
+            .patches
+            .iter()
+            .find(|row| row.id == region_id)
+            .unwrap();
+        assert_eq!(row.bbox, prepared.write_support.bounds);
+        assert_eq!(
+            row.text_shape_plan_identity.as_deref(),
+            Some(prepared.identity.identity_sha256.as_str())
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -3173,7 +5501,16 @@ mod tests {
         let initial = Job::open(&located.job_path).unwrap();
         let source = initial.project.strip.order[0];
         let (w, h) = page_size(&initial, source).unwrap();
-        let rect = pixels_of(Bbox { x: 25.0, y: 90.0, w: 50.0, h: 20.0 }, w, h);
+        let rect = pixels_of(
+            Bbox {
+                x: 25.0,
+                y: 90.0,
+                w: 50.0,
+                h: 20.0,
+            },
+            w,
+            h,
+        );
         let shape = PaintedShape {
             kind: ShapeKind::Ellipse,
             points: vec![
@@ -3185,6 +5522,7 @@ mod tests {
             feather: 0.0,
         };
         let plan = Plan {
+            expected_source: None,
             region_id: "chapter-p001-h1".into(),
             geometry: Geometry::Given(rect),
             choice: Choice::Exact(Engine::Fill),
@@ -3193,7 +5531,10 @@ mod tests {
             fill_mode: Some("solid"),
             clears_untouched: false,
             paint: Some(PaintPlan {
-                kind: PaintKind::Shape { color: [30, 30, 30], shape: shape.clone() },
+                kind: PaintKind::Shape {
+                    color: [30, 30, 30],
+                    shape: shape.clone(),
+                },
                 points: Vec::new(),
                 spec: cleaner_core::paint::BrushSpec::default(),
                 alignment: "aligned",
@@ -3207,19 +5548,29 @@ mod tests {
         assert!(matches!(created, Outcome::Cleaned(_)));
 
         let written = Job::open(&located.job_path).unwrap();
-        let record = written.project.patches.iter().find(|p| p.id == "chapter-p001-h1").unwrap();
+        let record = written
+            .project
+            .patches
+            .iter()
+            .find(|p| p.id == "chapter-p001-h1")
+            .unwrap();
         assert!(record.bbox.y < h as i64 && record.bbox.bottom() > h as i64);
         let patch = written.load_patch(record).unwrap();
-        assert!(!patch.mask.contains(record.bbox.x, record.bbox.y), "ellipse became its box");
+        assert!(
+            !patch.mask.contains(record.bbox.x, record.bbox.y),
+            "ellipse became its box"
+        );
         assert!(patch.mask.bits.contains(&0) && patch.mask.bits.iter().any(|b| *b != 0));
         let strip = run::strip_of(&written.project);
         let global = cleaner_core::export::StripPatch::lift(&strip, 0, &patch).unwrap();
         let first = cleaner_core::export::patches_on_page(&strip, 0, std::slice::from_ref(&global));
-        let second = cleaner_core::export::patches_on_page(&strip, 1, std::slice::from_ref(&global));
+        let second =
+            cleaner_core::export::patches_on_page(&strip, 1, std::slice::from_ref(&global));
         assert!(!first.is_empty() && first[0].mask.bits.iter().any(|bit| *bit != 0));
         assert!(!second.is_empty() && second[0].mask.bits.iter().any(|bit| *bit != 0));
 
         let rerun = Plan {
+            expected_source: None,
             region_id: "chapter-p001-h1".into(),
             geometry: Geometry::Stored,
             choice: Choice::Exact(Engine::Fill),
@@ -3252,6 +5603,7 @@ mod tests {
         };
         let second_rect = Rect::new(19, 8, 26, 24);
         let second_plan = Plan {
+            expected_source: None,
             region_id: "chapter-p002-h1".into(),
             geometry: Geometry::Given(second_rect),
             choice: Choice::Exact(Engine::Fill),
@@ -3260,7 +5612,10 @@ mod tests {
             fill_mode: Some("solid"),
             clears_untouched: false,
             paint: Some(PaintPlan {
-                kind: PaintKind::Shape { color: [230, 230, 230], shape: second_shape.clone() },
+                kind: PaintKind::Shape {
+                    color: [230, 230, 230],
+                    shape: second_shape.clone(),
+                },
                 points: Vec::new(),
                 spec: cleaner_core::paint::BrushSpec {
                     opacity: 50.0,
@@ -3277,11 +5632,30 @@ mod tests {
             Outcome::Cleaned(_)
         ));
         let layered = Job::open(&located.job_path).unwrap();
-        let old_order = layered.project.patches.iter().find(|p| p.id == "chapter-p001-h1").unwrap().order;
-        let old_record = layered.project.patches.iter().find(|p| p.id == "chapter-p001-h1").unwrap();
-        let new_record = layered.project.patches.iter().find(|p| p.id == "chapter-p002-h1").unwrap();
+        let old_order = layered
+            .project
+            .patches
+            .iter()
+            .find(|p| p.id == "chapter-p001-h1")
+            .unwrap()
+            .order;
+        let old_record = layered
+            .project
+            .patches
+            .iter()
+            .find(|p| p.id == "chapter-p001-h1")
+            .unwrap();
+        let new_record = layered
+            .project
+            .patches
+            .iter()
+            .find(|p| p.id == "chapter-p002-h1")
+            .unwrap();
         let new_order = new_record.order;
-        assert!(new_order > old_order, "strip paint order must be chapter-wide");
+        assert!(
+            new_order > old_order,
+            "strip paint order must be chapter-wide"
+        );
         let old_patch = layered.load_patch(old_record).unwrap();
         let new_patch = layered.load_patch(new_record).unwrap();
         let global_x = 32i64;
@@ -3299,8 +5673,158 @@ mod tests {
             0,
         );
         let expected = ((230.0 + below as f64) / 2.0).round() as u16;
-        assert_eq!(below, 30, "the older seam paint must be the sampled under-layer");
-        assert_eq!(above, expected, "page-two paint did not composite over the seam patch");
+        assert_eq!(
+            below, 30,
+            "the older seam paint must be the sampled under-layer"
+        );
+        assert_eq!(
+            above, expected,
+            "page-two paint did not composite over the seam patch"
+        );
+
+        let cross_ai = Plan {
+            expected_source: None,
+            region_id: "chapter-p001-ai-cross".into(),
+            geometry: Geometry::Painted(Mask::filled(Rect::new(27, 390, 10, 24))),
+            choice: Choice::Exact(Engine::Fill),
+            source: "hand",
+            tool: Some("aiMaskBrush".into()),
+            fill_mode: None,
+            clears_untouched: false,
+            paint: None,
+            requested: Some(Rect::new(27, 390, 10, 24)),
+            stroke: None,
+            drawn: None,
+        };
+        let mut cross_seen = None;
+        let mut fake_cross = |image: &Raster, fitted: &Fitted| {
+            cross_seen = Some((
+                image.sample(32, 380, 0),
+                image.sample(32, 420, 0),
+                fitted.mask.contains(32, 420),
+            ));
+            let pixels = cleaner_core::engines::fill::render_solid(image, fitted);
+            run::Made {
+                engine: Engine::Fill,
+                mask: fitted.mask.clone(),
+                ink: fitted.ink.clone(),
+                pixels,
+                provider: None,
+                model_sha256: None,
+                pad: cleaner_core::strip::EdgePad::None,
+                tiles: None,
+            }
+        };
+        assert!(matches!(
+            edit_with_bench_render(
+                &mut bench,
+                Engine::Fill,
+                &located,
+                cross_ai,
+                Some(&mut fake_cross)
+            )
+            .unwrap(),
+            Outcome::Cleaned(_)
+        ));
+        let cloud_job = Job::open(&located.job_path).unwrap();
+        let cloud_record = cloud_job
+            .project
+            .patches
+            .iter()
+            .find(|p| p.id == "chapter-p001-ai-cross")
+            .unwrap();
+        let cloud_patch = cloud_job.load_patch(cloud_record).unwrap();
+        let source = std::fs::read(cloud_job.source_path(0).unwrap()).unwrap();
+        let raw = decode(&source).unwrap();
+        let cloud = crate::underlay::prepare_cloud(&cloud_job, 0, &raw, cloud_record, &cloud_patch)
+            .unwrap();
+        let at = |x: i64, y: i64| {
+            cloud.input.image.sample(
+                (x - cloud.input.window.x) as u32,
+                (y - cloud.input.window.y) as u32,
+                0,
+            )
+        };
+        assert_eq!(
+            at(32, 420),
+            above,
+            "cloud crop must include the page-two predecessor"
+        );
+        assert_eq!(
+            cross_seen,
+            Some((30, expected, false)),
+            "AI context must include patches from both join sides"
+        );
+        let mut review_job = Job::open(&located.job_path).unwrap();
+        let older_record = review_job
+            .project
+            .patches
+            .iter()
+            .find(|p| p.id == "chapter-p001-h1")
+            .unwrap();
+        let mut older = review_job.load_patch(older_record).unwrap();
+        review_job.complete_region(0, &older, None).unwrap();
+        crate::underlay::refresh_dependencies(&mut review_job, "chapter-p001-h1").unwrap();
+        assert_eq!(
+            review_job
+                .project
+                .patches
+                .iter()
+                .find(|p| p.id == "chapter-p001-ai-cross")
+                .unwrap()
+                .review_state,
+            None,
+            "same pixels must not create a cross-join warning"
+        );
+        let original = older.clone();
+        older.pixels.data.fill(99);
+        review_job.complete_region(0, &older, None).unwrap();
+        crate::underlay::refresh_dependencies(&mut review_job, "chapter-p001-h1").unwrap();
+        assert_eq!(
+            review_job
+                .project
+                .patches
+                .iter()
+                .find(|p| p.id == "chapter-p001-ai-cross")
+                .unwrap()
+                .review_state
+                .as_deref(),
+            Some("review.reason.inputChanged")
+        );
+        review_job.complete_region(0, &original, None).unwrap();
+        crate::underlay::refresh_dependencies(&mut review_job, "chapter-p001-h1").unwrap();
+        review_job.complete_region(1, &new_patch, None).unwrap();
+        crate::underlay::refresh_dependencies(&mut review_job, "chapter-p002-h1").unwrap();
+        assert_eq!(
+            review_job
+                .project
+                .patches
+                .iter()
+                .find(|p| p.id == "chapter-p001-ai-cross")
+                .unwrap()
+                .review_state,
+            None,
+            "same page-two pixels must not warn the page-one AI stroke"
+        );
+        let mut changed_second = new_patch.clone();
+        changed_second.pixels.data.fill(99);
+        review_job
+            .complete_region(1, &changed_second, None)
+            .unwrap();
+        crate::underlay::refresh_dependencies(&mut review_job, "chapter-p002-h1").unwrap();
+        assert_eq!(
+            review_job
+                .project
+                .patches
+                .iter()
+                .find(|p| p.id == "chapter-p001-ai-cross")
+                .unwrap()
+                .review_state
+                .as_deref(),
+            Some("review.reason.inputChanged")
+        );
+        review_job.complete_region(1, &new_patch, None).unwrap();
+        crate::underlay::refresh_dependencies(&mut review_job, "chapter-p002-h1").unwrap();
 
         assert!(matches!(
             edit_with_bench(&mut bench, Engine::Fill, &located, rerun).unwrap(),
@@ -3308,13 +5832,43 @@ mod tests {
         ));
 
         let mut undone = Job::open(&located.job_path).unwrap();
-        undone.project.patches.iter_mut().find(|p| p.id == "chapter-p001-h1").unwrap().visible = false;
+        undone
+            .project
+            .patches
+            .iter_mut()
+            .find(|p| p.id == "chapter-p001-h1")
+            .unwrap()
+            .visible = false;
         undone.flush().unwrap();
-        assert!(!Job::open(&located.job_path).unwrap().project.patches.iter().find(|p| p.id == "chapter-p001-h1").unwrap().visible);
+        assert!(
+            !Job::open(&located.job_path)
+                .unwrap()
+                .project
+                .patches
+                .iter()
+                .find(|p| p.id == "chapter-p001-h1")
+                .unwrap()
+                .visible
+        );
         let mut redone = Job::open(&located.job_path).unwrap();
-        redone.project.patches.iter_mut().find(|p| p.id == "chapter-p001-h1").unwrap().visible = true;
+        redone
+            .project
+            .patches
+            .iter_mut()
+            .find(|p| p.id == "chapter-p001-h1")
+            .unwrap()
+            .visible = true;
         redone.flush().unwrap();
-        assert!(Job::open(&located.job_path).unwrap().project.patches.iter().find(|p| p.id == "chapter-p001-h1").unwrap().visible);
+        assert!(
+            Job::open(&located.job_path)
+                .unwrap()
+                .project
+                .patches
+                .iter()
+                .find(|p| p.id == "chapter-p001-h1")
+                .unwrap()
+                .visible
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -3366,15 +5920,24 @@ mod tests {
             setting_str(Some(&stored), FLUX_MODEL_KEYS).as_deref(),
             Some("flux2-klein-9b")
         );
-        assert_eq!(setting_str(Some(&stored), FLUX_BACKEND_KEYS).as_deref(), Some("sdnq"));
+        assert_eq!(
+            setting_str(Some(&stored), FLUX_BACKEND_KEYS).as_deref(),
+            Some("sdnq")
+        );
 
         // The current spelling wins where both are present.
         let both = serde_json::json!({ "fluxBackend": "mflux", "sidecarBackend": "sdnq" });
-        assert_eq!(setting_str(Some(&both), FLUX_BACKEND_KEYS).as_deref(), Some("mflux"));
+        assert_eq!(
+            setting_str(Some(&both), FLUX_BACKEND_KEYS).as_deref(),
+            Some("mflux")
+        );
 
         // Cleared, missing, and no settings file at all are one answer, and
         // `flux_backend` turns it into the platform default rather than an error.
-        for empty in [serde_json::json!({ "fluxBackend": "  " }), serde_json::json!({})] {
+        for empty in [
+            serde_json::json!({ "fluxBackend": "  " }),
+            serde_json::json!({}),
+        ] {
             assert_eq!(setting_str(Some(&empty), FLUX_BACKEND_KEYS), None);
         }
         assert_eq!(setting_str(None, FLUX_BACKEND_KEYS), None);
@@ -3391,13 +5954,19 @@ mod tests {
         let nowhere = "/nonexistent/manga-cleaner-sidecar";
         let absent = sidecar_status_from(Some(nowhere), Some("sdnq"), None);
         assert!(!absent.available);
-        assert_eq!(absent.reason_key, None, "a rung nobody installed says nothing");
+        assert_eq!(
+            absent.reason_key, None,
+            "a rung nobody installed says nothing"
+        );
 
         // A virtual environment built for the test, so "installed" is a fact
         // about a directory rather than about this machine.
         let base = std::env::temp_dir().join(format!("mc-region-sidecar-{}", std::process::id()));
-        let (dir, name) =
-            if cfg!(windows) { ("Scripts", "python.exe") } else { ("bin", "python3") };
+        let (dir, name) = if cfg!(windows) {
+            ("Scripts", "python.exe")
+        } else {
+            ("bin", "python3")
+        };
         std::fs::create_dir_all(base.join(dir)).unwrap();
         std::fs::write(base.join(dir).join(name), b"").unwrap();
         std::fs::write(base.join("pyvenv.cfg"), b"home = /usr/bin\n").unwrap();
@@ -3416,7 +5985,10 @@ mod tests {
             assert!(portable.available, "{:?}", portable.reason_key);
             assert_eq!(portable.reason_key, None);
         } else {
-            assert_eq!(portable.reason_key, Some("decline.reason.sidecarUnknownMachine"));
+            assert_eq!(
+                portable.reason_key,
+                Some("decline.reason.sidecarUnknownMachine")
+            );
         }
 
         let _ = std::fs::remove_dir_all(&base);
@@ -3473,14 +6045,22 @@ mod tests {
             },
         });
         let plan = paint_plan("brush", &params).unwrap();
-        assert_eq!(plan.kind, PaintKind::Brush { color: [0xff, 0x80, 0x00] });
+        assert_eq!(
+            plan.kind,
+            PaintKind::Brush {
+                color: [0xff, 0x80, 0x00]
+            }
+        );
         assert_eq!(plan.points.len(), 2);
         assert_eq!(plan.points[0].p, 0.25);
         // The block wins over `params` where both carry the key.
         assert_eq!(plan.spec.hardness, 90.0);
         // And `params` is read where the block is silent.
         assert_eq!(plan.spec.size, 40.0);
-        assert_eq!((plan.spec.opacity, plan.spec.flow, plan.spec.spacing), (70.0, 55.0, 4.0));
+        assert_eq!(
+            (plan.spec.opacity, plan.spec.flow, plan.spec.spacing),
+            (70.0, 55.0, 4.0)
+        );
         assert!(!plan.spec.pressure_size);
         assert!(plan.spec.pressure_opacity);
         assert_eq!(plan.spec.seed, 4242);
@@ -3513,7 +6093,13 @@ mod tests {
         assert!(plan.points.iter().all(|p| p.p == 0.5));
         // No `mode` word means heal, which is the tool's own default. The offset
         // is the seam's, negated - see the sign test below.
-        assert_eq!(plan.kind, PaintKind::Clone { heal: true, offset: (4.0, -3.0) });
+        assert_eq!(
+            plan.kind,
+            PaintKind::Clone {
+                heal: true,
+                offset: (4.0, -3.0)
+            }
+        );
 
         let cloning = serde_json::json!({
             "mode": "clone",
@@ -3522,7 +6108,10 @@ mod tests {
         });
         assert_eq!(
             paint_plan("cloneHeal", &cloning).unwrap().kind,
-            PaintKind::Clone { heal: false, offset: (-1.5, 2.5) }
+            PaintKind::Clone {
+                heal: false,
+                offset: (-1.5, 2.5)
+            }
         );
     }
 
@@ -3558,7 +6147,10 @@ mod tests {
         // than trusting the field is the whole point: this is the arithmetic
         // the kernel does.
         let source = (stroke_start.0 - offset.0, stroke_start.1 - offset.1);
-        assert_eq!(source, alt_click, "the kernel would have sampled the wrong pixel");
+        assert_eq!(
+            source, alt_click,
+            "the kernel would have sampled the wrong pixel"
+        );
 
         // And the `cloneSource` fallback lands on the same internal value, so
         // the two routes into `clone_offset` cannot disagree about direction.
@@ -3569,7 +6161,10 @@ mod tests {
         });
         assert_eq!(
             paint_plan("cloneHeal", &by_source).unwrap().kind,
-            PaintKind::Clone { heal: false, offset: (20.0, 25.0) }
+            PaintKind::Clone {
+                heal: false,
+                offset: (20.0, 25.0)
+            }
         );
     }
 
@@ -3586,7 +6181,13 @@ mod tests {
         let plan = paint_plan("cloneHeal", &params).unwrap();
         // `strokeStart − cloneSource` is already the internal `target − source`,
         // so this route is *not* negated a second time.
-        assert_eq!(plan.kind, PaintKind::Clone { heal: true, offset: (20.0, 25.0) });
+        assert_eq!(
+            plan.kind,
+            PaintKind::Clone {
+                heal: true,
+                offset: (20.0, 25.0)
+            }
+        );
 
         let bare = serde_json::json!({
             "stroke": { "points": [{ "x": 30.0, "y": 40.0 }], "radius": 6.0 },
@@ -3601,7 +6202,10 @@ mod tests {
     fn a_stroke_with_no_points_is_not_a_paint_plan() {
         let params = serde_json::json!({ "mode": "paint", "paint": { "points": [] } });
         assert_eq!(paint_plan("brush", &params), None);
-        assert_eq!(paint_plan("brush", &serde_json::json!({ "mode": "paint" })), None);
+        assert_eq!(
+            paint_plan("brush", &serde_json::json!({ "mode": "paint" })),
+            None
+        );
     }
 
     #[test]
@@ -3637,7 +6241,10 @@ mod tests {
 
         assert_eq!(made.mask.bounds, Rect::new(5, 113, 3, 4));
         assert_eq!(made.ink.bounds, made.mask.bounds);
-        assert_eq!(made.mask.bits, bits, "translation must not demote a stroke to its box");
+        assert_eq!(
+            made.mask.bits, bits,
+            "translation must not demote a stroke to its box"
+        );
         assert!(made.mask.contains(6, 114));
         assert!(!made.mask.contains(5, 113));
         assert_eq!((made.pixels.width, made.pixels.height), (3, 4));
@@ -3649,13 +6256,19 @@ mod tests {
         let anchor = strip.pages()[0];
         let target = Rect::new(20, 80, 30, 10);
         let paint = PaintPlan {
-            kind: PaintKind::Clone { heal: false, offset: (0.0, -30.0) },
+            kind: PaintKind::Clone {
+                heal: false,
+                offset: (0.0, -30.0),
+            },
             points: Vec::new(),
             spec: cleaner_core::paint::BrushSpec::default(),
             alignment: "aligned",
         };
 
-        assert_eq!(manual_requested(target, Some(&paint), Some(anchor)), Rect::new(20, 80, 30, 40));
+        assert_eq!(
+            manual_requested(target, Some(&paint), Some(anchor)),
+            Rect::new(20, 80, 30, 40)
+        );
     }
 
     /// Both hex spellings, and black for everything else - a stroke with an
@@ -3665,7 +6278,13 @@ mod tests {
         assert_eq!(colour_of(Some("#1a2b3c")), [0x1a, 0x2b, 0x3c]);
         assert_eq!(colour_of(Some("1a2b3c")), [0x1a, 0x2b, 0x3c]);
         assert_eq!(colour_of(Some("#f0c")), [0xff, 0x00, 0xcc]);
-        for bad in [Some("#12345"), Some("rebeccapurple"), Some("#zzzzzz"), Some(""), None] {
+        for bad in [
+            Some("#12345"),
+            Some("rebeccapurple"),
+            Some("#zzzzzz"),
+            Some(""),
+            None,
+        ] {
             assert_eq!(colour_of(bad), [0, 0, 0], "{bad:?}");
         }
     }
@@ -3686,7 +6305,10 @@ mod tests {
             },
         });
         let spec = paint_plan("brush", &params).unwrap().spec;
-        assert_eq!((spec.size, spec.opacity, spec.flow, spec.hardness), (1.0, 100.0, 0.0, 100.0));
+        assert_eq!(
+            (spec.size, spec.opacity, spec.flow, spec.hardness),
+            (1.0, 100.0, 0.0, 100.0)
+        );
     }
 
     /// **The snapshot is the brush and not a fit.** `run::params_snapshot`
@@ -3696,6 +6318,7 @@ mod tests {
     #[test]
     fn a_painted_snapshot_records_the_brush_and_not_a_fit() {
         let plan_of = |paint: PaintPlan, tool: &str| Plan {
+            expected_source: None,
             region_id: "c1-p001-h1".into(),
             geometry: Geometry::Stored,
             choice: Choice::Exact(Engine::Fill),
@@ -3730,8 +6353,17 @@ mod tests {
         assert_eq!(snapshot["tool"], "brush");
         assert_eq!(snapshot["fill_mode"], "solid");
         assert_eq!(snapshot["brush"]["size"], 24.0);
-        for absent in ["thickness", "deviation", "write_set", "quality", "alignment"] {
-            assert!(snapshot.get(absent).is_none(), "{absent} has no meaning for a stroke");
+        for absent in [
+            "thickness",
+            "deviation",
+            "write_set",
+            "quality",
+            "alignment",
+        ] {
+            assert!(
+                snapshot.get(absent).is_none(),
+                "{absent} has no meaning for a stroke"
+            );
         }
 
         let clone_params = serde_json::json!({
@@ -3742,15 +6374,26 @@ mod tests {
         });
         let paint = paint_plan("cloneHeal", &clone_params).unwrap();
         let plan = plan_of(paint.clone(), "cloneHeal");
-        let snapshot =
-            paint_snapshot(&plan, &paint, Engine::Clone, 3, std::time::Duration::from_millis(1));
+        let snapshot = paint_snapshot(
+            &plan,
+            &paint,
+            Engine::Clone,
+            3,
+            std::time::Duration::from_millis(1),
+        );
         assert_eq!(snapshot["rung"], "ladder.rung.clone");
         assert_eq!(snapshot["mode"], "clone");
         assert_eq!(snapshot["alignment"], "nonAligned");
         // The seam sent `source − target`; the snapshot records the internal
         // `target − source`, which is its negation.
-        assert_eq!(snapshot["source_offset"], serde_json::json!({ "x": -2.0, "y": 1.0 }));
-        assert!(snapshot.get("color").is_none(), "a clone stroke has no colour of its own");
+        assert_eq!(
+            snapshot["source_offset"],
+            serde_json::json!({ "x": -2.0, "y": 1.0 })
+        );
+        assert!(
+            snapshot.get("color").is_none(),
+            "a clone stroke has no colour of its own"
+        );
 
         // A filled shape records the geometry instead of the sweep: which
         // shape, how far the feather reached, how many vertices described it.
@@ -3772,8 +6415,13 @@ mod tests {
         });
         let paint = paint_plan("shapes", &shape_params).unwrap();
         let plan = plan_of(paint.clone(), "shapes");
-        let snapshot =
-            paint_snapshot(&plan, &paint, Engine::Paint, 0, std::time::Duration::from_millis(2));
+        let snapshot = paint_snapshot(
+            &plan,
+            &paint,
+            Engine::Paint,
+            0,
+            std::time::Duration::from_millis(2),
+        );
         assert_eq!(snapshot["rung"], "ladder.rung.paint");
         assert_eq!(snapshot["mode"], "solid");
         assert_eq!(snapshot["color"], "#ffffff");
@@ -3783,7 +6431,10 @@ mod tests {
         assert_eq!(snapshot["brush"]["opacity"], 40.0);
         // Nothing was walked, and the field says so rather than being absent.
         assert_eq!(snapshot["dabs"], 0);
-        assert!(snapshot.get("source_offset").is_none(), "a filled shape reads from nowhere");
+        assert!(
+            snapshot.get("source_offset").is_none(),
+            "a filled shape reads from nowhere"
+        );
     }
 
     /// The two hand tools are not rungs, and every place that asks the ladder a
@@ -3795,10 +6446,17 @@ mod tests {
         for engine in [Engine::Paint, Engine::Clone] {
             assert!(!engine.is_rung());
             assert!(!run::reachable_automatically(engine));
-            assert_eq!(step(engine, true), engine, "a picker cannot step off a hand tool");
+            assert_eq!(
+                step(engine, true),
+                engine,
+                "a picker cannot step off a hand tool"
+            );
             assert_eq!(step(engine, false), engine);
             assert!(!MANUAL_RUNGS.contains(&engine));
-            assert_eq!(run::effective_ceiling(None, Some(engine.rung_key())), run::HIGHEST_LOCAL);
+            assert_eq!(
+                run::effective_ceiling(None, Some(engine.rung_key())),
+                run::HIGHEST_LOCAL
+            );
             assert_eq!(named_rung(Some(engine.rung_key())), None);
         }
         // And the six that are rungs still are, so the predicate has not
@@ -3884,7 +6542,10 @@ mod tests {
         ));
         // Rung 3a is the one word no pick can carry - no automatic run may
         // reach it - so it can only ever be a rung named outright.
-        assert!(matches!(choice_for(Some("flux"), EnginePick::Fill), Choice::Exact(Engine::Flux)));
+        assert!(matches!(
+            choice_for(Some("flux"), EnginePick::Fill),
+            Choice::Exact(Engine::Flux)
+        ));
         // A word this build does not know is not a rung: it falls back to the
         // pick rather than to a guess.
         assert!(matches!(
@@ -3943,14 +6604,20 @@ mod tests {
 
         // An ellipse is the one inscribed in that same box: the centre is in,
         // the corners are out, and it covers about π/4 of the box.
-        let ellipse = PaintedShape { kind: ShapeKind::Ellipse, ..rect.clone() };
+        let ellipse = PaintedShape {
+            kind: ShapeKind::Ellipse,
+            ..rect.clone()
+        };
         let mask = shape_mask(&ellipse, 1000, 1000).expect("an ellipse on the page is a mask");
         assert!(mask.contains(300, 200), "the centre is inside");
         assert!(!mask.contains(101, 101), "a corner of the box is not");
         assert!(!mask.contains(499, 299));
         let area = (mask.bounds.w as usize) * (mask.bounds.h as usize);
         let ratio = mask.count() as f64 / area as f64;
-        assert!((ratio - std::f64::consts::FRAC_PI_4).abs() < 0.01, "{ratio} is not π/4");
+        assert!(
+            (ratio - std::f64::consts::FRAC_PI_4).abs() < 0.01,
+            "{ratio} is not π/4"
+        );
 
         // A polygon is its own outline. This is the L a lasso draws, and the
         // notch is the half of the bounding box that must stay empty - the
@@ -3975,7 +6642,10 @@ mod tests {
         // Nothing to fill is not a mask: the caller falls back to the box.
         let two = PaintedShape {
             kind: ShapeKind::Polygon,
-            points: vec![StrokePoint { x: 1.0, y: 1.0 }, StrokePoint { x: 2.0, y: 2.0 }],
+            points: vec![
+                StrokePoint { x: 1.0, y: 1.0 },
+                StrokePoint { x: 2.0, y: 2.0 },
+            ],
             feather: 0.0,
         };
         assert!(shape_mask(&two, 1000, 1000).is_none());
@@ -3994,18 +6664,35 @@ mod tests {
             feather: 0.0,
         };
         let plain = shape_mask(&square, 1000, 1000).expect("a mask");
-        let feathered =
-            shape_mask(&PaintedShape { feather: 8.0, ..square.clone() }, 1000, 1000).expect("a mask");
+        let feathered = shape_mask(
+            &PaintedShape {
+                feather: 8.0,
+                ..square.clone()
+            },
+            1000,
+            1000,
+        )
+        .expect("a mask");
         assert!(feathered.count() > plain.count());
-        assert!(feathered.contains(396, 500), "the mask reaches past the outline");
+        assert!(
+            feathered.contains(396, 500),
+            "the mask reaches past the outline"
+        );
         assert!(!plain.contains(396, 500));
 
         // A feather nothing offered - the row stops at `MAX_FEATHER_PX` -
         // cannot ask for a dilation the size of the page. It is clamped rather
         // than refused, and the clamp is what keeps the cost bounded: the
         // dilation tests a `(2r+1)²` kernel at every pixel it grows into.
-        let absurd = shape_mask(&PaintedShape { feather: 1.0e9, ..square.clone() }, 1000, 1000)
-            .expect("a mask");
+        let absurd = shape_mask(
+            &PaintedShape {
+                feather: 1.0e9,
+                ..square.clone()
+            },
+            1000,
+            1000,
+        )
+        .expect("a mask");
         assert_eq!(
             absurd.bounds.w as f64,
             200.0 + MAX_FEATHER_PX * 2.0,
@@ -4044,7 +6731,9 @@ mod tests {
             "painted": painted,
         });
         let plan = paint_plan("shapes", &params).expect("a solid shape is a paint plan");
-        let PaintKind::Shape { color, shape } = plan.kind else { panic!("not a filled shape") };
+        let PaintKind::Shape { color, shape } = plan.kind else {
+            panic!("not a filled shape")
+        };
         assert_eq!(color, [0xff, 0x88, 0x00]);
         assert_eq!(shape.kind, ShapeKind::Ellipse);
         assert_eq!(shape.feather, 3.0);
@@ -4059,16 +6748,22 @@ mod tests {
             "paint": { "shape": painted, "color": "#123", "opacity": 100 },
         });
         let plan = paint_plan("shapes", &params).expect("a solid shape is a paint plan");
-        let PaintKind::Shape { color, .. } = plan.kind else { panic!("not a filled shape") };
+        let PaintKind::Shape { color, .. } = plan.kind else {
+            panic!("not a filled shape")
+        };
         assert_eq!(color, [0x11, 0x22, 0x33]);
 
         // A shape whose kind this build does not know fails to parse, and a
         // caller that sent no shape at all is not painting: both fall back to
         // the ladder with the bounding box, which is §6.1's promised
         // degradation rather than a refusal.
-        let params = serde_json::json!({ "mode": "solid", "painted": { "kind": "bezier", "points": [] } });
+        let params =
+            serde_json::json!({ "mode": "solid", "painted": { "kind": "bezier", "points": [] } });
         assert_eq!(paint_plan("shapes", &params), None);
-        assert_eq!(paint_plan("shapes", &serde_json::json!({ "mode": "solid" })), None);
+        assert_eq!(
+            paint_plan("shapes", &serde_json::json!({ "mode": "solid" })),
+            None
+        );
     }
 
     /// A colour is a colour in every mode this build paints on, and alpha is
@@ -4076,14 +6771,20 @@ mod tests {
     #[test]
     fn a_solid_colour_is_written_per_channel_and_never_into_alpha() {
         use cleaner_core::image::ColorMode;
-        assert_eq!(solid_levels(ColorMode::Rgb, [10, 20, 30]), vec![Some(10), Some(20), Some(30)]);
+        assert_eq!(
+            solid_levels(ColorMode::Rgb, [10, 20, 30]),
+            vec![Some(10), Some(20), Some(30)]
+        );
         assert_eq!(
             solid_levels(ColorMode::Rgba, [10, 20, 30]),
             vec![Some(10), Some(20), Some(30), None]
         );
         // Rec. 601: 0.299·255 + 0.587·0 + 0.114·0 = 76.
         assert_eq!(solid_levels(ColorMode::Gray, [255, 0, 0]), vec![Some(76)]);
-        assert_eq!(solid_levels(ColorMode::GrayAlpha, [255, 255, 255]), vec![Some(255), None]);
+        assert_eq!(
+            solid_levels(ColorMode::GrayAlpha, [255, 255, 255]),
+            vec![Some(255), None]
+        );
     }
 
     /// **A stroke that carries its shape is read as that shape** - the mask is
@@ -4126,7 +6827,15 @@ mod tests {
         let area = (mask.bounds.w as usize) * (mask.bounds.h as usize);
         assert!(mask.count() * 4 < area, "a rectangle got through");
         // Nothing to paint is not a mask: the caller falls back to the box.
-        assert!(stroke_mask(&PaintedStroke { points: vec![], radius: 6.0 }, 1000, 1000).is_none());
+        assert!(stroke_mask(
+            &PaintedStroke {
+                points: vec![],
+                radius: 6.0
+            },
+            1000,
+            1000
+        )
+        .is_none());
     }
 
     /// The engines the AI mask brush's row offers are `ROW_ENGINES` in
@@ -4151,7 +6860,16 @@ mod tests {
     /// Percentages and pixels are inverses, to the rounding.
     #[test]
     fn a_percentage_box_and_a_pixel_box_are_the_same_rectangle() {
-        let rect = pixels_of(Bbox { x: 10.0, y: 25.0, w: 50.0, h: 10.0 }, 1000, 1600);
+        let rect = pixels_of(
+            Bbox {
+                x: 10.0,
+                y: 25.0,
+                w: 50.0,
+                h: 10.0,
+            },
+            1000,
+            1600,
+        );
         assert_eq!(rect, Rect::new(100, 400, 500, 160));
         let back = crate::library::percent_of(rect, 1000, 1600);
         assert!((back.x - 10.0).abs() < 0.01 && (back.h - 10.0).abs() < 0.01);
@@ -4185,15 +6903,24 @@ mod tests {
     fn parse_model_dir_name_derives_correct_id_and_label() {
         assert_eq!(
             parse_model_dir_name("flux2-klein-4b-mflux-q4"),
-            ("flux2-klein-4b".to_string(), "FLUX.2 Klein 4B (4-bit)".to_string())
+            (
+                "flux2-klein-4b".to_string(),
+                "FLUX.2 Klein 4B (4-bit)".to_string()
+            )
         );
         assert_eq!(
             parse_model_dir_name("flux2-klein-4b-mflux-q8"),
-            ("flux2-klein-4b".to_string(), "FLUX.2 Klein 4B (8-bit)".to_string())
+            (
+                "flux2-klein-4b".to_string(),
+                "FLUX.2 Klein 4B (8-bit)".to_string()
+            )
         );
         assert_eq!(
             parse_model_dir_name("flux2-klein-9b-mflux-q4"),
-            ("flux2-klein-9b".to_string(), "FLUX.2 Klein 9B (4-bit)".to_string())
+            (
+                "flux2-klein-9b".to_string(),
+                "FLUX.2 Klein 9B (4-bit)".to_string()
+            )
         );
         assert_eq!(
             parse_model_dir_name("flux2-klein-4b"),
@@ -4205,7 +6932,10 @@ mod tests {
         );
         assert_eq!(
             parse_model_dir_name("flux2-klein-4b-gguf-q4_k_m"),
-            ("flux2-klein-4b".to_string(), "FLUX.2 Klein 4B (Q4_K_M)".to_string())
+            (
+                "flux2-klein-4b".to_string(),
+                "FLUX.2 Klein 4B (Q4_K_M)".to_string()
+            )
         );
         assert_eq!(
             parse_model_dir_name("custom-model"),
@@ -4282,7 +7012,8 @@ mod tests {
     }
 
     #[test]
-    fn clean_anyway_fallback_selects_bubble_for_in_balloon_gate_skips_and_outside_for_outside_bubble() {
+    fn clean_anyway_fallback_selects_bubble_for_in_balloon_gate_skips_and_outside_for_outside_bubble(
+    ) {
         assert_eq!(
             untouched_fallback_pick(Some("review.reason.gateSkippedOutsideBubble")),
             Picks::default().outside
@@ -4296,10 +7027,16 @@ mod tests {
             Picks::default().bubble
         );
 
-        let in_balloon_choice = choice_for(None, untouched_fallback_pick(Some("review.reason.gateSkippedNotJapanese")));
+        let in_balloon_choice = choice_for(
+            None,
+            untouched_fallback_pick(Some("review.reason.gateSkippedNotJapanese")),
+        );
         assert_eq!(in_balloon_choice, Choice::Ladder(Some(EnginePick::Fill)));
 
-        let out_balloon_choice = choice_for(None, untouched_fallback_pick(Some("review.reason.gateSkippedOutsideBubble")));
+        let out_balloon_choice = choice_for(
+            None,
+            untouched_fallback_pick(Some("review.reason.gateSkippedOutsideBubble")),
+        );
         assert_eq!(out_balloon_choice, Choice::Ladder(Some(EnginePick::Lama)));
     }
 
@@ -4337,11 +7074,21 @@ mod tests {
 
     #[test]
     fn explicit_remote_and_malformed_targets_fail_closed() {
-        for value in [serde_json::json!({"type":"beam","profile_id":"p"}), serde_json::json!(null), serde_json::json!({"type":"local","extra":true})] {
-            assert!(explicit_remote_or_invalid_target(&serde_json::json!({"executionTarget":value})));
+        for value in [
+            serde_json::json!({"type":"beam","profile_id":"p"}),
+            serde_json::json!(null),
+            serde_json::json!({"type":"local","extra":true}),
+        ] {
+            assert!(explicit_remote_or_invalid_target(
+                &serde_json::json!({"executionTarget":value})
+            ));
         }
-        assert!(!explicit_remote_or_invalid_target(&serde_json::json!({"engine":"flux","executionTarget":{"type":"local"}})));
-        assert!(!explicit_remote_or_invalid_target(&serde_json::json!({"engine":"lama"})));
+        assert!(!explicit_remote_or_invalid_target(
+            &serde_json::json!({"engine":"flux","executionTarget":{"type":"local"}})
+        ));
+        assert!(!explicit_remote_or_invalid_target(
+            &serde_json::json!({"engine":"lama"})
+        ));
     }
 
     #[test]
@@ -4349,13 +7096,18 @@ mod tests {
         assert!(!run::reachable_automatically(Engine::Cloud));
         assert!(!run::reachable_automatically(Engine::Flux));
         assert_eq!(run::HIGHEST_AUTOMATIC, Engine::Lama);
-        assert_eq!(run::effective_ceiling(None, Some(Engine::Cloud.rung_key())), run::HIGHEST_LOCAL);
+        assert_eq!(
+            run::effective_ceiling(None, Some(Engine::Cloud.rung_key())),
+            run::HIGHEST_LOCAL
+        );
     }
 
     #[test]
     fn is_remote_target_detects_beam_and_modal() {
-        let beam_params = serde_json::json!({"executionTarget": {"type": "beam", "profile_id": "test-beam"}});
-        let modal_params = serde_json::json!({"executionTarget": {"type": "modal", "profile_id": "test-modal"}});
+        let beam_params =
+            serde_json::json!({"executionTarget": {"type": "beam", "profile_id": "test-beam"}});
+        let modal_params =
+            serde_json::json!({"executionTarget": {"type": "modal", "profile_id": "test-modal"}});
         let local_params = serde_json::json!({"executionTarget": {"type": "local"}});
         let empty_params = serde_json::json!({});
 

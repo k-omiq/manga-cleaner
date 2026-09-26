@@ -30,17 +30,25 @@ import { notify } from '../state/app.svelte.js'
 import {
   applyRegionState,
   editor,
+  recordBackgroundRegionEdit,
   recordRegionEdit,
+  reloadPage,
+  scopePageIndices,
   select,
 } from '../state/editor.svelte.js'
+import { holdCreation, releaseCreation } from '../state/heldcreations.js'
 import { cloudRefused } from './cloudflow.svelte.js'
 import { draft, clearDraft, setCloneOffset } from './draft.svelte.js'
 import { AI_STROKE_PX, cloneOffset, paintedStroke } from './gesture.js'
 import { paintParamsOf } from './paint.js'
 import { renderRegionInCloud } from './toolapply.svelte.js'
+import { reportRegionEditFailure } from './maskactions.svelte.js'
 import { SOLID, TOOL_SPECS, toolSpendsCloud } from './tools.js'
 
 export { paintParamsOf }
+
+/** Per-page promise tails. Enqueue synchronously when the gesture ends. */
+const gestureTails = new Map()
 
 /**
  * Commit whatever the draft describes. Clears the draft either way: a gesture
@@ -69,19 +77,37 @@ export async function commitDraft() {
       p: typeof point.p === 'number' && point.p > 0 ? point.p : 0.5,
     })),
     start: active.points[0] ?? { x: active.bbox.x, y: active.bbox.y },
+    chapterId: editor.chapter?.id ?? null,
+    pageIndex: pageOf(active.pageId)?.index ?? null,
+    sourceIndex: pageOf(active.pageId)?.sourceIndex ?? null,
+    sourceSha: pageOf(active.pageId)?.sourceSha ?? null,
+    params: paramsOf(active.tool),
+    cloneSource: draft.cloneSource ? { ...draft.cloneSource } : null,
+    cloneOffset: draft.cloneOffset ? { ...draft.cloneOffset } : null,
   }
   clearDraft()
-
-  switch (spec.tool) {
+  if (!spec.chapterId || spec.pageIndex === null) return false
+  const key = `${spec.chapterId}:${spec.pageId}`
+  const previous = gestureTails.get(key) ?? Promise.resolve()
+  const run = () => {
+    switch (spec.tool) {
     case 'brush':
       return createMask(spec)
     case 'cloneHeal':
       return cloneInto(spec)
     case 'shapes':
-      return createMask(spec, shapeEngine())
+      return createMask(spec, shapeEngine(spec))
     default:
       return createMask(spec)
+    }
   }
+  const next = previous.catch(() => false).then(run).catch(reportRegionEditFailure)
+  gestureTails.set(key, next)
+  void next.then(
+    () => { if (gestureTails.get(key) === next) gestureTails.delete(key) },
+    () => { if (gestureTails.get(key) === next) gestureTails.delete(key) },
+  )
+  return next
 }
 
 /**
@@ -96,8 +122,8 @@ export async function commitDraft() {
  *
  * @returns {Record<string, unknown>}
  */
-function shapeEngine() {
-  const mode = String(paramsOf('shapes').mode ?? SOLID)
+function shapeEngine(spec) {
+  const mode = String(spec.params?.mode ?? SOLID)
   return mode === SOLID ? {} : { engine: mode }
 }
 
@@ -110,6 +136,13 @@ function shapeEngine() {
  * @property {'add'|'paint'} mode
  * @property {Array<{x: number, y: number}>} points
  * @property {{x: number, y: number}} start
+ * @property {string|null} chapterId
+ * @property {number|null} pageIndex
+ * @property {number|null} sourceIndex
+ * @property {string|null} sourceSha
+ * @property {Record<string, unknown>} params
+ * @property {any} cloneSource
+ * @property {any} cloneOffset
  */
 
 /**
@@ -128,7 +161,7 @@ function shapeEngine() {
  */
 function strokeOf(spec) {
   if (spec.kind !== 'stroke') return null
-  const size = paramsOf(spec.tool).size ?? (spec.tool === 'aiMaskBrush' ? AI_STROKE_PX : 0)
+  const size = (spec.params ?? paramsOf(spec.tool)).size ?? (spec.tool === 'aiMaskBrush' ? AI_STROKE_PX : 0)
   return paintedStroke(spec.points, Number(size))
 }
 
@@ -155,7 +188,7 @@ export function paintedShape(spec) {
   if (spec.tool !== 'shapes') return null
   const box = spec.bbox
   if (!box) return null
-  const feather = Math.max(0, Number(paramsOf(spec.tool).feather ?? 0) || 0)
+  const feather = Math.max(0, Number((spec.params ?? paramsOf(spec.tool)).feather ?? 0) || 0)
 
   // A rectangle and an ellipse are their box: the drag says two corners, and
   // the keyboard route says a rectangle outright. The corners travel anyway,
@@ -230,13 +263,13 @@ function paramsOf(tool) {
 async function createMask(spec, extraParams) {
   const chapter = editor.chapter
   const page = pageOf(spec.pageId)
-  if (!chapter || !page) return false
+  if (!chapter || !page || chapter.id !== spec.chapterId || page.index !== spec.pageIndex) return false
 
   const before = page.status
   const stroke = strokeOf(spec)
   const shape = paintedShape(spec)
   const mergedParams = {
-    ...paramsOf(spec.tool),
+    ...spec.params,
     ...(stroke ? { stroke } : {}),
     // The drawn area, for the tools whose gesture is an area rather than a
     // path. `painted` and `stroke` are never both present: a shape has no
@@ -258,14 +291,15 @@ async function createMask(spec, extraParams) {
   // otherwise be a silent hole.
   if (cloudRefused(spec.tool, params)) return false
 
-  // `createRegion` always renders on this machine: consent is bound to a
-  // stored region, and a drawn one is not stored until this call returns. So a
-  // gesture pointed at the cloud makes its region locally first, and the cloud
-  // renders it after one consent, as the second of two undoable edits.
+  // Consent is bound to a stored region, so a cloud gesture creates its local
+  // seed first. Both steps share one undo entry after the cloud result settles.
   const cloud = toolSpendsCloud(spec.tool, params)
   const result = await getBackend().createRegion({
     chapterId: chapter.id,
-    pageIndex: page.index,
+    pageIndex: spec.pageIndex,
+    ...(spec.sourceIndex !== null && spec.sourceSha ? {
+      sourceIndex: spec.sourceIndex, sourceSha: spec.sourceSha,
+    } : {}),
     bbox: spec.bbox,
     tool: spec.tool,
     params: cloud ? withoutCloud(spec.tool, params) : params,
@@ -276,18 +310,75 @@ async function createMask(spec, extraParams) {
   // `applyRegionState` puts this same object into reactive state, and a
   // command must not hold a handle on state that later edits can move under it.
   const created = /** @type {any} */ ($state.snapshot(result.region))
+  const beforeState = { region: null, pageStatus: before }
+  if (editor.chapter?.id !== spec.chapterId) {
+    return recordBackgroundRegionEdit(spec.chapterId, 'canvas.command.drawMask', created.id,
+      beforeState, { region: created, pageStatus: result.pageStatus })
+  }
   applyRegionState(result.region.id, result.region, result.pageStatus)
-  select(created.id)
+  // Selected only while its page is still the one in view. A result that
+  // arrives after a page turn is on a page the reader has left, and a
+  // selection there is one a Delete shortcut would act on unseen.
+  if (scopePageIndices().includes(spec.pageIndex)) select(created.id)
   // Before the gesture the region was not there at all, and that is what the
   // delta's `before` side says: `present: false`, which `restoreRegion` reads
   // as "take it away again".
-  recordRegionEdit(
-    'canvas.command.drawMask',
-    created.id,
-    { region: null, pageStatus: before },
-    { region: created, pageStatus: result.pageStatus },
-  )
-  if (cloud) void renderRegionInCloud(created.id, spec.tool, paramsOf(spec.tool))
+  if (cloud) {
+    // The render records the creation when it lands, from nothing to the
+    // rendered region: one gesture, one entry. Until then the entry is held
+    // (`state/heldcreations.js`). An edit to the seed meanwhile - a Delete
+    // above all - records the seed's creation first, and the render, if it
+    // still lands, is then an edit of the seed: `renderBefore` is read when
+    // the render records, not now.
+    const renderBefore = { region: null, pageStatus: before }
+    holdCreation(created.id, renderBefore, () => {
+      // Into the stroke's own chapter, whichever is open when the seed is edited.
+      recordRegionEdit('canvas.command.drawMask', created.id, beforeState,
+        { region: created, pageStatus: result.pageStatus }, spec.chapterId)
+      renderBefore.region = created
+      renderBefore.pageStatus = result.pageStatus
+    })
+    let applied = false
+    /** @type {{error: unknown}|null} */
+    let thrown = null
+    try {
+      applied = await renderRegionInCloud(created.id, spec.tool, spec.params, renderBefore)
+    } catch (error) {
+      // The seed is on the page whatever went wrong, so its creation is kept
+      // like a declined render's below, and the error is reported after.
+      thrown = { error }
+    }
+    const waiting = releaseCreation(created.id, renderBefore)
+    if (applied) return true
+    // A page the window has evicted since is a header with no regions to look
+    // in; the seed was stored and nothing recorded its removal, so it is there.
+    const seedHere = () => {
+      const page = pageOf(spec.pageId)
+      if (!page) return false
+      return page.resident === false || page.regions.some((region) => region.id === created.id)
+    }
+    /** @returns {Promise<boolean>} */
+    const keepSeed = async () => {
+      // An edit to the seed already put its creation on the history.
+      if (!waiting) return seedHere()
+      // A failed/declined cloud attempt leaves the local creation as one action.
+      if (editor.chapter?.id !== spec.chapterId) {
+        return recordBackgroundRegionEdit(spec.chapterId, 'canvas.command.drawMask', created.id,
+          beforeState, { region: created, pageStatus: result.pageStatus })
+      }
+      if (!seedHere()) return false
+      recordRegionEdit('canvas.command.drawMask', created.id, beforeState,
+        { region: created, pageStatus: result.pageStatus })
+      void reloadPage(spec.pageIndex).catch(() => {})
+      return true
+    }
+    const kept = await keepSeed()
+    if (thrown) throw thrown.error
+    return kept
+  }
+  recordRegionEdit('canvas.command.drawMask', created.id, beforeState,
+    { region: created, pageStatus: result.pageStatus })
+  void reloadPage(spec.pageIndex).catch(() => {})
   return true
 }
 
@@ -328,8 +419,8 @@ function withoutCloud(tool, params) {
  * @returns {Promise<boolean>}
  */
 async function cloneInto(spec) {
-  const params = paramsOf(spec.tool)
-  const source = draft.cloneSource?.pageId === spec.pageId ? draft.cloneSource : null
+  const params = spec.params
+  const source = spec.cloneSource?.pageId === spec.pageId ? spec.cloneSource : null
   if (!source) {
     notify({ key: 'notice.tool.cloneNeedsSource', tone: 'warn' })
     return false
@@ -338,7 +429,7 @@ async function cloneInto(spec) {
     source: { x: source.x, y: source.y },
     strokeStart: spec.start,
     alignment: String(params.alignment ?? 'aligned'),
-    offset: draft.cloneOffset,
+    offset: spec.cloneOffset,
   })
   if (!resolved) return false
   setCloneOffset(resolved.offset)

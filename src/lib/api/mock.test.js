@@ -7,6 +7,7 @@
  * `region` ms per pending region plus `pageTail` ms.
  */
 
+import { inflateSync } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createMockBackend } from './mock.js'
 import { maskRows } from '../editor/maskrows.js'
@@ -483,6 +484,130 @@ describe('run scheduler', () => {
   })
 })
 
+/** The width and height a PNG data URL declares, after checking that its image data inflates to them. */
+function pngSize(dataUrl) {
+  const bytes = Buffer.from(String(dataUrl).replace(/^data:image\/png;base64,/, ''), 'base64')
+  expect([...bytes.subarray(0, 8)]).toEqual([137, 80, 78, 71, 13, 10, 26, 10])
+  const width = bytes.readUInt32BE(16)
+  const height = bytes.readUInt32BE(20)
+  const depth = bytes[24]
+  const color = bytes[25]
+  const channels = { 0: 1, 2: 3, 6: 4 }[color]
+  const idat = []
+  for (let at = 8; at < bytes.length;) {
+    const length = bytes.readUInt32BE(at)
+    const type = bytes.toString('latin1', at + 4, at + 8)
+    if (type === 'IDAT') idat.push(bytes.subarray(at + 8, at + 8 + length))
+    at += 12 + length
+  }
+  expect(depth).toBe(8)
+  expect(inflateSync(Buffer.concat(idat)).length).toBe((width * channels + 1) * height)
+  return { width, height }
+}
+
+const TIMING_CLOUD = 900
+
+describe('remote analysis mock', () => {
+  async function configured(scenario) {
+    const backend = createMockBackend({ timing: { ...TIMING, cloud: TIMING_CLOUD }, remoteAnalysisScenario: scenario })
+    await settle(backend.writeSettings({ cloudEngines: 'allowed' }))
+    await settle(backend.writeInferenceConfig({ config: {
+      schemaVersion: 1, selectedTarget: { type: 'modal', profile_id: 'm1' }, beamProfiles: {},
+      modalProfiles: { m1: { id: 'm1', name: 'Modal test', endpointUrl: 'https://worker.modal.run/mc/v1',
+        canonicalOrigin: 'https://worker.modal.run', canonicalOriginFingerprint: 'a'.repeat(64),
+        createdAtMs: 1, updatedAtMs: 1 } },
+    } }))
+    return backend
+  }
+
+  it('discloses one page and returns review-only evidence after explicit acknowledgements', async () => {
+    const backend = await configured()
+    const proposal = await settle(backend.proposeRemoteAnalysis({ chapterId: CHAPTER, pageIndex: 0,
+      provider: 'modal', profileId: 'm1', capability: 'text_mask_sam_ts@1' }))
+    expect(proposal.pages).toBe(1)
+    expect(proposal.includesSurroundingArt).toBe(true)
+    expect(proposal.costEstimateUsd).toBeNull()
+    expect(proposal.tiles.length).toBeGreaterThan(0)
+    await expect(backend.confirmRemoteAnalysis({ proposalId: proposal.proposalId,
+      rightsAttested: false, retentionAcknowledged: true })).rejects.toThrow('rights_attestation_required')
+    const result = await settle(backend.confirmRemoteAnalysis({ proposalId: proposal.proposalId,
+      rightsAttested: true, retentionAcknowledged: true }))
+    expect(result.samWriteEligible).toBe(false)
+    expect(result.remoteSource).toContain('remote:modal:text_mask_sam_ts@1')
+    expect((await backend.getRemoteAnalysisStatus({ proposalId: proposal.proposalId })).phase.phase).toBe('attached_evidence')
+    // Review-only evidence of a drawn page: a source image, a mask and components, never a write.
+    expect(result.samBackend).toBe('remote')
+    expect(result.evidence.components.length).toBeGreaterThan(0)
+    expect(pngSize(result.sourceDataUrl)).toEqual({ width: proposal.pageWidth, height: proposal.pageHeight })
+    expect(pngSize(result.maskDataUrl)).toEqual({ width: proposal.pageWidth, height: proposal.pageHeight })
+    await expect(settle(backend.prepareComponentWrite({ analysisId: result.analysisId, chapterId: CHAPTER, pageIndex: 0,
+      componentId: 'sam-00001', allowOutsideBubbles: true }))).rejects.toThrow('Remote analysis is review-only')
+    await expect(settle(backend.loadComponentCorrection({ analysisId: result.analysisId, componentId: 'sam-00001' })))
+      .rejects.toThrow('Remote analysis is review-only')
+  })
+
+  it('returns detector regions only for the RT capability', async () => {
+    const backend = await configured()
+    const proposal = await settle(backend.proposeRemoteAnalysis({ chapterId: CHAPTER, pageIndex: 0,
+      provider: 'modal', profileId: 'm1', capability: 'text_regions_rt@1' }))
+    const result = await settle(backend.confirmRemoteAnalysis({ proposalId: proposal.proposalId,
+      rightsAttested: true, retentionAcknowledged: true }))
+    expect(result).toMatchObject({ rtBackend: 'remote', samBackend: null, maskDataUrl: null, samWriteEligible: false })
+    expect(result.evidence.components).toEqual([])
+    expect(result.evidence.regions.length).toBeGreaterThan(0)
+    expect(result.evidence.regions.every((region) => region.detectorOnly)).toBe(true)
+  })
+
+  it('refuses a longstrip chapter before anything is proposed', async () => {
+    const backend = await configured()
+    await expect(settle(backend.proposeRemoteAnalysis({ chapterId: 'neon-alley-ch4', pageIndex: 0,
+      provider: 'modal', profileId: 'm1', capability: 'text_mask_sam_ts@1' })))
+      .rejects.toThrow('Remote analysis currently requires a paginated chapter')
+  })
+
+  it('leaves a tile in the unknown state, with the cancel request recorded, when the connection drops', async () => {
+    const backend = await configured('unknown')
+    const records = []
+    backend.onRemoteAnalysis((record) => records.push(record))
+    const proposal = await settle(backend.proposeRemoteAnalysis({ chapterId: CHAPTER, pageIndex: 0,
+      provider: 'modal', profileId: 'm1', capability: 'text_mask_sam_ts@1' }))
+    expect(proposal.tiles.length).toBeGreaterThan(1)
+    const running = backend.confirmRemoteAnalysis({ proposalId: proposal.proposalId,
+      rightsAttested: true, retentionAcknowledged: true })
+    const observed = running.catch((error) => error)
+    // The first tile answers; cancel lands while the second is out.
+    await vi.advanceTimersByTimeAsync(TIMING_CLOUD + 1)
+    expect(records.at(-1).phase).toEqual({ phase: 'submitted_tile', index: 1 })
+    expect(records.at(-1).completed_tiles).toBe(1)
+    expect(await backend.cancelRemoteAnalysis({ proposalId: proposal.proposalId })).toBe(true)
+    await vi.runAllTimersAsync()
+    expect(String((await observed).message)).toContain('transport error')
+    const status = await backend.getRemoteAnalysisStatus({ proposalId: proposal.proposalId })
+    expect(status.phase).toEqual({ phase: 'unknown_remote_state', index: 1 })
+    expect(status.cancel_requested).toBe(true)
+    expect(records.at(-1)).toEqual(status)
+  })
+
+  it('supports cancel, stale results, and a missing-capability refusal', async () => {
+    const backend = await configured()
+    const spec = { chapterId: CHAPTER, pageIndex: 0, provider: 'modal', profileId: 'm1', capability: 'text_mask_sam_ts@1' }
+    const proposal = await settle(backend.proposeRemoteAnalysis(spec))
+    const running = backend.confirmRemoteAnalysis({ proposalId: proposal.proposalId,
+      rightsAttested: true, retentionAcknowledged: true })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(await backend.cancelRemoteAnalysis({ proposalId: proposal.proposalId })).toBe(true)
+    await expect(settle(running)).rejects.toThrow('analysis_cancelled')
+    expect((await backend.getRemoteAnalysisStatus({ proposalId: proposal.proposalId })).phase.phase).toBe('cancelled')
+    const stale = await configured('stale')
+    const staleProposal = await settle(stale.proposeRemoteAnalysis(spec))
+    await expect(settle(stale.confirmRemoteAnalysis({ proposalId: staleProposal.proposalId,
+      rightsAttested: true, retentionAcknowledged: true }))).rejects.toThrow('analysis_stale')
+    expect((await stale.getRemoteAnalysisStatus({ proposalId: staleProposal.proposalId })).completed_tiles).toBe(0)
+    const missing = await configured('missingCapability')
+    await expect(settle(missing.proposeRemoteAnalysis(spec))).rejects.toThrow('capability_unavailable')
+  })
+})
+
 /**
  * `exportChapter` refuses nine different things here and used to refuse one.
  * The mock is the only backend outside a Tauri window, so a refusal it does
@@ -725,6 +850,7 @@ describe('the model catalogue', () => {
     for (const model of view.models) {
       expect(model.kindKey).toMatch(/^models\.kind\./)
       expect(model.bytes).toBeGreaterThan(0)
+      expect(model.sha256).toMatch(/^[a-f0-9]{64}$/)
       expect(Array.isArray(model.requiredBy)).toBe(true)
     }
     // The redraw model, which is what makes the engine gating visible, and the
@@ -739,6 +865,24 @@ describe('the model catalogue', () => {
     expect(view).not.toHaveProperty('hfToken')
     expect(view.hasToken).toBe(false)
     expect(view.tokenStore).toBe('fileNoStore')
+  })
+
+  it('downloads, cancels, and removes grouped weights as one capability', async () => {
+    const { backend, events } = makeBackend()
+    expect(await settle(backend.deleteModel({ id: 'scriptGateLabels' }))).toBe('deleted')
+    let view = await settle(backend.listModels())
+    expect(view.models.filter((model) => ['scriptGate', 'scriptGateLabels'].includes(model.id)).every((model) => !model.installed)).toBe(true)
+
+    expect(await begin(backend.downloadModel({ id: 'scriptGateLabels' }))).toBe('started')
+    expect(events.some((event) => event.type === 'model-progress' && event.id === 'scriptGate')).toBe(true)
+    expect(events.some((event) => event.type === 'model-progress' && event.id === 'scriptGateLabels')).toBe(true)
+    expect(await settle(backend.cancelDownload({ id: 'scriptGateLabels' }))).toBe(true)
+    expect(events.some((event) => event.type === 'model-progress' && event.id === 'scriptGate' && event.done && event.error === 'cancelled')).toBe(true)
+
+    expect(await settle(backend.downloadModel({ id: 'scriptGate' }))).toBe('started')
+    expect(events.some((event) => event.type === 'model-progress' && event.id === 'scriptGate' && event.done && event.total === null && !event.error)).toBe(true)
+    view = await settle(backend.listModels())
+    expect(view.models.filter((model) => ['scriptGate', 'scriptGateLabels'].includes(model.id)).every((model) => model.installed)).toBe(true)
   })
 
   it('reports a download on the event channel and ends with exactly one done', async () => {
@@ -1149,5 +1293,141 @@ describe('inference config and cloud secrets in mock backend', () => {
         }),
       ),
     ).rejects.toThrow(/replay detected/)
+  })
+})
+
+describe('analysis cancellation', () => {
+  it('rejects a pending analysis with the typed cancellation and resolves cancel', async () => {
+    const { backend } = makeBackend()
+    const pending = backend.analyzeCapabilities({ requestId: 'cancel-me' })
+    const rejected = expect(pending).rejects.toBe('analysis cancelled')
+    expect(await backend.cancelCapabilityAnalysis('cancel-me')).toBe(true)
+    await rejected
+    // Nothing by that id is running any more.
+    expect(await backend.cancelCapabilityAnalysis('cancel-me')).toBe(false)
+  })
+})
+
+/**
+ * The text-shaped review's local half: analysis of the page `mockreview.js`
+ * draws, and the one-component write, refused in the native order.
+ */
+describe('text-shaped review mock', () => {
+  const ANALYSIS_MS = 1400
+  const spec = (overrides = {}) => ({ chapterId: CHAPTER, pageIndex: 0, workflow: 'text_shape', rtProfile: 'full-halves',
+    rtBackend: 'ort-cpu', samBackend: 'ort-webgpu', ...overrides })
+  const reviewBackend = () => createMockBackend({ timing: { ...TIMING, analysis: ANALYSIS_MS } })
+  let requests = 0
+  const request = () => `mock-test-${++requests}`
+
+  it('answers after its delay with the drawn page, its mask and its components', async () => {
+    const backend = reviewBackend()
+    const caps = await settle(backend.listWorkflowCapabilities())
+    expect(caps).toMatchObject({ runtimeInstalled: true, fullRtInstalled: true, samInstalled: true, samWriteQualified: true })
+    let landed = null
+    const pending = backend.analyzeChapterPage(spec({ requestId: request() })).then((value) => { landed = value })
+    await vi.advanceTimersByTimeAsync(ANALYSIS_MS - 1)
+    expect(landed).toBeNull()
+    await vi.advanceTimersByTimeAsync(1)
+    await pending
+    const { evidence } = landed
+    expect(landed.samWriteEligible).toBe(true)
+    expect(landed.analysisId).toMatch(/^[0-9a-f]{64}$/)
+    expect(pngSize(landed.sourceDataUrl)).toEqual({ width: evidence.width, height: evidence.height })
+    expect(pngSize(landed.maskDataUrl)).toEqual({ width: evidence.width, height: evidence.height })
+    expect(evidence.components.length).toBeGreaterThan(3)
+    expect(evidence.components.some((component) => component.reviewRequired === true)).toBe(true)
+    expect(evidence.components.some((component) => !component.rtBubbleIds.length)).toBe(true)
+    expect(evidence.regions.some((region) => region.kind === 'bubble_context')).toBe(true)
+    expect(evidence.regions.some((region) => region.detectorOnly)).toBe(true)
+  })
+
+  it('refuses a reused request id and a longstrip chapter as the native side does', async () => {
+    const backend = reviewBackend()
+    const id = request()
+    const first = backend.analyzeChapterPage(spec({ requestId: id }))
+    await expect(backend.analyzeChapterPage(spec({ requestId: id }))).rejects.toThrow('Analysis request id was already used')
+    await settle(first)
+    await expect(settle(backend.analyzeChapterPage(spec({ chapterId: 'neon-alley-ch4', requestId: request() }))))
+      .rejects.toThrow('Chapter model analysis currently requires a paginated chapter')
+  })
+
+  it('keeps CPU and regions-only analyses from writing', async () => {
+    const backend = reviewBackend()
+    const cpu = await settle(backend.analyzeChapterPage(spec({ samBackend: 'ort-cpu', requestId: request() })))
+    expect(cpu.samWriteEligible).toBe(false)
+    await expect(settle(backend.prepareComponentWrite({ analysisId: cpu.analysisId, chapterId: CHAPTER, pageIndex: 0,
+      componentId: 'sam-00001', allowOutsideBubbles: true }))).rejects.toThrow('not qualified for component writing')
+    const regions = await settle(backend.analyzeChapterPage(spec({ workflow: 'regions', requestId: request() })))
+    expect(regions).toMatchObject({ analysisId: null, samBackend: null, maskDataUrl: null })
+    expect(regions.evidence.components).toEqual([])
+    expect(regions.evidence.regions.every((region) => region.detectorOnly)).toBe(true)
+  })
+
+  it('prepares, applies and reloads one component, and holds one outside every bubble', async () => {
+    const backend = reviewBackend()
+    const analysis = await settle(backend.analyzeChapterPage(spec({ requestId: request() })))
+    const inside = analysis.evidence.components.find((component) => component.rtBubbleIds.length)
+    const outside = analysis.evidence.components.find((component) => !component.rtBubbleIds.length)
+    const write = (componentId, extra = {}) => ({ analysisId: analysis.analysisId, chapterId: CHAPTER, pageIndex: 0,
+      componentId, allowOutsideBubbles: false, paddingPx: 0, correctionRevision: 0, ...extra })
+
+    await expect(settle(backend.prepareComponentWrite(write(outside.id))))
+      .rejects.toThrow('Outside-bubble component is held until explicitly permitted')
+    await expect(settle(backend.prepareComponentWrite(write('rt-0000', { allowOutsideBubbles: true }))))
+      .rejects.toThrow('Only a SAM component can grant write support')
+
+    const plan = await settle(backend.prepareComponentWrite(write(inside.id)))
+    expect(plan.supportPixels).toBe(inside.pixels)
+    expect(pngSize(plan.supportDataUrl)).toEqual({ width: plan.bounds.w, height: plan.bounds.h })
+    const padded = await settle(backend.prepareComponentWrite(write(inside.id, { paddingPx: 2 })))
+    expect(padded.supportPixels).toBeGreaterThan(plan.supportPixels)
+
+    await expect(settle(backend.applyComponentWrite({ planId: plan.planId, approvedSupportSha256: plan.supportSha256 })))
+      .rejects.toThrow('Approval does not match the prepared support raster')
+    const applied = await settle(backend.applyComponentWrite({ planId: padded.planId, approvedSupportSha256: padded.supportSha256 }))
+    expect(applied.regionId).toMatch(new RegExp(`-hreview-${inside.id}$`))
+    const saved = await settle(backend.loadComponentCorrection({ analysisId: analysis.analysisId, componentId: inside.id }))
+    expect(saved).toMatchObject({ regionId: applied.regionId, paddingPx: 2, correctionRevision: 0, planRevision: 1 })
+
+    // A different correction needs a new revision.
+    const additions = { bounds: { x: inside.bounds.x, y: inside.bounds.y, w: 1, h: 1 }, bits: [255] }
+    await expect(settle(backend.prepareComponentWrite(write(inside.id, { additions }))))
+      .rejects.toThrow('Mask corrections changed without a new correction revision')
+    const next = await settle(backend.prepareComponentWrite(write(inside.id, { additions, correctionRevision: 1 })))
+    expect(next.correctionRevision).toBe(1)
+  })
+})
+
+/**
+ * The runtime's load, as `diagnostics` reports it. The native side loads the
+ * library to answer; the mock has nothing to load, so it answers from the
+ * catalogue and a `?runtimeLoad=` knob stands in for a machine that refuses.
+ */
+describe('diagnostics in mock backend', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  /** @param {any} answer */
+  const runtimeOf = (answer) => answer.components.find((/** @type {any} */ c) => c.name === 'onnxruntime')
+
+  it('loads an installed runtime and reports a deleted one as missing', async () => {
+    const { backend } = makeBackend()
+    expect(runtimeOf(await settle(backend.diagnostics()))).toEqual({
+      name: 'onnxruntime', available: true, detail: null, reasonKey: null,
+    })
+    expect(await settle(backend.deleteRuntime())).toBe('deleted')
+    expect(runtimeOf(await settle(backend.diagnostics()))).toMatchObject({
+      available: false, reasonKey: 'diagnostics.runtime.missing',
+    })
+  })
+
+  it('reports the load failure the knob names, and only a known one', async () => {
+    vi.stubGlobal('location', { search: '?runtimeLoad=quarantined' })
+    const { backend } = makeBackend()
+    expect(runtimeOf(await settle(backend.diagnostics()))).toMatchObject({
+      available: false, reasonKey: 'diagnostics.runtime.quarantined',
+    })
+    vi.stubGlobal('location', { search: '?runtimeLoad=toString' })
+    expect(runtimeOf(await settle(backend.diagnostics()))).toMatchObject({ available: true, reasonKey: null })
   })
 })

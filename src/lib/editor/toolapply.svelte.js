@@ -16,11 +16,15 @@
  */
 
 import { getBackend } from '../api/backend.js'
+import { pushModal } from '../state/app.svelte.js'
+import { session } from '../state/session.svelte.js'
 import {
   adoptRun,
   editor,
   pageStatusOf,
+  recordBackgroundRegionEdit,
   recordRegionEdit,
+  reloadPage,
   replaceRegion,
   select,
 } from '../state/editor.svelte.js'
@@ -73,12 +77,22 @@ export async function applyActiveToolToRegion(regionId, extraParams) {
   const { region, pageIndex } = located
 
   const tool = editor.tool
+  if (tool === 'autoClean' && session.textPolicy === 'all_text') {
+    pushModal({ kind: 'workflowReview', props: { chapterId: chapter.id, pageIndex } })
+    return false
+  }
   const mergedParams = { ...$state.snapshot(editor.toolParams[tool] ?? {}), ...(extraParams ?? {}) }
   const points = extraParams?.points ?? (/** @type {any} */ (extraParams?.stroke)?.points)
   const paint = extraParams?.paint ?? (points ? paintParamsOf(tool, mergedParams, points) : null)
   const params = {
     ...mergedParams,
     ...(paint ? { paint } : {}),
+    ...(tool === 'autoClean' ? {
+      detection: $state.snapshot(session.detection),
+      geometryPolicy: 'legacy',
+      textPolicy: 'legacy_gate',
+      ocrRescue: session.ocrRescue === true,
+    } : {}),
   }
 
   // Refused in the interface, before anything is sent. The adapter's own block
@@ -113,7 +127,7 @@ export async function applyActiveToolToRegion(regionId, extraParams) {
   } catch (error) {
     return reportRegionEditFailure(error)
   }
-  return landApplied(result, regionId, before)
+  return landIn(chapter.id, result, regionId, before)
 }
 
 /**
@@ -126,7 +140,7 @@ export async function applyActiveToolToRegion(regionId, extraParams) {
  * @param {Record<string, unknown>} params - the tool's own, cloud choice included
  * @returns {Promise<boolean>} whether anything changed
  */
-export async function renderRegionInCloud(regionId, tool, params) {
+export async function renderRegionInCloud(regionId, tool, params, creationBefore = null) {
   const chapter = editor.chapter
   const located = locateRegion(regionId)
   if (!chapter || !located) return false
@@ -136,22 +150,21 @@ export async function renderRegionInCloud(regionId, tool, params) {
     regionId,
     tool,
     params,
-    before: snapshot(located.region),
+    before: creationBefore ?? snapshot(located.region),
+    label: creationBefore ? 'canvas.command.drawMask' : 'canvas.command.applyTool',
   })
 }
 
 /**
  * The cloud half of a click: one consent, then the render, watched.
  *
- * The chapter can change while the dialog is up or the render runs. A result
- * for a chapter that is no longer open is not swapped into the one that is,
- * and not recorded for its undo: the native side has already stored it on the
- * page it belongs to, where the chapter shows it when it opens again.
+ * The chapter can change while the dialog is up or the render runs; `landIn`
+ * puts the result on the chapter it was made in either way.
  *
  * @param {{chapterId: string, pageIndex: number, regionId: string, tool: string, params: Record<string, unknown>, before: RegionState}} spec
  * @returns {Promise<boolean>}
  */
-async function applyInCloud({ chapterId, pageIndex, regionId, tool, params, before }) {
+async function applyInCloud({ chapterId, pageIndex, regionId, tool, params, before, label = 'canvas.command.applyTool' }) {
   const where = { chapterId, pageIndex, regionId }
   const intent = { action: 'applyTool', tool, params }
   const grant = await requestCloudConsent({ ...where, intent })
@@ -163,8 +176,33 @@ async function applyInCloud({ chapterId, pageIndex, regionId, tool, params, befo
     (cloudParams) => getBackend().applyTool({ tool, params: { ...params, ...cloudParams }, ...where }),
     cloudOutcomeOf,
   )
-  if (!result || editor.chapter?.id !== chapterId) return false
-  return landApplied(result, regionId, before)
+  if (!result) return false
+  return landIn(chapterId, result, regionId, before, label)
+}
+
+/**
+ * Land an answer in the chapter the edit was made in.
+ *
+ * The chapter can change while the call is out - a local rung takes seconds, a
+ * cloud render minutes. A result for a chapter that is no longer open is not
+ * swapped into the one that is, and nothing is selected there: the native side
+ * has already stored it on its own page, where the chapter shows it when it
+ * opens again, and its undo entry goes on that chapter's journal.
+ *
+ * @param {string} chapterId - the chapter the edit was made in
+ * @param {any} result
+ * @param {string} regionId
+ * @param {RegionState} before
+ * @param {string} [label]
+ * @returns {boolean|Promise<boolean>} whether anything changed
+ */
+function landIn(chapterId, result, regionId, before, label = 'canvas.command.applyTool') {
+  if (editor.chapter?.id !== chapterId && result?.status === 'applied') {
+    if (!result.region) return false
+    return recordBackgroundRegionEdit(chapterId, label, regionId, before,
+      { region: result.region, pageStatus: result.pageStatus ?? before.pageStatus })
+  }
+  return landApplied(result, regionId, before, label)
 }
 
 /**
@@ -199,7 +237,7 @@ function cloudOutcomeOf(result) {
  * @param {RegionState} before
  * @returns {boolean} whether anything changed
  */
-function landApplied(result, regionId, before) {
+function landApplied(result, regionId, before, label = 'canvas.command.applyTool') {
   switch (result?.status) {
     case 'applied': {
       if (!result.region) return false
@@ -207,11 +245,13 @@ function landApplied(result, regionId, before) {
       // other region-level edit: `api/tools.js#applyToolToRegion` moves an
       // unclean page to cleaned, and a region put back without its page's
       // status is how a full track ends up under a "not cleaned" mark.
-      replaceRegion(result.region, result.pageStatus)
-      recordApply(regionId, before, {
+      if (!replaceRegion(result.region, result.pageStatus)) return false
+      recordRegionEdit(label, regionId, before, {
         region: result.region,
         pageStatus: result.pageStatus ?? before.pageStatus,
       })
+      const pageIndex = locateRegion(regionId)?.pageIndex
+      if (pageIndex !== undefined) void reloadPage(pageIndex).catch(() => {})
       return true
     }
     // Auto clean is not a per-region tool: clicking a region with it selected
@@ -225,15 +265,6 @@ function landApplied(result, regionId, before) {
     default:
       return false
   }
-}
-
-/**
- * @param {string} regionId
- * @param {RegionState} before
- * @param {RegionState} after
- */
-function recordApply(regionId, before, after) {
-  recordRegionEdit('canvas.command.applyTool', regionId, before, after)
 }
 
 /**

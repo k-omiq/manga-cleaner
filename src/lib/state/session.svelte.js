@@ -48,7 +48,7 @@ import {
   MIN_HEIGHT,
 } from '../model/windows.js'
 
-import { DEFAULT_DETECTOR, LANGUAGES, detectorsFor } from '../model/pipelines.js'
+import { DEFAULT_DETECTOR, LANGUAGES, migrateDetectorChoice } from '../model/pipelines.js'
 
 const STORAGE_KEY = 'session.v1'
 
@@ -69,6 +69,7 @@ export const THEME_LABEL_KEYS = Object.freeze({
 })
 export const READING_DIRECTIONS = /** @type {const} */ (['rtl', 'ltr'])
 export const ORIGINAL_VIEW_MODES = /** @type {const} */ (['hold', 'pinned'])
+export const TEXT_POLICIES = /** @type {const} */ (['legacy_gate', 'all_text'])
 
 /**
  * The values the AI redraw engine row offers.
@@ -121,6 +122,8 @@ function viewport() {
  * @property {boolean} firstLaunchOffered - whether the first-launch download offer has been made on this machine
  * @property {boolean} closeToTray - close control hides the window and keeps downloads running
  * @property {Record<string, string|null>} detection - the detector each source language uses, by language id; null skips the language
+ * @property {'legacy_gate'|'all_text'} textPolicy - whether to use the legacy script gate or open no-recognition text-shaped review
+ * @property {boolean} ocrRescue - whether the optional Japanese OCR rescue may run after an uncertain script decision
  * @property {Record<string, import('../shortcuts.js').Chord|null>} shortcuts - rebindings, by shortcut id; only the differences from the defaults
  * @property {Record<string, WindowState>} windows
  */
@@ -145,6 +148,8 @@ function defaults() {
     firstLaunchOffered: false,
     closeToTray: false,
     detection: defaultDetection(),
+    textPolicy: 'legacy_gate',
+    ocrRescue: false,
     shortcuts: {},
     windows,
   }
@@ -239,6 +244,13 @@ export function sanitizeSession(raw) {
     firstLaunchOffered: boolOr(record.firstLaunchOffered, base.firstLaunchOffered),
     closeToTray: boolOr(record.closeToTray, base.closeToTray),
     detection: sanitizeDetection(record.detection),
+    textPolicy: /** @type {'legacy_gate'|'all_text'} */ (
+      oneOf(record.textPolicy, TEXT_POLICIES, base.textPolicy)
+    ),
+    // A retired `ctd-rtdetr-ocr` row meant "rescue Japanese with OCR". It
+    // reads back as the plain detector (above) with the rescue on, so the
+    // intent survives the row. The first save then stores the migrated pair.
+    ocrRescue: storedRetiredRescue(record.detection) || boolOr(record.ocrRescue, base.ocrRescue),
     // The shortcut table owns this vocabulary and validates it: an id the
     // table no longer has, a chord that will not parse, or a chord that is
     // only the default written out is dropped here rather than kept as a
@@ -310,6 +322,8 @@ function persistable() {
     firstLaunchOffered: session.firstLaunchOffered,
     closeToTray: session.closeToTray,
     detection: { ...session.detection },
+    textPolicy: session.textPolicy,
+    ocrRescue: session.ocrRescue,
     shortcuts: shortcutOverrides(),
     windows,
   }
@@ -388,8 +402,26 @@ export function setCloseToTray(enabled) {
  */
 export function setDetection(language, detectorId) {
   if (!LANGUAGES.some((entry) => entry.id === language)) return
-  if (detectorId !== null && !detectorsFor(language).some((engine) => engine.id === detectorId)) return
-  session.detection = { ...session.detection, [language]: detectorId }
+  // A retired id (`ctd-rtdetr-ocr`) is accepted as what it meant: the plain
+  // detector, with the OCR rescue switched on.
+  const { detector, ocrRescue } = migrateDetectorChoice(language, detectorId)
+  if (detector === undefined) return
+  session.detection = { ...session.detection, [language]: detector }
+  if (ocrRescue) session.ocrRescue = true
+  save()
+}
+
+/** @param {'legacy_gate'|'all_text'} policy */
+export function setTextPolicy(policy) {
+  session.textPolicy = /** @type {'legacy_gate'|'all_text'} */ (
+    oneOf(policy, TEXT_POLICIES, session.textPolicy)
+  )
+  save()
+}
+
+/** @param {boolean} enabled */
+export function setOcrRescue(enabled) {
+  session.ocrRescue = boolOr(enabled, session.ocrRescue)
   save()
 }
 
@@ -406,11 +438,21 @@ function sanitizeDetection(raw) {
   const record = plainObject(raw)
   const detection = defaultDetection()
   for (const language of LANGUAGES) {
-    const value = record[language.id]
-    if (value === null) detection[language.id] = null
-    else if (detectorsFor(language.id).some((engine) => engine.id === value)) detection[language.id] = /** @type {string} */ (value)
+    const { detector } = migrateDetectorChoice(language.id, record[language.id])
+    if (detector !== undefined) detection[language.id] = detector
   }
   return detection
+}
+
+/**
+ * Whether a stored detection map still holds a retired row that meant the OCR
+ * rescue was wanted.
+ *
+ * @param {unknown} raw
+ */
+function storedRetiredRescue(raw) {
+  const record = plainObject(raw)
+  return LANGUAGES.some((language) => migrateDetectorChoice(language.id, record[language.id]).ocrRescue)
 }
 
 /** @param {'rtl'|'ltr'} direction */

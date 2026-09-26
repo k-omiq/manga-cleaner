@@ -328,6 +328,25 @@ pub fn package(id: &str) -> Option<&'static ModelPackage> {
     MODELS.iter().find(|model| model.id == id)
 }
 
+/// Logical multi-file capabilities. No group includes the shared RT-DETR
+/// detector, so removing Japanese filtering cannot remove discovery weights.
+fn model_group(id: &str) -> Option<Vec<&'static ModelPackage>> {
+    let ids: &[&str] = match id {
+        "scriptGate" => &["scriptGate", "scriptGateLabels"],
+        "mangaOcr" => &["ocrEncoder", "ocrDecoder", "ocrVocab"],
+        _ => return None,
+    };
+    ids.iter().map(|id| package(id)).collect()
+}
+
+fn group_for_member(id: &str) -> Option<&'static str> {
+    match id {
+        "scriptGate" | "scriptGateLabels" => Some("scriptGate"),
+        "ocrEncoder" | "ocrDecoder" | "ocrVocab" => Some("mangaOcr"),
+        _ => None,
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Where things are                                                    */
 /* ------------------------------------------------------------------ */
@@ -430,7 +449,7 @@ fn no_space(needed: u64, free: u64) -> String {
 /// The path need not exist. `<app_data>/runtimes` is created by the first
 /// download, and the question is about the volume rather than the directory, so
 /// the nearest ancestor that does exist is what is asked about.
-fn free_space(path: &Path) -> Option<u64> {
+pub(crate) fn free_space(path: &Path) -> Option<u64> {
     let mut candidate = path;
     loop {
         if candidate.exists() {
@@ -746,6 +765,27 @@ fn claim(id: &str) -> Option<Arc<AtomicBool>> {
     Some(flag)
 }
 
+/// Reserve every file of one logical model in a single registry operation.
+/// File-level buttons cannot race a multi-file install or removal halfway
+/// through its dependency set.
+fn claim_group(group: &str, models: &[&ModelPackage]) -> Option<Arc<AtomicBool>> {
+    let mut map = inflight().lock().ok()?;
+    if map.contains_key(group) || models.iter().any(|model| map.contains_key(model.id)) {
+        return None;
+    }
+    let flag = Arc::new(AtomicBool::new(false));
+    map.insert(group.to_owned(), Arc::clone(&flag));
+    for model in models { map.insert(model.id.to_owned(), Arc::clone(&flag)); }
+    Some(flag)
+}
+
+fn release_group(group: &str, models: &[&ModelPackage]) {
+    if let Ok(mut map) = inflight().lock() {
+        map.remove(group);
+        for model in models { map.remove(model.id); }
+    }
+}
+
 fn release(id: &str) {
     if let Ok(mut map) = inflight().lock() {
         map.remove(id);
@@ -788,6 +828,8 @@ pub struct ModelRow {
     pub id: &'static str,
     pub file_name: &'static str,
     pub bytes: u64,
+    /// Immutable file identity even when the upstream URL points at main.
+    pub sha256: &'static str,
     pub kind_key: &'static str,
     pub required_by: &'static [&'static str],
     pub installed: bool,
@@ -945,6 +987,7 @@ pub fn list_models(app: tauri::AppHandle, retry_store: Option<bool>) -> ModelsVi
                 id: model.id,
                 file_name: model.file_name,
                 bytes: model.bytes,
+                sha256: model.sha256,
                 kind_key: model.kind_key,
                 required_by: model.required_by,
                 installed: found.is_some(),
@@ -1213,6 +1256,9 @@ fn evict_sessions_of(id: &str) -> usize {
 /// The answer says *why* when it does not start one. See [`DownloadStart`].
 #[tauri::command]
 pub fn download_model(app: tauri::AppHandle, id: String) -> Result<DownloadStart, String> {
+    if let Some(group) = group_for_member(&id) {
+        return download_model_group(app, group.to_owned());
+    }
     let model = package(&id).copied().ok_or_else(|| format!("no such model: {id}"))?;
     let dir = writable_models_dir(&app)?;
     let data = app_data(&app);
@@ -1242,6 +1288,142 @@ pub fn download_model(app: tauri::AppHandle, id: String) -> Result<DownloadStart
         finish(model.id, result.map(|_| ()));
     });
     Ok(DownloadStart::Started)
+}
+
+/// Install a multi-file model as one capability. Missing members are fetched
+/// into a private staging directory and checked before any final file appears.
+/// A failed transfer leaves installed members intact and resumable staging
+/// files; a failed final rename rolls back newly moved members.
+#[tauri::command]
+pub fn download_model_group(app: tauri::AppHandle, id: String) -> Result<DownloadStart, String> {
+    let models = model_group(&id).ok_or_else(|| format!("no such model group: {id}"))?;
+    let dir = writable_models_dir(&app)?;
+    let data = app_data(&app);
+    let auth = token(&app);
+    let Some(cancel) = claim_group(&id, &models) else { return Ok(DownloadStart::AlreadyRunning) };
+    std::thread::spawn(move || {
+        let staged = dir.join(".model-groups").join(&id);
+        let result = (|| -> Result<(), String> {
+            std::fs::create_dir_all(&staged).map_err(|e| e.to_string())?;
+            let mut missing = Vec::new();
+            for model in &models {
+                if let Some((path, _)) = locate(model, data.as_deref(), Some(dir.as_path())) {
+                    if digest_file(&path)? != model.sha256 {
+                        return Err(format!(
+                            "{} failed its pinned SHA-256; remove the damaged group before reinstalling",
+                            path.display()
+                        ));
+                    }
+                } else {
+                    let path = staged.join(model.file_name);
+                    if !std::fs::metadata(&path).is_ok_and(|meta| meta.len() == model.bytes)
+                        || !digest_file(&path).is_ok_and(|sha| sha == model.sha256)
+                    {
+                        // This is private staging, never a user-installed
+                        // model. Windows cannot rename a verified `.part`
+                        // over a corrupt prior staging file.
+                        if path.exists() { std::fs::remove_file(&path).map_err(|e| e.to_string())?; }
+                        fetch_verified(model.url, model.sha256, &path, model.id, &auth, &cancel, Portion::ALONE)?;
+                    }
+                    if !std::fs::metadata(&path).is_ok_and(|meta| meta.len() == model.bytes)
+                        || digest_file(&path)? != model.sha256
+                    {
+                        return Err(format!("{} failed group verification", model.file_name));
+                    }
+                    missing.push((*model, path));
+                }
+            }
+            if cancel.load(Ordering::Relaxed) { return Err("cancelled".into()); }
+            let mut moved: Vec<(&ModelPackage, PathBuf)> = Vec::new();
+            for (model, staged_path) in &missing {
+                let final_path = dir.join(model.file_name);
+                if final_path.exists() {
+                    for (prior, _) in moved.iter().rev() {
+                        let _ = std::fs::rename(dir.join(prior.file_name), staged.join(prior.file_name));
+                    }
+                    return Err(format!("{} exists but is not a verified model; remove it before installing the group", final_path.display()));
+                }
+                if let Err(error) = std::fs::rename(staged_path, &final_path) {
+                    for (prior, _) in moved.iter().rev() {
+                        let _ = std::fs::rename(dir.join(prior.file_name), staged.join(prior.file_name));
+                    }
+                    return Err(format!("{}: {error}", final_path.display()));
+                }
+                moved.push((model, final_path));
+            }
+            for model in &models {
+                let path = dir.join(model.file_name);
+                record_verified(model.id, true);
+                remember(Some(dir.as_path()), model.id, &path, true);
+                emit(model.id, model.bytes, Some(model.bytes), true, None);
+            }
+            Ok(())
+        })();
+        release_group(&id, &models);
+        emit(&id, 0, None, true, result.err());
+    });
+    Ok(DownloadStart::Started)
+}
+
+/// Verify all dependency files, with one result for the logical model.
+#[tauri::command]
+pub async fn verify_model_group(app: tauri::AppHandle, id: String) -> Result<bool, String> {
+    crate::library::blocking(move || {
+        let models = model_group(&id).ok_or_else(|| format!("no such model group: {id}"))?;
+        let data = app_data(&app);
+        let writable = data.as_ref().map(|dir| dir.join("models"));
+        let mut all_valid = true;
+        for model in models {
+            let valid = locate(model, data.as_deref(), writable.as_deref())
+                .is_some_and(|(path, _)| digest_file(&path).is_ok_and(|sha| sha == model.sha256));
+            record_verified(model.id, valid);
+            all_valid &= valid;
+        }
+        Ok(all_valid)
+    }).await
+}
+
+/// Remove a logical model as one unit. All files are preflighted and moved
+/// aside first, so a refused member does not strand a newly partial install.
+#[tauri::command]
+pub fn delete_model_group(app: tauri::AppHandle, id: String) -> Result<DeleteOutcome, String> {
+    let models = model_group(&id).ok_or_else(|| format!("no such model group: {id}"))?;
+    let dir = writable_models_dir(&app)?;
+    let data = app_data(&app);
+    let Some(_claim) = claim_group(&id, &models) else { return Ok(DeleteOutcome::Busy) };
+    let result = (|| -> Result<DeleteOutcome, String> {
+        let mut paths = Vec::new();
+        for model in &models {
+            match plan_delete(locate(model, data.as_deref(), Some(dir.as_path()))) {
+                Ok(path) => paths.push((*model, path)),
+                Err(DeleteOutcome::NotFound) => {},
+                Err(outcome) => return Ok(outcome),
+            }
+        }
+        if paths.is_empty() { return Ok(DeleteOutcome::NotFound); }
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?.as_nanos();
+        let mut aside = Vec::new();
+        for (model, path) in &paths {
+            let backup = dir.join(format!(".group-delete-{id}-{stamp}-{}", model.file_name));
+            if let Err(error) = std::fs::rename(path, &backup) {
+                for (original, saved) in aside.iter().rev() {
+                    let _ = std::fs::rename(saved, original);
+                }
+                return Err(format!("{}: {error}", path.display()));
+            }
+            aside.push((path.clone(), backup));
+        }
+        for (_, backup) in aside { let _ = std::fs::remove_file(backup); }
+        for model in models.iter() {
+            forget_verified(model.id);
+            forget_remembered(Some(dir.as_path()), model.id);
+            evict_sessions_of(model.id);
+        }
+        Ok(DeleteOutcome::Deleted)
+    })();
+    release_group(&id, &models);
+    result
 }
 
 /// Ask a download to stop. It stops at its next block, deletes its `.part`, and
@@ -1277,6 +1459,9 @@ pub fn cancel_download(id: String) -> bool {
 /// the capability store on the press it made.
 #[tauri::command]
 pub fn delete_model(app: tauri::AppHandle, id: String) -> Result<DeleteOutcome, String> {
+    if let Some(group) = group_for_member(&id) {
+        return delete_model_group(app, group.to_owned());
+    }
     let model = package(&id).ok_or_else(|| format!("no such model: {id}"))?;
     let dir = writable_models_dir(&app)?;
     let data = app_data(&app);
@@ -2865,6 +3050,18 @@ fn unpack_zip(archive: &Path, library_dir: &str, dest: &Path) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logical_model_groups_contain_every_dependency_but_no_shared_detector() {
+        let gate: Vec<_> = model_group("scriptGate").unwrap().iter().map(|m| m.id).collect();
+        assert_eq!(gate, ["scriptGate", "scriptGateLabels"]);
+        let reader: Vec<_> = model_group("mangaOcr").unwrap().iter().map(|m| m.id).collect();
+        assert_eq!(reader, ["ocrEncoder", "ocrDecoder", "ocrVocab"]);
+        assert!(model_group("balloonDetector").is_none());
+        assert_eq!(group_for_member("scriptGateLabels"), Some("scriptGate"));
+        assert_eq!(group_for_member("ocrDecoder"), Some("mangaOcr"));
+        assert_eq!(group_for_member("balloonDetector"), None);
+    }
 
     /// The script and the table are two copies of eight digests, and a copy that
     /// can drift is a download verified against the wrong number. Parsed rather

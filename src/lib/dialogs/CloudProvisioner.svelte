@@ -33,6 +33,7 @@
   import { Button, Disclosure, Field, Modal, Select, TextInput } from '../ui/index.js'
   import { getBackend } from '../api/backend.js'
   import { t } from '../i18n/index.js'
+  import { parseModalTokenCommand } from './modal-token-command.js'
   import {
     applyCleanup,
     backendRunner,
@@ -140,6 +141,7 @@
     heading: `${uid}-heading`,
     tokenId: `${uid}-token-id`,
     tokenSecret: `${uid}-token-secret`,
+    tokenCommand: `${uid}-token-command`,
     beamToken: `${uid}-beam-token`,
     help: `${uid}-help`,
     gpu: `${uid}-gpu`,
@@ -163,13 +165,55 @@
 
   let modalTokenId = $state('')
   let modalTokenSecret = $state('')
+  let modalCommand = $state('')
+  let modalCommandError = $state(false)
+  let modalProfile = $state('')
   let beamToken = $state('')
 
   /** Wipe the keys. Called on close, on success and on destroy. */
   export function clearSecrets() {
     modalTokenId = ''
     modalTokenSecret = ''
+    modalCommand = ''
+    modalCommandError = false
+    modalProfile = ''
     beamToken = ''
+  }
+
+  /** Modal's copy button supplies a CLI command. Parse it; never execute it. */
+  function importModalCommand(value) {
+    modalCommand = value
+    const parsed = parseModalTokenCommand(value)
+    if (!parsed) {
+      modalCommandError = value.trim().length > 0
+      modalTokenId = ''
+      modalTokenSecret = ''
+      modalProfile = ''
+      return
+    }
+    modalTokenId = parsed.tokenId
+    modalTokenSecret = parsed.tokenSecret
+    modalProfile = parsed.profile
+    modalCommandError = false
+    // TextInput is controlled. Give Svelte one render of the pasted value so
+    // clearing the field also clears the DOM input, not only component state.
+    void tick().then(() => {
+      if (alive && modalCommand === value) modalCommand = ''
+    })
+  }
+
+  function setModalTokenId(value) {
+    modalTokenId = value
+    modalCommand = ''
+    modalCommandError = false
+    modalProfile = ''
+  }
+
+  function setModalTokenSecret(value) {
+    modalTokenSecret = value
+    modalCommand = ''
+    modalCommandError = false
+    modalProfile = ''
   }
 
   /** @param {'modal'|'beam'} which */
@@ -214,6 +258,7 @@
   let planError = $state(null)
   /** @type {string|null} */
   let planCode = $state(null)
+  let accountName = $state('')
   /** @type {any} */
   let plan = $state(null)
   /** @type {import('./provisioning.svelte.js').SetupOptions} */
@@ -524,6 +569,7 @@
       .map((/** @type {string} */ name) => ({ value: name, label: name })),
   )
   const gpu = $derived(typeof allocation.gpu === 'string' && GPU_NAME.test(allocation.gpu) ? allocation.gpu : null)
+  const model = $derived(typeof allocation.model_id === 'string' ? allocation.model_id.slice(0, 120) : '')
   const idleSeconds = $derived(
     typeof allocation.idle_seconds === 'number' && Number.isInteger(allocation.idle_seconds) && allocation.idle_seconds > 0
       ? allocation.idle_seconds
@@ -567,7 +613,17 @@
    * A refused `apply` whose plan changed created nothing, so there is nothing
    * to resume: the way on is a new plan.
    */
-  const resumable = $derived(!(run?.op === 'apply' && run.errorCode === 'ERR_UNAPPROVED_PLAN'))
+  const resumable = $derived(
+    !(run?.op === 'apply' && run.errorCode === 'ERR_UNAPPROVED_PLAN') && run?.errorCode !== 'ERR_ORPHANED_TOKEN',
+  )
+
+  /**
+   * A Modal access token may exist that the setup never recorded, so neither
+   * Resume nor Cleanup can find it. Resume stays refused until the setup is
+   * cleaned up; the way on is the three steps the failed view lists, in the
+   * catalogue's words (the helper's own steps are free text and never shown).
+   */
+  const orphanedToken = $derived(view === 'failed' && run?.errorCode === 'ERR_ORPHANED_TOKEN')
 
   /** The provider the key fields are for on this screen. */
   const keysFor = $derived(view === 'connect' || view === 'review' ? provider : (target?.provider ?? provider))
@@ -578,6 +634,7 @@
   function chooseProvider(which) {
     if (planning) return
     provider = which
+    accountName = ''
     planError = null
     planCode = null
   }
@@ -607,6 +664,7 @@
         planError = 'settings.cloud.setup.connect.notEligible'
         return
       }
+      accountName = typeof inspected.data?.workspace_name === 'string' ? inspected.data.workspace_name.slice(0, 120) : ''
       if (await makePlan(which, {})) page = 'review'
     } catch {
       if (alive) planFailed('ERR_EXECUTION_FAILED')
@@ -838,11 +896,29 @@
   <div class="keys">
     {#if which === 'modal'}
       <div class="key">
+        <label class="key-label" for={ids.tokenCommand}>{t('settings.cloud.setup.connect.modalCommand')}</label>
+        <TextInput
+          id={ids.tokenCommand}
+          value={modalCommand}
+          onchange={importModalCommand}
+          type="password"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+          maxlength="1024"
+          aria-invalid={modalCommandError}
+          disabled={busy}
+        />
+        {#if modalCommandError}<p class="field-error" role="alert">{t('settings.cloud.setup.connect.modalCommandInvalid')}</p>{/if}
+        {#if modalProfile}<p class="note" role="status">{t('settings.cloud.setup.connect.modalCommandImported', { profile: modalProfile })}</p>{/if}
+      </div>
+      <p class="note">{t('settings.cloud.setup.connect.modalCommandOr')}</p>
+      <div class="key">
         <label class="key-label" for={ids.tokenId}>{t('settings.cloud.setup.connect.modalTokenId')}</label>
         <TextInput
           id={ids.tokenId}
           value={modalTokenId}
-          onchange={(/** @type {string} */ value) => (modalTokenId = value)}
+          onchange={setModalTokenId}
           type="password"
           autocomplete="off"
           autocapitalize="off"
@@ -855,7 +931,7 @@
         <TextInput
           id={ids.tokenSecret}
           value={modalTokenSecret}
-          onchange={(/** @type {string} */ value) => (modalTokenSecret = value)}
+          onchange={setModalTokenSecret}
           type="password"
           autocomplete="off"
           autocapitalize="off"
@@ -1009,6 +1085,12 @@
     {#if planError}{@render problem(planError, planCode)}{/if}
   {:else if view === 'review'}
     <p class="lead">{t('settings.cloud.setup.review.lead', { providerKey: providerKey(provider) })}</p>
+    {#if accountName}
+      <div class="fixed">
+        <span class="fixed-label">{t('settings.cloud.setup.review.workspace')}</span>
+        <span class="mono">{accountName}</span>
+      </div>
+    {/if}
     <ul class="resources">
       {#each planResources as item, index (index)}
         <li>
@@ -1017,6 +1099,13 @@
         </li>
       {/each}
     </ul>
+    {#if model}
+      <div class="fixed">
+        <span class="fixed-label">{t('settings.cloud.setup.review.model')}</span>
+        <span class="mono">{model}</span>
+      </div>
+      <p class="note">{t('settings.cloud.setup.review.modelNote')}</p>
+    {/if}
     {#if gpuOptions.length > 0 || gpu || idleSeconds !== null}
       <div class="choices">
         {#if gpuOptions.length > 0}
@@ -1096,6 +1185,18 @@
       view === 'cleanupFailed' ? 'settings.cloud.setup.error.cleanup' : setupErrorKey(run?.errorCode),
       run?.errorCode ?? null,
     )}
+    {#if orphanedToken}
+      <div class="recover">
+        <svelte:element this={inline ? 'h5' : 'h4'} class="recover-heading" id="{uid}-recover">
+          {t('settings.cloud.setup.orphaned.heading')}
+        </svelte:element>
+        <ol class="recover-steps" aria-labelledby="{uid}-recover">
+          <li>{t('settings.cloud.setup.orphaned.dashboard')}</li>
+          <li>{t('settings.cloud.setup.orphaned.cleanup')}</li>
+          <li>{t('settings.cloud.setup.orphaned.again')}</li>
+        </ol>
+      </div>
+    {/if}
     {@render checklist()}
     {#if view === 'failed' && resumable}
       <p class="note">{t('settings.cloud.setup.failed.kept')}</p>
@@ -1196,6 +1297,10 @@
     <Button onclick={stop} disabled={stopping}>
       {stopping ? t('settings.cloud.setup.running.stopping') : t('settings.cloud.setup.running.stop')}
     </Button>
+  {:else if orphanedToken}
+    <!-- No Resume: the helper refuses it until the setup is cleaned up. -->
+    <Button onclick={close}>{t('shell.action.close')}</Button>
+    <Button variant="primary" onclick={startCleanup}>{t('settings.cloud.setup.failed.cleanup')}</Button>
   {:else if view === 'failed' && !resumable}
     <Button onclick={close}>{t('shell.action.close')}</Button>
     <Button variant="primary" onclick={startAgain}>{t('settings.cloud.setup.failed.again')}</Button>
@@ -1327,6 +1432,7 @@
   .keys { display: grid; gap: var(--s-3) }
   .key { display: grid; gap: var(--s-1) }
   .key-label { font-size: 11.5px; color: var(--t2) }
+  .field-error { margin: 0; font-size: 11.5px; color: var(--warn) }
 
   .help-toggle {
     display: inline-flex;
@@ -1499,6 +1605,25 @@
     color: var(--t3);
   }
   .problem :global(svg) { flex: none; margin-top: 2px }
+
+  /* The way out of a problem that has one, in order. Numbered because the
+     order matters: the token goes before Clean up can finish the job. */
+  .recover { display: grid; gap: var(--s-2) }
+  .recover-heading {
+    margin: 0;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .recover-steps {
+    display: grid;
+    gap: 6px;
+    margin: 0;
+    padding-left: 18px;
+    color: var(--t2);
+    line-height: 1.5;
+  }
+  .recover-steps li::marker { color: var(--t3); font-variant-numeric: tabular-nums }
 
   .health {
     display: flex;

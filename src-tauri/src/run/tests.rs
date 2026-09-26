@@ -1987,12 +1987,860 @@ fn a_run_id_cannot_collide_with_the_mocks() {
 /// webview for the whole of it.
 #[test]
 fn every_command_is_async_and_so_never_runs_on_the_invoke_handlers_thread() {
-    fn check<A, B, C, D, E, F, G, H, I, R: std::future::Future>(_: fn(A, B, C, D, E, F, G, H, I) -> R) {}
+    #[allow(clippy::type_complexity)]
+    fn check<A, B, C, D, E, F, G, H, I, J, K, L, M, R: std::future::Future>(_: fn(A, B, C, D, E, F, G, H, I, J, K, L, M) -> R) {}
     fn check1<A, R: std::future::Future>(_: fn(A) -> R) {}
     fn check3<A, B, C, R: std::future::Future>(_: fn(A, B, C) -> R) {}
     check(run_clean);
     check1(cancel_run);
     check3(resume_job);
+}
+
+#[test]
+fn native_run_language_selection_and_optional_reader_are_explicit() {
+    let selection = RunSelection::from_args(
+        Some(&serde_json::json!({"ja": null, "zh": "ctd-rtdetr", "ko": null})),
+        None,
+    ).unwrap();
+    assert!(!selection.ja && selection.zh && !selection.ko);
+    assert!(!selection.ocr_rescue);
+    assert!(!selection.allows(&Verdict::Clean { script: "Japanese".into() }));
+    assert!(selection.allows(&Verdict::Clean { script: "HanS".into() }));
+    assert!(!selection.allows(&Verdict::Clean { script: "Hangul".into() }));
+    assert!(!selection.allows(&Verdict::OptedIn),
+        "outside-bubble opt-in cannot classify a region against skipped languages");
+    assert!(RunSelection::default().allows(&Verdict::OptedIn));
+    let skipped = RunSelection::from_args(
+        Some(&serde_json::json!({"ja": null, "zh": null, "ko": null})), None,
+    ).unwrap();
+    assert!(!skipped.any());
+    let rescue = RunSelection::from_args(
+        Some(&serde_json::json!({"ja": "ctd-rtdetr-ocr"})), None,
+    ).unwrap();
+    assert!(rescue.ocr_rescue);
+    assert!(!RunSelection::from_args(
+        Some(&serde_json::json!({"ja": "ctd-rtdetr-ocr"})), Some(false),
+    ).unwrap().ocr_rescue);
+    assert!(RunSelection::from_args(
+        Some(&serde_json::json!({"ko": "unknown"})), None,
+    ).is_err());
+}
+
+#[test]
+fn interrupted_run_restores_its_captured_policy_instead_of_current_defaults() {
+    let saved = serde_json::json!({
+        "runGeometryPolicy": "legacy",
+        "runDetection": {"ja": null, "zh": null, "ko": "ctd-rtdetr"},
+        "runOcrRescue": false,
+        "runBubbleEngine": "denoise",
+        "runOutsideEngine": "fill",
+        "runOutsideBubbles": "clean",
+        "runBubbleColor": "#102030",
+    });
+    let resumed = captured_run_policy(&saved).unwrap();
+    assert!(!resumed.selection.ja && !resumed.selection.zh && resumed.selection.ko);
+    assert_eq!(resumed.picks.bubble, EnginePick::Denoise);
+    assert_eq!(resumed.picks.outside, EnginePick::Fill);
+    assert_eq!(resumed.outside, OutsideText::Clean);
+    assert_eq!(resumed.bubble_color, Some([0x10, 0x20, 0x30]));
+    assert!(!resumed.selection.allows(&Verdict::OptedIn), "partial-language outside text is held");
+    assert!(captured_run_policy(&serde_json::json!({"runGeometryPolicy": "future"})).is_err());
+}
+
+fn snapshot_pipeline(name: &str) -> (Scratch, Pipeline) {
+    let scratch = Scratch::new(name);
+    let models = scratch.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    for model in REQUIRED_MODELS { std::fs::write(models.join(model), b"").unwrap(); }
+    let pipeline = Pipeline::open(&models, Preference::Automatic).unwrap();
+    (scratch, pipeline)
+}
+
+#[test]
+fn interrupted_run_captures_explicit_engine_ceiling() {
+    let (_scratch, pipeline) = snapshot_pipeline("ceiling-snapshot");
+    let snapshot = run_settings_snapshot(
+        &serde_json::json!({"engineCeiling": "lama"}), None, &pipeline,
+        Some("fill"), "chapter", None,
+    );
+    assert_eq!(snapshot["runEngineCeiling"], "fill");
+    assert_eq!(captured_run_policy(&snapshot).unwrap().engine_ceiling.as_deref(), Some("fill"));
+}
+
+#[test]
+fn interrupted_run_restores_captured_global_ceiling_when_run_ceiling_is_null() {
+    let (_scratch, pipeline) = snapshot_pipeline("global-ceiling-snapshot");
+    let snapshot = run_settings_snapshot(
+        &serde_json::json!({"engineCeiling": "fill"}), None, &pipeline,
+        None, "chapter", None,
+    );
+    assert!(snapshot["runEngineCeiling"].is_null());
+    let resumed = captured_run_policy(&snapshot).unwrap();
+    assert_eq!(resumed.engine_ceiling.as_deref(), Some("fill"));
+    assert_eq!(effective_ceiling(resumed.engine_ceiling.as_deref(), Some("lama")), Engine::Fill);
+
+    let missing_run_ceiling = serde_json::json!({"engineCeiling": "fill"});
+    assert_eq!(captured_run_policy(&missing_run_ceiling).unwrap().engine_ceiling.as_deref(), Some("fill"));
+
+    let old = captured_run_policy(&serde_json::json!({})).unwrap();
+    assert_eq!(old.engine_ceiling, None);
+}
+
+#[test]
+fn interrupted_run_captures_effective_ocr_rescue_choice() {
+    let (_scratch, pipeline) = snapshot_pipeline("effective-ocr-snapshot");
+    let requested = RunSelection::from_args(None, Some(true)).unwrap();
+    let pipeline = pipeline.with_selection(requested);
+    assert!(!pipeline.selection.ocr_rescue);
+    let snapshot = run_settings_snapshot(
+        &serde_json::json!({}), None, &pipeline, None, "chapter", None,
+    );
+    assert_eq!(snapshot["runOcrRescue"], false);
+}
+
+#[test]
+fn default_bubble_fill_clears_stale_captured_color() {
+    let (_scratch, pipeline) = snapshot_pipeline("default-bubble-snapshot");
+    let snapshot = run_settings_snapshot(
+        &serde_json::json!({"runBubbleColor": "#ffffff"}), None, &pipeline,
+        None, "chapter", None,
+    );
+    assert_eq!(captured_run_policy(&snapshot).unwrap().bubble_color, None);
+}
+
+#[test]
+fn page_run_captures_scope_for_resume() {
+    let (_scratch, pipeline) = snapshot_pipeline("page-scope-snapshot");
+    let snapshot = run_settings_snapshot(
+        &serde_json::json!({}), None, &pipeline, None, "page", Some(3),
+    );
+    assert_eq!(snapshot["runScope"], "page");
+    assert_eq!(snapshot["runPageIndex"], 3);
+    let restored = captured_run_policy(&snapshot).unwrap();
+    assert_eq!(restored.scope, "page");
+    assert_eq!(restored.page_index, Some(3));
+}
+
+#[test]
+fn resume_without_a_started_run_does_not_report_success() {
+    let empty = RunHandle { run_id: None, pages: Vec::new(), already_running: None };
+    assert!(!resume_started(&empty));
+    let active = RunHandle {
+        run_id: Some("other".into()), pages: Vec::new(), already_running: Some(true),
+    };
+    assert!(!resume_started(&active));
+}
+
+#[test]
+fn skipped_language_and_unclassified_outside_are_counted_as_held() {
+    assert!(is_gate_skip("review.reason.languageSkipped"));
+    assert!(is_gate_skip("review.reason.outsideLanguageUnverified"));
+    assert!(!is_gate_skip("review.reason.declined"));
+}
+
+#[test]
+fn every_skipped_language_has_its_own_run_notice() {
+    let selection = RunSelection::from_args(
+        Some(&serde_json::json!({ "ja": null, "zh": null, "ko": null })),
+        Some(true),
+    ).unwrap();
+    assert_eq!(selection.empty_notice(), Some("notice.run.allLanguagesSkipped"));
+    assert!(!selection.ocr_rescue);
+    assert_eq!(RunSelection::default().empty_notice(), None);
+}
+
+#[test]
+fn absent_optional_reader_reports_rescue_off_before_cleaning() {
+    let scratch = Scratch::new("missing-ocr-notice");
+    let models = scratch.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    for name in REQUIRED_MODELS {
+        std::fs::write(models.join(name), b"").unwrap();
+    }
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let received = Arc::clone(&notices);
+    let subscription = events::register(Box::new(move |event| {
+        if let Event::Notice { key, params, .. } = event {
+            if key == "notice.run.ocrRescueUnavailable" {
+                received.lock().unwrap().push(params.clone());
+            }
+        }
+    }));
+    let selected = RunSelection::from_args(None, Some(true)).unwrap();
+    let pipeline = Pipeline::open(&models, Preference::Automatic).unwrap().with_selection(selected);
+    assert!(!pipeline.selection.ocr_rescue);
+    assert_eq!(notices.lock().unwrap().len(), 1);
+    assert!(notices.lock().unwrap()[0]["reason"].as_str().unwrap().contains(OCR_ENCODER));
+
+    for name in OCR_MODELS {
+        std::fs::write(models.join(name), b"").unwrap();
+    }
+    let pipeline = Pipeline::open(&models, Preference::Automatic).unwrap().with_selection(selected);
+    assert!(!pipeline.selection.ocr_rescue);
+    assert_eq!(notices.lock().unwrap().len(), 2);
+    assert!(notices.lock().unwrap()[1]["reason"].as_str().unwrap().contains("Empty reader file"));
+    events::unregister(subscription);
+}
+
+#[test]
+fn skipped_language_is_held_in_the_page_clean_path() {
+    use cleaner_core::balloon::{BalloonBox, BalloonClass};
+    use cleaner_core::detect::{DetBox, DetectedLanguage, Detection, Letterbox, Region, Segmentation};
+
+    fn detect(crop: &Raster, _: usize) -> Detection {
+        let boxes = [40, 150].map(|x| DetBox {
+            rect: Rect::new(x, 55, 28, 28),
+            confidence: 0.95,
+            language: DetectedLanguage::Japanese,
+        });
+        let mut levels = vec![0; (crop.width * crop.height) as usize];
+        for x in [40, 150] {
+            for y in 55..83 {
+                for xx in x..x + 28 {
+                    levels[(y * crop.width as i64 + xx) as usize] = 255;
+                }
+            }
+        }
+        Detection {
+            boxes: boxes.to_vec(),
+            segmentation: Segmentation {
+                width: crop.width,
+                height: crop.height,
+                levels,
+                fit: Letterbox::fit(crop.width, crop.height),
+            },
+        }
+    }
+    fn balloons(_: &Raster, _: usize) -> Vec<BalloonBox> {
+        [40, 150].map(|x| BalloonBox {
+            rect: Rect::new(x - 15, 40, 65, 60),
+            class: BalloonClass::TextInBubble,
+            score: 0.9,
+        }).to_vec()
+    }
+    fn judge(region: &Region) -> Verdict {
+        let script = if region.masking.x < 100 { "Japanese" } else { "Hangul" };
+        Verdict::Clean { script: script.to_owned() }
+    }
+
+    let scratch = Scratch::new("selected-page-clean");
+    let models = scratch.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    for name in REQUIRED_MODELS {
+        std::fs::write(models.join(name), b"").unwrap();
+    }
+    let selection = RunSelection::from_args(
+        Some(&serde_json::json!({ "ja": null, "zh": null, "ko": "ctd-rtdetr" })),
+        None,
+    ).unwrap();
+    let mut pipeline = Pipeline::open(&models, Preference::Automatic).unwrap()
+        .with_selection(selection)
+        .with_picks(Picks { bubble: EnginePick::Fill, outside: EnginePick::Fill })
+        .with_bubble_color(Some([245, 245, 245]));
+    pipeline.test_vision = Some(TestVision { detect, balloons, judge });
+    let page = gray_test_page(240, 140);
+    let bytes = encode(&page, Format::Png).unwrap();
+    let strip = Strip::of_sizes(&[(page.width, page.height)]);
+    let survey = cleaner_core::strip::survey(&strip, |_| None);
+    let context = PageContext {
+        strip: &strip, joins: &survey.joins, segments: &survey.segments,
+        placement: 0, sources: &[],
+    };
+    let outcome = pipeline.clean_page("c1-p001", &bytes, Engine::Fill, &context).unwrap();
+    assert_eq!(outcome.regions.len(), 2);
+    assert!(matches!(&outcome.regions[0], RegionOutcome::Untouched { reason, .. }
+        if reason == "review.reason.languageSkipped"));
+    assert!(matches!(&outcome.regions[1], RegionOutcome::Cleaned(..)),
+        "{}", one_line(&outcome.regions[1]));
+    assert_eq!(outcome.regions.iter().filter(|r| matches!(r, RegionOutcome::Cleaned(..))).count(), 1);
+    if let RegionOutcome::Cleaned(patch, _) = &outcome.regions[1] {
+        assert!(patch.mask.contains(160, 65));
+    }
+}
+
+fn gray_test_page(width: u32, height: u32) -> Raster {
+    Raster {
+        width, height, mode: ColorMode::Gray, depth: BitDepth::Eight,
+        icc: None, palette: None, trns: None, srgb_intent: None,
+        data: vec![245; (width * height) as usize],
+    }
+}
+
+#[test]
+fn a_box_taller_than_the_strip_overlap_is_held_at_its_full_extent() {
+    use cleaner_core::balloon::{BalloonBox, BalloonClass};
+    use cleaner_core::detect::{Detection, Letterbox, Region, Segmentation};
+
+    fn detect(crop: &Raster, _: usize) -> Detection {
+        Detection {
+            boxes: Vec::new(),
+            segmentation: Segmentation {
+                width: crop.width,
+                height: crop.height,
+                levels: vec![0; (crop.width * crop.height) as usize],
+                fit: Letterbox::fit(crop.width, crop.height),
+            },
+        }
+    }
+    fn balloons(crop: &Raster, segment: usize) -> Vec<BalloonBox> {
+        // The two detector crops see clipped parts of one box at y=1500..3200.
+        let rect = match segment {
+            0 => {
+                assert_eq!((crop.width, crop.height), (400, 2_900));
+                Rect::new(80, 1_500, 120, 1_400)
+            }
+            1 => {
+                assert_eq!((crop.width, crop.height), (400, 2_000));
+                Rect::new(80, 0, 120, 1_200)
+            }
+            _ => panic!("unexpected segment {segment}"),
+        };
+        vec![BalloonBox { rect, class: BalloonClass::TextFree, score: 0.9 }]
+    }
+    fn judge(_: &Region) -> Verdict { Verdict::Uncertain }
+
+    let scratch = Scratch::new("strip-cut-adoption");
+    let models = scratch.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    for name in REQUIRED_MODELS {
+        std::fs::write(models.join(name), b"").unwrap();
+    }
+    let mut pipeline = Pipeline::open(&models, Preference::Automatic).unwrap();
+    pipeline.test_vision = Some(TestVision { detect, balloons, judge });
+    let page = gray_test_page(400, 4_000);
+    let bytes = encode(&page, Format::Png).unwrap();
+    let strip = Strip::of_sizes(&[(page.width, page.height)]);
+    let splits = [Split { y: 2_000, kind: SplitKind::Fallback }];
+    let segments = cleaner_core::strip::detection_segments(4_000, &splits);
+    assert_eq!(segments.len(), 2);
+    assert_eq!((segments[0].index, segments[0].start), (0, 0),
+        "the held box starts in segment zero");
+    assert_eq!((segments[1].index, segments[1].start), (1, 2_000));
+    assert_eq!(segments[0].detect_end, 2_900);
+    let first_detector_box = Rect::new(80, 1_500, 120, 1_400);
+    let second_detector_box_in_strip = Rect::new(80, 2_000, 120, 1_200);
+    let full_box = rect_hull(first_detector_box, second_detector_box_in_strip);
+    assert_eq!(full_box, Rect::new(80, 1_500, 120, 1_700));
+    assert!(full_box.y < segments[1].start as i64);
+    assert!(full_box.bottom() > segments[0].detect_end as i64);
+    let survey = cleaner_core::strip::survey(&strip, |_| None);
+    let context = PageContext {
+        strip: &strip, joins: &survey.joins, segments: &segments,
+        placement: 0, sources: &[],
+    };
+
+    let outcome = pipeline.clean_page("c1-p001", &bytes, Engine::Fill, &context).unwrap();
+    assert_eq!(outcome.regions.len(), 1);
+    assert!(matches!(&outcome.regions[0], RegionOutcome::Untouched { bbox, reason }
+        if *bbox == Rect::new(73, 1_493, 135, 1_714)
+            && reason == "review.reason.gateSkippedLowConfidence"),
+        "{}", one_line(&outcome.regions[0]));
+}
+
+#[test]
+fn a_clipped_chain_without_a_third_fragment_keeps_its_review_row() {
+    use cleaner_core::balloon::{BalloonBox, BalloonClass};
+    use cleaner_core::detect::{Detection, Letterbox, Region, Segmentation};
+
+    fn detect(crop: &Raster, _: usize) -> Detection {
+        Detection { boxes: Vec::new(), segmentation: Segmentation {
+            width: crop.width, height: crop.height,
+            levels: vec![0; (crop.width * crop.height) as usize],
+            fit: Letterbox::fit(crop.width, crop.height),
+        } }
+    }
+    fn balloons(_: &Raster, segment: usize) -> Vec<BalloonBox> {
+        let rect = match segment {
+            0 => Some(Rect::new(80, 1_500, 120, 1_400)),
+            1 => Some(Rect::new(80, 0, 120, 2_900)),
+            2 => None,
+            _ => panic!("unexpected segment {segment}"),
+        };
+        rect.into_iter().map(|rect| BalloonBox {
+            rect, class: BalloonClass::TextFree, score: 0.9,
+        }).collect()
+    }
+    fn judge(_: &Region) -> Verdict { Verdict::Uncertain }
+
+    let scratch = Scratch::new("strip-three-segment-chain");
+    let models = scratch.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    for name in REQUIRED_MODELS { std::fs::write(models.join(name), b"").unwrap(); }
+    let mut pipeline = Pipeline::open(&models, Preference::Automatic).unwrap();
+    pipeline.test_vision = Some(TestVision { detect, balloons, judge });
+    let page = gray_test_page(400, 6_000);
+    let bytes = encode(&page, Format::Png).unwrap();
+    let strip = Strip::of_sizes(&[(page.width, page.height)]);
+    let segments = cleaner_core::strip::detection_segments(6_000, &[
+        Split { y: 2_000, kind: SplitKind::Fallback },
+        Split { y: 4_000, kind: SplitKind::Fallback },
+    ]);
+    let survey = cleaner_core::strip::survey(&strip, |_| None);
+    let context = PageContext {
+        strip: &strip, joins: &survey.joins, segments: &segments,
+        placement: 0, sources: &[],
+    };
+
+    let outcome = pipeline.clean_page("c1-p001", &bytes, Engine::Fill, &context).unwrap();
+    assert_eq!(outcome.regions.len(), 1, "three-segment chain lost its review row");
+    assert!(matches!(&outcome.regions[0], RegionOutcome::Untouched { bbox, .. }
+        if bbox.y <= 1_500 && bbox.bottom() >= 4_900));
+}
+
+#[test]
+fn tall_clipped_fragments_match_across_the_full_detection_overlap() {
+    let upper = Rect::new(80, 900, 120, 2_000);
+    let lower = Rect::new(80, 2_000, 120, 2_000);
+    assert_eq!(upper.bottom() - lower.y, strip::DETECTION_OVERLAP as i64);
+    assert!(clipped_continuation(&upper, &lower, 2_000));
+    assert!(!clipped_continuation(&upper, &lower, 1_900));
+    assert!(!clipped_continuation(&upper, &Rect::new(140, 2_000, 120, 2_000), 2_000));
+}
+
+#[test]
+fn distinct_tall_balloons_overlapping_near_the_relaxed_threshold_stay_separate() {
+    use cleaner_core::balloon::{BalloonBox, BalloonClass};
+    use cleaner_core::detect::{Detection, Letterbox, Region, Segmentation};
+
+    fn detect(crop: &Raster, _: usize) -> Detection {
+        Detection { boxes: Vec::new(), segmentation: Segmentation {
+            width: crop.width, height: crop.height,
+            levels: vec![0; (crop.width * crop.height) as usize],
+            fit: Letterbox::fit(crop.width, crop.height),
+        } }
+    }
+    fn balloons(_: &Raster, segment: usize) -> Vec<BalloonBox> {
+        let rect = match segment {
+            0 => Rect::new(80, 900, 120, 2_000),
+            1 => Rect::new(140, 225, 120, 2_000),
+            _ => panic!("unexpected segment {segment}"),
+        };
+        vec![BalloonBox { rect, class: BalloonClass::TextFree, score: 0.9 }]
+    }
+    fn judge(_: &Region) -> Verdict { Verdict::Uncertain }
+
+    let scratch = Scratch::new("strip-distinct-tall-balloons");
+    let models = scratch.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    for name in REQUIRED_MODELS { std::fs::write(models.join(name), b"").unwrap(); }
+    let mut pipeline = Pipeline::open(&models, Preference::Automatic).unwrap();
+    pipeline.test_vision = Some(TestVision { detect, balloons, judge });
+    let page = gray_test_page(400, 5_000);
+    let bytes = encode(&page, Format::Png).unwrap();
+    let strip = Strip::of_sizes(&[(page.width, page.height)]);
+    let segments = cleaner_core::strip::detection_segments(5_000,
+        &[Split { y: 2_000, kind: SplitKind::Fallback }]);
+    assert_eq!(segments[0].detect_end, 2_900);
+    let survey = cleaner_core::strip::survey(&strip, |_| None);
+    let context = PageContext {
+        strip: &strip, joins: &survey.joins, segments: &segments,
+        placement: 0, sources: &[],
+    };
+
+    let outcome = pipeline.clean_page("c1-p001", &bytes, Engine::Fill, &context).unwrap();
+    assert_eq!(outcome.regions.len(), 2, "distinct balloons were joined: {:?}",
+        outcome.regions.iter().map(one_line).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_join_keeps_the_provisional_index_for_later_patch_ids() {
+    use cleaner_core::balloon::{BalloonBox, BalloonClass};
+    use cleaner_core::detect::{DetBox, DetectedLanguage, Detection, Letterbox, Region, Segmentation};
+
+    fn detect(crop: &Raster, segment: usize) -> Detection {
+        let boxes = if segment == 1 {
+            vec![DetBox {
+                rect: Rect::new(250, 1_350, 32, 32),
+                confidence: 0.95,
+                language: DetectedLanguage::Japanese,
+            }]
+        } else { Vec::new() };
+        let mut levels = vec![0; (crop.width * crop.height) as usize];
+        if segment == 1 {
+            for y in 1_350..1_382 {
+                for x in 250..282 {
+                    levels[(y * crop.width + x) as usize] = 255;
+                }
+            }
+        }
+        Detection { boxes, segmentation: Segmentation {
+            width: crop.width, height: crop.height, levels,
+            fit: Letterbox::fit(crop.width, crop.height),
+        } }
+    }
+    fn balloons(_: &Raster, segment: usize) -> Vec<BalloonBox> {
+        let rects = if segment == 0 {
+            vec![Rect::new(80, 1_500, 120, 1_400)]
+        } else {
+            vec![Rect::new(80, 0, 120, 1_200), Rect::new(240, 1_340, 55, 55)]
+        };
+        rects.into_iter().map(|rect| BalloonBox {
+            rect, class: BalloonClass::TextFree, score: 0.9,
+        }).collect()
+    }
+    fn balloons_without_join(_: &Raster, segment: usize) -> Vec<BalloonBox> {
+        let rect = if segment == 0 {
+            Rect::new(80, 1_500, 120, 1_400)
+        } else {
+            Rect::new(240, 1_340, 55, 55)
+        };
+        vec![BalloonBox { rect, class: BalloonClass::TextFree, score: 0.9 }]
+    }
+    fn judge(_: &Region) -> Verdict { Verdict::Clean { script: "Japanese".into() } }
+
+    let scratch = Scratch::new("strip-join-index");
+    let models = scratch.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    for name in REQUIRED_MODELS { std::fs::write(models.join(name), b"").unwrap(); }
+    let mut pipeline = Pipeline::open(&models, Preference::Automatic).unwrap()
+        .with_picks(Picks { bubble: EnginePick::Fill, outside: EnginePick::Fill })
+        .with_bubble_color(Some([245, 245, 245]));
+    pipeline.test_vision = Some(TestVision { detect, balloons, judge });
+    let page = gray_test_page(400, 4_000);
+    let bytes = encode(&page, Format::Png).unwrap();
+    let strip = Strip::of_sizes(&[(page.width, page.height)]);
+    let segments = cleaner_core::strip::detection_segments(4_000,
+        &[Split { y: 2_000, kind: SplitKind::Fallback }]);
+    let survey = cleaner_core::strip::survey(&strip, |_| None);
+    let context = PageContext {
+        strip: &strip, joins: &survey.joins, segments: &segments,
+        placement: 0, sources: &[],
+    };
+
+    let outcome = pipeline.clean_page("c1-p001", &bytes, Engine::Fill, &context).unwrap();
+    assert_eq!(outcome.regions.len(), 2);
+    assert!(matches!(&outcome.regions[0], RegionOutcome::Untouched { bbox, reason }
+        if *bbox == Rect::new(73, 1_493, 135, 1_714)
+            && reason == "review.reason.gateSkippedLowConfidence"));
+    let RegionOutcome::Cleaned(patch, _) = &outcome.regions[1] else {
+        panic!("later region was not cleaned: {}", one_line(&outcome.regions[1]));
+    };
+    assert_eq!(patch.id, "c1-p001-r1");
+    assert_eq!(patch.order, 1);
+
+    let mut without_join = Pipeline::open(&models, Preference::Automatic).unwrap()
+        .with_picks(Picks { bubble: EnginePick::Fill, outside: EnginePick::Fill })
+        .with_bubble_color(Some([245, 245, 245]));
+    without_join.test_vision = Some(TestVision { detect, balloons: balloons_without_join, judge });
+    let baseline = without_join.clean_page("c1-p001", &bytes, Engine::Fill, &context).unwrap();
+    let baseline_patch = baseline.regions.iter().find_map(|region| match region {
+        RegionOutcome::Cleaned(patch, _) => Some(patch),
+        _ => None,
+    }).expect("the later region cleans without a join");
+    assert_eq!((patch.id.as_str(), patch.order),
+        (baseline_patch.id.as_str(), baseline_patch.order));
+}
+
+#[test]
+fn an_unowned_clipped_fragment_cannot_withdraw_an_unrelated_patch() {
+    use cleaner_core::balloon::{BalloonBox, BalloonClass};
+    use cleaner_core::detect::{DetBox, DetectedLanguage, Detection, Letterbox, Region, Segmentation};
+
+    fn detect(crop: &Raster, segment: usize) -> Detection {
+        let boxes = if segment == 0 {
+            vec![DetBox {
+                rect: Rect::new(250, 1_800, 32, 32),
+                confidence: 0.95,
+                language: DetectedLanguage::Japanese,
+            }]
+        } else { Vec::new() };
+        let mut levels = vec![0; (crop.width * crop.height) as usize];
+        if segment == 0 {
+            for y in 1_800..1_832 {
+                for x in 250..282 {
+                    levels[(y * crop.width + x) as usize] = 255;
+                }
+            }
+        }
+        Detection { boxes, segmentation: Segmentation {
+            width: crop.width, height: crop.height, levels,
+            fit: Letterbox::fit(crop.width, crop.height),
+        } }
+    }
+    fn balloons(_: &Raster, segment: usize) -> Vec<BalloonBox> {
+        let rects = if segment == 0 {
+            vec![Rect::new(240, 1_790, 55, 55), Rect::new(80, 2_020, 120, 880)]
+        } else {
+            vec![Rect::new(80, 20, 120, 1_180)]
+        };
+        rects.into_iter().map(|rect| BalloonBox {
+            rect, class: BalloonClass::TextFree, score: 0.9,
+        }).collect()
+    }
+    fn judge(_: &Region) -> Verdict { Verdict::Clean { script: "Japanese".into() } }
+
+    let scratch = Scratch::new("strip-unowned-fragment");
+    let models = scratch.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    for name in REQUIRED_MODELS { std::fs::write(models.join(name), b"").unwrap(); }
+    let mut pipeline = Pipeline::open(&models, Preference::Automatic).unwrap()
+        .with_picks(Picks { bubble: EnginePick::Fill, outside: EnginePick::Fill })
+        .with_bubble_color(Some([245, 245, 245]));
+    pipeline.test_vision = Some(TestVision { detect, balloons, judge });
+    let page = gray_test_page(400, 4_000);
+    let bytes = encode(&page, Format::Png).unwrap();
+    let strip = Strip::of_sizes(&[(page.width, page.height)]);
+    let segments = cleaner_core::strip::detection_segments(4_000,
+        &[Split { y: 2_000, kind: SplitKind::Fallback }]);
+    assert!(segments[1].start <= 2_013 && segments[1].end > 2_013);
+    let survey = cleaner_core::strip::survey(&strip, |_| None);
+    let context = PageContext {
+        strip: &strip, joins: &survey.joins, segments: &segments,
+        placement: 0, sources: &[],
+    };
+
+    let outcome = pipeline.clean_page("c1-p001", &bytes, Engine::Fill, &context).unwrap();
+    assert_eq!(outcome.regions.len(), 2);
+    let patch = outcome.regions.iter().find_map(|region| match region {
+        RegionOutcome::Cleaned(patch, _) => Some(patch),
+        _ => None,
+    }).expect("the unrelated box survives the join");
+    assert_eq!(patch.id, "c1-p001-r0");
+    assert_eq!(patch.order, 0);
+    assert!(matches!(&outcome.regions[1], RegionOutcome::Untouched { bbox, reason }
+        if *bbox == Rect::new(73, 2_013, 135, 1_194)
+            && reason == "review.reason.gateSkippedLowConfidence"));
+}
+
+#[test]
+fn an_unowned_forward_overlap_fragment_does_not_add_a_review_row() {
+    use cleaner_core::balloon::{BalloonBox, BalloonClass};
+    use cleaner_core::detect::{DetBox, DetectedLanguage, Detection, Letterbox, Region, Segmentation};
+
+    fn detect(crop: &Raster, segment: usize) -> Detection {
+        let boxes = if segment == 1 { vec![DetBox {
+            rect: Rect::new(160, 500, 28, 28), confidence: 0.95,
+            language: DetectedLanguage::Japanese,
+        }] } else { Vec::new() };
+        let mut levels = vec![0; (crop.width * crop.height) as usize];
+        if segment == 1 {
+            for y in 500..528 {
+                for x in 160..188 { levels[(y * crop.width + x) as usize] = 255; }
+            }
+        }
+        Detection { boxes, segmentation: Segmentation {
+            width: crop.width, height: crop.height, levels,
+            fit: Letterbox::fit(crop.width, crop.height),
+        } }
+    }
+    fn balloons(_: &Raster, segment: usize) -> Vec<BalloonBox> {
+        let rect = if segment == 0 {
+            Rect::new(80, 2_020, 120, 880)
+        } else {
+            Rect::new(150, 20, 120, 1_180)
+        };
+        vec![BalloonBox { rect, class: BalloonClass::TextFree, score: 0.9 }]
+    }
+    fn judge(_: &Region) -> Verdict { Verdict::Clean { script: "Japanese".into() } }
+
+    let scratch = Scratch::new("strip-unowned-overlap-row");
+    let models = scratch.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    for name in REQUIRED_MODELS { std::fs::write(models.join(name), b"").unwrap(); }
+    let mut pipeline = Pipeline::open(&models, Preference::Automatic).unwrap()
+        .with_picks(Picks { bubble: EnginePick::Fill, outside: EnginePick::Fill })
+        .with_bubble_color(Some([245, 245, 245]));
+    pipeline.test_vision = Some(TestVision { detect, balloons, judge });
+    let page = gray_test_page(400, 4_000);
+    let bytes = encode(&page, Format::Png).unwrap();
+    let strip = Strip::of_sizes(&[(page.width, page.height)]);
+    let segments = cleaner_core::strip::detection_segments(4_000,
+        &[Split { y: 2_000, kind: SplitKind::Fallback }]);
+    let survey = cleaner_core::strip::survey(&strip, |_| None);
+    let context = PageContext {
+        strip: &strip, joins: &survey.joins, segments: &segments,
+        placement: 0, sources: &[],
+    };
+
+    let outcome = pipeline.clean_page("c1-p001", &bytes, Engine::Fill, &context).unwrap();
+    assert_eq!(outcome.regions.len(), 1, "unowned overlap added a review row");
+    assert!(matches!(&outcome.regions[0], RegionOutcome::Cleaned(..)));
+}
+
+#[test]
+fn an_edge_box_without_a_continuation_follows_the_normal_adoption_path() {
+    use cleaner_core::balloon::{BalloonBox, BalloonClass};
+    use cleaner_core::detect::{Detection, Letterbox, Region, Segmentation};
+
+    fn detect(crop: &Raster, _: usize) -> Detection {
+        Detection {
+            boxes: Vec::new(),
+            segmentation: Segmentation {
+                width: crop.width,
+                height: crop.height,
+                levels: vec![0; (crop.width * crop.height) as usize],
+                fit: Letterbox::fit(crop.width, crop.height),
+            },
+        }
+    }
+    fn balloons(_: &Raster, segment: usize) -> Vec<BalloonBox> {
+        if segment == 0 {
+            vec![BalloonBox {
+                rect: Rect::new(80, 1_500, 120, 1_400),
+                class: BalloonClass::TextFree,
+                score: 0.9,
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+    fn judge(_: &Region) -> Verdict { Verdict::Clean { script: "Japanese".into() } }
+
+    let scratch = Scratch::new("strip-edge-whole-box");
+    let models = scratch.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    for name in REQUIRED_MODELS {
+        std::fs::write(models.join(name), b"").unwrap();
+    }
+    let selection = RunSelection::from_args(
+        Some(&serde_json::json!({ "ja": null, "zh": null, "ko": "ctd-rtdetr" })), None,
+    ).unwrap();
+    let mut pipeline = Pipeline::open(&models, Preference::Automatic).unwrap()
+        .with_selection(selection);
+    pipeline.test_vision = Some(TestVision { detect, balloons, judge });
+    let page = gray_test_page(400, 4_000);
+    let bytes = encode(&page, Format::Png).unwrap();
+    let strip = Strip::of_sizes(&[(page.width, page.height)]);
+    let segments = cleaner_core::strip::detection_segments(4_000,
+        &[Split { y: 2_000, kind: SplitKind::Fallback }]);
+    assert_eq!(segments[0].detect_end, 2_900);
+    let survey = cleaner_core::strip::survey(&strip, |_| None);
+    let context = PageContext {
+        strip: &strip, joins: &survey.joins, segments: &segments,
+        placement: 0, sources: &[],
+    };
+
+    let outcome = pipeline.clean_page("c1-p001", &bytes, Engine::Fill, &context).unwrap();
+    assert_eq!(outcome.regions.len(), 1);
+    assert!(matches!(&outcome.regions[0], RegionOutcome::Untouched { bbox, reason }
+        if *bbox == Rect::new(73, 1_493, 135, 1_407)
+            && reason == "review.reason.languageSkipped"),
+        "an unmatched edge box lost its normal gate result: {}", one_line(&outcome.regions[0]));
+}
+
+#[test]
+fn two_prior_fragments_matching_one_current_box_keep_both_review_areas() {
+    use cleaner_core::balloon::{BalloonBox, BalloonClass};
+    use cleaner_core::detect::{Detection, Letterbox, Region, Segmentation};
+
+    fn detect(crop: &Raster, _: usize) -> Detection {
+        Detection {
+            boxes: Vec::new(),
+            segmentation: Segmentation {
+                width: crop.width,
+                height: crop.height,
+                levels: vec![0; (crop.width * crop.height) as usize],
+                fit: Letterbox::fit(crop.width, crop.height),
+            },
+        }
+    }
+    fn balloons(_: &Raster, segment: usize) -> Vec<BalloonBox> {
+        let rects = match segment {
+            0 => vec![Rect::new(80, 1_500, 100, 1_400), Rect::new(180, 1_700, 100, 1_200)],
+            1 => vec![Rect::new(120, 0, 120, 1_200)],
+            _ => panic!("unexpected segment {segment}"),
+        };
+        rects.into_iter().map(|rect| BalloonBox {
+            rect, class: BalloonClass::TextFree, score: 0.9,
+        }).collect()
+    }
+    fn judge(_: &Region) -> Verdict { Verdict::Uncertain }
+
+    let scratch = Scratch::new("strip-two-priors-one-current");
+    let models = scratch.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    for name in REQUIRED_MODELS {
+        std::fs::write(models.join(name), b"").unwrap();
+    }
+    let mut pipeline = Pipeline::open(&models, Preference::Automatic).unwrap();
+    pipeline.test_vision = Some(TestVision { detect, balloons, judge });
+    let page = gray_test_page(400, 4_000);
+    let bytes = encode(&page, Format::Png).unwrap();
+    let strip = Strip::of_sizes(&[(page.width, page.height)]);
+    let segments = cleaner_core::strip::detection_segments(4_000,
+        &[Split { y: 2_000, kind: SplitKind::Fallback }]);
+    let survey = cleaner_core::strip::survey(&strip, |_| None);
+    let context = PageContext {
+        strip: &strip, joins: &survey.joins, segments: &segments,
+        placement: 0, sources: &[],
+    };
+
+    let outcome = pipeline.clean_page("c1-p001", &bytes, Engine::Fill, &context).unwrap();
+    assert_eq!(outcome.regions.len(), 2, "one prior fragment was lost: {:?}",
+        outcome.regions.iter().map(one_line).collect::<Vec<_>>());
+    assert!(outcome.regions.iter().all(|region| matches!(region, RegionOutcome::Untouched { .. })));
+    let bounds = outcome.regions.iter().map(|region| match region {
+        RegionOutcome::Untouched { bbox, .. } => *bbox,
+        _ => unreachable!(),
+    }).collect::<Vec<_>>();
+    assert!(bounds.iter().any(|bbox| bbox.x <= 80 && bbox.right() >= 240
+        && bbox.y <= 1_500 && bbox.bottom() >= 3_200), "joined box missing: {bounds:?}");
+    assert!(bounds.iter().any(|bbox| bbox.x <= 180 && bbox.right() >= 280
+        && bbox.y <= 1_700 && bbox.bottom() >= 2_900), "unmatched prior missing: {bounds:?}");
+}
+
+#[test]
+fn distinct_boxes_meeting_at_a_strip_cut_stay_separate() {
+    use cleaner_core::balloon::{BalloonBox, BalloonClass};
+    use cleaner_core::detect::{Detection, Letterbox, Region, Segmentation};
+
+    fn detect(crop: &Raster, _: usize) -> Detection {
+        Detection {
+            boxes: Vec::new(),
+            segmentation: Segmentation {
+                width: crop.width,
+                height: crop.height,
+                levels: vec![0; (crop.width * crop.height) as usize],
+                fit: Letterbox::fit(crop.width, crop.height),
+            },
+        }
+    }
+    fn balloons(_: &Raster, segment: usize) -> Vec<BalloonBox> {
+        let above = BalloonBox {
+            rect: Rect::new(80, 1_600, 120, 400),
+            class: BalloonClass::TextFree,
+            score: 0.9,
+        };
+        let below = BalloonBox {
+            rect: Rect::new(80, 2_000, 120, 400),
+            class: BalloonClass::TextFree,
+            score: 0.9,
+        };
+        match segment {
+            0 => vec![above, below],
+            1 => vec![BalloonBox { rect: Rect::new(80, 0, 120, 400), ..below }],
+            _ => panic!("unexpected segment {segment}"),
+        }
+    }
+    fn judge(_: &Region) -> Verdict { Verdict::Uncertain }
+
+    let scratch = Scratch::new("strip-cut-distinct-boxes");
+    let models = scratch.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    for name in REQUIRED_MODELS {
+        std::fs::write(models.join(name), b"").unwrap();
+    }
+    let mut pipeline = Pipeline::open(&models, Preference::Automatic).unwrap();
+    pipeline.test_vision = Some(TestVision { detect, balloons, judge });
+    let page = gray_test_page(400, 4_000);
+    let bytes = encode(&page, Format::Png).unwrap();
+    let strip = Strip::of_sizes(&[(page.width, page.height)]);
+    let segments = cleaner_core::strip::detection_segments(4_000,
+        &[Split { y: 2_000, kind: SplitKind::Fallback }]);
+    let survey = cleaner_core::strip::survey(&strip, |_| None);
+    let context = PageContext {
+        strip: &strip, joins: &survey.joins, segments: &segments,
+        placement: 0, sources: &[],
+    };
+
+    let outcome = pipeline.clean_page("c1-p001", &bytes, Engine::Fill, &context).unwrap();
+    assert_eq!(outcome.regions.len(), 2);
+    let mut bounds = outcome.regions.iter().map(|region| match region {
+        RegionOutcome::Untouched { bbox, .. } => *bbox,
+        other => panic!("unexpected outcome: {}", one_line(other)),
+    }).collect::<Vec<_>>();
+    bounds.sort_by_key(|bbox| bbox.y);
+    assert_eq!(bounds, [Rect::new(73, 1_593, 135, 414), Rect::new(73, 1_993, 135, 414)]);
 }
 
 /// The seam's own names, on the wire. `runClean` resolves with the queue and
@@ -2195,8 +3043,19 @@ fn a_reader_that_is_absent_or_will_not_open_leaves_the_gate_standing() {
         std::fs::copy(pipeline_models.join(name), models.join(name)).unwrap();
     }
 
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let received = Arc::clone(&notices);
+    let subscription = events::register(Box::new(move |event| {
+        if let Event::Notice { key, params, .. } = event {
+            if key == "notice.run.ocrRescueUnavailable" {
+                received.lock().unwrap().push(params.clone());
+            }
+        }
+    }));
+
     let bare = open_gate(&models, Preference::Automatic).expect("the gate opens without a reader");
     assert!(!bare.has_reader(), "no reader files, no reader");
+    assert!(notices.lock().unwrap()[0]["reason"].as_str().unwrap().contains(OCR_ENCODER));
 
     for name in OCR_MODELS {
         std::fs::write(models.join(name), b"not a model").unwrap();
@@ -2204,6 +3063,12 @@ fn a_reader_that_is_absent_or_will_not_open_leaves_the_gate_standing() {
     let fallen_back =
         open_gate(&models, Preference::Automatic).expect("a reader that will not open is not a failure");
     assert!(!fallen_back.has_reader(), "a corrupt reader must fall back to the bare gate");
+    let notices = notices.lock().unwrap();
+    assert_eq!(notices.len(), 2);
+    let reason = notices[1]["reason"].as_str().unwrap();
+    assert!(!reason.is_empty() && reason.len() <= 180);
+    drop(notices);
+    events::unregister(subscription);
 }
 
 fn one_gpu_at_a_time() -> std::sync::MutexGuard<'static, ()> {

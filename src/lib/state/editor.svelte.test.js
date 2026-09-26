@@ -4,6 +4,7 @@ import {
   editor,
   LOCAL_CEILING,
   openEditorChapter,
+  redo,
   recordRegionEdit,
   select,
   selectedRegion,
@@ -13,6 +14,7 @@ import {
 import { app } from './app.svelte.js'
 import { setBackend } from '../api/backend.js'
 import { createHistory, push } from '../model/history.js'
+import { session } from './session.svelte.js'
 
 describe('editor history persistence failures', () => {
   beforeEach(() => {
@@ -714,6 +716,10 @@ describe('startRun local engine ceiling boundary', () => {
         outsideEngine: 'lama',
         outsideBubbles: 'review',
         bubbleColor: '#ffffff',
+        detection: { ...session.detection },
+        geometryPolicy: 'legacy',
+        textPolicy: 'legacy_gate',
+        ocrRescue: session.ocrRescue,
       })
       expect(runClean.mock.calls[0][0].engineCeiling).toBe(LOCAL_CEILING)
       expect(editor.run).toMatchObject({
@@ -724,4 +730,121 @@ describe('startRun local engine ceiling boundary', () => {
       })
     },
   )
+
+  it('routes all-text policy to chapter review without starting the legacy cleaner', async () => {
+    const previousPolicy = session.textPolicy
+    session.textPolicy = 'all_text'
+    const runClean = vi.fn()
+    setBackend(/** @type {any} */ ({ runClean }))
+    app.modals.length = 0
+    try {
+      expect(await startRun()).toBeNull()
+      expect(runClean).not.toHaveBeenCalled()
+      expect(app.modals.at(-1)).toMatchObject({ kind: 'workflowReview', props: { chapterId: 'ch-test-1', pageIndex: 0 } })
+    } finally {
+      session.textPolicy = previousPolicy
+      app.modals.length = 0
+    }
+  })
+})
+
+describe('text-shaped revision history', () => {
+  afterEach(() => {
+    setBackend(null)
+    editor.chapter = null
+    editor.history = createHistory()
+  })
+
+  it('undoes and redoes successive immutable patch revisions by exact identity', async () => {
+    const regionAt = (revision) => ({ id: 'p1-hreview-sam-1', pageId: 'p1', outcome: 'cleaned',
+      mask: { id: `mask-${revision}`, textShapePatchRevision: `patch-revision-${revision}` } })
+    const first = regionAt(1)
+    const second = regionAt(2)
+    const journal = []
+    let cursor = 0
+    let currentRegion = second
+    const restoreRegion = vi.fn(async ({ region }) => {
+      currentRegion = region
+      return region
+    })
+    setBackend(/** @type {any} */ ({
+      historyPush: async ({ entry }) => {
+        journal.push(entry)
+        cursor = journal.length
+        return { cursor, entries: journal.map((item, index) => ({ seq: index + 1, label: item.label })) }
+      },
+      historyMove: async ({ direction }) => {
+        if (direction === 'undo') cursor = Math.max(0, cursor - 1)
+        else cursor = Math.min(journal.length, cursor + 1)
+        const entry = direction === 'undo' ? journal[cursor] : journal[cursor - 1]
+        return { cursor, entry }
+      },
+      restoreRegion,
+      loadPages: async () => [],
+    }))
+    editor.chapter = { id: 'revision-chapter', pages: [{ id: 'p1', index: 0, resident: true,
+      status: 'cleaned', regions: [second], regionCount: 1, doneCount: 1, reviewCount: 0 }], review: [] }
+    editor.history = createHistory()
+
+    recordRegionEdit('canvas.command.applyTool', second.id, { region: null, pageStatus: 'unclean' },
+      { region: first, pageStatus: 'cleaned' })
+    await editor.history.running
+    recordRegionEdit('canvas.command.applyTool', second.id, { region: first, pageStatus: 'cleaned' },
+      { region: second, pageStatus: 'cleaned' })
+    await editor.history.running
+
+    undo()
+    await editor.history.running
+    expect(currentRegion.mask.textShapePatchRevision).toBe('patch-revision-1')
+    undo()
+    await editor.history.running
+    expect(currentRegion).toBeNull()
+    redo()
+    await editor.history.running
+    expect(currentRegion.mask.textShapePatchRevision).toBe('patch-revision-1')
+    redo()
+    await editor.history.running
+    expect(currentRegion.mask.textShapePatchRevision).toBe('patch-revision-2')
+    expect(restoreRegion.mock.calls.map(([call]) => call.region?.mask?.textShapePatchRevision ?? null)).toEqual([
+      'patch-revision-1', null, 'patch-revision-1', 'patch-revision-2',
+    ])
+  })
+
+  it('carries legacy patch revisions through undo and redo', async () => {
+    const regionAt = (revision) => ({
+      id: 'p1-r1', pageId: 'p1', outcome: 'cleaned',
+      mask: { id: 'p1-r1-m1', legacyPatchRevision: revision },
+    })
+    const first = regionAt('old-pixels')
+    const second = regionAt('new-pixels')
+    const entries = []
+    let cursor = 0
+    const restoreRegion = vi.fn(async ({ region }) => region)
+    setBackend(/** @type {any} */ ({
+      historyPush: async ({ entry }) => {
+        entries.push(entry)
+        cursor = entries.length
+        return { cursor, entries: entries.map((item, index) => ({ seq: index + 1, label: item.label })) }
+      },
+      historyMove: async ({ direction }) => {
+        cursor += direction === 'undo' ? -1 : 1
+        return { cursor, entry: direction === 'undo' ? entries[cursor] : entries[cursor - 1] }
+      },
+      restoreRegion,
+      loadPages: async () => [],
+    }))
+    editor.chapter = { id: 'legacy-chapter', pages: [{ id: 'p1', index: 0, resident: true,
+      status: 'cleaned', regions: [second], regionCount: 1, doneCount: 1, reviewCount: 0 }], review: [] }
+    editor.history = createHistory()
+
+    recordRegionEdit('canvas.command.applyTool', first.id,
+      { region: first, pageStatus: 'cleaned' }, { region: second, pageStatus: 'cleaned' })
+    await editor.history.running
+    undo()
+    await editor.history.running
+    redo()
+    await editor.history.running
+    expect(restoreRegion.mock.calls.map(([call]) => call.region.mask.legacyPatchRevision))
+      .toEqual(['old-pixels', 'new-pixels'])
+  })
 })

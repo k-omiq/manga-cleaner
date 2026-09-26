@@ -17,6 +17,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+serde_json.workspace = true
 
 [dependencies]
 cleaner-core = { path = "../crates/cleaner-core" }
@@ -38,6 +39,8 @@ ort = { workspace = true, features = ["std", "load-dynamic", "api-22"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 # The pinned digests, verified from the bytes as they are written.
 sha2 = "0.10"
+base64 = "0.22"
+png = "0.18"
 # Unpacking the ONNX Runtime archive: a `.tgz` on macOS and Linux, a `.nupkg`
 # (which is a zip) on Windows. Both are already in the lockfile - the updater
 # plugin unpacks its own artefacts with them.

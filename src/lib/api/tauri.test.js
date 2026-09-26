@@ -63,6 +63,99 @@ describe('the Tauri adapter', () => {
     }
   })
 
+  it('does not expose the unqualified text-shaped IPC route', () => {
+    const backend = createTauriBackend({ fallback: recordingFallback(), invoke: vi.fn() })
+    for (const method of ['prepareTextShape', 'textShapePreviewTile', 'applyPreparedTextShape']) {
+      expect(SEAM_METHODS).not.toContain(method)
+      expect(implementedMethods()).not.toContain(method)
+      expect(backend[method]).toBeUndefined()
+    }
+  })
+
+  it('binds a new stroke to the source slot and hash shown at gesture start', async () => {
+    const invoke = vi.fn().mockResolvedValue(null)
+    const backend = createTauriBackend({ fallback: recordingFallback(), invoke })
+    await backend.createRegion({ chapterId: 'c1', pageIndex: 2,
+      sourceIndex: 7, sourceSha: 'scan-digest',
+      bbox: { x: 1, y: 2, w: 3, h: 4 }, tool: 'aiMaskBrush', params: {} })
+    expect(invoke).toHaveBeenCalledWith('create_region', expect.objectContaining({
+      pageIndex: 2, expectedSourceIdx: 7, expectedSourceSha: 'scan-digest',
+    }))
+  })
+
+  it('maps chapter analysis, saved corrections, group installs, and corrected exact-W plans', async () => {
+    const invoke = vi.fn().mockResolvedValue(null)
+    const backend = createTauriBackend({ fallback: recordingFallback(), invoke })
+    const request = { analysisId: 'analysis-1', chapterId: 'chapter-1', pageIndex: 3, componentId: 'sam-1' }
+    const additions = { bounds: { x: 4, y: 5, w: 1, h: 1 }, bits: [255] }
+    const removals = { bounds: { x: 0, y: 0, w: 0, h: 0 }, bits: [] }
+
+    await backend.analyzeChapterPage({ chapterId: 'chapter-1', pageIndex: 3, workflow: 'text_shape',
+      rtProfile: 'full-halves', rtBackend: 'ort-cpu', samBackend: 'ort-webgpu' })
+    await backend.loadComponentCorrection(request)
+    await backend.prepareComponentWrite({ ...request, allowOutsideBubbles: false, paddingPx: 5,
+      additions, removals, correctionRevision: 8 })
+    await backend.downloadModelGroup({ id: 'scriptGate' })
+
+    expect(invoke).toHaveBeenNthCalledWith(1, 'analyze_chapter_page', {
+      chapterId: 'chapter-1', pageIndex: 3, workflow: 'text_shape', rtProfile: 'full-halves',
+      rtBackend: 'ort-cpu', samBackend: 'ort-webgpu', requestId: expect.any(String),
+    })
+    expect(invoke).toHaveBeenNthCalledWith(2, 'load_component_correction', request)
+    expect(invoke).toHaveBeenNthCalledWith(3, 'prepare_component_write', {
+      ...request, allowOutsideBubbles: false, paddingPx: 5, additions, removals, correctionRevision: 8,
+    })
+    expect(invoke).toHaveBeenNthCalledWith(4, 'download_model_group', { id: 'scriptGate' })
+  })
+
+  it('generates distinct ids for callers that omit an analysis id', async () => {
+    const invoke = vi.fn().mockResolvedValue(null)
+    const backend = createTauriBackend({ fallback: recordingFallback(), invoke })
+    const spec = { sourcePath: '/tmp/page.png', workflow: 'mask', rtProfile: 'full-halves',
+      rtBackend: 'ort-cpu', samBackend: 'ort-cpu' }
+    await backend.analyzeCapabilities(spec)
+    await backend.analyzeCapabilities(spec)
+    const first = invoke.mock.calls[0][1].requestId
+    const second = invoke.mock.calls[1][1].requestId
+    expect(first).toEqual(expect.any(String))
+    expect(second).not.toBe(first)
+  })
+
+  it('passes explicit analysis ids to both commands and cancels that id', async () => {
+    const invoke = vi.fn().mockResolvedValue(true)
+    const backend = createTauriBackend({ fallback: recordingFallback(), invoke })
+    const spec = { sourcePath: '/tmp/page.png', workflow: 'mask', rtProfile: 'full-halves',
+      rtBackend: 'ort-cpu', samBackend: 'ort-cpu', requestId: 'request-1' }
+    await backend.analyzeCapabilities(spec)
+    await backend.analyzeChapterPage({ ...spec, chapterId: 'c1', pageIndex: 0 })
+    expect(await backend.cancelCapabilityAnalysis('request-1')).toBe(true)
+    expect(invoke).toHaveBeenNthCalledWith(1, 'analyze_capabilities', spec)
+    expect(invoke).toHaveBeenNthCalledWith(2, 'analyze_chapter_page', {
+      chapterId: 'c1', pageIndex: 0, workflow: 'mask', rtProfile: 'full-halves',
+      rtBackend: 'ort-cpu', samBackend: 'ort-cpu', requestId: 'request-1',
+    })
+    expect(invoke).toHaveBeenNthCalledWith(3, 'cancel_capability_analysis', { requestId: 'request-1' })
+  })
+
+  it('maps remote analysis consent and status to registered commands', async () => {
+    const invoke = vi.fn().mockResolvedValue({})
+    const backend = createTauriBackend({ fallback: recordingFallback(), invoke })
+    await backend.listRemoteAnalysisCapabilities({ provider: 'modal', profileId: 'm1' })
+    await backend.proposeRemoteAnalysis({ chapterId: 'c1', pageIndex: 0,
+      provider: 'modal', profileId: 'm1', capability: 'text_mask_sam_ts@1' })
+    await backend.confirmRemoteAnalysis({ proposalId: 'p1', rightsAttested: true, retentionAcknowledged: true })
+    await backend.cancelRemoteAnalysis({ proposalId: 'p1' })
+    await backend.getRemoteAnalysisStatus({ proposalId: 'p1' })
+    expect(invoke.mock.calls).toEqual([
+      ['list_remote_analysis_capabilities', { provider: 'modal', profileId: 'm1' }],
+      ['propose_remote_analysis', { regions: [], chapterId: 'c1', pageIndex: 0,
+        provider: 'modal', profileId: 'm1', capability: 'text_mask_sam_ts@1' }],
+      ['confirm_remote_analysis', { proposalId: 'p1', rightsAttested: true, retentionAcknowledged: true }],
+      ['cancel_remote_analysis', { proposalId: 'p1' }],
+      ['get_remote_analysis_status', { proposalId: 'p1' }],
+    ])
+  })
+
   it('lists exactly the methods it does not delegate', async () => {
     const fallback = recordingFallback()
     const invoke = vi.fn().mockResolvedValue({})
@@ -92,6 +185,42 @@ describe('the Tauri adapter', () => {
       facts: [{ labelKey: 'about.fact.licence', value: 'GPL-3.0-or-later' }],
     })
     expect(invoke).toHaveBeenCalledWith('about')
+  })
+
+  // The command's `source_files` is a required bool; the seam makes it optional.
+  it('sends deleteChapter without source files unless the caller asks for them', async () => {
+    const invoke = vi.fn().mockResolvedValue(true)
+    const backend = createTauriBackend({ fallback: recordingFallback(), invoke })
+
+    await expect(backend.deleteChapter({ projectId: 'p1', chapterId: 'c1' })).resolves.toBe(true)
+    expect(invoke).toHaveBeenLastCalledWith('delete_chapter', { projectId: 'p1', chapterId: 'c1', sourceFiles: false })
+    await backend.deleteChapter({ projectId: 'p1', chapterId: 'c1', sourceFiles: true })
+    expect(invoke).toHaveBeenLastCalledWith('delete_chapter', { projectId: 'p1', chapterId: 'c1', sourceFiles: true })
+  })
+
+  // `diagnostics.rs` serialises its fields as written, so the command answers
+  // `reason_key` where every other command answers camelCase.
+  it('brings the diagnostics answer onto the seam in camelCase', async () => {
+    const invoke = vi.fn().mockResolvedValue({
+      app_version: '1.0.0',
+      components: [{ name: 'onnxruntime', available: false, detail: 'dlopen failed', reason_key: 'diagnostics.runtime.quarantined' }],
+    })
+    const backend = createTauriBackend({ fallback: recordingFallback(), invoke })
+
+    await expect(backend.diagnostics()).resolves.toEqual({
+      appVersion: '1.0.0',
+      components: [{ name: 'onnxruntime', available: false, detail: 'dlopen failed', reasonKey: 'diagnostics.runtime.quarantined' }],
+    })
+    expect(invoke).toHaveBeenCalledWith('diagnostics')
+
+    invoke.mockResolvedValue({
+      appVersion: '1.0.0',
+      components: [{ name: 'onnxruntime', available: true, detail: '1.28.0', reasonKey: null }],
+    })
+    await expect(backend.diagnostics()).resolves.toEqual({
+      appVersion: '1.0.0',
+      components: [{ name: 'onnxruntime', available: true, detail: '1.28.0', reasonKey: null }],
+    })
   })
 
   /**
@@ -650,6 +779,11 @@ describe('the Tauri adapter', () => {
         'get_cloud_secret_summary',
         'check_cloud_connection',
         'get_cloud_model_info',
+        'list_remote_analysis_capabilities',
+        'propose_remote_analysis',
+        'confirm_remote_analysis',
+        'cancel_remote_analysis',
+        'get_remote_analysis_status',
         'prepare_cloud_consent',
         'confirm_cloud_consent',
         'submit_cloud_attempt',
@@ -725,20 +859,24 @@ describe('the Tauri adapter', () => {
   })
 
   describe('cloud events and cancel', () => {
-    it('listens to the two cloud events and answers with their unlisten', async () => {
+    it('listens to cloud events and answers with their unlisten', async () => {
       const unlisten = vi.fn()
       const listen = vi.fn(() => Promise.resolve(unlisten))
       const backend = createTauriBackend({ fallback: recordingFallback(), invoke: vi.fn(), listen })
       const onProgress = () => {}
       const onAttempt = () => {}
+      const onAnalysis = () => {}
 
       expect(await backend.onProvisionProgress(onProgress)).toBe(unlisten)
       expect(await backend.onCloudAttempt(onAttempt)).toBe(unlisten)
+      expect(await backend.onRemoteAnalysis(onAnalysis)).toBe(unlisten)
       expect(listen).toHaveBeenNthCalledWith(1, CLOUD_EVENTS.provisionProgress, onProgress)
       expect(listen).toHaveBeenNthCalledWith(2, CLOUD_EVENTS.cloudAttempt, onAttempt)
+      expect(listen).toHaveBeenNthCalledWith(3, CLOUD_EVENTS.remoteAnalysis, onAnalysis)
       expect(CLOUD_EVENTS).toEqual({
         provisionProgress: 'provision://progress',
         cloudAttempt: 'cloud://attempt',
+        remoteAnalysis: 'cloud://analysis',
       })
     })
 

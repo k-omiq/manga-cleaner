@@ -159,6 +159,7 @@ function titleKeyFor(region, mask) {
 function subLine(region, mask) {
   if (!mask) return [{ key: 'masks.sub.noMask' }]
   const parts = [{ key: fillModeLabel(mask.fillMode) }]
+  if (mask.maskQualityState) parts.push({ key: 'review.reason.maskNeedsCorrection' })
   if (mask.provenance.cloud) {
     if (typeof mask.provenance.cloud.cost === 'number' && Number.isFinite(mask.provenance.cloud.cost)) {
       parts.push({ key: 'masks.value.cloudCost', params: { cost: mask.provenance.cloud.cost } })

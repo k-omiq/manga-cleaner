@@ -33,7 +33,7 @@
 
 import { getBackend } from '../api/backend.js'
 import { hasKey } from '../i18n/index.js'
-import { CLOUD_ENGINE, isCloudMask } from '../model/masks.js'
+import { CLOUD_ENGINE, isCloudMask, reRunnable } from '../model/masks.js'
 import { requestCloudConsent, runCloudJob } from './cloudflow.svelte.js'
 import { notify } from '../state/app.svelte.js'
 import {
@@ -43,6 +43,7 @@ import {
   recordRegionEdit,
   replaceRegion,
   pageStatusOf,
+  reloadPage,
   select,
   setTool,
 } from '../state/editor.svelte.js'
@@ -108,13 +109,33 @@ export function reportRegionEditFailure(error) {
  * Records one region-level edit as an undoable command. Both directions are
  * the same call with a different snapshot, so redo cannot drift from undo.
  *
+ * `chapterId` is the chapter the edit was made in, read before the call went
+ * out: every edit here awaits the backend, and one answered after a chapter
+ * switch belongs on its own chapter's history, not the open one's.
+ *
  * @param {string} label - i18n key for the undo/redo tooltip
  * @param {string} regionId
  * @param {RegionState} before
  * @param {RegionState} after
+ * @param {string|null} chapterId
  */
-function recordEdit(label, regionId, before, after) {
-  recordRegionEdit(label, regionId, before, after)
+function recordEdit(label, regionId, before, after, chapterId) {
+  recordRegionEdit(label, regionId, before, after, chapterId)
+}
+
+/**
+ * Whether the chapter an edit was made in is still the open one. The
+ * interface's own copy is only touched when it is; an answer for a closed
+ * chapter is already on disk, and its page shows it when it opens again.
+ *
+ * @param {string|null} chapterId
+ */
+function stillOpen(chapterId) {
+  return chapterId !== null && editor.chapter?.id === chapterId
+}
+
+function refreshPage(index) {
+  if (index !== null) void reloadPage(index).catch(() => {})
 }
 
 /**
@@ -136,6 +157,8 @@ function recordEdit(label, regionId, before, after) {
  */
 export async function deleteMask(region) {
   if (!region.mask) return false
+  const chapterId = editor.chapter?.id ?? null
+  const pageIndex = pageIndexOf(region.id)
   const before = snapshot(region)
   const result = await getBackend().deleteMask({ maskId: region.mask.id })
   if (!result) return false
@@ -144,8 +167,9 @@ export async function deleteMask(region) {
   // for every route into a removal rather than for this one. A selection
   // pointing at a region that is no longer on the page highlights nothing and
   // steps to nothing; the row it belonged to has gone.
-  applyRegionState(region.id, null, after.pageStatus ?? undefined)
-  recordRegionEdit('masks.command.deleteMask', region.id, before, after)
+  if (stillOpen(chapterId)) applyRegionState(region.id, null, after.pageStatus ?? undefined)
+  recordEdit('masks.command.deleteMask', region.id, before, after, chapterId)
+  if (stillOpen(chapterId)) refreshPage(pageIndex)
   return true
 }
 
@@ -166,10 +190,11 @@ export async function deleteMask(region) {
  */
 export async function deleteRegion(region) {
   if (region.mask) return deleteMask(region)
+  const chapterId = editor.chapter?.id ?? null
   const before = snapshot(region)
   const gone = { region: null, pageStatus: before.pageStatus }
-  await restoreRegionThroughSeam(region.id, gone)
-  recordRegionEdit('masks.command.deleteRegion', region.id, before, gone)
+  await restoreRegionThroughSeam(region.id, gone, chapterId)
+  recordEdit('masks.command.deleteRegion', region.id, before, gone, chapterId)
   return true
 }
 
@@ -187,15 +212,32 @@ export async function deleteRow(region) {
 }
 
 /**
+ * A changed lower-layer input has been reviewed; keep these committed pixels.
+ * Not an undoable edit. Answered after a chapter switch, it is kept on disk
+ * and the chapter opened meanwhile is left alone.
+ */
+export async function keepDependencyResult(region) {
+  if (!region.mask?.dependencyReview) return false
+  const chapterId = editor.chapter?.id ?? null
+  const result = await getBackend().keepDependencyResult({ regionId: region.id })
+  if (!result) return false
+  if (!stillOpen(chapterId)) return true
+  if (!replaceRegion(result)) return false
+  refreshPage(pageIndexOf(region.id))
+  return true
+}
+
+/**
  * One direction of a removal: put the region - and its page's status - into
  * the state the snapshot describes, on the backend and then in the open
  * chapter. `{region: null}` means "it was not there".
  *
  * @param {string} regionId
  * @param {{region: import('../api/backend.js').ApiRegion|null, pageStatus: string|null}} state
+ * @param {string|null} chapterId - the chapter the removal was made in
  * @returns {Promise<void>}
  */
-async function restoreRegionThroughSeam(regionId, state) {
+async function restoreRegionThroughSeam(regionId, state, chapterId) {
   // One applier, in `state/editor.svelte.js`, shared with every replay the
   // journal drives: a failed restore must not delete what it was asked to bring
   // back, and that reading should exist once rather than at each call site.
@@ -203,7 +245,7 @@ async function restoreRegionThroughSeam(regionId, state) {
     present: !!state.region,
     pageStatus: state.pageStatus ?? null,
     region: state.region ?? null,
-  })
+  }, chapterId)
 }
 
 /**
@@ -226,8 +268,10 @@ async function restoreRegionThroughSeam(regionId, state) {
  */
 export async function rerunMask(region, kind, engine) {
   if (!region.mask) return false
+  if (kind === 'retry' && !reRunnable(region.mask)) return false
   if (kind === 'engine' && engine === CLOUD_ENGINE) return rerunInCloud(region)
   if (kind === 'retry' && isCloudMask(region.mask)) return rerunInCloud(region)
+  const chapterId = editor.chapter?.id ?? null
   const before = snapshot(region)
   /** @type {any} */
   let result
@@ -237,9 +281,13 @@ export async function rerunMask(region, kind, engine) {
     return reportRegionEditFailure(error)
   }
   if (!result) return false
-  replaceRegion(result.region, result.pageStatus)
+  const open = stillOpen(chapterId)
+  if (open) replaceRegion(result.region, result.pageStatus)
 
   if (kind === 'reopenInTool') {
+    // Not an edit, only a hand-off to a tool: with its chapter gone there is
+    // nothing on screen to hand off.
+    if (!open) return false
     select(region.id)
     const reopenTool =
       result.reopenTool ??
@@ -252,7 +300,8 @@ export async function rerunMask(region, kind, engine) {
   recordEdit('masks.command.rerunMask', region.id, before, {
     region: result.region,
     pageStatus: result.pageStatus,
-  })
+  }, chapterId)
+  if (open) refreshPage(pageIndexOf(region.id))
   return true
 }
 
@@ -281,6 +330,7 @@ export async function rerunMask(region, kind, engine) {
  * @returns {Promise<boolean>}
  */
 export async function cleanAnyway(region) {
+  const chapterId = editor.chapter?.id ?? null
   const before = snapshot(region)
   const params = /** @type {any} */ (editor.toolParams.autoClean ?? {})
   const engine =
@@ -295,11 +345,13 @@ export async function cleanAnyway(region) {
     return reportRegionEditFailure(error)
   }
   if (!result) return false
-  replaceRegion(result.region, result.pageStatus)
+  const open = stillOpen(chapterId)
+  if (open) replaceRegion(result.region, result.pageStatus)
   recordEdit('masks.command.cleanAnyway', region.id, before, {
     region: result.region,
     pageStatus: result.pageStatus,
-  })
+  }, chapterId)
+  if (open) refreshPage(pageIndexOf(region.id))
   return true
 }
 
@@ -327,7 +379,8 @@ function pageIndexOf(regionId) {
  *
  * The chapter can change while the dialog is up or the render runs. A result
  * for a chapter that is no longer open is not swapped into the one that is:
- * the native side stored it on its own page.
+ * the native side stored it on its own page, and its undo entry goes on that
+ * chapter's history.
  *
  * @param {import('../api/backend.js').ApiRegion} region
  * @param {import('../model/types.js').OperationIntent} intent
@@ -344,9 +397,11 @@ async function renderInCloud(region, intent, call, label) {
   const grant = await requestCloudConsent({ ...where, intent })
   if (!grant) return false
   const result = await runCloudJob(grant, where, call, (answer) => (answer ? { phase: 'committed' } : null))
-  if (!result?.region || editor.chapter?.id !== chapterId) return false
-  replaceRegion(result.region, result.pageStatus)
-  recordEdit(label, region.id, before, { region: result.region, pageStatus: result.pageStatus })
+  if (!result?.region) return false
+  const open = stillOpen(chapterId)
+  if (open) replaceRegion(result.region, result.pageStatus)
+  recordEdit(label, region.id, before, { region: result.region, pageStatus: result.pageStatus }, chapterId)
+  if (open) refreshPage(pageIndex)
   return true
 }
 

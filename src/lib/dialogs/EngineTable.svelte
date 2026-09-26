@@ -6,6 +6,12 @@
    * With `onchoose`, ready engines get a checkbox; engines that are not ready
    * are drawn muted and cannot be chosen.
    *
+   * **The stars are provisional**, and the table says so itself, beside them,
+   * wherever it is drawn: setup and Settings both, Detection and Cleaning
+   * both. The ratings come from file sizes and scattered timings rather than
+   * one shared benchmark (`model/pipelines.js`), and a caption that each
+   * caller had to remember was a caption two of the four places forgot.
+   *
    * @type {{
    *   engines: readonly import('../model/pipelines.js').Engine[],
    *   label: string,
@@ -22,7 +28,8 @@
   const uid = $props.id()
 </script>
 
-<div class="engines" role="table" aria-label={label}>
+<p class="provisional" id="{uid}-provisional">{t('pipelines.workflow.ratingsNote')}</p>
+<div class="engines" role="table" aria-label={label} aria-describedby="{uid}-provisional">
   <div class="engine head" role="row">
     <span role="columnheader">{t('pipelines.column.engine')}</span>
     <span role="columnheader">{t('pipelines.column.efficiency')}</span>
@@ -54,6 +61,13 @@
 </div>
 
 <style>
+  .provisional {
+    margin: 0 0 var(--s-3);
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--t3);
+    max-width: 68ch;
+  }
   .engines { display: grid }
   .engine {
     display: grid;

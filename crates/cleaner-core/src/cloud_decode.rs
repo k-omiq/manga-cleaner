@@ -84,6 +84,34 @@ pub enum ResultDecodeError {
 pub const MAX_RESULT_ENCODED_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_RESULT_PIXELS: u64 = 16 * 1024 * 1024;
 
+/// Decode a validated analysis mask with a hard one-tile allocation ceiling.
+pub fn decode_analysis_mask(
+    bytes: &[u8],
+    tile: crate::cloud_analysis_wire::TileRect,
+) -> Result<Vec<u8>, ResultDecodeError> {
+    tile.validate().map_err(ResultDecodeError::PngDecoding)?;
+    crate::cloud_analysis_wire::validate_png(bytes, tile, png::ColorType::Grayscale)
+        .map_err(ResultDecodeError::PngDecoding)?;
+    let pixels = usize::try_from(u64::from(tile.width) * u64::from(tile.height))
+        .map_err(|_| ResultDecodeError::DecompressionLimitExceeded)?;
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decoder.set_limits(png::Limits { bytes: crate::cloud_analysis_wire::MAX_TILE_PIXELS as usize });
+    let mut reader = decoder.read_info().map_err(|e| ResultDecodeError::PngDecoding(e.to_string()))?;
+    if reader.output_buffer_size().is_none_or(|size| size != pixels) {
+        return Err(ResultDecodeError::DecompressionLimitExceeded);
+    }
+    let mut data = vec![0; pixels];
+    let frame = reader.next_frame(&mut data).map_err(|e| ResultDecodeError::PngDecoding(e.to_string()))?;
+    if frame.width != tile.width || frame.height != tile.height || frame.buffer_size() != pixels {
+        return Err(ResultDecodeError::FrameGeometryMismatch {
+            expected_w: tile.width, expected_h: tile.height,
+            actual_w: frame.width, actual_h: frame.height,
+        });
+    }
+    reader.finish().map_err(|e| ResultDecodeError::PngDecoding(e.to_string()))?;
+    Ok(data)
+}
+
 fn check_complete_png(bytes: &[u8]) -> Result<(), ResultDecodeError> {
     let mut offset = 8usize;
     while offset < bytes.len() {

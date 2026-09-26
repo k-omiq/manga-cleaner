@@ -36,6 +36,7 @@ import { notify, pushModal } from './app.svelte.js'
 import { session, openWindow } from './session.svelte.js'
 import { loadAutosave, storeAutosave } from './autosave.js'
 import { numberIn } from './persist.js'
+import { settleCreation } from './heldcreations.js'
 
 const AUTOSAVE_DEBOUNCE_MS = 250
 const HISTORY_RETRY_MS = 50
@@ -351,9 +352,18 @@ export function scopedRegions() {
  * back without its page's status is how a full track ends up under a "not
  * cleaned" mark. Omit it only for an edit that cannot move the page.
  *
+ * **A page the window has evicted still takes the answer.** An edit can be
+ * answered after the reader has turned far enough for its page to be reduced
+ * to a header - a cloud render takes minutes - and the native side has
+ * already written the result by then. The regions are not in hand, so only
+ * the header moves (its status, and the review index entry), and the answer
+ * counts as landed so the caller records its undo entry. A region missing from
+ * a page that **is** in hand is different: it was deleted meanwhile, and that
+ * answer is refused.
+ *
  * @param {import('../api/backend.js').ApiRegion|null} region
  * @param {string} [pageStatus]
- * @returns {boolean} whether the region was found and replaced
+ * @returns {boolean} whether the region was found and replaced, or its page is out of the window
  */
 export function replaceRegion(region, pageStatus) {
   if (!region) return false
@@ -371,7 +381,13 @@ export function replaceRegion(region, pageStatus) {
       return true
     }
   }
-  return false
+  const page = pages().find((candidate) => candidate.id === region.pageId) ?? pageHolding(region.id)
+  // `resident: false` is what an eviction writes; a page without the flag at
+  // all is one the window never reduced, so it is treated as in hand.
+  if (!page || page.resident !== false) return false
+  if (pageStatus) page.status = pageStatus
+  syncReviewEntry(page, region)
+  return true
 }
 
 /**
@@ -588,6 +604,19 @@ export async function syncPageWindow() {
     applyPage: applyLoadedPage,
     evictPage,
   })
+}
+
+/** Refresh one resident page after a native edit changes later-layer review state. */
+const reloadVersions = new Map()
+export async function reloadPage(index) {
+  const chapter = editor.chapter
+  if (!chapter || !Number.isInteger(index)) return
+  const key = `${chapter.id}:${index}`
+  const version = (reloadVersions.get(key) ?? 0) + 1
+  reloadVersions.set(key, version)
+  const loaded = await getBackend().loadPages({ chapterId: chapter.id, indices: [index] })
+  if (editor.chapter?.id !== chapter.id || reloadVersions.get(key) !== version) return
+  for (const page of loaded ?? []) applyLoadedPage(page)
 }
 
 /**
@@ -1310,6 +1339,13 @@ export function stepReview(direction) {
  */
 export async function startRun(scope = 'page') {
   if (!editor.chapter || editor.run.active) return null
+  if (session.textPolicy === 'all_text') {
+    pushModal({
+      kind: 'workflowReview',
+      props: { chapterId: editor.chapter.id, pageIndex: editor.pageIndex },
+    })
+    return null
+  }
   const params = editor.toolParams.autoClean ?? {}
   const handle = await getBackend().runClean({
     scope,
@@ -1328,6 +1364,10 @@ export async function startRun(scope = 'page') {
     // record with no such key reviews that text as it always did.
     outsideBubbles: String(params.outsideBubbles ?? 'review'),
     bubbleColor: String(params.bubbleColor ?? '#ffffff'),
+    detection: { ...session.detection },
+    geometryPolicy: 'legacy',
+    textPolicy: 'legacy_gate',
+    ocrRescue: session.ocrRescue,
   })
   return adoptRun(handle, scope)
 }
@@ -1484,10 +1524,13 @@ export async function renameOpenProject(name) {
  * @returns {import('../model/journal.js').DeltaSide}
  */
 function sideOf(state) {
+  const region = state?.region ? /** @type {any} */ ($state.snapshot(state.region)) : null
+  const revisionId = state?.region?.mask?.legacyPatchRevision
+  if (region?.mask && revisionId) region.mask.legacyPatchRevision = revisionId
   return {
     present: !!state?.region,
     pageStatus: state?.pageStatus ?? null,
-    region: state?.region ? /** @type {any} */ ($state.snapshot(state.region)) : null,
+    region,
   }
 }
 
@@ -1498,23 +1541,32 @@ function sideOf(state) {
  * The one applier for every op there is, which is what makes undo and redo the
  * same code path in opposite directions.
  *
+ * `chapterId` is the chapter the delta belongs to, read before anything was
+ * awaited. The backend applies it to that chapter's files whatever happens;
+ * the interface's copy is only touched while that chapter is still the open
+ * one, so an answer that arrives after a switch changes nothing on screen.
+ *
  * @param {string} regionId
  * @param {import('../model/journal.js').DeltaSide} side
+ * @param {string|null} [chapterId]
  * @returns {Promise<void>}
  */
-export async function applyRegionDelta(regionId, side) {
+export async function applyRegionDelta(regionId, side, chapterId = editor.chapter?.id ?? null) {
   const pageStatus = side?.pageStatus ?? undefined
   const result = await getBackend().restoreRegion({
     regionId,
     region: side?.region ?? null,
     pageStatus,
   })
+  if (!chapterId || editor.chapter?.id !== chapterId) return
   // A null answer to a *present* side is a failure - the page the region
   // belongs to is no longer open - and not an instruction to remove anything.
   // Passing it through would make a failed redo silently delete the region it
   // was meant to bring back, so the interface is left as it stands.
   if (side?.present && !result) return
   applyRegionState(regionId, side?.present ? result : null, pageStatus)
+  const page = pageHolding(regionId)
+  if (page) await reloadPage(page.index).catch(() => {})
 }
 
 /**
@@ -1604,14 +1656,30 @@ function enqueueHistoryTask(history, task) {
  * losing an undo step is recoverable, and blocking the editor on a disk write
  * after every brush stroke is not.
  *
+ * **`chapterId` is the chapter the edit was made in**, read by the caller
+ * before it awaited anything. An edit answered after that chapter stopped
+ * being the open one goes on that chapter's journal
+ * (`recordBackgroundRegionEdit`), never on the open one's: recorded here it
+ * would be an undo step in the wrong chapter that replays against a region
+ * this chapter does not have. Omitted, it is the open chapter, which is right
+ * for an edit that awaited nothing.
+ *
  * @param {string} label - i18n key for the undo/redo tooltip
  * @param {string} regionId
  * @param {RegionState} before
  * @param {RegionState} after
+ * @param {string|null} [chapterId]
  */
-export function recordRegionEdit(label, regionId, before, after) {
+export function recordRegionEdit(label, regionId, before, after, chapterId = editor.chapter?.id ?? null) {
+  if (!chapterId) return
+  // A cloud stroke's creation still waiting on its render goes on first, so
+  // an edit to its seed is never the only step behind it (`heldcreations.js`).
+  settleCreation(regionId, before)
   const chapter = editor.chapter
-  if (!chapter) return
+  if (chapter?.id !== chapterId) {
+    void recordBackgroundRegionEdit(chapterId, label, regionId, before, after)
+    return
+  }
   const entry = {
     label,
     op: 'region-state',
@@ -1628,19 +1696,52 @@ export function recordRegionEdit(label, regionId, before, after) {
   const expectedCursor = history.cursor
   enqueueHistoryTask(history, async () => {
     try {
-      const view = await getBackend().historyPush({ chapterId: chapter.id, entry })
+      const view = await pushHistoryInChapterOrder(chapter.id, entry)
       applyPushView(history, view, expectedCursor)
-    } catch (_firstError) {
-      await delay(HISTORY_RETRY_MS)
-      try {
-        const view = await getBackend().historyPush({ chapterId: chapter.id, entry })
-        applyPushView(history, view, expectedCursor)
-      } catch (error) {
-        if (editor.history === history) history.error = error
-        notify({ key: 'notice.history.saveFailed', tone: 'warn' })
-      }
+    } catch (error) {
+      if (editor.history === history) history.error = error
+      notify({ key: 'notice.history.saveFailed', tone: 'warn' })
     }
   })
+}
+
+const chapterHistoryWrites = new Map()
+function pushHistoryInChapterOrder(chapterId, entry) {
+  const previous = chapterHistoryWrites.get(chapterId)
+  const perform = async () => {
+    try {
+      return await getBackend().historyPush({ chapterId, entry })
+    } catch (_firstError) {
+      await delay(HISTORY_RETRY_MS)
+      return getBackend().historyPush({ chapterId, entry })
+    }
+  }
+  const next = previous ? previous.catch(() => {}).then(perform) : perform()
+  chapterHistoryWrites.set(chapterId, next)
+  void next.then(
+    () => { if (chapterHistoryWrites.get(chapterId) === next) chapterHistoryWrites.delete(chapterId) },
+    () => { if (chapterHistoryWrites.get(chapterId) === next) chapterHistoryWrites.delete(chapterId) },
+  )
+  return next
+}
+
+/** Persist an edit that finished after its chapter stopped being the open one. */
+export async function recordBackgroundRegionEdit(chapterId, label, regionId, before, after) {
+  const entry = {
+    label,
+    op: 'region-state',
+    regionId,
+    before: sideOf(before),
+    after: sideOf(after),
+  }
+  try {
+    await pushHistoryInChapterOrder(chapterId, entry)
+    return true
+  } catch (error) {
+    console.error('a background region edit could not be saved to undo history', error)
+    notify({ key: 'notice.history.saveFailed', tone: 'warn' })
+    return false
+  }
 }
 
 /**
@@ -1677,7 +1778,7 @@ async function replayHistory(direction) {
     if (!entry) return
     if (entry.op !== 'region-state') return
     const side = direction === 'undo' ? entry.before : entry.after
-    await applyRegionDelta(entry.regionId, side)
+    await applyRegionDelta(entry.regionId, side, chapter.id)
   } finally {
     history._busy = false
   }

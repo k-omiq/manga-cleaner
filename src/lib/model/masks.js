@@ -199,7 +199,11 @@ export function maskEngine(mask) {
  * @returns {boolean}
  */
 export function reRunnable(mask) {
-  return Boolean(mask?.provenance)
+  // Approved SAM components have versioned support in a single insertion
+  // sidecar. Legacy re-run replaces that sidecar in place, so offer Delete and
+  // Undo until revisioned replacement storage exists.
+  return Boolean(mask?.provenance && !mask.id?.includes('-hreview-sam-')
+    && !['paint', 'clone'].includes(mask.provenance.engine))
 }
 
 /**

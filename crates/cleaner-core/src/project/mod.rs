@@ -24,9 +24,13 @@
 use std::path::{Path, PathBuf};
 
 use crate::image::{BitDepth, ColorMode};
-use crate::ingest::{IngestReport, SourceRef, Warning, sha256_hex};
+use crate::ingest::{sha256_hex, IngestReport, SourceRef, Warning};
 use crate::mask::Rect;
 use crate::patch::{Engine, Patch, Provenance};
+use crate::text_shape::{
+    GeometryPolicy, MaskPlan, MaskQualityState, MaskRaster, PlanIdentity, PreparedMaskPlan,
+};
+use sha2::{Digest, Sha256};
 
 pub mod buffers;
 
@@ -45,16 +49,15 @@ pub mod buffers;
 /// It still says nothing about a shape that changes *without* the number
 /// changing. That is a decision to be justified in each case, and
 /// [`Strip::splits`] carries the one instance of it in this build.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// The oldest manifest this build reads.
 ///
-/// **Version 3 is the cloud provenance and nullable-cost bump.** It extends
-/// [`crate::patch::CloudRecord`] with nullable cost, model/recipe identities,
-/// attempt/request metadata, and provider execution details, while preserving
-/// deserialization of legacy v1 and v2 manifests. A v1 or v2 manifest opens
-/// without fabricating unmeasured data, and is upgraded in memory to v3.
-/// The disk file remains untouched until the next [`Job::flush`].
+/// Version 4 adds prepared text-shape mask plans and a per-patch geometry
+/// policy. Missing plan rows and missing patch policy fields deserialize as
+/// legacy, so v1-v3 projects open without reinterpreting their saved masks.
+/// Opening upgrades the in-memory version; the disk file remains untouched
+/// until the next [`Job::flush`].
 pub const OLDEST_READABLE_VERSION: u32 = 1;
 
 /// The extension §1 names, and the sidecar directory beside it.
@@ -63,18 +66,26 @@ pub const EXTENSION: &str = "mtclean";
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("{path}: {source}")]
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("the manifest is not readable as JSON: {0}")]
     Json(String),
     #[error("{0}")]
     Malformed(String),
+    #[error("prepared text-shaped mask plan is stale or does not match the approved preview")]
+    StalePlan,
     #[error("this build reads manifest version {expected}; the file is version {found}")]
     Version { expected: u32, found: u32 },
 }
 
 impl StoreError {
     fn io(path: &Path, source: std::io::Error) -> StoreError {
-        StoreError::Io { path: path.to_path_buf(), source }
+        StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
     }
 }
 
@@ -196,10 +207,43 @@ pub struct PatchRecord {
     /// for the same reason: state the composite depends on that re-running
     /// would not reproduce.
     pub review_state: Option<String>,
+    /// Geometry used to derive this patch's applied mask. Missing in v1-v3
+    /// manifests and every existing patch means legacy.
+    #[serde(default, skip_serializing_if = "is_legacy_geometry_policy")]
+    pub geometry_policy: GeometryPolicy,
+    /// Exact prepared-plan identity for a text-shaped patch. Kept separate
+    /// from the stable region ID so an older undo state can still identify its
+    /// own padding/correction revision after a newer preview is prepared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_shape_plan_identity: Option<String>,
     pub provenance: Provenance,
 }
 
+fn is_legacy_geometry_policy(policy: &GeometryPolicy) -> bool {
+    *policy == GeometryPolicy::Legacy
+}
+
 impl PatchRecord {
+    pub fn legacy_revision_id(&self) -> Option<String> {
+        (self.geometry_policy == GeometryPolicy::Legacy)
+            .then(|| revision_from_buffer_ref(&self.buffer_ref))
+            .flatten()
+    }
+
+    /// Opaque content revision exposed to undo snapshots. Old M3 records can
+    /// still be addressed by their plan identity if no content ref exists.
+    pub fn text_shape_revision_id(&self) -> Option<String> {
+        (self.geometry_policy == GeometryPolicy::TextShape).then(|| {
+            revision_from_buffer_ref(&self.buffer_ref)
+                .or_else(|| {
+                    self.text_shape_plan_identity
+                        .as_ref()
+                        .map(|identity| format!("legacy:{identity}"))
+                })
+                .unwrap_or_default()
+        })
+    }
+
     /// The row a patch becomes.
     ///
     /// One constructor rather than two, because the row is built in two places -
@@ -217,6 +261,8 @@ impl PatchRecord {
             order: patch.order,
             visible: patch.visible,
             review_state,
+            geometry_policy: GeometryPolicy::Legacy,
+            text_shape_plan_identity: None,
             provenance: patch.provenance.clone(),
         }
     }
@@ -229,7 +275,75 @@ impl PatchRecord {
     /// it still has to read: [`Job::load_patch`] answers a missing file with
     /// the applied mask.
     pub fn ink_ref(&self) -> String {
-        format!("{}.ink", self.id)
+        if revision_from_buffer_ref(&self.buffer_ref).is_some() {
+            self.mask_ref
+                .strip_suffix(".mask")
+                .map(|stem| format!("{stem}.ink"))
+                .unwrap_or_else(|| format!("{}.ink", self.id))
+        } else {
+            format!("{}.ink", self.id)
+        }
+    }
+}
+
+fn revision_from_buffer_ref(reference: &str) -> Option<String> {
+    reference
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.strip_suffix(".buf"))
+        .filter(|stem| stem.len() == 64 && stem.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_owned)
+}
+
+/// Manifest metadata for one prepared text-shaped mask revision. Pixel data
+/// lives in bounded versioned sidecar artifacts; it is never embedded in the
+/// JSON manifest. Rows are append-only by `(region_id, identity)` so undo and
+/// redo can keep referring to the exact plan that produced a patch.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TextShapePlanRecord {
+    pub region_id: String,
+    pub source_idx: usize,
+    pub geometry_policy: GeometryPolicy,
+    pub plan_version: u32,
+    pub source_sha256: String,
+    pub lower_composite_sha256: String,
+    pub algorithm_id: String,
+    pub model_id: Option<String>,
+    pub candidate_bounds: Rect,
+    pub refinement_crop: Rect,
+    pub base_revision: u64,
+    pub correction_revision: u64,
+    pub plan_revision: u64,
+    pub padding_px: u32,
+    pub model_hole_margin_px: u32,
+    pub reading_context: Rect,
+    pub quality: MaskQualityState,
+    pub identity: PlanIdentity,
+    /// References are relative to the job sidecar directory.
+    pub base_mask_ref: String,
+    pub additions_ref: String,
+    pub removals_ref: String,
+    pub write_support_ref: String,
+    pub model_hole_ref: String,
+    pub blend_alpha_ref: Option<String>,
+}
+
+/// Latest failed text-shaped preparation for a region. Failed previews have
+/// no approved W and therefore no prepared sidecar, but their correction
+/// state must survive save/reopen until a newer plan is accepted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TextShapeCorrectionRecord {
+    pub region_id: String,
+    pub source_idx: usize,
+    pub plan_version: u32,
+    pub plan_revision: u64,
+    pub candidate_bounds: Rect,
+    pub reason: String,
+}
+
+impl TextShapePlanRecord {
+    fn same_identity(&self, region_id: &str, identity_sha256: &str) -> bool {
+        self.region_id == region_id && self.identity.identity_sha256 == identity_sha256
     }
 }
 
@@ -352,6 +466,19 @@ pub struct Project {
     pub sources: Vec<ProjectSource>,
     pub strip: Strip,
     pub patches: Vec<PatchRecord>,
+    /// Prepared text-shaped geometry, including plans that have a preview but
+    /// have not produced an applied patch yet. Absent from old projects, where
+    /// the policy remains legacy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_shape_plans: Vec<TextShapePlanRecord>,
+    /// Earlier committed patch records retain their own immutable sidecars so
+    /// a correction or rerun can be undone after a later revision is saved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_shape_patch_revisions: Vec<PatchRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_patch_revisions: Vec<PatchRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_shape_corrections: Vec<TextShapeCorrectionRecord>,
     pub regions_untouched: Vec<RegionUntouched>,
     pub counters: Counters,
     /// What §2 refused on the way in, and what it warned about.
@@ -416,6 +543,13 @@ pub struct Project {
 }
 
 impl Project {
+    fn requires_v4(&self) -> bool {
+        !self.text_shape_plans.is_empty()
+            || !self.text_shape_corrections.is_empty()
+            || self.patches.iter().any(|row| row.geometry_policy == GeometryPolicy::TextShape)
+            || !self.text_shape_patch_revisions.is_empty()
+    }
+
     /// A new project over a set of ingested sources.
     ///
     /// Takes [`SourceRef`]s because that is what [`crate::ingest`] produces and
@@ -445,12 +579,20 @@ impl Project {
             .collect();
 
         Project {
-            version: FORMAT_VERSION,
+            version: 3,
             created: now(),
             app_version: app_version.to_owned(),
-            strip: Strip { mode, order: (0..rows.len()).collect(), splits: Vec::new() },
+            strip: Strip {
+                mode,
+                order: (0..rows.len()).collect(),
+                splits: Vec::new(),
+            },
             sources: rows,
             patches: Vec::new(),
+            text_shape_plans: Vec::new(),
+            text_shape_patch_revisions: Vec::new(),
+            legacy_patch_revisions: Vec::new(),
+            text_shape_corrections: Vec::new(),
             regions_untouched: Vec::new(),
             counters: Counters::default(),
             input_report: InputReport::default(),
@@ -484,7 +626,9 @@ impl Project {
     /// never overwrites input": a destination path can be anything, but a file
     /// whose content is one of ours is one of ours.
     pub fn source_with_hash(&self, sha256: &str) -> Option<usize> {
-        self.sources.iter().position(|source| source.sha256 == sha256)
+        self.sources
+            .iter()
+            .position(|source| source.sha256 == sha256)
     }
 }
 
@@ -516,7 +660,9 @@ pub enum SourceState {
     Unchanged,
     Missing,
     /// The file is there and is not what it was.
-    Changed { sha256: String },
+    Changed {
+        sha256: String,
+    },
 }
 
 impl SourceState {
@@ -553,7 +699,11 @@ impl Job {
     /// appears once it has produced output is a job that cannot report having
     /// produced none.
     pub fn create(path: &Path, project: Project) -> Result<Job, StoreError> {
-        let job = Job { path: path.to_path_buf(), dir: sidecar_dir(path), project };
+        let job = Job {
+            path: path.to_path_buf(),
+            dir: sidecar_dir(path),
+            project,
+        };
         std::fs::create_dir_all(&job.dir).map_err(|e| StoreError::io(&job.dir, e))?;
         job.flush()?;
         Ok(job)
@@ -578,23 +728,22 @@ impl Job {
         let probe: VersionOnly =
             serde_json::from_slice(&bytes).map_err(|e| StoreError::Json(e.to_string()))?;
         if !(OLDEST_READABLE_VERSION..=FORMAT_VERSION).contains(&probe.version) {
-            return Err(StoreError::Version { expected: FORMAT_VERSION, found: probe.version });
+            return Err(StoreError::Version {
+                expected: FORMAT_VERSION,
+                found: probe.version,
+            });
         }
 
         let mut project: Project =
             serde_json::from_slice(&bytes).map_err(|e| StoreError::Json(e.to_string()))?;
-        // **Opening upgrades the number, so the next flush upgrades the file.**
-        // [`OLDEST_READABLE_VERSION`] promises exactly this, and without the
-        // line the promise is empty: [`Job::flush`] writes `project.version`
-        // verbatim, so a v1 chapter that gains a painted patch would be written
-        // back as `{"version": 1, ..., "engine": "paint"}`. A v1 build meeting
-        // *that* file passes the version probe and dies inside the body as
-        // `unknown variant \`paint\``, which is the failure the bump to 2
-        // exists to convert into a clean refusal. The upgrade is free because
-        // the v2 types only widened an enum - the value now in memory decodes
-        // from the v1 bytes unchanged.
-        project.version = FORMAT_VERSION;
-        Ok(Job { path: path.to_path_buf(), dir: sidecar_dir(path), project })
+        // The v3 reader ignores added legacy metadata. Only text-shaped rows
+        // and plans require v4; older versions still advance to the v3 floor.
+        project.version = if project.requires_v4() { FORMAT_VERSION } else { 3 };
+        Ok(Job {
+            path: path.to_path_buf(),
+            dir: sidecar_dir(path),
+            project,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -612,7 +761,10 @@ impl Job {
     }
 
     pub fn source_path(&self, index: usize) -> Option<PathBuf> {
-        self.project.sources.get(index).map(|source| self.root().join(&source.rel_path))
+        self.project
+            .sources
+            .get(index)
+            .map(|source| self.root().join(&source.rel_path))
     }
 
     /// Where the page **came from**, which since ingest began importing pages
@@ -632,14 +784,633 @@ impl Job {
     /// [`source_path`]: Job::source_path
     pub fn origin_path(&self, index: usize) -> Option<PathBuf> {
         let source = self.project.sources.get(index)?;
-        Some(self.root().join(source.converted_from.as_ref().unwrap_or(&source.rel_path)))
+        Some(
+            self.root()
+                .join(source.converted_from.as_ref().unwrap_or(&source.rel_path)),
+        )
     }
 
     /// Rewrite the manifest atomically.
     pub fn flush(&self) -> Result<(), StoreError> {
-        let bytes = serde_json::to_vec_pretty(&self.project)
+        let mut project = self.project.clone();
+        project.version = if project.requires_v4() { FORMAT_VERSION } else { 3 };
+        let bytes = serde_json::to_vec_pretty(&project)
             .map_err(|e| StoreError::Json(e.to_string()))?;
         buffers::write_atomic(&self.path, &bytes)
+    }
+
+    pub fn text_shape_correction(&self, region_id: &str) -> Option<&TextShapeCorrectionRecord> {
+        self.project
+            .text_shape_corrections
+            .iter()
+            .find(|record| record.region_id == region_id)
+    }
+
+    /// Save the latest review state without fabricating an approved support.
+    /// The mask plan itself remains in the caller until a newer valid revision
+    /// can be stored with `store_text_shape_plan`.
+    pub fn record_text_shape_correction(
+        &mut self,
+        source_idx: usize,
+        region_id: &str,
+        plan_revision: u64,
+        candidate_bounds: Rect,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        if self.project.sources.get(source_idx).is_none()
+            || region_id.is_empty()
+            || reason.is_empty()
+        {
+            return Err(StoreError::Malformed(
+                "invalid text-shape correction state".into(),
+            ));
+        }
+        if self.text_shape_correction(region_id).is_some_and(|record| {
+            record.source_idx != source_idx || plan_revision < record.plan_revision
+        }) {
+            return Err(StoreError::StalePlan);
+        }
+        self.project
+            .text_shape_corrections
+            .retain(|record| record.region_id != region_id);
+        let source = &self.project.sources[source_idx];
+        let safe_locator = candidate_bounds.w > 0
+            && candidate_bounds.h > 0
+            && candidate_bounds.x >= 0
+            && candidate_bounds.y >= 0
+            && candidate_bounds
+                .x
+                .checked_add(candidate_bounds.w as i64)
+                .is_some_and(|right| right <= source.w as i64)
+            && candidate_bounds
+                .y
+                .checked_add(candidate_bounds.h as i64)
+                .is_some_and(|bottom| bottom <= source.h as i64)
+            && u64::from(candidate_bounds.w) * u64::from(candidate_bounds.h)
+                <= crate::text_shape::MAX_PLAN_PIXELS as u64;
+        let candidate_bounds = if safe_locator {
+            candidate_bounds
+        } else {
+            Rect::new(
+                (source.w / 2) as i64,
+                (source.h / 2) as i64,
+                source.w.min(1),
+                source.h.min(1),
+            )
+        };
+        self.project
+            .text_shape_corrections
+            .push(TextShapeCorrectionRecord {
+                region_id: region_id.to_owned(),
+                source_idx,
+                plan_version: crate::text_shape::MASK_PLAN_VERSION,
+                plan_revision,
+                candidate_bounds,
+                reason: reason.to_owned(),
+            });
+        self.project.version = FORMAT_VERSION;
+        self.flush()
+    }
+
+    /// Persist a prepared text-shaped plan before any engine runs. Raster
+    /// artifacts are written before the manifest names them, matching the
+    /// patch-buffer ordering used by [`complete_region`]. Revisions remain in
+    /// the manifest so an undo snapshot can keep naming the plan that produced
+    /// its patch while a newer preview is prepared for the same region.
+    pub fn store_text_shape_plan(
+        &mut self,
+        source_idx: usize,
+        plan: &MaskPlan,
+        prepared: &PreparedMaskPlan,
+    ) -> Result<(), StoreError> {
+        let source = self.project.sources.get(source_idx).ok_or_else(|| {
+            StoreError::Malformed(format!(
+                "text-shape plan source index {source_idx} is out of range"
+            ))
+        })?;
+        if source.sha256 != plan.source_sha256 || prepared.identity.source_sha256 != source.sha256 {
+            return Err(StoreError::StalePlan);
+        }
+        let canonical = plan
+            .prepare(prepared.identity.page_w, prepared.identity.page_h)
+            .map_err(|error| StoreError::Malformed(error.to_string()))?;
+        if canonical != *prepared
+            || plan.region_id != prepared.identity.region_id
+            || plan.lower_composite_sha256 != prepared.identity.lower_composite_sha256
+            || crate::text_shape::support_sha256(&prepared.write_support)
+                != prepared.identity.support_sha256
+        {
+            return Err(StoreError::StalePlan);
+        }
+        if prepared.identity.page_w != source.w || prepared.identity.page_h != source.h {
+            return Err(StoreError::StalePlan);
+        }
+        if self
+            .text_shape_correction(&plan.region_id)
+            .is_some_and(|failed| {
+                failed.source_idx != source_idx || failed.plan_revision >= plan.plan_revision
+            })
+        {
+            return Err(StoreError::StalePlan);
+        }
+
+        let directory_key = sha256_hex(plan.region_id.as_bytes());
+        let id_key = &prepared.identity.identity_sha256;
+        if !id_key.bytes().all(|byte| byte.is_ascii_hexdigit()) || id_key.len() != 64 {
+            return Err(StoreError::Malformed(
+                "invalid text-shape plan identity digest".into(),
+            ));
+        }
+        let prefix = format!(
+            "mask-plans/{directory_key}/r{}-{}/",
+            plan.plan_revision,
+            &id_key[..16]
+        );
+        let record = TextShapePlanRecord {
+            region_id: plan.region_id.clone(),
+            source_idx,
+            geometry_policy: GeometryPolicy::TextShape,
+            plan_version: plan.version,
+            source_sha256: plan.source_sha256.clone(),
+            lower_composite_sha256: plan.lower_composite_sha256.clone(),
+            algorithm_id: plan.algorithm_id.clone(),
+            model_id: plan.model_id.clone(),
+            candidate_bounds: plan.candidate_bounds,
+            refinement_crop: plan.refinement_crop,
+            base_revision: plan.base_revision,
+            correction_revision: plan.correction_revision,
+            plan_revision: plan.plan_revision,
+            padding_px: plan.padding_px,
+            model_hole_margin_px: plan.model_hole_margin_px,
+            reading_context: plan.reading_context,
+            quality: plan.quality.clone(),
+            identity: prepared.identity.clone(),
+            base_mask_ref: format!("{prefix}base.mask"),
+            additions_ref: format!("{prefix}additions.mask"),
+            removals_ref: format!("{prefix}removals.mask"),
+            write_support_ref: format!("{prefix}support.mask"),
+            model_hole_ref: format!("{prefix}model-hole.mask"),
+            blend_alpha_ref: plan
+                .blend_alpha
+                .as_ref()
+                .map(|_| format!("{prefix}blend-alpha.mask")),
+        };
+
+        let existing = self.project.text_shape_plans.iter().find(|existing| {
+            existing.same_identity(&plan.region_id, &prepared.identity.identity_sha256)
+        });
+        if let Some(existing) = existing {
+            // Check before writing: a corrupted caller reusing an identity must
+            // not overwrite a sidecar that an older patch still references.
+            if existing != &record {
+                return Err(StoreError::Malformed(
+                    "a prepared plan identity was reused with different metadata".into(),
+                ));
+            }
+            let (saved_plan, saved_prepared) = self.load_text_shape_plan_record(existing)?;
+            if saved_plan != *plan || saved_prepared != *prepared {
+                return Err(StoreError::Malformed(
+                    "a prepared plan identity was reused with different raster inputs".into(),
+                ));
+            }
+        } else if self.project.text_shape_plans.iter().any(|existing| {
+            existing.region_id == plan.region_id && existing.plan_revision == plan.plan_revision
+        }) {
+            return Err(StoreError::Malformed(
+                "a text-shape plan revision was reused".into(),
+            ));
+        }
+
+        for (reference, raster, kind) in [
+            (
+                &record.base_mask_ref,
+                &plan.base_mask,
+                buffers::TextShapeMaskKind::Base,
+            ),
+            (
+                &record.additions_ref,
+                &plan.additions,
+                buffers::TextShapeMaskKind::Additions,
+            ),
+            (
+                &record.removals_ref,
+                &plan.removals,
+                buffers::TextShapeMaskKind::Removals,
+            ),
+            (
+                &record.write_support_ref,
+                &prepared.write_support,
+                buffers::TextShapeMaskKind::Support,
+            ),
+            (
+                &record.model_hole_ref,
+                &prepared.model_hole,
+                buffers::TextShapeMaskKind::ModelHole,
+            ),
+        ] {
+            self.write_plan_mask(reference, raster, kind)?;
+        }
+        if let (Some(reference), Some(alpha)) = (&record.blend_alpha_ref, &plan.blend_alpha) {
+            self.write_plan_mask(reference, alpha, buffers::TextShapeMaskKind::BlendAlpha)?;
+        }
+
+        if existing.is_none() {
+            // Keep the row in append order and never discard the exact identity
+            // referenced by an already committed patch or undo record.
+            self.project.text_shape_plans.push(record.clone());
+        }
+        self.project
+            .text_shape_corrections
+            .retain(|failed| failed.region_id != plan.region_id);
+        self.project.version = FORMAT_VERSION;
+        // The same row may already exist; the just-encoded refs are stable and
+        // identical, and flush is still useful when called as a retry after an
+        // interrupted manifest write.
+        if self.project.text_shape_plans.iter().any(|existing| {
+            existing.same_identity(&plan.region_id, &prepared.identity.identity_sha256)
+        }) {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Load the most recent prepared plan for a stable region ID. The returned
+    /// raster is verified against the persisted support artifact before it is
+    /// trusted as preview authority.
+    pub fn load_text_shape_plan(
+        &self,
+        region_id: &str,
+    ) -> Result<Option<(MaskPlan, PreparedMaskPlan)>, StoreError> {
+        let Some(record) = self
+            .project
+            .text_shape_plans
+            .iter()
+            .filter(|record| record.region_id == region_id)
+            .max_by_key(|record| record.plan_revision)
+        else {
+            return Ok(None);
+        };
+        self.load_text_shape_plan_record(record).map(Some)
+    }
+
+    /// Load an exact plan revision by its prepared identity. Patches and undo
+    /// snapshots use this instead of resolving the latest preview.
+    pub fn load_text_shape_plan_identity(
+        &self,
+        region_id: &str,
+        identity_sha256: &str,
+    ) -> Result<Option<(MaskPlan, PreparedMaskPlan)>, StoreError> {
+        let Some(record) = self
+            .project
+            .text_shape_plans
+            .iter()
+            .find(|record| record.same_identity(region_id, identity_sha256))
+        else {
+            return Ok(None);
+        };
+        self.load_text_shape_plan_record(record).map(Some)
+    }
+
+    /// Recheck the values captured by the preview/apply protocol immediately
+    /// before rendering or attaching output.
+    pub fn validate_text_shape_plan(
+        &self,
+        region_id: &str,
+        expected_source_sha256: &str,
+        expected_lower_composite_sha256: &str,
+        expected_identity_sha256: &str,
+        expected_support_sha256: &str,
+    ) -> Result<PreparedMaskPlan, StoreError> {
+        let (_, prepared) = self
+            .load_text_shape_plan_identity(region_id, expected_identity_sha256)?
+            .ok_or(StoreError::StalePlan)?;
+        if prepared.identity.source_sha256 != expected_source_sha256
+            || prepared.identity.lower_composite_sha256 != expected_lower_composite_sha256
+            || prepared.identity.identity_sha256 != expected_identity_sha256
+            || prepared.identity.support_sha256 != expected_support_sha256
+        {
+            return Err(StoreError::StalePlan);
+        }
+        Ok(prepared)
+    }
+
+    /// Commit a patch against one exact text-shape preview. This method is the
+    /// only persistence path that marks a patch as `text_shape`; the legacy
+    /// [`complete_region`] path keeps its prior behavior even if an unused
+    /// prepared preview exists for a region with the same ID.
+    pub fn complete_text_shape_region(
+        &mut self,
+        source_idx: usize,
+        patch: &Patch,
+        plan_identity_sha256: &str,
+        review_state: Option<String>,
+    ) -> Result<(), StoreError> {
+        let (plan, prepared) = self
+            .load_text_shape_plan_identity(&patch.id, plan_identity_sha256)?
+            .ok_or(StoreError::StalePlan)?;
+        let source = self
+            .project
+            .sources
+            .get(source_idx)
+            .ok_or(StoreError::StalePlan)?;
+        if plan.region_id != patch.id
+            || source_idx
+                != self
+                    .project
+                    .text_shape_plans
+                    .iter()
+                    .find(|record| record.same_identity(&patch.id, plan_identity_sha256))
+                    .map(|record| record.source_idx)
+                    .unwrap_or(usize::MAX)
+            || source.sha256 != plan.source_sha256
+            || patch.mask.bounds != prepared.write_support.bounds
+            || patch.mask.bits != prepared.write_support.bits
+        {
+            return Err(StoreError::StalePlan);
+        }
+        let mut patch = patch.clone();
+        if !patch.provenance.params_snapshot.is_object() {
+            patch.provenance.params_snapshot = serde_json::json!({});
+        }
+        patch.provenance.params_snapshot["geometry_policy"] = serde_json::json!("text_shape");
+        patch.provenance.params_snapshot["write_support_sha256"] =
+            serde_json::json!(prepared.identity.support_sha256);
+        self.complete_region_with_policy(
+            source_idx,
+            &patch,
+            review_state,
+            GeometryPolicy::TextShape,
+            Some(plan_identity_sha256.to_owned()),
+        )
+    }
+
+    /// Select a previously committed text-shaped patch, preserving every
+    /// revision for subsequent redo. The caller supplies the opaque content
+    /// revision from a saved region snapshot (or an old plan identity).
+    pub fn restore_text_shape_revision(
+        &mut self,
+        region_id: &str,
+        revision_or_plan_identity: &str,
+    ) -> Result<bool, StoreError> {
+        let mut revisions = self
+            .project
+            .patches
+            .iter()
+            .chain(self.project.text_shape_patch_revisions.iter());
+        let exact = revisions.clone().find(|record| {
+            record.id == region_id
+                && record.text_shape_revision_id().as_deref() == Some(revision_or_plan_identity)
+        });
+        let Some(selected) = exact
+            .or_else(|| {
+                revisions.find(|record| {
+                    record.id == region_id
+                        && record.geometry_policy == GeometryPolicy::TextShape
+                        && record.text_shape_plan_identity.as_deref()
+                            == Some(revision_or_plan_identity)
+                })
+            })
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        let identity = selected
+            .text_shape_plan_identity
+            .as_deref()
+            .ok_or(StoreError::StalePlan)?;
+        let (_, prepared) = self
+            .load_text_shape_plan_identity(region_id, identity)?
+            .ok_or(StoreError::StalePlan)?;
+        let selected_patch = self.load_patch(&selected)?;
+        if selected_patch.mask.bounds != prepared.write_support.bounds
+            || selected_patch.mask.bits != prepared.write_support.bits
+        {
+            return Err(StoreError::StalePlan);
+        }
+        let Some(current) = self
+            .project
+            .patches
+            .iter_mut()
+            .find(|record| record.id == region_id)
+        else {
+            return Ok(false);
+        };
+        if *current != selected {
+            *current = selected;
+            self.flush()?;
+        }
+        Ok(true)
+    }
+
+    pub fn restore_legacy_revision(
+        &mut self,
+        region_id: &str,
+        revision: &str,
+    ) -> Result<bool, StoreError> {
+        let selected = self.project.patches.iter()
+            .chain(self.project.legacy_patch_revisions.iter())
+            .find(|row| row.id == region_id && row.legacy_revision_id().as_deref() == Some(revision))
+            .cloned();
+        let Some(selected) = selected else { return Ok(false) };
+        let patch = self.load_patch(&selected)?;
+        buffers::write_atomic(
+            &self.dir.join(format!("{region_id}.ink")),
+            &buffers::encode_mask(&patch.ink),
+        )?;
+        let Some(current) = self.project.patches.iter_mut().find(|row| row.id == region_id) else {
+            return Ok(false);
+        };
+        if *current != selected {
+            *current = selected;
+            self.flush()?;
+        }
+        Ok(true)
+    }
+
+    fn write_plan_mask(
+        &self,
+        reference: &str,
+        raster: &MaskRaster,
+        kind: buffers::TextShapeMaskKind,
+    ) -> Result<(), StoreError> {
+        let path = self.plan_artifact_path(reference)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| StoreError::io(parent, error))?;
+        }
+        let bytes = buffers::encode_text_shape_mask_parts(raster.bounds, &raster.bits, kind)?;
+        buffers::write_atomic(&path, &bytes)
+    }
+
+    fn read_plan_mask(
+        &self,
+        reference: &str,
+        kind: buffers::TextShapeMaskKind,
+    ) -> Result<MaskRaster, StoreError> {
+        let path = self.plan_artifact_path(reference)?;
+        let bytes = std::fs::read(&path).map_err(|error| StoreError::io(&path, error))?;
+        Ok(buffers::decode_text_shape_mask(&bytes, kind)?.into())
+    }
+
+    fn plan_artifact_path(&self, reference: &str) -> Result<PathBuf, StoreError> {
+        let relative = Path::new(reference);
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(StoreError::Malformed(
+                "unsafe text-shape artifact reference".into(),
+            ));
+        }
+        Ok(self.dir.join(relative))
+    }
+
+    fn load_text_shape_plan_record(
+        &self,
+        record: &TextShapePlanRecord,
+    ) -> Result<(MaskPlan, PreparedMaskPlan), StoreError> {
+        let source = self
+            .project
+            .sources
+            .get(record.source_idx)
+            .ok_or(StoreError::StalePlan)?;
+        if record.geometry_policy != GeometryPolicy::TextShape
+            || record.region_id != record.identity.region_id
+            || source.sha256 != record.source_sha256
+            || record.source_sha256 != record.identity.source_sha256
+            || record.lower_composite_sha256 != record.identity.lower_composite_sha256
+        {
+            return Err(StoreError::StalePlan);
+        }
+        let plan = MaskPlan {
+            version: record.plan_version,
+            region_id: record.region_id.clone(),
+            source_sha256: record.source_sha256.clone(),
+            lower_composite_sha256: record.lower_composite_sha256.clone(),
+            algorithm_id: record.algorithm_id.clone(),
+            model_id: record.model_id.clone(),
+            candidate_bounds: record.candidate_bounds,
+            refinement_crop: record.refinement_crop,
+            base_revision: record.base_revision,
+            correction_revision: record.correction_revision,
+            plan_revision: record.plan_revision,
+            base_mask: self
+                .read_plan_mask(&record.base_mask_ref, buffers::TextShapeMaskKind::Base)?,
+            additions: self
+                .read_plan_mask(&record.additions_ref, buffers::TextShapeMaskKind::Additions)?,
+            removals: self
+                .read_plan_mask(&record.removals_ref, buffers::TextShapeMaskKind::Removals)?,
+            padding_px: record.padding_px,
+            model_hole_margin_px: record.model_hole_margin_px,
+            reading_context: record.reading_context,
+            blend_alpha: record
+                .blend_alpha_ref
+                .as_deref()
+                .map(|reference| {
+                    self.read_plan_mask(reference, buffers::TextShapeMaskKind::BlendAlpha)
+                })
+                .transpose()?,
+            quality: record.quality.clone(),
+        };
+        let prepared = plan
+            .prepare(source.w, source.h)
+            .map_err(|error| StoreError::Malformed(error.to_string()))?;
+        let persisted_support = self.read_plan_mask(
+            &record.write_support_ref,
+            buffers::TextShapeMaskKind::Support,
+        )?;
+        let persisted_hole = self.read_plan_mask(
+            &record.model_hole_ref,
+            buffers::TextShapeMaskKind::ModelHole,
+        )?;
+        if prepared.identity != record.identity
+            || prepared.write_support != persisted_support
+            || prepared.model_hole != persisted_hole
+            || crate::text_shape::support_sha256(&persisted_support)
+                != record.identity.support_sha256
+        {
+            return Err(StoreError::StalePlan);
+        }
+        prepared
+            .verify_against(&plan, source.w, source.h)
+            .map_err(|_| StoreError::StalePlan)?;
+        Ok((plan, prepared))
+    }
+
+    #[cfg(test)]
+    fn plan_fixture(&self, region_id: &str, plan_revision: u64, padding_px: u32) -> MaskPlan {
+        let source = &self.project.sources[0];
+        let base_bounds = Rect::new(10, 10, 3, 2);
+        let mut base = crate::mask::Mask::empty(base_bounds);
+        base.set(10, 10, true);
+        base.set(12, 11, true);
+        let empty = crate::mask::Mask::empty(Rect::new(0, 0, 0, 0));
+        MaskPlan {
+            version: crate::text_shape::MASK_PLAN_VERSION,
+            region_id: region_id.to_owned(),
+            source_sha256: source.sha256.clone(),
+            lower_composite_sha256: format!("underlay-{plan_revision}"),
+            algorithm_id: "synthetic-test".into(),
+            model_id: None,
+            candidate_bounds: Rect::new(
+                6,
+                6,
+                source.w.saturating_sub(6).min(12),
+                source.h.saturating_sub(6).min(12),
+            ),
+            refinement_crop: Rect::new(
+                5,
+                5,
+                source.w.saturating_sub(5).min(14),
+                source.h.saturating_sub(5).min(14),
+            ),
+            base_revision: 1,
+            correction_revision: 1,
+            plan_revision,
+            base_mask: base.into(),
+            additions: empty.clone().into(),
+            removals: empty.into(),
+            padding_px,
+            model_hole_margin_px: 2,
+            reading_context: Rect::new(0, 0, source.w, source.h),
+            blend_alpha: Some(MaskRaster {
+                bounds: base_bounds,
+                bits: vec![64, 0, 0, 0, 0, 192],
+            }),
+            quality: MaskQualityState::Ready,
+        }
+    }
+
+    #[cfg(test)]
+    fn patch_with_support(id: &str, support: &MaskRaster) -> Patch {
+        let mut pixels = crate::image::fixtures::by_name("l8").raster;
+        pixels.width = support.bounds.w;
+        pixels.height = support.bounds.h;
+        pixels.data = vec![127; support.bounds.w as usize * support.bounds.h as usize];
+        Patch {
+            id: id.to_owned(),
+            mask: support.to_mask(),
+            ink: support.to_mask(),
+            pixels,
+            order: 3,
+            visible: true,
+            provenance: Provenance {
+                engine: Engine::Fill,
+                engine_version: "test".into(),
+                model_sha256: None,
+                execution_provider: "cpu".into(),
+                params_snapshot: serde_json::Value::Null,
+                mask_sha256: "0".repeat(64),
+                source_sha256: "1".repeat(64),
+                cloud: None,
+                created: 0,
+            },
+        }
     }
 
     /// Record one completed region: its pixels, its mask, its provenance - and
@@ -656,26 +1427,135 @@ impl Job {
         patch: &Patch,
         review_state: Option<String>,
     ) -> Result<(), StoreError> {
+        self.complete_region_with_policy(
+            source_idx,
+            patch,
+            review_state,
+            GeometryPolicy::Legacy,
+            None,
+        )
+    }
+
+    fn complete_region_with_policy(
+        &mut self,
+        source_idx: usize,
+        patch: &Patch,
+        review_state: Option<String>,
+        geometry_policy: GeometryPolicy,
+        text_shape_plan_identity: Option<String>,
+    ) -> Result<(), StoreError> {
         let record = PatchRecord::of(source_idx, patch, review_state);
-        buffers::write_atomic(
-            &self.dir.join(&record.mask_ref),
-            &buffers::encode_mask(&patch.mask),
-        )?;
-        buffers::write_atomic(
-            &self.dir.join(record.ink_ref()),
-            &buffers::encode_mask(&patch.ink),
-        )?;
-        buffers::write_atomic(
-            &self.dir.join(&record.buffer_ref),
-            &buffers::encode_patch(&patch.pixels),
-        )?;
+        let mut record = PatchRecord {
+            geometry_policy,
+            text_shape_plan_identity,
+            ..record
+        };
+        let mask_bytes = buffers::encode_mask(&patch.mask);
+        let ink_bytes = buffers::encode_mask(&patch.ink);
+        let pixel_bytes = buffers::encode_patch(&patch.pixels);
+        if geometry_policy == GeometryPolicy::TextShape || geometry_policy == GeometryPolicy::Legacy {
+            let mut hash = Sha256::new();
+            hash.update(b"manga-cleaner/patch-revision/v1\0");
+            for bytes in [&mask_bytes, &ink_bytes, &pixel_bytes] {
+                hash.update((bytes.len() as u64).to_le_bytes());
+                hash.update(bytes);
+            }
+            hash.update(
+                serde_json::to_vec(&record).map_err(|error| StoreError::Json(error.to_string()))?,
+            );
+            let revision = format!("{:x}", hash.finalize());
+            let region_key = sha256_hex(patch.id.as_bytes());
+            let stem = format!("patch-revisions/{region_key}/{revision}");
+            record.mask_ref = format!("{stem}.mask");
+            record.buffer_ref = format!("{stem}.buf");
+        }
+        for reference in [&record.mask_ref, &record.buffer_ref] {
+            let path = self.dir.join(reference);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| StoreError::io(parent, error))?;
+            }
+        }
+        buffers::write_atomic(&self.dir.join(&record.mask_ref), &mask_bytes)?;
+        buffers::write_atomic(&self.dir.join(record.ink_ref()), &ink_bytes)?;
+        buffers::write_atomic(&self.dir.join(&record.buffer_ref), &pixel_bytes)?;
 
         // A re-run replaces the record rather than appending a second one with
         // the same id - §3 forbids overwriting a prior *provenance* entry, and
         // that history lives in the mask revisions, not in duplicate rows here.
-        match self.project.patches.iter_mut().find(|existing| existing.id == record.id) {
+        if let Some(previous) = self
+            .project
+            .patches
+            .iter()
+            .find(|existing| existing.id == record.id)
+            .cloned()
+        {
+            if previous.geometry_policy == GeometryPolicy::TextShape
+                && previous != record
+                && !self.project.text_shape_patch_revisions.contains(&previous)
+            {
+                self.project
+                    .text_shape_patch_revisions
+                    .push(previous.clone());
+            }
+            if previous.geometry_policy == GeometryPolicy::Legacy && previous != record {
+                let archived = if previous.legacy_revision_id().is_some() {
+                    previous
+                } else {
+                    // A v3 row used mutable sidecar names. Preserve its bytes
+                    // before the next revision can replace those names.
+                    let old = self.load_patch(&previous)?;
+                    let old_mask = buffers::encode_mask(&old.mask);
+                    let old_ink = buffers::encode_mask(&old.ink);
+                    let old_pixels = buffers::encode_patch(&old.pixels);
+                    let mut hash = Sha256::new();
+                    hash.update(b"manga-cleaner/patch-revision/v1\0");
+                    for bytes in [&old_mask, &old_ink, &old_pixels] {
+                        hash.update((bytes.len() as u64).to_le_bytes());
+                        hash.update(bytes);
+                    }
+                    hash.update(serde_json::to_vec(&previous).map_err(|error| StoreError::Json(error.to_string()))?);
+                    let stem = format!("patch-revisions/{}/{:x}", sha256_hex(previous.id.as_bytes()), hash.finalize());
+                    let mut archived = previous;
+                    archived.mask_ref = format!("{stem}.mask");
+                    archived.buffer_ref = format!("{stem}.buf");
+                    let parent = self.dir.join("patch-revisions").join(sha256_hex(archived.id.as_bytes()));
+                    std::fs::create_dir_all(&parent).map_err(|error| StoreError::io(&parent, error))?;
+                    buffers::write_atomic(&self.dir.join(&archived.mask_ref), &old_mask)?;
+                    buffers::write_atomic(&self.dir.join(archived.ink_ref()), &old_ink)?;
+                    buffers::write_atomic(&self.dir.join(&archived.buffer_ref), &old_pixels)?;
+                    archived
+                };
+                if !self.project.legacy_patch_revisions.contains(&archived) {
+                    self.project.legacy_patch_revisions.push(archived);
+                }
+            }
+        }
+        if geometry_policy == GeometryPolicy::TextShape
+            && !self.project.text_shape_patch_revisions.contains(&record)
+        {
+            self.project.text_shape_patch_revisions.push(record.clone());
+        }
+        if geometry_policy == GeometryPolicy::Legacy
+            && !self.project.legacy_patch_revisions.contains(&record)
+        {
+            self.project.legacy_patch_revisions.push(record.clone());
+        }
+        if geometry_policy == GeometryPolicy::Legacy {
+            // The v3 reader derives <id>.ink even for an unfamiliar buffer
+            // reference. Keep that compatibility sidecar at the active ink.
+            buffers::write_atomic(&self.dir.join(format!("{}.ink", record.id)), &ink_bytes)?;
+        }
+        match self
+            .project
+            .patches
+            .iter_mut()
+            .find(|existing| existing.id == record.id)
+        {
             Some(existing) => *existing = record,
             None => self.project.patches.push(record),
+        }
+        if geometry_policy == GeometryPolicy::TextShape {
+            self.project.version = FORMAT_VERSION;
         }
         self.flush()
     }
@@ -771,6 +1651,15 @@ impl Job {
         let mask = buffers::decode_mask(
             &std::fs::read(&mask_path).map_err(|e| StoreError::io(&mask_path, e))?,
         )?;
+        if record.geometry_policy == GeometryPolicy::TextShape {
+            let identity = record.text_shape_plan_identity.as_deref().ok_or(StoreError::StalePlan)?;
+            let (_, prepared) = self
+                .load_text_shape_plan_identity(&record.id, identity)?
+                .ok_or(StoreError::StalePlan)?;
+            if mask.bounds != prepared.write_support.bounds || mask.bits != prepared.write_support.bits {
+                return Err(StoreError::StalePlan);
+            }
+        }
         let ink = match std::fs::read(&ink_path) {
             Ok(bytes) => buffers::decode_mask(&bytes)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => mask.clone(),
@@ -851,8 +1740,24 @@ impl Job {
                 report.dropped_patches.push(record.id.clone());
             }
         }
-        self.project.patches.retain(|record| !stale.contains(&record.source_idx));
-        self.project.regions_untouched.retain(|region| !stale.contains(&region.source_idx));
+        self.project
+            .patches
+            .retain(|record| !stale.contains(&record.source_idx));
+        self.project
+            .text_shape_plans
+            .retain(|record| !stale.contains(&record.source_idx));
+        self.project
+            .text_shape_patch_revisions
+            .retain(|record| !stale.contains(&record.source_idx));
+        self.project
+            .legacy_patch_revisions
+            .retain(|record| !stale.contains(&record.source_idx));
+        self.project
+            .text_shape_corrections
+            .retain(|record| !stale.contains(&record.source_idx));
+        self.project
+            .regions_untouched
+            .retain(|region| !stale.contains(&region.source_idx));
         // A source that changed has not been examined in its present form. The
         // patches go, and the record of having looked has to go with them, or a
         // re-crop would leave the page permanently out of the queue with
@@ -879,7 +1784,9 @@ impl Job {
             // it was protected.
             let paths = [Some(&source.rel_path), source.converted_from.as_ref()];
             for path in paths.into_iter().flatten().map(|rel| root.join(rel)) {
-                let Some(parent) = path.parent() else { continue };
+                let Some(parent) = path.parent() else {
+                    continue;
+                };
                 if same_directory(parent, destination) {
                     return Some(OutputRefusal::SourceDirectory { source_idx: index });
                 }
@@ -896,7 +1803,9 @@ impl Job {
 
 /// §1's default: a sibling `<input>_cleaned/`.
 pub fn default_output_dir(input_dir: &Path) -> PathBuf {
-    let name = input_dir.file_name().map(|n| n.to_string_lossy().into_owned());
+    let name = input_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
     match (input_dir.parent(), name) {
         (Some(parent), Some(name)) if !name.is_empty() => parent.join(format!("{name}_cleaned")),
         // A path with no name to extend - a bare root, or the empty path. Put
@@ -971,14 +1880,18 @@ fn relative_to(base: &Path, target: &Path) -> PathBuf {
     for part in target_parts {
         out.push(part.as_os_str());
     }
-    if out.as_os_str().is_empty() { PathBuf::from(".") } else { out }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
 }
 
 /// A path's last component, or the whole path where it has none.
 fn file_name(path: &Path) -> String {
-    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| {
-        path.to_string_lossy().into_owned()
-    })
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 fn mtime_of(path: &Path) -> Option<u64> {
@@ -997,9 +1910,12 @@ fn now() -> u64 {
 }
 
 #[cfg(test)]
+mod v3_manifest;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image::{Format, encode, fixtures};
+    use crate::image::{decode, encode, fixtures, Format};
     use crate::mask::Mask;
     use crate::patch::Engine;
 
@@ -1075,9 +1991,166 @@ mod tests {
         let source = write_source(&scratch.join("raws"), "001.png", "l8");
         let manifest = scratch.join("out/chapter.mtclean");
         std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-        let project =
-            Project::new(manifest.parent().unwrap(), "0.1.0", StripMode::Single, &[source]);
+        let project = Project::new(
+            manifest.parent().unwrap(),
+            "0.1.0",
+            StripMode::Single,
+            &[source],
+        );
         Job::create(&manifest, project).unwrap()
+    }
+
+    #[test]
+    fn flushing_legacy_v3_does_not_add_empty_text_shape_plans() {
+        let scratch = Scratch::new("v3-no-empty-plans");
+        let job = a_job(&scratch);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(job.path()).unwrap()).unwrap();
+        manifest.as_object_mut().unwrap().remove("text_shape_plans");
+        std::fs::write(job.path(), serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+
+        let reopened = Job::open(job.path()).unwrap();
+        reopened.flush().unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(job.path()).unwrap()).unwrap();
+        assert_eq!(saved["version"], 3);
+        assert!(saved.get("text_shape_plans").is_none());
+    }
+
+    #[test]
+    fn flushing_legacy_v3_with_patches_preserves_manifest_bytes() {
+        let fixture = include_bytes!("fixtures/legacy_v3_patches.json");
+        let old: v3_manifest::Project = serde_json::from_slice(fixture).unwrap();
+        assert_eq!(old.patches.len(), 4);
+        assert_eq!(serde_json::to_vec_pretty(&old).unwrap(), fixture);
+
+        let scratch = Scratch::new("v3-patches-byte-for-byte");
+        let path = scratch.join("chapter.mtclean");
+        std::fs::write(&path, fixture).unwrap();
+        let job = Job::open(&path).unwrap();
+        assert_eq!(job.project.version, 3);
+        job.flush().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), fixture);
+    }
+
+    #[test]
+    fn legacy_edits_keep_v3_and_text_shape_plan_upgrades_to_v4() {
+        let scratch = Scratch::new("v3-legacy-roundtrip");
+        let mut job = a_job(&scratch);
+        let path = job.path().to_path_buf();
+        let mut raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        raw["version"] = serde_json::json!(3);
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        job = Job::open(&path).unwrap();
+        job.complete_region(0, &a_patch("legacy"), None).unwrap();
+        let old_revision = job.project.patches[0].legacy_revision_id().unwrap();
+        let mut retry = a_patch("legacy");
+        retry.pixels.data.fill(91);
+        job.complete_region(0, &retry, None).unwrap();
+        assert!(job.restore_legacy_revision("legacy", &old_revision).unwrap());
+        let record = &mut job.project.patches[0];
+        record.review_state = Some("review.reason.inputChanged".into());
+        record.provenance.params_snapshot["input_provenance"] = serde_json::json!({
+            "read_footprint": Rect::new(8, 8, 12, 10),
+            "input_sha256": "earlier-composite"
+        });
+        record.provenance.params_snapshot["review_before_input_change"] = serde_json::Value::Null;
+        job.flush().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let old: v3_manifest::Project = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(old.version, 3);
+        assert_eq!(old.sources.len(), 1);
+        assert_eq!(old.strip.order, vec![0]);
+        assert_eq!(old.patches.len(), 1);
+        let row = &old.patches[0];
+        assert_eq!(row.id, "legacy");
+        assert!(!row.mask_ref.is_empty() && !row.buffer_ref.is_empty());
+        assert_eq!(row.engine, Engine::Fill);
+        assert_eq!(row.order, 3);
+        assert!(row.visible);
+        assert_eq!(row.provenance.engine, Engine::Fill);
+        assert_eq!(row.review_state.as_deref(), Some("review.reason.inputChanged"));
+        assert_eq!(row.provenance.params_snapshot["input_provenance"]["input_sha256"], "earlier-composite");
+        let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(saved["legacy_patch_revisions"].as_array().unwrap().len(), 2);
+        assert!(saved["patches"][0].get("geometry_policy").is_none());
+
+        let plan = job.plan_fixture("shape", 1, 0);
+        let prepared = plan.prepare(job.project.sources[0].w, job.project.sources[0].h).unwrap();
+        job.store_text_shape_plan(0, &plan, &prepared).unwrap();
+        let upgraded: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(upgraded["version"], 4);
+        job.project.text_shape_plans.clear();
+        job.flush().unwrap();
+        let rolled_back: serde_json::Value = serde_json::from_slice(&std::fs::read(job.path()).unwrap()).unwrap();
+        assert_eq!(rolled_back["version"], 3);
+    }
+
+    #[test]
+    fn legacy_retry_restores_exact_pixels_after_reopen() {
+        let scratch = Scratch::new("legacy-retry-revisions");
+        let mut job = a_job(&scratch);
+        let mut patch = a_patch("legacy");
+        patch.pixels.data.fill(23);
+        job.complete_region(0, &patch, None).unwrap();
+        let first = job.project.patches[0].legacy_revision_id().unwrap();
+        patch.pixels.data.fill(91);
+        job.complete_region(0, &patch, None).unwrap();
+        let second = job.project.patches[0].legacy_revision_id().unwrap();
+        assert_ne!(first, second);
+        let mut job = Job::open(job.path()).unwrap();
+        assert!(job.restore_legacy_revision("legacy", &first).unwrap());
+        assert!(job.load_patch(&job.project.patches[0]).unwrap().pixels.data.iter().all(|&p| p == 23));
+        job = Job::open(job.path()).unwrap();
+        assert!(job.restore_legacy_revision("legacy", &second).unwrap());
+        assert!(job.load_patch(&job.project.patches[0]).unwrap().pixels.data.iter().all(|&p| p == 91));
+    }
+
+    #[test]
+    fn old_legacy_sidecars_are_archived_before_retry() {
+        let scratch = Scratch::new("legacy-pre-archive-retry");
+        let mut job = a_job(&scratch);
+        let mut patch = a_patch("legacy");
+        patch.pixels.data.fill(7);
+        let old = PatchRecord::of(0, &patch, None);
+        buffers::write_atomic(&job.sidecar().join(&old.mask_ref), &buffers::encode_mask(&patch.mask)).unwrap();
+        buffers::write_atomic(&job.sidecar().join(old.ink_ref()), &buffers::encode_mask(&patch.ink)).unwrap();
+        buffers::write_atomic(&job.sidecar().join(&old.buffer_ref), &buffers::encode_patch(&patch.pixels)).unwrap();
+        job.project.patches.push(old);
+        job.flush().unwrap();
+
+        patch.pixels.data.fill(99);
+        job.complete_region(0, &patch, None).unwrap();
+        let old_revision = job.project.legacy_patch_revisions.iter()
+            .find(|row| row.buffer_ref != job.project.patches[0].buffer_ref)
+            .unwrap().legacy_revision_id().unwrap();
+        let new_revision = job.project.patches[0].legacy_revision_id().unwrap();
+        let mut reopened = Job::open(job.path()).unwrap();
+        assert!(reopened.restore_legacy_revision("legacy", &old_revision).unwrap());
+        assert!(reopened.load_patch(&reopened.project.patches[0]).unwrap().pixels.data.iter().all(|&p| p == 7));
+        assert!(reopened.restore_legacy_revision("legacy", &new_revision).unwrap());
+        assert!(reopened.load_patch(&reopened.project.patches[0]).unwrap().pixels.data.iter().all(|&p| p == 99));
+    }
+
+    #[test]
+    fn tampered_text_shape_mask_is_rejected_on_patch_load() {
+        let scratch = Scratch::new("text-shape-tampered-mask");
+        let mut job = a_job(&scratch);
+        let plan = job.plan_fixture("shape", 1, 0);
+        let prepared = plan.prepare(job.project.sources[0].w, job.project.sources[0].h).unwrap();
+        job.store_text_shape_plan(0, &plan, &prepared).unwrap();
+        let patch = Job::patch_with_support("shape", &prepared.write_support);
+        job.complete_text_shape_region(0, &patch, &prepared.identity.identity_sha256, None).unwrap();
+        let row = &job.project.patches[0];
+        let mut mask = job.load_patch(row).unwrap().mask;
+        let bounds = mask.bounds;
+        let point = (bounds.y..bounds.bottom())
+            .flat_map(|y| (bounds.x..bounds.right()).map(move |x| (x, y)))
+            .find(|&(x, y)| !mask.contains(x, y))
+            .unwrap();
+        mask.set(point.0, point.1, true);
+        std::fs::write(job.sidecar().join(&row.mask_ref), buffers::encode_mask(&mask)).unwrap();
+        assert!(matches!(job.load_patch(row), Err(StoreError::StalePlan)));
     }
 
     #[test]
@@ -1086,9 +2159,14 @@ mod tests {
         let mut job = a_job(&scratch);
         job.project.settings = serde_json::json!({ "engineCeiling": "lama", "cloud": false });
         job.project.counters.declined = 2;
-        job.complete_region(0, &a_patch("r0"), Some("review.reason.declined".into())).unwrap();
-        job.leave_untouched(0, Rect::new(4, 4, 6, 6), "review.reason.gateSkippedLowConfidence")
+        job.complete_region(0, &a_patch("r0"), Some("review.reason.declined".into()))
             .unwrap();
+        job.leave_untouched(
+            0,
+            Rect::new(4, 4, 6, 6),
+            "review.reason.gateSkippedLowConfidence",
+        )
+        .unwrap();
 
         let reopened = Job::open(job.path()).unwrap();
         assert_eq!(reopened.project, job.project);
@@ -1100,6 +2178,548 @@ mod tests {
         );
     }
 
+    #[test]
+    fn text_shape_plan_and_exact_support_survive_reopen_and_patch_commit() {
+        let scratch = Scratch::new("text-shape-plan-roundtrip");
+        let mut job = a_job(&scratch);
+        let plan = job.plan_fixture("region-text", 1, 2);
+        let prepared = plan
+            .prepare(job.project.sources[0].w, job.project.sources[0].h)
+            .unwrap();
+        let support_hash = prepared.identity.support_sha256.clone();
+        let identity_hash = prepared.identity.identity_sha256.clone();
+        job.store_text_shape_plan(0, &plan, &prepared).unwrap();
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(job.path()).unwrap()).unwrap();
+        assert_eq!(manifest["version"], FORMAT_VERSION);
+        assert_eq!(manifest["text_shape_plans"].as_array().unwrap().len(), 1);
+        assert!(
+            manifest.to_string().len() < 30_000,
+            "mask pixels must be stored in sidecar artifacts"
+        );
+
+        let mut reopened = Job::open(job.path()).unwrap();
+        let (loaded_plan, loaded_prepared) = reopened
+            .load_text_shape_plan("region-text")
+            .unwrap()
+            .expect("preview plan was persisted before apply");
+        assert_eq!(loaded_plan, plan);
+        assert_eq!(loaded_prepared, prepared);
+        let validated = reopened
+            .validate_text_shape_plan(
+                "region-text",
+                &plan.source_sha256,
+                &plan.lower_composite_sha256,
+                &identity_hash,
+                &support_hash,
+            )
+            .unwrap();
+        assert_eq!(validated.write_support, prepared.write_support);
+
+        let patch = Job::patch_with_support("region-text", &prepared.write_support);
+        reopened
+            .complete_text_shape_region(0, &patch, &identity_hash, None)
+            .unwrap();
+        let row = &reopened.project.patches[0];
+        assert_eq!(row.geometry_policy, GeometryPolicy::TextShape);
+        assert_eq!(
+            row.provenance.params_snapshot["geometry_policy"],
+            "text_shape"
+        );
+        assert_eq!(
+            row.provenance.params_snapshot["write_support_sha256"],
+            support_hash
+        );
+        assert_eq!(
+            row.text_shape_plan_identity.as_deref(),
+            Some(identity_hash.as_str())
+        );
+        let saved_patch = reopened.load_patch(row).unwrap();
+        assert_eq!(saved_patch.mask, prepared.write_support.to_mask());
+    }
+
+    #[test]
+    fn text_shape_revisions_are_retained_and_stale_preview_values_are_rejected() {
+        let scratch = Scratch::new("text-shape-plan-revisions");
+        let mut job = a_job(&scratch);
+        let first = job.plan_fixture("stable-region", 1, 2);
+        let first_prepared = first
+            .prepare(job.project.sources[0].w, job.project.sources[0].h)
+            .unwrap();
+        job.store_text_shape_plan(0, &first, &first_prepared)
+            .unwrap();
+        let first_patch = Job::patch_with_support("stable-region", &first_prepared.write_support);
+        job.complete_text_shape_region(
+            0,
+            &first_patch,
+            &first_prepared.identity.identity_sha256,
+            None,
+        )
+        .unwrap();
+        let second = job.plan_fixture("stable-region", 2, 5);
+        let second_prepared = second
+            .prepare(job.project.sources[0].w, job.project.sources[0].h)
+            .unwrap();
+        job.store_text_shape_plan(0, &second, &second_prepared)
+            .unwrap();
+
+        let reopened = Job::open(job.path()).unwrap();
+        let latest = reopened
+            .load_text_shape_plan("stable-region")
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.0.plan_revision, 2);
+        let old = reopened
+            .load_text_shape_plan_identity(
+                "stable-region",
+                &first_prepared.identity.identity_sha256,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.1.write_support, first_prepared.write_support);
+        assert_eq!(
+            reopened.project.patches[0]
+                .text_shape_plan_identity
+                .as_deref(),
+            Some(first_prepared.identity.identity_sha256.as_str()),
+            "an applied patch keeps its plan identity across a newer preview"
+        );
+        assert!(matches!(
+            reopened.validate_text_shape_plan(
+                "stable-region",
+                &first.source_sha256,
+                "changed-lower-layer",
+                &first_prepared.identity.identity_sha256,
+                &first_prepared.identity.support_sha256,
+            ),
+            Err(StoreError::StalePlan)
+        ));
+        assert!(matches!(
+            reopened.validate_text_shape_plan(
+                "stable-region",
+                &first.source_sha256,
+                &first.lower_composite_sha256,
+                &first_prepared.identity.identity_sha256,
+                "bad-support-hash",
+            ),
+            Err(StoreError::StalePlan)
+        ));
+    }
+
+    #[test]
+    fn text_shape_commit_refuses_a_patch_mask_different_from_preview_support() {
+        let scratch = Scratch::new("text-shape-plan-mismatch");
+        let mut job = a_job(&scratch);
+        let plan = job.plan_fixture("region-text", 1, 0);
+        let prepared = plan
+            .prepare(job.project.sources[0].w, job.project.sources[0].h)
+            .unwrap();
+        job.store_text_shape_plan(0, &plan, &prepared).unwrap();
+        let mut patch = Job::patch_with_support("region-text", &prepared.write_support);
+        patch.mask.set(
+            patch.mask.bounds.x,
+            patch.mask.bounds.y,
+            !patch
+                .mask
+                .contains(patch.mask.bounds.x, patch.mask.bounds.y),
+        );
+        assert!(matches!(
+            job.complete_text_shape_region(0, &patch, &prepared.identity.identity_sha256, None),
+            Err(StoreError::StalePlan)
+        ));
+        assert!(job.project.patches.is_empty());
+    }
+
+    #[test]
+    fn reusing_plan_identity_cannot_replace_immutable_base_or_corrections() {
+        let scratch = Scratch::new("text-shape-plan-identity-collision");
+        let mut job = a_job(&scratch);
+        let plan = job.plan_fixture("region-text", 1, 2);
+        let prepared = plan
+            .prepare(job.project.sources[0].w, job.project.sources[0].h)
+            .unwrap();
+        job.store_text_shape_plan(0, &plan, &prepared).unwrap();
+
+        // Add a base pixel that the unchanged correction removes. The final W
+        // and identity are the same, but the immutable inputs are not; a
+        // revision-reuse bug must not overwrite the first plan's sidecars.
+        let mut alias = plan.clone();
+        alias.base_mask.bits[1] = 255;
+        alias.removals = MaskRaster {
+            bounds: alias.base_mask.bounds,
+            bits: vec![0, 255, 0, 0, 0, 0],
+        };
+        let alias_prepared = alias
+            .prepare(job.project.sources[0].w, job.project.sources[0].h)
+            .unwrap();
+        assert_eq!(alias_prepared.identity, prepared.identity);
+        assert!(matches!(
+            job.store_text_shape_plan(0, &alias, &alias_prepared),
+            Err(StoreError::Malformed(_))
+        ));
+        let (saved, _) = job
+            .load_text_shape_plan_identity("region-text", &prepared.identity.identity_sha256)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved, plan);
+    }
+
+    #[test]
+    fn mixed_legacy_and_text_shape_patches_reopen_and_export_the_same_composite() {
+        let scratch = Scratch::new("mixed-geometry-export");
+        let mut job = a_job(&scratch);
+        job.complete_region(0, &a_patch("legacy"), None).unwrap();
+
+        let plan = job.plan_fixture("text-shape", 1, 2);
+        let prepared = plan
+            .prepare(job.project.sources[0].w, job.project.sources[0].h)
+            .unwrap();
+        job.store_text_shape_plan(0, &plan, &prepared).unwrap();
+        let mut text_patch = Job::patch_with_support("text-shape", &prepared.write_support);
+        text_patch.order = 9;
+        job.complete_text_shape_region(0, &text_patch, &prepared.identity.identity_sha256, None)
+            .unwrap();
+
+        let reopened = Job::open(job.path()).unwrap();
+        assert_eq!(reopened.project.patches.len(), 2);
+        assert_eq!(
+            reopened.project.patches[0].geometry_policy,
+            GeometryPolicy::Legacy
+        );
+        assert_eq!(
+            reopened.project.patches[1].geometry_policy,
+            GeometryPolicy::TextShape
+        );
+        let patches: Vec<Patch> = reopened
+            .project
+            .patches
+            .iter()
+            .map(|record| reopened.load_patch(record).unwrap())
+            .collect();
+        let source_bytes = std::fs::read(reopened.source_path(0).unwrap()).unwrap();
+        let source_page = decode(&source_bytes).unwrap();
+        let preview = crate::composite::composite(&source_page, &patches).unwrap();
+        let exported = crate::export::export_page(
+            &source_bytes,
+            &patches,
+            crate::export::Target::SameAsSource,
+        )
+        .unwrap();
+        let flattened = decode(&exported.bytes).unwrap();
+        assert_eq!(flattened.data, preview.data);
+        assert_eq!(flattened.mode, preview.mode);
+        assert_eq!(flattened.depth, preview.depth);
+    }
+
+    #[test]
+    fn text_shape_saved_patches_preserve_source_samples_mode_depth_and_icc_on_lossless_export() {
+        for fixture in fixtures::all() {
+            let scratch = Scratch::new(fixture.name);
+            let format = if fixture.name == "cmyk8" {
+                Format::Tiff
+            } else {
+                Format::Png
+            };
+            let source_bytes = encode(&fixture.raster, format).unwrap();
+            let source_path = scratch.join(if format == Format::Tiff {
+                "source.tiff"
+            } else {
+                "source.png"
+            });
+            std::fs::write(&source_path, &source_bytes).unwrap();
+            let source = crate::ingest::source_ref(&source_path, &source_bytes).unwrap();
+            let manifest = scratch.join("chapter.mtclean");
+            let mut job = Job::create(
+                &manifest,
+                Project::new(
+                    manifest.parent().unwrap(),
+                    "test",
+                    StripMode::Single,
+                    &[source],
+                ),
+            )
+            .unwrap();
+            let plan = job.plan_fixture("shape", 1, 2);
+            let prepared = plan
+                .prepare(fixture.raster.width, fixture.raster.height)
+                .unwrap();
+            job.store_text_shape_plan(0, &plan, &prepared).unwrap();
+            let mut patch = Job::patch_with_support("shape", &prepared.write_support);
+            let decoded_source = decode(&source_bytes).unwrap();
+            patch.pixels = crate::engines::model::page_crop(&decoded_source, patch.mask.bounds);
+            let (x, y) = (plan.base_mask.bounds.x, plan.base_mask.bounds.y);
+            let (local_x, local_y) = (
+                (x - patch.mask.bounds.x) as u32,
+                (y - patch.mask.bounds.y) as u32,
+            );
+            let old = patch.pixels.sample(local_x, local_y, 0);
+            patch.pixels.set_sample(local_x, local_y, 0, old ^ 1);
+            assert!(patch.mask.contains(x, y));
+            job.complete_text_shape_region(0, &patch, &prepared.identity.identity_sha256, None)
+                .unwrap();
+
+            let reopened = Job::open(&manifest).unwrap();
+            let loaded = reopened.load_patch(&reopened.project.patches[0]).unwrap();
+            let preview = crate::composite::composite(&decoded_source, std::slice::from_ref(&loaded)).unwrap();
+            let output = crate::export::export_page(
+                &source_bytes,
+                &[loaded],
+                crate::export::Target::SameAsSource,
+            )
+            .unwrap();
+            let after = decode(&output.bytes).unwrap();
+            assert_eq!(
+                (after.mode, after.depth, &after.icc),
+                (
+                    decoded_source.mode,
+                    decoded_source.depth,
+                    &decoded_source.icc
+                ),
+                "{}",
+                fixture.name
+            );
+            assert_eq!(after.data, preview.data, "{}", fixture.name);
+            for y in 0..after.height {
+                for x in 0..after.width {
+                    if prepared.write_support.contains(x as i64, y as i64) {
+                        continue;
+                    }
+                    for channel in 0..after.mode.samples() {
+                        assert_eq!(
+                            after.sample(x, y, channel),
+                            decoded_source.sample(x, y, channel),
+                            "{} ({x}, {y}) channel {channel}",
+                            fixture.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_shape_visibility_undo_redo_keeps_the_prepared_support_identity() {
+        let scratch = Scratch::new("text-shape-visibility-undo-redo");
+        let mut job = a_job(&scratch);
+        let plan = job.plan_fixture("text-shape", 1, 2);
+        let prepared = plan
+            .prepare(job.project.sources[0].w, job.project.sources[0].h)
+            .unwrap();
+        job.store_text_shape_plan(0, &plan, &prepared).unwrap();
+        let patch = Job::patch_with_support("text-shape", &prepared.write_support);
+        job.complete_text_shape_region(0, &patch, &prepared.identity.identity_sha256, None)
+            .unwrap();
+        let identity = prepared.identity.identity_sha256.clone();
+
+        for visible in [false, true, false, true] {
+            job.project.patches[0].visible = visible;
+            job.flush().unwrap();
+            job = Job::open(job.path()).unwrap();
+            let row = &job.project.patches[0];
+            assert_eq!(row.visible, visible);
+            assert_eq!(row.geometry_policy, GeometryPolicy::TextShape);
+            assert_eq!(
+                row.text_shape_plan_identity.as_deref(),
+                Some(identity.as_str())
+            );
+            assert_eq!(
+                job.load_patch(row).unwrap().mask.bits,
+                prepared.write_support.bits
+            );
+            assert!(job
+                .load_text_shape_plan_identity("text-shape", &identity)
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn successive_text_shape_revisions_restore_exact_patch_bytes_in_both_directions() {
+        let scratch = Scratch::new("text-shape-successive-revision-undo");
+        let mut job = a_job(&scratch);
+        let first = job.plan_fixture("shape", 1, 2);
+        let first_plan = first
+            .prepare(job.project.sources[0].w, job.project.sources[0].h)
+            .unwrap();
+        job.store_text_shape_plan(0, &first, &first_plan).unwrap();
+        let mut first_patch = Job::patch_with_support("shape", &first_plan.write_support);
+        first_patch.pixels.data.fill(21);
+        job.complete_text_shape_region(0, &first_patch, &first_plan.identity.identity_sha256, None)
+            .unwrap();
+        let first_record = job.project.patches[0].clone();
+        let first_revision = first_record.text_shape_revision_id().unwrap();
+
+        let second = job.plan_fixture("shape", 2, 5);
+        let second_plan = second
+            .prepare(job.project.sources[0].w, job.project.sources[0].h)
+            .unwrap();
+        job.store_text_shape_plan(0, &second, &second_plan).unwrap();
+        let mut second_patch = Job::patch_with_support("shape", &second_plan.write_support);
+        second_patch.pixels.data.fill(89);
+        job.complete_text_shape_region(
+            0,
+            &second_patch,
+            &second_plan.identity.identity_sha256,
+            None,
+        )
+        .unwrap();
+        let second_record = job.project.patches[0].clone();
+        let second_revision = second_record.text_shape_revision_id().unwrap();
+        assert_ne!(first_record.buffer_ref, second_record.buffer_ref);
+
+        // A retry can keep the same plan identity while producing different
+        // pixels. Its undo token must still name a distinct patch revision.
+        let mut retry_patch = second_patch.clone();
+        retry_patch.pixels.data.fill(117);
+        job.complete_text_shape_region(
+            0,
+            &retry_patch,
+            &second_plan.identity.identity_sha256,
+            None,
+        )
+        .unwrap();
+        let retry_record = job.project.patches[0].clone();
+        let retry_revision = retry_record.text_shape_revision_id().unwrap();
+        assert_ne!(second_revision, retry_revision);
+
+        let mut reopened = Job::open(job.path()).unwrap();
+        assert!(reopened
+            .restore_text_shape_revision("shape", &first_revision)
+            .unwrap());
+        assert_eq!(reopened.project.patches[0], first_record);
+        assert_eq!(
+            reopened
+                .load_patch(&reopened.project.patches[0])
+                .unwrap()
+                .pixels
+                .data,
+            first_patch.pixels.data
+        );
+        reopened = Job::open(job.path()).unwrap();
+        assert!(reopened
+            .restore_text_shape_revision("shape", &second_revision)
+            .unwrap());
+        assert_eq!(reopened.project.patches[0], second_record);
+        assert_eq!(
+            reopened
+                .load_patch(&reopened.project.patches[0])
+                .unwrap()
+                .pixels
+                .data,
+            second_patch.pixels.data
+        );
+        reopened = Job::open(job.path()).unwrap();
+        assert!(reopened
+            .restore_text_shape_revision("shape", &retry_revision)
+            .unwrap());
+        assert_eq!(reopened.project.patches[0], retry_record);
+        assert_eq!(
+            reopened
+                .load_patch(&reopened.project.patches[0])
+                .unwrap()
+                .pixels
+                .data,
+            retry_patch.pixels.data
+        );
+    }
+
+    #[test]
+    fn pre_archive_text_shape_patch_can_be_restored_after_a_new_retry() {
+        let scratch = Scratch::new("text-shape-pre-archive-patch");
+        let mut job = a_job(&scratch);
+        let plan = job.plan_fixture("shape", 1, 2);
+        let prepared = plan
+            .prepare(job.project.sources[0].w, job.project.sources[0].h)
+            .unwrap();
+        job.store_text_shape_plan(0, &plan, &prepared).unwrap();
+        let mut patch = Job::patch_with_support("shape", &prepared.write_support);
+        patch.pixels.data.fill(31);
+        job.complete_text_shape_region(0, &patch, &prepared.identity.identity_sha256, None)
+            .unwrap();
+        // Simulate the uncommitted M3 sidecar naming, which used stable IDs.
+        let row = &mut job.project.patches[0];
+        for (from, to) in [
+            (row.mask_ref.clone(), "shape.mask"),
+            (row.ink_ref(), "shape.ink"),
+            (row.buffer_ref.clone(), "shape.buf"),
+        ] {
+            std::fs::copy(job.dir.join(from), job.dir.join(to)).unwrap();
+        }
+        row.mask_ref = "shape.mask".into();
+        row.buffer_ref = "shape.buf".into();
+        let legacy_revision = row.text_shape_revision_id().unwrap();
+        job.flush().unwrap();
+
+        let mut retry = patch.clone();
+        retry.pixels.data.fill(92);
+        job.complete_text_shape_region(0, &retry, &prepared.identity.identity_sha256, None)
+            .unwrap();
+        let mut reopened = Job::open(job.path()).unwrap();
+        assert!(reopened
+            .restore_text_shape_revision("shape", &legacy_revision)
+            .unwrap());
+        assert_eq!(
+            reopened
+                .load_patch(&reopened.project.patches[0])
+                .unwrap()
+                .pixels
+                .data,
+            patch.pixels.data
+        );
+    }
+
+    #[test]
+    fn correction_state_survives_reopen_blocks_old_plan_and_clears_after_new_approval() {
+        let scratch = Scratch::new("text-shape-correction-state");
+        let mut job = a_job(&scratch);
+        let first = job.plan_fixture("shape", 1, 2);
+        let first_prepared = first
+            .prepare(job.project.sources[0].w, job.project.sources[0].h)
+            .unwrap();
+        job.store_text_shape_plan(0, &first, &first_prepared)
+            .unwrap();
+        job.record_text_shape_correction(
+            0,
+            "shape",
+            2,
+            Rect::new(8, 8, 10, 10),
+            "lettering mask is empty",
+        )
+        .unwrap();
+        let mut reopened = Job::open(job.path()).unwrap();
+        assert_eq!(
+            reopened.text_shape_correction("shape").unwrap().reason,
+            "lettering mask is empty"
+        );
+        let second = reopened.plan_fixture("shape", 2, 5);
+        let second_prepared = second
+            .prepare(reopened.project.sources[0].w, reopened.project.sources[0].h)
+            .unwrap();
+        assert!(matches!(
+            reopened.store_text_shape_plan(0, &second, &second_prepared),
+            Err(StoreError::StalePlan)
+        ));
+        let third = reopened.plan_fixture("shape", 3, 5);
+        let third_prepared = third
+            .prepare(reopened.project.sources[0].w, reopened.project.sources[0].h)
+            .unwrap();
+        reopened
+            .store_text_shape_plan(0, &third, &third_prepared)
+            .unwrap();
+        let reopened = Job::open(job.path()).unwrap();
+        assert!(reopened.text_shape_correction("shape").is_none());
+        assert_eq!(
+            reopened
+                .load_text_shape_plan("shape")
+                .unwrap()
+                .unwrap()
+                .0
+                .plan_revision,
+            3
+        );
+    }
+
     /// The manifest is a human-readable record of a job, and §1 fixes the field
     /// names. A rename here is a break for anything reading it.
     #[test]
@@ -1107,30 +2727,60 @@ mod tests {
         let scratch = Scratch::new("field-names");
         let mut job = a_job(&scratch);
         job.complete_region(0, &a_patch("r0"), None).unwrap();
-        job.leave_untouched(0, Rect::new(4, 4, 6, 6), "decline.reason.qualityMetric").unwrap();
+        job.leave_untouched(0, Rect::new(4, 4, 6, 6), "decline.reason.qualityMetric")
+            .unwrap();
 
         let text = std::fs::read_to_string(job.path()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         for key in [
-            "version", "created", "app_version", "sources", "strip", "patches",
-            "regions_untouched", "counters", "settings",
+            "version",
+            "created",
+            "app_version",
+            "sources",
+            "strip",
+            "patches",
+            "regions_untouched",
+            "counters",
+            "settings",
         ] {
             assert!(value.get(key).is_some(), "the manifest has no {key}");
         }
         for key in ["rel_path", "sha256", "mtime", "w", "h", "mode", "bit_depth"] {
-            assert!(value["sources"][0].get(key).is_some(), "a source row has no {key}");
+            assert!(
+                value["sources"][0].get(key).is_some(),
+                "a source row has no {key}"
+            );
         }
         for key in [
-            "id", "source_idx", "bbox", "mask_ref", "buffer_ref", "engine", "order", "visible",
-            "review_state", "provenance",
+            "id",
+            "source_idx",
+            "bbox",
+            "mask_ref",
+            "buffer_ref",
+            "engine",
+            "order",
+            "visible",
+            "review_state",
+            "provenance",
         ] {
-            assert!(value["patches"][0].get(key).is_some(), "a patch row has no {key}");
+            assert!(
+                value["patches"][0].get(key).is_some(),
+                "a patch row has no {key}"
+            );
         }
         for key in [
-            "refused", "errored", "param_reject", "residual_reject", "structural_reject",
-            "declined", "gate_dropped",
+            "refused",
+            "errored",
+            "param_reject",
+            "residual_reject",
+            "structural_reject",
+            "declined",
+            "gate_dropped",
         ] {
-            assert!(value["counters"].get(key).is_some(), "the counters have no {key}");
+            assert!(
+                value["counters"].get(key).is_some(),
+                "the counters have no {key}"
+            );
         }
         // The vocabulary a reader expects: mode names and a bit depth that
         // is a number.
@@ -1167,11 +2817,17 @@ mod tests {
         patch.ink = Mask::filled(Rect::new(10, 10, 4, 3));
         job.complete_region(0, &patch, None).unwrap();
         let record = job.project.patches[0].clone();
-        assert!(job.sidecar().join(record.ink_ref()).exists(), "the ink is a sidecar file");
+        assert!(
+            job.sidecar().join(record.ink_ref()).exists(),
+            "the ink is a sidecar file"
+        );
 
         std::fs::remove_file(job.sidecar().join(record.ink_ref())).unwrap();
         let loaded = job.load_patch(&record).unwrap();
-        assert_eq!(loaded.ink, patch.mask, "no ink file: the applied mask stands in");
+        assert_eq!(
+            loaded.ink, patch.mask,
+            "no ink file: the applied mask stands in"
+        );
     }
 
     #[test]
@@ -1198,7 +2854,8 @@ mod tests {
         let scratch = Scratch::new("atomic");
         let mut job = a_job(&scratch);
         for index in 0..8 {
-            job.complete_region(0, &a_patch(&format!("r{index}")), None).unwrap();
+            job.complete_region(0, &a_patch(&format!("r{index}")), None)
+                .unwrap();
             let bytes = std::fs::read(job.path()).unwrap();
             serde_json::from_slice::<Project>(&bytes).expect("the manifest parsed mid-job");
         }
@@ -1231,7 +2888,10 @@ mod tests {
         assert_eq!(report.sources, vec![0]);
         assert_eq!(report.dropped_patches, vec!["r0".to_string()]);
         assert!(job.project.patches.is_empty());
-        assert!(Job::open(job.path()).unwrap().project.patches.is_empty(), "the drop was not flushed");
+        assert!(
+            Job::open(job.path()).unwrap().project.patches.is_empty(),
+            "the drop was not flushed"
+        );
     }
 
     #[test]
@@ -1243,7 +2903,10 @@ mod tests {
 
         let states = job.verify_sources();
         assert_eq!(states, vec![SourceState::Missing]);
-        assert_eq!(job.drop_stale(&states).unwrap().dropped_patches, vec!["r0".to_string()]);
+        assert_eq!(
+            job.drop_stale(&states).unwrap().dropped_patches,
+            vec!["r0".to_string()]
+        );
     }
 
     /// An untouched mtime is not evidence of an untouched file, and a moved one
@@ -1256,7 +2919,11 @@ mod tests {
         let bytes = std::fs::read(&source).unwrap();
         std::fs::remove_file(&source).unwrap();
         std::fs::write(&source, &bytes).unwrap();
-        assert_eq!(job.verify_sources(), vec![SourceState::Unchanged], "a new mtime read as a change");
+        assert_eq!(
+            job.verify_sources(),
+            vec![SourceState::Unchanged],
+            "a new mtime read as a change"
+        );
     }
 
     #[test]
@@ -1295,7 +2962,10 @@ mod tests {
     fn sources_are_stored_relative_so_a_job_survives_being_moved() {
         let scratch = Scratch::new("relative");
         let job = a_job(&scratch);
-        assert_eq!(job.project.sources[0].rel_path, PathBuf::from("../raws/001.png"));
+        assert_eq!(
+            job.project.sources[0].rel_path,
+            PathBuf::from("../raws/001.png")
+        );
 
         // Move the pair, and the source still resolves.
         let moved = scratch.join("moved");
@@ -1323,7 +2993,9 @@ mod tests {
             (dir.join(".DS_Store"), b"junk".to_vec()),
         ];
         let report = crate::ingest::ingest(
-            files.iter().map(|(path, bytes)| (path.as_path(), bytes.as_slice())),
+            files
+                .iter()
+                .map(|(path, bytes)| (path.as_path(), bytes.as_slice())),
         );
 
         let manifest = scratch.join("out/chapter.mtclean");
@@ -1338,7 +3010,10 @@ mod tests {
 
         let reopened = Job::open(job.path()).unwrap().project;
         assert_eq!(reopened.input_report.junk_skipped, 1);
-        assert_eq!(reopened.input_report.duplicate_basenames, vec!["001".to_string()]);
+        assert_eq!(
+            reopened.input_report.duplicate_basenames,
+            vec!["001".to_string()]
+        );
         assert_eq!(
             reopened.input_report.skipped,
             vec![SkippedInput {
@@ -1349,7 +3024,11 @@ mod tests {
         );
         // The junk entry is counted, never listed: it is not a page anybody
         // expected to see, and naming `.DS_Store` in a skip list is noise.
-        assert!(!reopened.input_report.skipped.iter().any(|s| s.file == ".DS_Store"));
+        assert!(!reopened
+            .input_report
+            .skipped
+            .iter()
+            .any(|s| s.file == ".DS_Store"));
     }
 
     /// §6's "any incomplete job offers a resume" needs a manifest that can say
@@ -1361,7 +3040,10 @@ mod tests {
         assert_eq!(job.project.interrupted_at, None);
 
         job.mark_interrupted(Some(7)).unwrap();
-        assert_eq!(Job::open(job.path()).unwrap().project.interrupted_at, Some(7));
+        assert_eq!(
+            Job::open(job.path()).unwrap().project.interrupted_at,
+            Some(7)
+        );
 
         job.mark_interrupted(None).unwrap();
         assert_eq!(Job::open(job.path()).unwrap().project.interrupted_at, None);
@@ -1381,7 +3063,11 @@ mod tests {
         job.mark_examined(0).unwrap();
 
         let reopened = Job::open(job.path()).unwrap().project;
-        assert_eq!(reopened.examined, vec![0], "a second pass doubled the record");
+        assert_eq!(
+            reopened.examined,
+            vec![0],
+            "a second pass doubled the record"
+        );
         assert!(reopened.patches.is_empty());
         assert!(reopened.regions_untouched.is_empty());
         assert_eq!(reopened.counters, Counters::default());
@@ -1415,20 +3101,24 @@ mod tests {
     /// says `"version": 1` on disk rather than against the constant, because
     /// the constant is the thing that moved.
     #[test]
-    fn a_version_one_manifest_still_opens_and_is_rewritten_at_the_current_version() {
+    fn a_version_one_manifest_still_opens_and_is_rewritten_at_the_legacy_floor() {
         let scratch = Scratch::new("version-one");
-        let mut job = a_job(&scratch);
-        job.project.version = 1;
-        job.flush().unwrap();
+        let job = a_job(&scratch);
+        let mut old: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(job.path()).unwrap()).unwrap();
+        old["version"] = serde_json::json!(1);
+        std::fs::write(job.path(), serde_json::to_vec_pretty(&old).unwrap()).unwrap();
         assert!(
-            std::fs::read_to_string(job.path()).unwrap().contains("\"version\": 1"),
+            std::fs::read_to_string(job.path())
+                .unwrap()
+                .contains("\"version\": 1"),
             "the fixture has to actually be a v1 file"
         );
 
         // Opening raises the number in memory; the file on disk is untouched
         // until something writes it.
         let reopened = Job::open(job.path()).expect("a v1 manifest is still readable");
-        assert_eq!(reopened.project.version, FORMAT_VERSION);
+        assert_eq!(reopened.project.version, 3);
 
         // And the next flush is what upgrades the file - no migration pass, no
         // conversion step, and nothing the caller has to remember to do. This is
@@ -1437,27 +3127,42 @@ mod tests {
         // a v1 file carrying `"engine": "paint"`.
         reopened.flush().unwrap();
         let text = std::fs::read_to_string(job.path()).unwrap();
-        assert!(text.contains(&format!("\"version\": {FORMAT_VERSION}")), "the flush did not rewrite the version");
-        assert_eq!(Job::open(job.path()).unwrap().project.version, FORMAT_VERSION);
+        assert!(
+            text.contains("\"version\": 3"),
+            "the flush did not rewrite the version"
+        );
+        assert_eq!(
+            Job::open(job.path()).unwrap().project.version,
+            3
+        );
     }
 
     #[test]
     fn legacy_cloud_json_migrates_without_inventing_history_or_writing_on_read() {
-        for version in [1, 2] {
+        for version in [1, 2, 3] {
             let scratch = Scratch::new(&format!("legacy-cloud-v{version}"));
             let mut job = a_job(&scratch);
             job.complete_region(0, &a_patch("legacy"), None).unwrap();
-            if version == 2 {
+            if version >= 2 {
                 for (id, engine) in [("paint", Engine::Paint), ("clone", Engine::Clone)] {
                     let mut patch = a_patch(id);
                     patch.provenance.engine = engine;
                     job.complete_region(0, &patch, None).unwrap();
                 }
             }
-            let mut fixture: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(job.path()).unwrap(),
-            ).unwrap();
+            let mut fixture: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(job.path()).unwrap()).unwrap();
             fixture["version"] = serde_json::json!(version);
+            // These fields did not exist before v4 and must not turn a legacy
+            // record into an implicit text-shaped plan during migration.
+            fixture.as_object_mut().unwrap().remove("text_shape_plans");
+            for record in fixture["patches"].as_array_mut().unwrap() {
+                record.as_object_mut().unwrap().remove("geometry_policy");
+                record
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("text_shape_plan_identity");
+            }
             fixture["patches"][0]["engine"] = serde_json::json!("cloud");
             fixture["patches"][0]["provenance"]["engine"] = serde_json::json!("cloud");
             // This is the exact old JSON shape, not serialization of the new
@@ -1470,8 +3175,14 @@ mod tests {
             std::fs::write(job.path(), &before).unwrap();
             let reopened = Job::open(job.path()).unwrap();
             assert_eq!(std::fs::read(job.path()).unwrap(), before);
-            assert_eq!(reopened.project.version, FORMAT_VERSION);
+            assert_eq!(reopened.project.version, 3);
             let record = &reopened.project.patches[0];
+            assert!(reopened.project.text_shape_plans.is_empty());
+            assert!(reopened
+                .project
+                .patches
+                .iter()
+                .all(|patch| patch.geometry_policy == GeometryPolicy::Legacy));
             assert_eq!(record.engine, Engine::Cloud);
             assert_eq!(record.provenance.engine, Engine::Cloud);
             let cloud = record.provenance.cloud.as_ref().unwrap();
@@ -1488,12 +3199,14 @@ mod tests {
             reopened.flush().unwrap();
             let upgraded = Job::open(job.path()).unwrap();
             assert_eq!(upgraded.project.patches, reopened.project.patches);
-            let saved: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(job.path()).unwrap(),
-            ).unwrap();
-            assert_eq!(saved["version"], FORMAT_VERSION);
-            assert_eq!(saved["patches"][0]["provenance"]["cloud"], fixture["patches"][0]["provenance"]["cloud"]);
-            if version == 2 {
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(job.path()).unwrap()).unwrap();
+            assert_eq!(saved["version"], 3);
+            assert_eq!(
+                saved["patches"][0]["provenance"]["cloud"],
+                fixture["patches"][0]["provenance"]["cloud"]
+            );
+            if version >= 2 {
                 assert_eq!(upgraded.project.patches[1].engine, Engine::Paint);
                 assert_eq!(upgraded.project.patches[2].engine, Engine::Clone);
             }
@@ -1506,14 +3219,18 @@ mod tests {
         let mut job = a_job(&scratch);
         let mut patch = a_patch("remote");
         patch.provenance.engine = Engine::Flux;
-        patch.provenance.cloud = Some(serde_json::from_value(serde_json::json!({
-            "provider": "modal", "profile_id": "test-profile", "job_id": "test-job",
-            "request_id": "test-request", "attempt_id": "test-attempt",
-            "recipe_id": "test-recipe", "model": "test-model",
-            "model_revision": "test-immutable-revision", "cost": null, "duration_ms": 120
-        })).unwrap());
+        patch.provenance.cloud = Some(
+            serde_json::from_value(serde_json::json!({
+                "provider": "modal", "profile_id": "test-profile", "job_id": "test-job",
+                "request_id": "test-request", "attempt_id": "test-attempt",
+                "recipe_id": "test-recipe", "model": "test-model",
+                "model_revision": "test-immutable-revision", "cost": null, "duration_ms": 120
+            }))
+            .unwrap(),
+        );
         job.complete_region(0, &patch, None).unwrap();
-        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(job.path()).unwrap()).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(job.path()).unwrap()).unwrap();
         assert_eq!(saved["version"], 3);
         let cloud_json = &saved["patches"][0]["provenance"]["cloud"];
         assert!(cloud_json.as_object().unwrap().contains_key("cost"));
@@ -1521,7 +3238,14 @@ mod tests {
         let reopened = Job::open(job.path()).unwrap();
         assert_eq!(reopened.project.patches[0].provenance, patch.provenance);
         assert_eq!(reopened.project.patches[0].engine, Engine::Flux);
-        assert_eq!(reopened.load_patch(&reopened.project.patches[0]).unwrap().pixels.data, patch.pixels.data);
+        assert_eq!(
+            reopened
+                .load_patch(&reopened.project.patches[0])
+                .unwrap()
+                .pixels
+                .data,
+            patch.pixels.data
+        );
     }
 
     /// A patch made by either hand tool survives the manifest, under the rung
@@ -1542,18 +3266,39 @@ mod tests {
         assert!(text.contains("\"engine\": \"clone\""), "{text}");
 
         let reopened = Job::open(job.path()).unwrap();
-        let engines: Vec<Engine> =
-            reopened.project.patches.iter().map(|record| record.provenance.engine).collect();
+        let engines: Vec<Engine> = reopened
+            .project
+            .patches
+            .iter()
+            .map(|record| record.provenance.engine)
+            .collect();
         assert_eq!(engines, vec![Engine::Paint, Engine::Clone]);
     }
 
     #[test]
     fn a_manifest_from_a_later_version_is_refused_rather_than_half_read() {
         let scratch = Scratch::new("version");
+        let job = a_job(&scratch);
+        let mut future: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(job.path()).unwrap()).unwrap();
+        future["version"] = serde_json::json!(FORMAT_VERSION + 1);
+        std::fs::write(job.path(), serde_json::to_vec(&future).unwrap()).unwrap();
+        assert!(matches!(
+            Job::open(job.path()),
+            Err(StoreError::Version { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unknown_geometry_policy_is_not_migrated_to_legacy() {
+        let scratch = Scratch::new("unknown-geometry-policy");
         let mut job = a_job(&scratch);
-        job.project.version = FORMAT_VERSION + 1;
-        job.flush().unwrap();
-        assert!(matches!(Job::open(job.path()), Err(StoreError::Version { .. })));
+        job.complete_region(0, &a_patch("r0"), None).unwrap();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(job.path()).unwrap()).unwrap();
+        manifest["patches"][0]["geometry_policy"] = serde_json::json!("future_mode");
+        std::fs::write(job.path(), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(matches!(Job::open(job.path()), Err(StoreError::Json(_))));
     }
 
     /// The version has to be read **before** the shape, or it is only ever
@@ -1590,7 +3335,10 @@ mod tests {
     fn nothing_writes_a_populated_splits_and_an_old_shaped_one_is_refused_loudly() {
         let scratch = Scratch::new("splits-shape");
         let job = a_job(&scratch);
-        assert!(job.project.strip.splits.is_empty(), "a fresh project writes no splits");
+        assert!(
+            job.project.strip.splits.is_empty(),
+            "a fresh project writes no splits"
+        );
 
         let written = std::fs::read_to_string(job.path()).unwrap();
         assert!(written.contains(r#""splits": []"#), "{written}");
@@ -1598,8 +3346,11 @@ mod tests {
 
         // The one manifest the change could have been wrong about, if a writer
         // for it had ever existed.
-        std::fs::write(job.path(), written.replace(r#""splits": []"#, r#""splits": [2000]"#))
-            .unwrap();
+        std::fs::write(
+            job.path(),
+            written.replace(r#""splits": []"#, r#""splits": [2000]"#),
+        )
+        .unwrap();
         assert!(
             matches!(Job::open(job.path()), Err(StoreError::Json(_))),
             "a row of the old shape was accepted, or dropped, instead of refused"
