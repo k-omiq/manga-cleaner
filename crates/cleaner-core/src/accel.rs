@@ -313,6 +313,9 @@ impl Accelerator {
         if self.needs_cuda_runtime() && !cuda_runtime_present() {
             return Err(Unavailable::MissingDependency);
         }
+        if self.needs_cuda_runtime() && !cuda_device_present() {
+            return Err(Unavailable::NoDevice);
+        }
         if self.publishes_devices() && !device_present(self) {
             return Err(Unavailable::NoDevice);
         }
@@ -347,7 +350,7 @@ impl Accelerator {
     /// providers that *work*, and asking it about CoreML would take the
     /// measured detector winner away from every Mac.
     fn publishes_devices(self) -> bool {
-        self.is_plugin() || self == Accelerator::DirectMl
+        self == Accelerator::WebGpu || self == Accelerator::DirectMl
     }
 
     /// Whether this provider reaches the process as a **plugin library**
@@ -368,6 +371,11 @@ impl Accelerator {
     /// cares must handle [`open_session`] returning an error and fall back.
     pub fn is_available(self) -> bool {
         self.availability().is_ok()
+    }
+
+    /// Present in the loaded runtime, before vendor libraries and hardware are checked.
+    pub fn is_installed(self) -> bool {
+        self.in_runtime()
     }
 
     /// Whether the **loaded** ONNX Runtime was built with this provider. The
@@ -442,8 +450,16 @@ enum Dispatch {
 /// wrong takes a working provider away.
 fn device_present(accelerator: Accelerator) -> bool {
     let Ok(env) = ort::environment::Environment::current() else {
-        return true;
+        return accelerator != Accelerator::WebGpu;
     };
+    if accelerator == Accelerator::WebGpu {
+        // The built-in macOS EP publishes devices too. A provider name alone
+        // is insufficient: a headless or broken adapter is not a GPU path.
+        return env.devices().any(|device| {
+            device.ep().ok() == Some(accelerator.ort_name())
+                && device.hardware_device().ty() == ort::memory::DeviceType::GPU
+        });
+    }
     listed_or_unreadable(env.devices().filter_map(|device| device.ep().ok()), accelerator.ort_name())
 }
 
@@ -508,7 +524,7 @@ pub fn available() -> Vec<Accelerator> {
     KNOWN.into_iter().filter(|a| a.is_available()).collect()
 }
 
-/// Whether the CUDA runtime this machine would need is installed.
+/// Whether CUDA and cuDNN libraries this machine would need are installed.
 ///
 /// Asked of the filesystem rather than of ONNX Runtime, because ONNX Runtime's
 /// own answer is the wrong one: `GetAvailableProviders` lists
@@ -518,6 +534,15 @@ pub fn available() -> Vec<Accelerator> {
 /// per call, and only on a build that carries CUDA at all.
 pub fn cuda_runtime_present() -> bool {
     cuda_runtime_in(&cuda_search_dirs())
+}
+
+/// Ask the NVIDIA driver for a real adapter. A CUDA EP compiled into ORT and
+/// libraries on disk still do not establish that a GPU is connected.
+fn cuda_device_present() -> bool {
+    std::process::Command::new("nvidia-smi")
+        .arg("--list-gpus")
+        .output()
+        .is_ok_and(|output| output.status.success() && output.stdout.windows(4).any(|part| part == b"GPU "))
 }
 
 /// Where a CUDA install puts its runtime library, on this machine.
@@ -560,15 +585,26 @@ fn cuda_search_dirs() -> Vec<PathBuf> {
 /// The same question, against a list of directories. Split out for
 /// [`choose_within`]'s reason: the rule is testable without a CUDA install.
 pub fn cuda_runtime_in(dirs: &[PathBuf]) -> bool {
-    dirs.iter().any(|dir| {
-        std::fs::read_dir(dir)
-            .map(|entries| {
-                entries.flatten().any(|entry| {
-                    is_cuda_runtime_library(&entry.file_name().to_string_lossy())
-                })
-            })
-            .unwrap_or(false)
-    })
+    let mut cuda = false;
+    let mut cudnn = false;
+    for dir in dirs {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                cuda |= is_cuda_runtime_library(&name);
+                cudnn |= is_cudnn_runtime_library(&name);
+            }
+        }
+    }
+    cuda && cudnn
+}
+
+/// The shipped CUDA EP targets cuDNN 9. A cuDNN 8 install is a missing
+/// dependency for this build even if the CUDA toolkit itself is present.
+pub fn is_cudnn_runtime_library(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "cudnn64_9.dll" || name == "libcudnn.so.9" || name.starts_with("libcudnn.so.9.")
 }
 
 /// Whether one filename is the CUDA runtime library.
@@ -653,13 +689,14 @@ impl ModelProfile {
     }
 }
 
-/// `comictextdetector.onnx`. Measured: CoreML 383 ms, WebGPU 548 ms, CPU
-/// 703 ms. The one model where CoreML wins.
+/// `comictextdetector.onnx`. CoreML was faster in a mixed CoreML/CPU run, but
+/// strict graph placement proves it needs CPU nodes. WebGPU owns the whole
+/// graph and is the automatic GPU choice on the measured Mac.
 pub const DETECTOR: ModelProfile = ModelProfile {
     name: "detector",
     label_key: "models.kind.textDetector",
     uses_dft: false,
-    measured_better: &[Accelerator::CoreMl, Accelerator::WebGpu],
+    measured_better: &[Accelerator::WebGpu],
     // Windows, in the order the two flavours are offered: DirectML is the
     // default download and reaches every vendor; CUDA is the opt-in one and is
     // only ever in this list because the detector has no `DFT` in it. Neither
@@ -678,6 +715,18 @@ pub const DETECTOR: ModelProfile = ModelProfile {
 /// fallback is reported rather than retried per page.
 pub const BALLOON: ModelProfile = ModelProfile {
     name: "balloon",
+    label_key: "models.kind.balloonDetector",
+    uses_dft: false,
+    measured_better: &[],
+    unmeasured_candidates: &[],
+    measured_peak_rss: &[],
+};
+
+/// Full FP32 RT-DETR uses the same ONNX session builder as the small detector.
+/// No GPU timing has been established, so Automatic remains on CPU. A forced
+/// GPU must commit the entire graph there or fail.
+pub const FULL_RT: ModelProfile = ModelProfile {
+    name: "rt-full",
     label_key: "models.kind.balloonDetector",
     uses_dft: false,
     measured_better: &[],
@@ -990,28 +1039,43 @@ pub fn open_session(
         }
     }
 
-    match build(model, selection.accelerator, intra_threads) {
+    if let Preference::Force(wanted) = preference {
+        if let Some(declined) = selection.declined {
+            if selection.accelerator != wanted {
+                return Err(SessionError::Build {
+                    model: profile.name,
+                    accelerator: wanted,
+                    detail: format!("requested backend is unavailable ({})", declined.reason_key),
+                });
+            }
+        }
+    }
+
+    match build(model, selection.accelerator, intra_threads, matches!(preference, Preference::Force(_))) {
         Ok(session) => Ok((session, selection)),
-        Err(detail) if selection.accelerator != Accelerator::Cpu => {
+        Err(detail) if selection.accelerator != Accelerator::Cpu && !matches!(preference, Preference::Force(_)) => {
             let wanted = selection.accelerator;
             selection = Selection {
                 accelerator: Accelerator::Cpu,
                 declined: Some(Declined::plain(wanted, "accel.declined.failed")),
                 note: None,
             };
-            let session = build(model, Accelerator::Cpu, intra_threads)
+            let session = build(model, Accelerator::Cpu, intra_threads, false)
                 .map_err(|detail| SessionError::Build { model: profile.name, accelerator: Accelerator::Cpu, detail })?;
             let _ = detail;
             Ok((session, selection))
         }
-        Err(detail) => Err(SessionError::Build { model: profile.name, accelerator: Accelerator::Cpu, detail }),
+        Err(detail) => Err(SessionError::Build { model: profile.name, accelerator: selection.accelerator, detail }),
     }
 }
 
-fn build(model: &Path, accelerator: Accelerator, intra_threads: Option<usize>) -> Result<Session, String> {
+fn build(model: &Path, accelerator: Accelerator, intra_threads: Option<usize>, strict: bool) -> Result<Session, String> {
     let mut builder = Session::builder().map_err(|e| e.to_string())?;
     if let Some(threads) = intra_threads {
         builder = builder.with_intra_threads(threads).map_err(|e| e.to_string())?;
+    }
+    if strict && accelerator != Accelerator::Cpu {
+        builder = builder.with_disable_cpu_fallback().map_err(|e| e.to_string())?;
     }
     match accelerator.dispatch() {
         None => {}
@@ -1039,6 +1103,32 @@ mod tests {
     const ALL: [Accelerator; 4] =
         [Accelerator::CoreMl, Accelerator::DirectMl, Accelerator::Cuda, Accelerator::WebGpu];
 
+    #[test]
+    #[ignore = "manual real graph and runtime placement check"]
+    fn forced_graph_backend_never_uses_cpu() {
+        let runtime = std::env::var("RT_RUNTIME").expect("RT_RUNTIME");
+        let graph = std::env::var("RT_GRAPH").expect("RT_GRAPH");
+        let profile = match std::env::var("RT_PROFILE").as_deref() {
+            Ok("ctd") => &DETECTOR,
+            Ok("rt-small") => &BALLOON,
+            Ok("rt-full") => &FULL_RT,
+            _ => panic!("RT_PROFILE must be ctd, rt-small or rt-full"),
+        };
+        let backend = match std::env::var("RT_BACKEND").as_deref() {
+            Ok("coreml") => Accelerator::CoreMl,
+            Ok("webgpu") => Accelerator::WebGpu,
+            _ => panic!("RT_BACKEND must be coreml or webgpu"),
+        };
+        crate::runtime::load(Path::new(&runtime)).unwrap();
+        match open_session(Path::new(&graph), profile, Preference::Force(backend), None) {
+            Ok((_, selected)) => {
+                assert_eq!(selected.accelerator, backend);
+                eprintln!("{} assigned fully to {backend:?}", profile.name);
+            }
+            Err(error) => eprintln!("{} rejected {backend:?} without CPU fallback: {error}", profile.name),
+        }
+    }
+
     /// The device list answers three ways, not two, and the third is the one
     /// that keeps this check from costing anybody a provider: a list with no
     /// CPU device in it is a list nobody produced - `ort` returns an empty
@@ -1059,10 +1149,9 @@ mod tests {
     }
 
     /// Only providers that publish `OrtEpDevice`s are asked about them. CoreML
-    /// is the case that proves it matters: it is in the macOS build and it is
-    /// the measured detector winner, and it is **not** in that runtime's device
-    /// list, so a device check applied to it would decline the fastest provider
-    /// on the only platform anybody has measured.
+    /// is the case that proves it matters: it is in the macOS build but absent
+    /// from that runtime's device list. WebGPU publishes GPU devices both as a
+    /// built-in provider and as a plugin.
     #[test]
     fn the_device_check_is_asked_only_of_providers_that_publish_devices() {
         assert!(Accelerator::DirectMl.publishes_devices());
@@ -1077,10 +1166,7 @@ mod tests {
         ] {
             assert!(!quiet.publishes_devices(), "{quiet:?}");
         }
-        // WebGPU's answer is a property of the process rather than of the
-        // provider: it publishes devices when it arrived as a registered
-        // plugin, and this build has registered none.
-        assert_eq!(Accelerator::WebGpu.publishes_devices(), Accelerator::WebGpu.is_plugin());
+        assert!(Accelerator::WebGpu.publishes_devices());
     }
 
     #[test]
@@ -1118,9 +1204,9 @@ mod tests {
 
     #[test]
     fn automatic_takes_the_first_measured_winner_that_exists() {
-        assert_eq!(choose(&DETECTOR, Preference::Automatic, &ALL).accelerator, Accelerator::CoreMl);
-        // Without CoreML it falls to the next measured winner, and without any
-        // of them to the CPU rather than to whichever GPU happens to be there.
+        assert_eq!(choose(&DETECTOR, Preference::Automatic, &ALL).accelerator, Accelerator::WebGpu);
+        // CoreML is measured fast only with hidden CPU partitions. Without
+        // WebGPU, Automatic takes the first unmeasured candidate or CPU.
         let windows = [Accelerator::DirectMl, Accelerator::Cuda, Accelerator::WebGpu];
         assert_eq!(choose(&DETECTOR, Preference::Automatic, &windows).accelerator, Accelerator::WebGpu);
         // DirectML is the detector's first unmeasured candidate, so it is taken
@@ -1311,12 +1397,26 @@ mod tests {
         for name in ["cudnn64_9.dll", "onnxruntime_providers_cuda.dll", "libcuda.so.1", "cudart64_12.lib"] {
             assert!(!is_cuda_runtime_library(name), "{name}");
         }
+        for name in ["cudnn64_9.dll", "libcudnn.so.9", "libcudnn.so.9.10.2"] {
+            assert!(is_cudnn_runtime_library(name), "{name}");
+        }
+        for name in ["cudnn64_8.dll", "libcudnn.so.8", "libcudnn.so", "libcudart.so.13"] {
+            assert!(!is_cudnn_runtime_library(name), "{name}");
+        }
 
         // A directory list with nothing in it, and one that does not exist, are
         // both "no CUDA here" rather than a panic.
         assert!(!cuda_runtime_in(&[]));
         assert!(!cuda_runtime_in(&[PathBuf::from("/definitely/not/here")]));
         assert!(!cuda_runtime_in(&[PathBuf::from(env!("CARGO_MANIFEST_DIR"))]));
+        let dir = std::env::temp_dir().join(format!("manga-cleaner-cuda-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("libcudart.so.13"), []).unwrap();
+        assert!(!cuda_runtime_in(&[dir.clone()]), "cudart alone is insufficient");
+        std::fs::write(dir.join("libcudnn.so.9"), []).unwrap();
+        assert!(cuda_runtime_in(&[dir.clone()]));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1465,10 +1565,9 @@ mod tests {
             let free = choose(&profile, Preference::Automatic, &ALL);
             assert_eq!(squeezed.accelerator, free.accelerator, "{}", profile.name);
         }
-        // The detector *is* CoreML's one automatic model and stays there;
-        // LaMa's and MI-GAN's CoreML rows are the ones `Automatic` never
-        // reaches, with or without a memory figure.
-        assert_eq!(choose_within(&DETECTOR, Preference::Automatic, &ALL, Some(0)).accelerator, Accelerator::CoreMl);
+        // Strict placement found CPU nodes in the CoreML detector graph, so
+        // Automatic uses WebGPU even under a low memory figure.
+        assert_eq!(choose_within(&DETECTOR, Preference::Automatic, &ALL, Some(0)).accelerator, Accelerator::WebGpu);
         assert_ne!(
             choose_within(&LAMA, Preference::Automatic, &ALL, Some(0)).accelerator,
             Accelerator::CoreMl,

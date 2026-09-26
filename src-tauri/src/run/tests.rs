@@ -15,6 +15,20 @@ use cleaner_core::image::{BitDepth, ColorMode, Format, encode, fixtures};
 use cleaner_core::project::StripMode;
 use cleaner_core::strip::{EdgePad, Strip};
 
+#[test]
+fn model_backend_overrides_inherit_and_reject_unknown_values() {
+    let settings = serde_json::json!({
+        "accelerator": "webgpu",
+        "modelAccelerators": {"ctd": "cpu", "rtFull": "cuda", "samTs": "auto"}
+    });
+    assert_eq!(model_preference_from(&settings, "ctd").unwrap(), Preference::CpuOnly);
+    assert_eq!(model_preference_from(&settings, "rtSmall").unwrap(), Preference::Force(accel::Accelerator::WebGpu));
+    assert_eq!(model_preference_from(&settings, "rtFull").unwrap(), Preference::Force(accel::Accelerator::Cuda));
+    assert_eq!(model_preference_from(&settings, "samTs").unwrap(), Preference::Automatic);
+    assert!(model_preference_from(&serde_json::json!({"modelAccelerators": {"ctd": "mlx"}}), "ctd").is_err());
+    assert!(model_preference_from(&serde_json::json!({"modelAccelerators": {"ctd": 4}}), "ctd").is_err());
+}
+
 /* ------------------------------------------------------------------ */
 /* Scaffolding                                                         */
 /* ------------------------------------------------------------------ */

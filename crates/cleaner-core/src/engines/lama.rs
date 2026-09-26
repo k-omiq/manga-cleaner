@@ -258,10 +258,11 @@ impl Inpainter {
     pub fn open(model: &Path, preference: Preference) -> Result<Inpainter, SessionError> {
         let (session, selection) =
             accel::open_session(model, &accel::LAMA, preference, Some(LAMA_INTRA_THREADS))?;
-        let lease = crate::registry::register(
+        let lease = crate::registry::register_named(
             crate::registry::Kind::Inpainter,
             crate::registry::Footprint::measured(RESIDENT_BYTES),
             crate::registry::Device::accelerator(selection.accelerator),
+            Some("LaMa Manga".into()),
         );
         Ok(Inpainter { session, selection, lease })
     }

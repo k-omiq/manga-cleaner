@@ -242,7 +242,7 @@ pub fn infer_cpu_cancellable(
     SamTsSession::open_cancellable(graph_dir, cancel)?.infer(page, cancel)
 }
 
-/// One CPU encoder/head pair for a run. The lease lives with both ORT sessions,
+/// One encoder/head pair for a run. The lease lives with both ORT sessions,
 /// so the loaded-models row disappears as soon as the owner drops this value.
 /// Pinned graph SHA-256 checks belong to the caller's installation boundary;
 /// a run should perform those once before opening this session.
@@ -251,6 +251,9 @@ pub struct SamTsSession {
     head: ort::session::Session,
     first_load: Option<Duration>,
     lease: crate::registry::Lease,
+    backend: crate::accel::Accelerator,
+    profiles: Option<ProfileCleanup>,
+    verified_nodes: Option<(u64, u64)>,
 }
 
 impl SamTsSession {
@@ -259,20 +262,34 @@ impl SamTsSession {
     }
 
     pub fn open_cancellable(graph_dir: &Path, cancel: &Cancellation) -> Result<Self, String> {
+        Self::open_on(graph_dir, crate::accel::Accelerator::Cpu, cancel)
+    }
+
+    pub fn open_on(graph_dir: &Path, backend: crate::accel::Accelerator, cancel: &Cancellation) -> Result<Self, String> {
         cancel.check()?;
         let started = Instant::now();
-        let encoder = ort::session::Session::builder()
-            .map_err(|e| e.to_string())?
-            .with_intra_threads(4)
-            .map_err(|e| e.to_string())?
-            .commit_from_file(graph_dir.join(ENCODER))
+        if !matches!(backend, crate::accel::Accelerator::Cpu | crate::accel::Accelerator::WebGpu) {
+            return Err(format!("SAM-TS-L does not support {backend:?}"));
+        }
+        if backend == crate::accel::Accelerator::WebGpu
+            && (!cfg!(target_os = "macos") || !built_in_webgpu_available()) {
+            return Err("SAM-TS-L WebGPU needs the built-in Apple WebGPU runtime and device".into());
+        }
+        let profiles = (backend == crate::accel::Accelerator::WebGpu)
+            .then(|| ProfileCleanup([profile_prefix("encoder"), profile_prefix("head")]));
+        let open = |path: &Path, index: usize| -> Result<ort::session::Session, String> {
+            if let Some(profiles) = profiles.as_ref() {
+                webgpu_session(path, &profiles.0[index])
+            } else {
+                ort::session::Session::builder().map_err(|e| e.to_string())?
+                    .with_intra_threads(4).map_err(|e| e.to_string())?
+                    .commit_from_file(path).map_err(|e| e.to_string())
+            }
+        };
+        let encoder = open(&graph_dir.join(ENCODER), 0)
             .map_err(|e| format!("SAM-TS encoder: {e}"))?;
         cancel.check()?;
-        let head = ort::session::Session::builder()
-            .map_err(|e| e.to_string())?
-            .with_intra_threads(4)
-            .map_err(|e| e.to_string())?
-            .commit_from_file(graph_dir.join(HEAD))
+        let head = open(&graph_dir.join(HEAD), 1)
             .map_err(|e| format!("SAM-TS text head: {e}"))?;
         cancel.check()?;
         let first_load = Some(started.elapsed());
@@ -282,7 +299,7 @@ impl SamTsSession {
                 &graph_dir.join(ENCODER),
                 &graph_dir.join(HEAD),
             ]),
-            crate::registry::Device::accelerator(crate::accel::Accelerator::Cpu),
+            crate::registry::Device::accelerator(backend),
             Some("SAM-TS-L".into()),
         );
         Ok(Self {
@@ -290,6 +307,9 @@ impl SamTsSession {
             head,
             first_load,
             lease,
+            backend,
+            profiles,
+            verified_nodes: None,
         })
     }
 
@@ -298,6 +318,8 @@ impl SamTsSession {
     pub fn spent(&self) -> bool {
         self.lease.spent()
     }
+
+    pub fn backend(&self) -> crate::accel::Accelerator { self.backend }
 
     pub fn infer(&mut self, page: &Raster, cancel: &Cancellation) -> Result<Inference, String> {
         cancel.check()?;
@@ -353,6 +375,19 @@ impl SamTsSession {
         let mask = restore(logits, &prepared)?;
         cancel.check()?;
         let restore_time = started.elapsed();
+        drop(output);
+        if self.backend == crate::accel::Accelerator::WebGpu && self.verified_nodes.is_none() {
+            let verified = (|| {
+                let encoder = verified_webgpu_nodes(&mut self.encoder, "encoder")?;
+                let head = verified_webgpu_nodes(&mut self.head, "head")?;
+                Ok::<_, String>((encoder, head))
+            })();
+            self.profiles = None;
+            match verified {
+                Ok(nodes) => self.verified_nodes = Some(nodes),
+                Err(error) => { self.lease.poison(); return Err(error); }
+            }
+        }
         Ok(Inference {
             mask,
             load: self.first_load.take().unwrap_or_default(),
@@ -360,8 +395,8 @@ impl SamTsSession {
             encoder: encoder_time,
             head: head_time,
             restore: restore_time,
-            webgpu_nodes: None,
-            cpu_fallback_nodes: None,
+            webgpu_nodes: self.verified_nodes,
+            cpu_fallback_nodes: self.verified_nodes.map(|_| (0, 0)),
             process_high_water_bytes: process_high_water_bytes(),
             process_phys_footprint_bytes: process_phys_footprint_bytes(),
             sampled_metal_high_water_bytes: None,
@@ -951,6 +986,25 @@ mod tests {
             "native SAM CPU load {:?}, encoder {:?}, head {:?}",
             inferred.load, inferred.encoder, inferred.head
         );
+    }
+
+    #[test]
+    #[ignore = "requires the app macOS ONNX runtime and local SAM graphs"]
+    fn native_webgpu_session_reuses_verified_assignment() {
+        let runtime = std::env::var("SAM_TS_RUNTIME").expect("SAM_TS_RUNTIME");
+        crate::runtime::load(Path::new(&runtime)).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spikes/sam-ts-l");
+        let page = crate::image::decode(&std::fs::read(root.join("fixtures/synthetic_page.png")).unwrap()).unwrap();
+        let mut session = SamTsSession::open_on(
+            &root.join("artifacts/proof"), crate::accel::Accelerator::WebGpu, &Cancellation::default()
+        ).unwrap();
+        let first = session.infer(&page, &Cancellation::default()).unwrap();
+        let second = session.infer(&page, &Cancellation::default()).unwrap();
+        assert_eq!(first.mask, second.mask);
+        assert_eq!(first.webgpu_nodes, second.webgpu_nodes);
+        assert!(first.webgpu_nodes.is_some_and(|(encoder, head)| encoder > 0 && head > 0));
+        assert_eq!(first.cpu_fallback_nodes, Some((0, 0)));
+        assert_eq!(second.load, Duration::default());
     }
 
     #[test]

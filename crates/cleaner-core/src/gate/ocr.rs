@@ -127,10 +127,11 @@ impl Ocr {
         if vocab.is_empty() {
             return Err(OcrError::Model("the vocabulary is empty".into()));
         }
-        let lease = crate::registry::register(
+        let lease = crate::registry::register_named(
             crate::registry::Kind::Ocr,
             crate::registry::Footprint::weights_of(&[encoder, decoder]),
             crate::registry::Device::accelerator(selection.accelerator),
+            Some("Manga OCR Base".into()),
         );
         Ok(Ocr {
             encoder: encoder_session,

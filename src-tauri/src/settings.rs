@@ -150,6 +150,7 @@ fn write_patch(path: &std::path::Path, mut patch: Value) -> Result<Value, String
         // into it; start again rather than lose the patch.
         _ => Map::new(),
     };
+    let prior_backend = (current.get("accelerator").cloned(), current.get("modelAccelerators").cloned());
     if let Value::Object(patch) = patch {
         for (key, value) in patch {
             current.insert(key, value);
@@ -192,6 +193,14 @@ fn write_patch(path: &std::path::Path, mut patch: Value) -> Result<Value, String
 
     let merged = Value::Object(current);
     write_file(path, &merged)?;
+    if let Value::Object(map) = &merged {
+        if prior_backend != (map.get("accelerator").cloned(), map.get("modelAccelerators").cloned()) {
+            use cleaner_core::registry::Kind;
+            for kind in [Kind::TextDetector, Kind::BalloonDetector, Kind::ScriptGate, Kind::Ocr, Kind::Inpainter] {
+                cleaner_core::residency::evict(kind);
+            }
+        }
+    }
     match refusal {
         Some(err) => Err(format!("the credential store kept the token: {err}")),
         None => Ok(merged),

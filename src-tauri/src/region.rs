@@ -622,13 +622,19 @@ impl Bench {
         let models = run::model_dir(app_data.as_deref()).unwrap_or_default();
         // The same accelerator setting a run reads, so a region edit and the
         // run that produced it land on the same provider.
-        let preference = settings
+        let default_preference = settings
             .as_ref()
             .map(run::preference_from)
             .unwrap_or(Preference::Automatic);
+        let detector_preference = settings.as_ref()
+            .and_then(|settings| run::model_preference_from(settings, "ctd").ok())
+            .unwrap_or(default_preference);
+        let inpainter_preference = settings.as_ref()
+            .and_then(|settings| run::model_preference_from(settings, "inpainter").ok())
+            .unwrap_or(default_preference);
         Bench {
-            rung2: run::Rung2::new(&models, preference),
-            detector: run::detector_on_demand(&models, preference),
+            rung2: run::Rung2::new(&models, inpainter_preference),
+            detector: run::detector_on_demand(&models, detector_preference),
             flux: None,
             flux_key: None,
             app_data,

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::library::Library;
 use base64::Engine;
-use cleaner_core::accel::Preference;
+use cleaner_core::accel::{Accelerator, Preference};
 use cleaner_core::balloon::{BalloonBox, BalloonClass, BalloonDetector};
 use cleaner_core::detect::Detector;
 use cleaner_core::fusion::ReviewEvidence;
@@ -266,7 +266,7 @@ fn status_digest_cache() -> &'static Mutex<StatusDigestCache> {
     CACHE.get_or_init(|| Mutex::new(StatusDigestCache::default()))
 }
 
-fn qualified_webgpu_write_environment(app_data: &Path) -> bool {
+pub(crate) fn qualified_webgpu_write_environment(app_data: &Path) -> bool {
     cfg!(target_os = "macos")
         && sam_ts::measured_m5_host()
         && cleaner_core::runtime::find(Some(app_data))
@@ -497,10 +497,12 @@ fn sam_backends(
 }
 
 fn rt_backends(runtime_installed: bool) -> Vec<Backend> {
+    let directml = runtime_installed && cleaner_core::accel::Accelerator::DirectMl.is_available();
+    let cuda = runtime_installed && cleaner_core::accel::Accelerator::Cuda.is_available();
     let mut rows = vec![Backend {
         id: "ort-cpu",
         platform: "all",
-        qualified: cfg!(target_os = "macos"),
+        qualified: cfg!(target_os = "macos") && sam_ts::measured_m5_host(),
         available: runtime_installed,
         selectable: runtime_installed,
         note: "Native full FP32 tiled and small INT8 CPU paths. Saved parity evidence is from macOS.",
@@ -508,7 +510,7 @@ fn rt_backends(runtime_installed: bool) -> Vec<Backend> {
     if cfg!(target_os = "macos") {
         rows.extend([
             Backend { id: "ort-webgpu", platform: "macOS", qualified: false, available: false, selectable: false,
-                note: "Existing detector timing was measured, but this review command has not qualified graph assignment." },
+                note: "Both RT-DETR graphs retain CPU nodes and fail strict WebGPU placement." },
             Backend { id: "ort-coreml", platform: "macOS", qualified: false, available: false, selectable: false,
                 note: "The small INT8 graph failed CoreML session creation; the full graph is unqualified in the desktop path." },
         ]);
@@ -518,17 +520,17 @@ fn rt_backends(runtime_installed: bool) -> Vec<Backend> {
                 id: "ort-directml",
                 platform: "Windows",
                 qualified: false,
-                available: false,
-                selectable: false,
-                note: "Requires matching-hardware provider and graph validation.",
+                available: directml,
+                selectable: directml,
+                note: "Strict DirectML session build; model assignment is not yet verified on Windows hardware.",
             },
             Backend {
                 id: "ort-cuda",
                 platform: "Windows",
                 qualified: false,
-                available: false,
-                selectable: false,
-                note: "Requires matching NVIDIA hardware validation.",
+                available: cuda,
+                selectable: cuda,
+                note: "Strict CUDA session build; model assignment is not yet verified on Windows hardware.",
             },
         ]);
     } else if cfg!(target_os = "linux") {
@@ -537,9 +539,9 @@ fn rt_backends(runtime_installed: bool) -> Vec<Backend> {
                 id: "ort-cuda",
                 platform: "Linux",
                 qualified: false,
-                available: false,
-                selectable: false,
-                note: "Requires matching NVIDIA hardware validation.",
+                available: cuda,
+                selectable: cuda,
+                note: "Strict CUDA session build; model assignment is not yet verified on Linux hardware.",
             },
             Backend {
                 id: "ort-webgpu",
@@ -547,7 +549,7 @@ fn rt_backends(runtime_installed: bool) -> Vec<Backend> {
                 qualified: false,
                 available: false,
                 selectable: false,
-                note: "Requires matching-hardware provider and graph validation.",
+                note: "RT-DETR graphs retained CPU nodes under strict WebGPU placement on macOS; Linux is unverified.",
             },
         ]);
     }
@@ -576,8 +578,9 @@ fn workflow_capabilities_with_room(app_data: &Path, room: Option<u64>) -> Workfl
     });
     let runtime = cleaner_core::runtime::find(Some(app_data)).ok();
     let runtime_installed = runtime.is_some();
+    let runtime_ready = runtime.as_ref().is_some_and(|path| cleaner_core::runtime::load(path).is_ok());
     let webgpu_ready = cfg!(target_os = "macos")
-        && runtime.as_ref().is_some_and(|path| cleaner_core::runtime::load(path).is_ok())
+        && runtime_ready
         && sam_ts::built_in_webgpu_available();
     // Parked CTD, LaMa and sidecar sessions count as room: analysis evicts
     // them before SAM and checks the room again, refusing by name if it is
@@ -627,9 +630,9 @@ fn workflow_capabilities_with_room(app_data: &Path, room: Option<u64>) -> Workfl
             })
             .collect(),
         coo_status: "Rights unresolved. No bundled model, download, or desktop execution.",
-        rt_backends: rt_backends(runtime_installed),
+        rt_backends: rt_backends(runtime_ready),
         sam_backends: sam_backends(
-            runtime_installed,
+            runtime_ready,
             sam_memory_ready,
             webgpu_ready,
             webgpu_qualified,
@@ -1739,6 +1742,29 @@ pub(crate) fn store_remote_analysis(
     })
 }
 
+fn review_preference(id: &str) -> Result<Preference, String> {
+    match id {
+        "auto" => Ok(Preference::Automatic),
+        "ort-cpu" => Ok(Preference::CpuOnly),
+        "ort-coreml" => Ok(Preference::Force(Accelerator::CoreMl)),
+        "ort-directml" => Ok(Preference::Force(Accelerator::DirectMl)),
+        "ort-cuda" => Ok(Preference::Force(Accelerator::Cuda)),
+        "ort-webgpu" => Ok(Preference::Force(Accelerator::WebGpu)),
+        _ => Err(format!("Unsupported local review backend {id}")),
+    }
+}
+
+fn review_backend_id(accelerator: Accelerator) -> &'static str {
+    match accelerator {
+        Accelerator::Cpu => "ort-cpu",
+        Accelerator::CoreMl => "ort-coreml",
+        Accelerator::DirectMl => "ort-directml",
+        Accelerator::Cuda => "ort-cuda",
+        Accelerator::WebGpu => "ort-webgpu",
+        _ => "ort-unsupported",
+    }
+}
+
 #[tauri::command]
 pub async fn analyze_capabilities(
     app: tauri::AppHandle,
@@ -1750,16 +1776,37 @@ pub async fn analyze_capabilities(
     request_id: String,
 ) -> Result<Analysis, String> {
     let mode = Workflow::parse(&workflow)?;
-    if mode.rt() && rt_backend != "ort-cpu" {
-        return Err(format!(
-            "RT backend {rt_backend} is not qualified for this analysis path"
-        ));
+    let settings = crate::settings::read(&app).unwrap_or(serde_json::Value::Null);
+    let rt_id = if rt_profile == "full-halves" { "rtFull" } else { "rtSmall" };
+    let mut rt_preference = review_preference(&rt_backend)?;
+    if rt_preference == Preference::Automatic {
+        rt_preference = crate::run::model_preference_from(&settings, rt_id)?;
     }
-    if mode.sam() && !matches!(sam_backend.as_str(), "ort-cpu" | "ort-webgpu") {
-        return Err(format!(
-            "SAM backend {sam_backend} is unavailable for this analysis path"
-        ));
+    let mut sam_preference = review_preference(&sam_backend)?;
+    if sam_preference == Preference::Automatic {
+        sam_preference = crate::run::model_preference_from(&settings, "samTs")?;
     }
+    let ctd_preference = crate::run::model_preference_from(&settings, "ctd")?;
+    let host = cleaner_core::runtime::package::Platform::host();
+    for (id, enabled, preference) in [
+        (rt_id, mode.rt(), rt_preference),
+        ("samTs", mode.sam(), sam_preference),
+        ("ctd", mode.ctd(), ctd_preference),
+    ] {
+        if enabled {
+            if let Preference::Force(accelerator) = preference {
+                if !crate::models::supports_model(id, accelerator, host) {
+                    return Err(format!("{id} does not support {accelerator:?} on this platform"));
+                }
+            }
+        }
+    }
+    let sam_backend = match sam_preference {
+        Preference::Force(Accelerator::WebGpu) => "ort-webgpu".to_owned(),
+        Preference::Automatic | Preference::CpuOnly | Preference::Force(Accelerator::Cpu) => "ort-cpu".to_owned(),
+        _ if mode.sam() => return Err("SAM-TS-L supports CPU or Apple WebGPU in local review".into()),
+        _ => "ort-cpu".to_owned(),
+    };
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let (active_guard, cancel) = begin_analysis(request_id)?;
     tauri::async_runtime::spawn_blocking(move || {
@@ -1783,6 +1830,7 @@ pub async fn analyze_capabilities(
         let runtime = cleaner_core::runtime::find(Some(&app_data)).map_err(|e| e.to_string())?;
         cleaner_core::runtime::load(&runtime).map_err(|e| e.to_string())?;
         let mut timings = Timings::default();
+        let mut effective_rt_backend = "ort-cpu";
         let mut sam_webgpu_nodes = None;
         let mut sam_cpu_fallback_nodes = None;
         let mut sam_process_high_water_bytes = None;
@@ -1793,7 +1841,8 @@ pub async fn analyze_capabilities(
                 "full-halves" => {
                     let path = full_rt_path(&app_data)
                         .ok_or("Full RT-DETR graph is not installed or failed SHA-256")?;
-                    let (mut model, load) = FullRegions::open_cpu(&path)?;
+                    let (mut model, load) = FullRegions::open(&path, rt_preference)?;
+                    effective_rt_backend = review_backend_id(model.selection().accelerator);
                     timings.rt_load = load.as_millis();
                     let started = Instant::now();
                     cancel.check()?;
@@ -1805,8 +1854,9 @@ pub async fn analyze_capabilities(
                     let path = rt_path(&app_data)
                         .ok_or("Small RT-DETR graph is not installed or failed SHA-256")?;
                     let started = Instant::now();
-                    let mut model = BalloonDetector::open(&path, Preference::CpuOnly)
+                    let mut model = BalloonDetector::open(&path, rt_preference)
                         .map_err(|e| e.to_string())?;
+                    effective_rt_backend = review_backend_id(model.selection().accelerator);
                     timings.rt_load = started.elapsed().as_millis();
                     let started = Instant::now();
                     cancel.check()?;
@@ -1827,7 +1877,7 @@ pub async fn analyze_capabilities(
                 .map(|dir| dir.join(crate::run::DETECTOR))
                 .find(|path| path.is_file())
                 .ok_or("Comic Text Detector graph is not installed")?;
-            let mut model = Detector::open(&path, Preference::CpuOnly).map_err(|e| e.to_string())?;
+            let mut model = Detector::open(&path, ctd_preference).map_err(|e| e.to_string())?;
             cancel.check()?;
             let detection = model.detect(&page).map_err(|e| e.to_string())?;
             cancel.check()?;
@@ -1843,7 +1893,7 @@ pub async fn analyze_capabilities(
             cancel.check()?;
             if cleaner_core::memory::room().is_none_or(|bytes| bytes < SAM_MIN_ROOM_BYTES) {
                 return Err(
-                    "SAM-TS CPU analysis needs at least 10 GB of measured process memory room"
+                    "SAM-TS-L analysis needs at least 10 GB of measured process memory room"
                         .into(),
                 );
             }
@@ -1926,7 +1976,7 @@ pub async fn analyze_capabilities(
             cancel.check()?;
             cancel.finish();
         }
-        let rt_backend = mode.rt().then_some("ort-cpu");
+        let rt_backend = mode.rt().then_some(effective_rt_backend);
         let sam_backend = mode.sam().then_some(if sam_backend == "ort-webgpu" {
             "ort-webgpu"
         } else {
@@ -2018,6 +2068,16 @@ pub async fn analyze_chapter_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_review_backend_ids_map_to_strict_preferences() {
+        assert_eq!(review_preference("auto").unwrap(), Preference::Automatic);
+        assert_eq!(review_preference("ort-cpu").unwrap(), Preference::CpuOnly);
+        assert_eq!(review_preference("ort-webgpu").unwrap(), Preference::Force(Accelerator::WebGpu));
+        assert_eq!(review_preference("ort-directml").unwrap(), Preference::Force(Accelerator::DirectMl));
+        assert!(review_preference("mlx").is_err());
+        assert_eq!(review_backend_id(Accelerator::Cuda), "ort-cuda");
+    }
 
     #[test]
     fn status_digest_cache_rehashes_changed_mtime_and_size() {

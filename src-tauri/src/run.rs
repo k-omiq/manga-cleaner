@@ -261,6 +261,22 @@ pub fn preference_from(settings: &serde_json::Value) -> Preference {
     accelerator_preference(name)
 }
 
+/// Per-model choices inherit the global setting until explicitly overridden.
+/// Invalid saved overrides fail the run rather than quietly changing devices.
+pub fn model_preference_from(settings: &serde_json::Value, id: &str) -> Result<Preference, String> {
+    let Some(value) = settings.get("modelAccelerators").and_then(|v| v.get(id)) else {
+        return Ok(preference_from(settings));
+    };
+    let name = value.as_str().ok_or_else(|| format!("{id} backend must be a string"))?;
+    let normalized = name.strip_prefix("accel.").unwrap_or(name);
+    if matches!(normalized, "auto" | "automatic" | "cpu")
+        || cleaner_core::accel::KNOWN.iter().any(|a| a.label_key() == format!("accel.{normalized}")) {
+        Ok(accelerator_preference(normalized))
+    } else {
+        Err(format!("Unsupported backend {name} for {id}"))
+    }
+}
+
 /// The same, from the bare name. Split out so the mapping is testable without a
 /// settings document.
 pub fn accelerator_preference(name: &str) -> Preference {
@@ -273,6 +289,13 @@ pub fn accelerator_preference(name: &str) -> Preference {
             .find(|accelerator| accelerator.label_key() == format!("accel.{other}"))
             .map(Preference::Force)
             .unwrap_or(Preference::Automatic),
+    }
+}
+
+fn requested_accel_key(preference: Preference) -> &'static str {
+    match preference {
+        Preference::Force(accelerator) => accelerator.label_key(),
+        Preference::Automatic | Preference::CpuOnly => accel::Accelerator::Cpu.label_key(),
     }
 }
 
@@ -1105,6 +1128,8 @@ pub struct Pipeline {
     app_data: Option<PathBuf>,
     full_rt: Option<FullRegions>,
     sam: Option<sam_ts::SamTsSession>,
+    full_rt_preference: Preference,
+    sam_preference: Preference,
     engine_version: &'static str,
     rung2: Rung2,
     /// The pressure ladder, latched for the life of the pipeline. See
@@ -1334,20 +1359,24 @@ impl Rung2 {
     /// `None` is "this run has no rung 2", not "this region cannot use it". The
     /// two are told apart at the call site because they carry different reasons
     /// into review.
-    fn held(&mut self) -> Option<&mut Held<lama::Inpainter>> {
+    fn held(&mut self) -> Result<Option<&mut Held<lama::Inpainter>>, String> {
         if matches!(self.state, Session::Unopened) {
             // The parked session first: 2.1 s and 510 MB that a second run, or
             // a hand edit after one, does not have to pay again.
             let resident = residency::checkout::<Held<lama::Inpainter>>(&self.key);
-            self.state = match resident.or_else(|| open_inpainter(&self.models, self.preference)) {
+            let opened = match resident {
+                Some(held) => Some(held),
+                None => open_inpainter(&self.models, self.preference)?,
+            };
+            self.state = match opened {
                 Some(held) => Session::Held(Box::new(held)),
                 None => Session::Unavailable,
             };
         }
-        match &mut self.state {
+        Ok(match &mut self.state {
             Session::Held(held) => Some(held),
             _ => None,
-        }
+        })
     }
 
     /// Give the session back, under the
@@ -1574,6 +1603,8 @@ impl Pipeline {
             app_data,
             full_rt: None,
             sam: None,
+            full_rt_preference: preference,
+            sam_preference: preference,
             engine_version: env!("CARGO_PKG_VERSION"),
             rung2: Rung2::new(models, preference),
             ladder: memory::Ladder::new(),
@@ -1596,6 +1627,34 @@ impl Pipeline {
     pub fn with_picks(mut self, picks: Picks) -> Pipeline {
         self.picks = Some(picks);
         self
+    }
+
+    fn with_model_preferences(mut self, settings: &serde_json::Value) -> Result<Pipeline, String> {
+        self.detector.preference = model_preference_from(settings, "ctd")?;
+        self.detector.key = session_key(registry::Kind::TextDetector, &self.detector.models, self.detector.preference);
+        self.balloons.preference = model_preference_from(settings, "rtSmall")?;
+        self.balloons.key = session_key(registry::Kind::BalloonDetector, &self.balloons.models, self.balloons.preference);
+        self.full_rt_preference = model_preference_from(settings, "rtFull")?;
+        self.sam_preference = model_preference_from(settings, "samTs")?;
+        self.rung2.preference = model_preference_from(settings, "inpainter")?;
+        self.rung2.key = session_key(registry::Kind::Inpainter, &self.rung2.models, self.rung2.preference);
+        let host = cleaner_core::runtime::package::Platform::host();
+        for (id, enabled, preference) in [
+            ("ctd", self.detection_models.ctd, self.detector.preference),
+            ("rtSmall", self.detection_models.rt_small, self.balloons.preference),
+            ("rtFull", self.detection_models.rt_full, self.full_rt_preference),
+            ("samTs", self.detection_models.sam, self.sam_preference),
+            ("inpainter", true, self.rung2.preference),
+        ] {
+            if enabled {
+                if let Preference::Force(accelerator) = preference {
+                    if !crate::models::supports_model(id, accelerator, host) {
+                        return Err(format!("{id} does not support {:?} on this platform", accelerator));
+                    }
+                }
+            }
+        }
+        Ok(self)
     }
 
     /// The chosen solid color for either speech bubble or outside text regions.
@@ -1646,7 +1705,12 @@ impl Pipeline {
         #[cfg(not(test))]
         let _ = segment;
         let mut balloons = if self.detection_models.rt_small {
-            let session = self.balloons.get()?;
+            let requested_key = requested_accel_key(self.balloons.preference);
+            let session = self.balloons.get().map_err(|detail| {
+                self.fault = Some(EngineFault { model_key: accel::BALLOON.label_key,
+                    accel_key: requested_key, detail: detail.clone() });
+                detail
+            })?;
             let boxes = session.detect(crop);
             ran(boxes, &*session, &accel::BALLOON, &mut self.fault)?
         } else if self.detection_models.rt_full {
@@ -1654,12 +1718,23 @@ impl Pipeline {
                 let app_data = self.app_data.as_deref().ok_or("App model directory unavailable")?;
                 let path = crate::model_workflows::full_rt_path(app_data)
                     .ok_or("Full RT-DETR graph is not installed or failed SHA-256")?;
-                self.full_rt = Some(FullRegions::open_cpu(&path)?.0);
+                let model = FullRegions::open(&path, self.full_rt_preference).map_err(|detail| {
+                    self.fault = Some(EngineFault { model_key: accel::FULL_RT.label_key,
+                        accel_key: requested_accel_key(self.full_rt_preference), detail: detail.clone() });
+                    detail
+                })?.0;
+                report_provider("RT-DETR v2 (full FP32)", model.selection());
+                self.full_rt = Some(model);
             }
             self.full_rt.as_mut().unwrap().detect_halves(crop)?
         } else { Vec::new() };
         let mut detection = if self.detection_models.ctd {
-            let session = self.detector.get()?;
+            let requested_key = requested_accel_key(self.detector.preference);
+            let session = self.detector.get().map_err(|detail| {
+                self.fault = Some(EngineFault { model_key: accel::DETECTOR.label_key,
+                    accel_key: requested_key, detail: detail.clone() });
+                detail
+            })?;
             let output = session.detect(crop);
             ran(output, &*session, &accel::DETECTOR, &mut self.fault)?
         } else {
@@ -1671,11 +1746,20 @@ impl Pipeline {
             }
         };
         if self.detection_models.sam {
+            let backend = match self.sam_preference {
+                Preference::Force(accel::Accelerator::WebGpu) => accel::Accelerator::WebGpu,
+                Preference::Automatic | Preference::CpuOnly | Preference::Force(accel::Accelerator::Cpu) => accel::Accelerator::Cpu,
+                _ => return Err(format!("SAM-TS-L does not support the requested backend {:?}", self.sam_preference)),
+            };
             if self.sam.is_none() {
                 let app_data = self.app_data.as_deref().ok_or("App model directory unavailable")?;
                 let dir = crate::model_workflows::graph_dir(app_data).ok_or("SAM-TS-L graphs are not installed")?;
                 cleaner_core::residency::evict_for_sam();
-                self.sam = Some(sam_ts::SamTsSession::open(&dir)?);
+                self.sam = Some(sam_ts::SamTsSession::open_on(&dir, backend, &sam_ts::Cancellation::default()).map_err(|detail| {
+                    self.fault = Some(EngineFault { model_key: accel::DETECTOR.label_key,
+                        accel_key: backend.label_key(), detail: detail.clone() });
+                    detail
+                })?);
             }
             let mask = self.sam.as_mut().unwrap().infer(crop, &sam_ts::Cancellation::default())?.mask;
             let evidence = cleaner_core::fusion::fuse(crop.width, crop.height, Some(&mask), &[], &[])?;
@@ -1745,15 +1829,44 @@ pub(crate) fn detector_on_demand(models: &Path, preference: Preference) -> OnDem
 }
 
 fn open_detector(models: &Path, preference: Preference) -> Result<Detector, String> {
-    Detector::open(&models.join(DETECTOR), preference).map_err(|e| e.to_string())
+    let model = Detector::open(&models.join(DETECTOR), preference).map_err(|e| e.to_string())?;
+    report_provider("Comic Text Detector", model.selection());
+    Ok(model)
 }
 
 fn open_balloons(
     models: &Path,
     preference: Preference,
 ) -> Result<cleaner_core::balloon::BalloonDetector, String> {
-    cleaner_core::balloon::BalloonDetector::open(&models.join(BALLOONS), preference)
-        .map_err(|e| e.to_string())
+    let model = cleaner_core::balloon::BalloonDetector::open(&models.join(BALLOONS), preference)
+        .map_err(|e| e.to_string())?;
+    report_provider("RT-DETR v2 (small INT8)", model.selection());
+    Ok(model)
+}
+
+fn report_provider(model: &str, selection: &accel::Selection) {
+    if let Some(declined) = selection.declined {
+        if declined.wanted != selection.accelerator {
+            let name = |accelerator: accel::Accelerator| match accelerator {
+                accel::Accelerator::Cpu => "CPU",
+                accel::Accelerator::CoreMl => "CoreML",
+                accel::Accelerator::DirectMl => "DirectML",
+                accel::Accelerator::Cuda => "CUDA",
+                accel::Accelerator::TensorRt => "TensorRT",
+                accel::Accelerator::Rocm => "ROCm",
+                accel::Accelerator::OpenVino => "OpenVINO",
+                accel::Accelerator::WebGpu => "WebGPU",
+                accel::Accelerator::Xnnpack => "XNNPACK",
+            };
+            events::notice("notice.run.accelFallback", serde_json::json!({
+                "model": model,
+                "requested": name(declined.wanted),
+                "effective": name(selection.accelerator),
+                "reason": "the requested backend could not build this model's session",
+                "reasonKey": declined.reason_key,
+            }), "warn");
+        }
+    }
 }
 
 /// The bare gate used when the optional rescue was not selected.
@@ -1829,14 +1942,21 @@ fn open_gate_with_ocr(models: &Path, preference: Preference) -> Result<ScriptGat
 /// this function and gives up if it cannot, so nothing in the application can
 /// arrive here in that state; a test asserting what a machine with no weights
 /// does can, and the answer it is asserting is the `None` below.
-fn open_inpainter(models: &Path, preference: Preference) -> Option<Held<lama::Inpainter>> {
+fn open_inpainter(models: &Path, preference: Preference) -> Result<Option<Held<lama::Inpainter>>, String> {
     let model = models.join(INPAINTER);
     // Read and digested in one expression so the 207 MB is dropped at the end
     // of it, which is the property the paragraph above is about.
-    let model_sha256 = Some(std::fs::read(&model).ok().map(|bytes| sha256_hex(&bytes))?);
-    let inpainter = lama::Inpainter::open(&model, preference).ok()?;
+    let Some(model_sha256) = std::fs::read(&model).ok().map(|bytes| sha256_hex(&bytes)) else {
+        return Ok(None);
+    };
+    let inpainter = match lama::Inpainter::open(&model, preference) {
+        Ok(inpainter) => inpainter,
+        Err(error) if matches!(preference, Preference::Force(_)) => return Err(error.to_string()),
+        Err(_) => return Ok(None),
+    };
+    report_provider("LaMa Manga", inpainter.selection());
     let provider = format!("{:?}", inpainter.selection().accelerator).to_lowercase();
-    Some(Held { inpainter, provider, model_sha256 })
+    Ok(Some(Held { inpainter, provider, model_sha256: Some(model_sha256) }))
 }
 
 impl Cleaner for Pipeline {
@@ -1897,7 +2017,7 @@ impl Cleaner for Pipeline {
         // here rather than at the first segment because this is where the name
         // is needed, and the first segment wants it anyway.
         #[cfg(test)]
-        let provider = if self.test_vision.is_some() {
+        let mut provider = if self.test_vision.is_some() {
             "test".to_owned()
         } else if !self.detection_models.ctd {
             "ort-cpu".to_owned()
@@ -1905,7 +2025,7 @@ impl Cleaner for Pipeline {
             format!("{:?}", self.detector.get()?.selection().accelerator).to_lowercase()
         };
         #[cfg(not(test))]
-        let provider = if self.detection_models.ctd {
+        let mut provider = if self.detection_models.ctd {
             format!("{:?}", self.detector.get()?.selection().accelerator).to_lowercase()
         } else { "ort-cpu".to_owned() };
         // Rule 4's engine-context term is a property of the rung that could
@@ -1958,6 +2078,24 @@ impl Cleaner for Pipeline {
             let (crop_x, crop_y) = bounded.origin;
 
             let (balloons, mut detection) = self.detect_segment(crop, segment.index)?;
+            if !self.detection_models.ctd {
+                #[cfg(test)]
+                let real_models = self.test_vision.is_none();
+                #[cfg(not(test))]
+                let real_models = true;
+                if real_models {
+                    let effective = if self.detection_models.sam {
+                        self.sam.as_ref().map(|model| model.backend())
+                    } else if self.detection_models.rt_full {
+                        self.full_rt.as_ref().map(|model| model.selection().accelerator)
+                    } else if self.detection_models.rt_small {
+                        self.balloons.held.as_ref().map(|model| model.selection().accelerator)
+                    } else { None };
+                    if let Some(effective) = effective {
+                        provider = format!("{:?}", effective).to_lowercase();
+                    }
+                }
+            }
             let mut regions = build_regions_separated(detection.boxes.clone(), crop.width, crop.height, |a, b| {
                 cleaner_core::balloon::merge_crosses_a_balloon(crop, &detection.segmentation, a, b)
             });
@@ -2457,7 +2595,7 @@ pub(crate) fn render_rung_with_color(
             Ok(plain(mask, pixels))
         }
         Engine::Lama => {
-            let Some(held) = rung2.held() else {
+            let Some(held) = rung2.held()? else {
                 return Ok(Rendered::Refused("decline.reason.rungUnavailable"));
             };
             // Bound rather than matched on directly, because the arms below
@@ -3618,7 +3756,7 @@ fn start_with_models(
     // notice or out of it by the shape of its wording.
     let pipeline = match Pipeline::open_selected(&models, preference_from(&settings),
         detection_models, all_text, app_data.clone()) {
-        Ok(pipeline) => pipeline
+        Ok(pipeline) => pipeline.with_model_preferences(&settings)?
             .with_picks(picks)
             .with_outside(if all_text { OutsideText::Clean } else { outside })
             .with_selection(selection)

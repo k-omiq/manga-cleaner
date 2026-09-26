@@ -153,10 +153,11 @@ impl BalloonDetector {
         let (session, selection) =
             crate::accel::open_session(model, &crate::accel::BALLOON, preference, None)
                 .map_err(|e| BalloonError::Model(e.to_string()))?;
-        let lease = crate::registry::register(
+        let lease = crate::registry::register_named(
             crate::registry::Kind::BalloonDetector,
             crate::registry::Footprint::weights(model),
             crate::registry::Device::accelerator(selection.accelerator),
+            Some("RT-DETR v2 (small INT8)".into()),
         );
         Ok(BalloonDetector { session, selection, lease })
     }
@@ -1408,6 +1409,18 @@ pub fn merge_crosses_a_balloon(page: &Raster, seg: &Segmentation, a: Rect, b: Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "manual local ONNX runtime and small RT-DETR graph required"]
+    fn native_cpu_small_graph_runs_synthetic_page() {
+        let runtime = std::env::var("RT_RUNTIME").expect("RT_RUNTIME");
+        let graph = std::env::var("RT_GRAPH").expect("RT_GRAPH");
+        crate::runtime::load(Path::new(&runtime)).unwrap();
+        let mut model = BalloonDetector::open(Path::new(&graph), crate::accel::Preference::CpuOnly).unwrap();
+        assert_eq!(model.selection().accelerator, crate::accel::Accelerator::Cpu);
+        let page = crate::image::fixtures::by_name("l8").raster;
+        let _boxes = model.detect(&page).unwrap();
+    }
 
     fn balloon(x: i64, y: i64, w: u32, h: u32, class: BalloonClass) -> BalloonBox {
         BalloonBox { rect: Rect::new(x, y, w, h), class, score: 0.9 }

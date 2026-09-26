@@ -151,10 +151,11 @@ impl Detector {
         let (session, selection) =
             crate::accel::open_session(model, &crate::accel::DETECTOR, preference, None)
                 .map_err(|e| DetectError::Model(e.to_string()))?;
-        let lease = crate::registry::register(
+        let lease = crate::registry::register_named(
             crate::registry::Kind::TextDetector,
             crate::registry::Footprint::weights(model),
             crate::registry::Device::accelerator(selection.accelerator),
+            Some("Comic Text Detector".into()),
         );
         Ok(Detector { session, selection, lease })
     }
@@ -350,6 +351,19 @@ pub fn forget() {
 mod tests {
     use super::*;
 
+    #[test]
+    #[ignore = "manual real CTD graph and ONNX runtime required"]
+    fn native_webgpu_detector_runs_without_cpu_nodes() {
+        let runtime = std::env::var("RT_RUNTIME").expect("RT_RUNTIME");
+        let graph = std::env::var("RT_GRAPH").expect("RT_GRAPH");
+        crate::runtime::load(Path::new(&runtime)).unwrap();
+        let mut model = Detector::open(Path::new(&graph), crate::accel::Preference::Force(crate::accel::Accelerator::WebGpu)).unwrap();
+        assert_eq!(model.selection().accelerator, crate::accel::Accelerator::WebGpu);
+        let page = crate::image::fixtures::by_name("l8").raster;
+        let result = model.detect(&page).unwrap();
+        assert_eq!(result.segmentation.levels.len(), page.width as usize * page.height as usize);
+    }
+
     /// The padding must not be sampled. A wide page leaves a black band down
     /// the right of the model's output, and a resize that includes it drags a
     /// dark edge into the mask - which then reads as text and gets cleaned.
@@ -396,4 +410,3 @@ mod tests {
         assert!(!seg.is_text(0, 100));
     }
 }
-

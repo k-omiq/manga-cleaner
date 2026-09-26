@@ -163,6 +163,12 @@ pub struct AcceleratorRow {
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelPlacement {
+    /// Stable setting id, independent of translated model names.
+    pub id: &'static str,
+    pub model_name: &'static str,
+    pub preference: &'static str,
+    pub supported_ids: Vec<&'static str>,
+    pub backend_status: Vec<ModelBackendStatus>,
     /// e.g. `models.kind.inpainter` - the same key the loaded-models tab uses.
     pub model_key: &'static str,
     pub accelerator_id: &'static str,
@@ -179,6 +185,17 @@ pub struct ModelPlacement {
     /// for. Both `None` unless the refusal was `accel.declined.memory`.
     pub needed_bytes: Option<u64>,
     pub room_bytes: Option<u64>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelBackendStatus {
+    pub id: &'static str,
+    pub supported: bool,
+    pub installed: bool,
+    pub available: bool,
+    pub verified: bool,
+    pub reason_key: Option<&'static str>,
 }
 
 /// Everything the accelerator setting needs to draw itself.
@@ -212,13 +229,16 @@ pub fn list_accelerators(app: tauri::AppHandle) -> Accelerators {
         use tauri::Manager;
         app.path().app_data_dir().ok()
     };
-    let _ = cleaner_core::runtime::find(app_data.as_deref())
-        .and_then(|path| cleaner_core::runtime::load(&path));
+    let runtime_loaded = cleaner_core::runtime::find(app_data.as_deref())
+        .and_then(|path| cleaner_core::runtime::load(&path)).is_ok();
 
     let settings = crate::settings::read(&app).unwrap_or(serde_json::Value::Null);
-    let mut view = accelerators(
+    let verified_runtime = app_data.as_deref()
+        .is_some_and(crate::model_workflows::qualified_webgpu_write_environment);
+    let mut view = accelerators_configured(
         crate::run::preference_from(&settings),
-        &accel::available(),
+        Some(&settings),
+        &if runtime_loaded { accel::available() } else { Vec::new() },
         cleaner_core::memory::room(),
         cleaner_core::runtime::package::Platform::host(),
     );
@@ -230,9 +250,30 @@ pub fn list_accelerators(app: tauri::AppHandle) -> Accelerators {
     // needs an install, not a different download. The rows are `KNOWN`'s order
     // by construction, so they zip.
     for (row, accelerator) in view.providers.iter_mut().zip(accel::KNOWN) {
-        if !row.available {
+        if !runtime_loaded {
+            row.available = false;
+            row.reason_key = Some("accel.declined.unavailable");
+            continue;
+        }
+        if runtime_loaded && !row.available {
             if let Err(reason) = accelerator.availability() {
                 row.reason_key = Some(reason.reason_key());
+            }
+        }
+    }
+    for model in &mut view.models {
+        for status in &mut model.backend_status {
+            let accelerator = accel::KNOWN.into_iter().find(|a| accelerator_id(*a) == status.id).unwrap();
+            status.installed = runtime_loaded && (accelerator == Accelerator::Cpu || accelerator.is_installed());
+            status.verified &= verified_runtime;
+            status.available = status.supported && runtime_loaded && accelerator.is_available()
+                && (model.id != "samTs" || accelerator != Accelerator::WebGpu
+                    || cleaner_core::sam_ts::built_in_webgpu_available());
+            if status.supported && !status.available {
+                status.reason_key = if runtime_loaded {
+                    accelerator.availability().err().map(accel::Unavailable::reason_key)
+                        .or(Some("accel.declined.noDevice"))
+                } else { Some("accel.declined.unavailable") };
             }
         }
     }
@@ -251,21 +292,102 @@ pub fn list_accelerators(app: tauri::AppHandle) -> Accelerators {
 /// `host` is the platform the panel is drawn on: the placements and the
 /// `measured` flag both depend on whether it is the one the table was timed
 /// on ([`accel::MEASURED_ON`]).
+#[cfg(test)]
 pub fn accelerators(
     preference: accel::Preference,
     available: &[Accelerator],
     room: Option<u64>,
     host: Option<cleaner_core::runtime::package::Platform>,
 ) -> Accelerators {
+    accelerators_configured(preference, None, available, room, host)
+}
+
+pub(crate) fn supports_model(id: &str, accelerator: Accelerator, host: Option<cleaner_core::runtime::package::Platform>) -> bool {
+    use cleaner_core::runtime::package::Os;
+    if accelerator == Accelerator::Cpu { return true; }
+    match id {
+        "ctd" => match accelerator {
+            Accelerator::DirectMl => host.is_some_and(|h| h.os == Os::Windows),
+            Accelerator::Cuda => host.is_some_and(|h| matches!(h.os, Os::Windows | Os::Linux)),
+            Accelerator::WebGpu => true,
+            _ => false,
+        },
+        "rtFull" => match accelerator {
+            Accelerator::DirectMl => host.is_some_and(|h| h.os == Os::Windows),
+            Accelerator::Cuda => host.is_some_and(|h| matches!(h.os, Os::Windows | Os::Linux)),
+            _ => false,
+        },
+        "rtSmall" => (accelerator == Accelerator::DirectMl && host.is_some_and(|h| h.os == Os::Windows))
+            || (accelerator == Accelerator::Cuda && host.is_some_and(|h| matches!(h.os, Os::Windows | Os::Linux))),
+        "samTs" => accelerator == Accelerator::WebGpu && host.is_some_and(|h| h.os == Os::MacOs),
+        "inpainter" => accelerator == Accelerator::WebGpu
+            || (accelerator == Accelerator::DirectMl && host.is_some_and(|h| h.os == Os::Windows)),
+        _ => false,
+    }
+}
+
+fn verified_model(id: &str, accelerator: Accelerator, measured_host: bool) -> bool {
+    if accelerator == Accelerator::Cpu { return measured_host; }
+    measured_host && matches!(
+        (id, accelerator),
+        ("ctd", Accelerator::WebGpu)
+            | ("samTs", Accelerator::WebGpu)
+            | ("inpainter", Accelerator::WebGpu)
+    )
+}
+
+fn accelerators_configured(
+    preference: accel::Preference,
+    settings: Option<&serde_json::Value>,
+    available: &[Accelerator],
+    room: Option<u64>,
+    host: Option<cleaner_core::runtime::package::Platform>,
+) -> Accelerators {
     let measured_here = host.map(|platform| platform.os) == Some(accel::MEASURED_ON);
-    let placements: Vec<(Accelerator, ModelPlacement)> = accel::PROFILES
+    let verified_here = measured_here && cfg!(target_os = "macos")
+        && cleaner_core::sam_ts::measured_m5_host();
+    let specs: [(&str, &str, &accel::ModelProfile); 5] = [
+        ("ctd", "Comic Text Detector", &accel::DETECTOR),
+        ("rtSmall", "RT-DETR v2 (small INT8)", &accel::BALLOON),
+        ("rtFull", "RT-DETR v2 (full FP32)", &accel::FULL_RT),
+        ("samTs", "SAM-TS-L", &accel::FULL_RT),
+        ("inpainter", "LaMa Manga", &accel::LAMA),
+    ];
+    let placements: Vec<(Accelerator, ModelPlacement)> = specs
         .iter()
-        .map(|profile| {
-            let chosen = accel::choose_on(profile, preference, available, room, host);
+        .map(|(id, model_name, profile)| {
+            let requested = settings.and_then(|s| crate::run::model_preference_from(s, id).ok()).unwrap_or(preference);
+            let mut chosen = accel::choose_on(profile, requested, available, room, host);
+            if !supports_model(id, chosen.accelerator, host) || matches!(requested, accel::Preference::Force(wanted) if !supports_model(id, wanted, host)) {
+                let wanted = match requested { accel::Preference::Force(wanted) => wanted, _ => chosen.accelerator };
+                chosen.accelerator = Accelerator::Cpu;
+                chosen.declined = Some(accel::Declined {
+                    wanted,
+                    reason_key: "accel.declined.unavailable",
+                    needed_bytes: None,
+                    room_bytes: None,
+                });
+                chosen.note = None;
+            }
             let declined = chosen.declined;
+            let backend_status = accel::KNOWN.into_iter().map(|accelerator| {
+                let supported = supports_model(id, accelerator, host);
+                let installed = accelerator == Accelerator::Cpu || available.contains(&accelerator);
+                let available = supported && installed;
+                ModelBackendStatus {
+                    id: accelerator_id(accelerator), supported, installed, available,
+                    verified: verified_model(id, accelerator, verified_here),
+                    reason_key: (supported && !available).then_some("accel.declined.unavailable"),
+                }
+            }).collect::<Vec<_>>();
             (
                 chosen.accelerator,
                 ModelPlacement {
+                    id: *id,
+                    model_name: *model_name,
+                    preference: preference_id(requested),
+                    supported_ids: backend_status.iter().filter(|s| s.supported).map(|s| s.id).collect(),
+                    backend_status,
                     model_key: profile.label_key,
                     accelerator_id: accelerator_id(chosen.accelerator),
                     label_key: chosen.accelerator.label_key(),
@@ -441,13 +563,13 @@ mod tests {
     #[test]
     fn a_refusal_reaches_the_panel_with_its_two_figures() {
         let mac = [Accelerator::CoreMl, Accelerator::WebGpu];
-        // An 8 GB machine, where CoreML's measured 8.19 GB does not fit.
-        let room = 8 * cleaner_core::memory::GIB / 3 * 2 - cleaner_core::memory::WEBVIEW_BYTES;
+        // A small memory budget, below WebGPU LaMa's measured 740 MiB peak.
+        let room = 700 * cleaner_core::memory::MIB;
         let view =
-            accelerators(accel::Preference::Force(Accelerator::CoreMl), &mac, Some(room), Some(MAC));
+            accelerators(accel::Preference::Force(Accelerator::WebGpu), &mac, Some(room), Some(MAC));
 
-        assert_eq!(view.preference, "coreml");
-        assert!(view.providers.iter().find(|row| row.id == "coreml").unwrap().selected);
+        assert_eq!(view.preference, "webgpu");
+        assert!(view.providers.iter().find(|row| row.id == "webgpu").unwrap().selected);
 
         let inpainter = view
             .models
@@ -456,7 +578,7 @@ mod tests {
             .expect("the inpainter");
         assert_eq!(inpainter.accelerator_id, "cpu");
         assert_eq!(inpainter.declined_key, Some("accel.declined.memory"));
-        assert_eq!(inpainter.declined_id, Some("coreml"));
+        assert_eq!(inpainter.declined_id, Some("webgpu"));
         assert!(inpainter.needed_bytes.is_some());
         assert_eq!(inpainter.room_bytes, Some(room));
     }
@@ -498,6 +620,27 @@ mod tests {
         for row in view.providers.iter().filter(|row| row.id != "cpu") {
             assert!(!row.active, "{}", row.id);
         }
+    }
+
+    #[test]
+    fn capability_rows_do_not_advertise_unsupported_backend_for_a_model() {
+        let mac = [Accelerator::CoreMl, Accelerator::WebGpu];
+        let settings = serde_json::json!({
+            "accelerator": "auto",
+            "modelAccelerators": {"samTs": "webgpu", "rtSmall": "coreml"}
+        });
+        let view = accelerators_configured(accel::Preference::Automatic, Some(&settings), &mac, None, Some(MAC));
+        let sam = view.models.iter().find(|row| row.id == "samTs").unwrap();
+        assert_eq!(sam.preference, "webgpu");
+        assert_eq!(sam.accelerator_id, "webgpu");
+        assert_eq!(sam.model_name, "SAM-TS-L");
+        assert!(sam.supported_ids.contains(&"webgpu"));
+        assert!(!sam.supported_ids.contains(&"coreml"));
+        let small = view.models.iter().find(|row| row.id == "rtSmall").unwrap();
+        assert_eq!(small.preference, "coreml");
+        assert_eq!(small.accelerator_id, "cpu");
+        assert_eq!(small.declined_id, Some("coreml"));
+        assert!(!small.backend_status.iter().find(|row| row.id == "coreml").unwrap().supported);
     }
 
     /// A click that arrives after the model has gone is not a failure.
