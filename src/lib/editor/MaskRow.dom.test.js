@@ -189,12 +189,12 @@ describe('the engine picker on a Layers row', () => {
         provenance: {
           ...region.mask.provenance,
           engine: 'flux',
-          cloud: { provider: 'modal', profile_id: PROFILE.id, request_id: 'req-1', model: 'm', cost: null },
+          cloud: { provider: 'modal', profile_id: PROFILE.id, request_id: 'req-1', model: 'Disty0/FLUX.2-klein-9B-SDNQ-4bit-dynamic-svd-r32', cost: null },
         },
       },
     }
     show(cloudPatch)
-    expect(screen.getByText(t('ladder.rung.cloud'), { selector: '.title' })).toBeTruthy()
+    expect(screen.getByText('☁ FLUX.2 Klein 9B · Cloud', { selector: '.title' })).toBeTruthy()
     expect(offered()).toEqual(['cloud', 'fill', 'denoise', 'lama'])
     expect(picker().value).toBe('cloud')
   })

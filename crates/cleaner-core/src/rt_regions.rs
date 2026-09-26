@@ -13,6 +13,7 @@ const SCORE: f32 = 0.35;
 
 pub struct FullRegions {
     session: ort::session::Session,
+    lease: crate::registry::Lease,
 }
 
 impl FullRegions {
@@ -24,8 +25,15 @@ impl FullRegions {
             .map_err(|e| e.to_string())?
             .commit_from_file(path)
             .map_err(|e| format!("RT-DETR full graph: {e}"))?;
-        Ok((Self { session }, started.elapsed()))
+        let lease = crate::registry::register_named(crate::registry::Kind::BalloonDetector,
+            crate::registry::Footprint::weights(path),
+            crate::registry::Device::accelerator(crate::accel::Accelerator::Cpu),
+            Some("RT-DETR v2 (full FP32)".into()));
+        Ok((Self { session, lease }, started.elapsed()))
     }
+
+    /// The run may release this session at its next region boundary.
+    pub fn spent(&self) -> bool { self.lease.spent() }
 
     /// Two contiguous vertical tiles with Pillow bilinear 640-square input,
     /// as in `spikes/chapter-rtdetr/compare_variants.py`. Outputs use source
@@ -36,6 +44,7 @@ impl FullRegions {
 
     pub fn detect_halves_cancellable(&mut self, page: &Raster, cancel: &Cancellation) -> Result<Vec<BalloonBox>, String> {
         cancel.check()?;
+        self.lease.touch();
         if page.width == 0 || page.height == 0 {
             return Err("RT-DETR needs a nonempty page".into());
         }
@@ -124,6 +133,7 @@ impl FullRegions {
                 .then(a.rect.x.cmp(&b.rect.x))
                 .then(b.score.total_cmp(&a.score))
         });
+        self.lease.touch();
         Ok(found)
     }
 }

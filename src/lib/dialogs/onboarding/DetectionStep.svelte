@@ -12,9 +12,8 @@
    */
   import { Select } from '../../ui/index.js'
   import { t } from '../../i18n/index.js'
-  import { session } from '../../state/session.svelte.js'
-  import EngineTable from '../EngineTable.svelte'
-  import { ALL_TEXT_POLICY, DETECTORS, LANGUAGES, OCR_FILES, detectorsFor, engineBytes } from '../../model/pipelines.js'
+  import { session, setDetectorModels } from '../../state/session.svelte.js'
+  import { ALL_TEXT_POLICY, DETECTOR_MODEL_IDS, LANGUAGES, OCR_FILES, engineBytes, model } from '../../model/pipelines.js'
   import { chooseDetector, chooseOcrRescue, finishedFiles, firstLaunch } from '../firstlaunch.svelte.js'
 
   const uid = $props.id()
@@ -25,20 +24,23 @@
   /** @param {string} language */
   function options(language) {
     return [
-      ...detectorsFor(language).map((engine) => ({ value: engine.id, label: engine.name })),
+      { value: 'ctd-rtdetr', label: t('pipelines.clean') },
       { value: SKIP, label: t('pipelines.skip') },
     ]
   }
 
-  /** @param {import('../../model/pipelines.js').Engine} engine */
-  function stateOf(engine) {
-    if (!engine.ready) return t('pipelines.status.soon')
-    const bytes = firstLaunch.plan ? engineBytes(engine, firstLaunch.plan.files, finishedFiles()) : 0
-    return bytes > 0 ? t('models.value.size', { bytes }) : t('pipelines.status.installed')
-  }
-
   /** Setup keeps the policy it finds; a replay after choosing all-text says so. */
   const allText = $derived(session.textPolicy === ALL_TEXT_POLICY)
+
+  function chooseModel(id, checked) {
+    let models = session.detectorModels.filter((selected) => selected !== id)
+    if (checked) {
+      if (id === 'rtFull') models = models.filter((selected) => selected !== 'rtSmall')
+      if (id === 'rtSmall') models = models.filter((selected) => selected !== 'rtFull')
+      models.push(id)
+    }
+    if (models.length) setDetectorModels(models)
+  }
 
   /**
    * What ticking the rescue means with these choices: nothing to read when
@@ -54,6 +56,18 @@
 </script>
 
 <p class="lead">{t('onboarding.detection.body')}</p>
+<fieldset class="detection-models">
+  <legend>Detection models</legend>
+  {#each DETECTOR_MODEL_IDS as id (id)}
+    <label>
+      <input type="checkbox" checked={session.detectorModels.includes(id)}
+        disabled={session.detectorModels.length === 1 && session.detectorModels.includes(id)}
+        onchange={(event) => chooseModel(id, event.currentTarget.checked)} />
+      {model(id)?.product}
+    </label>
+  {/each}
+</fieldset>
+<p class="note">{t('settings.detection.selectedModels', { models: session.detectorModels.map((id) => model(id)?.product).filter(Boolean).join(' + ') })}</p>
 {#if allText}<p class="note policy">{t('settings.detection.setupAllText')}</p>{/if}
 <div class="languages">
   {#each LANGUAGES as language (language.id)}
@@ -84,10 +98,12 @@
     <p id="{uid}-rescue-line" class="rescue-line" role="status">{rescueLine}</p>
   </div>
 </div>
-<EngineTable engines={DETECTORS} label={t('pipelines.detection')} {stateOf} />
 <p class="note">{t('settings.detection.setupReview')}</p>
 
 <style>
+  .detection-models { display: flex; flex-wrap: wrap; gap: var(--s-4); margin-bottom: var(--s-5); border: 0; padding: 0 }
+  .detection-models legend { font-weight: 600; margin-bottom: var(--s-2) }
+  .detection-models label { display: flex; align-items: center; gap: var(--s-2) }
   .policy { margin: 0 0 var(--s-5) }
   .languages { display: grid; gap: var(--s-2); margin-bottom: var(--s-5) }
   .language {

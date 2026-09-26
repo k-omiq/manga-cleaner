@@ -920,7 +920,7 @@ fn owned_patches(job: &Job, source_idx: usize) -> Result<Vec<Patch>, String> {
 /// coordinates.
 ///
 /// The two steps are ordered by the memory rule, not by taste. Selection is
-/// from `bbox` alone, which is in the manifest; only the records that survive
+/// from the transformed bbox, computable from the manifest; only records that survive
 /// it are loaded off disk. Building the whole global set first and then asking
 /// which parts of it touch this page would hold every patch in the chapter at
 /// once.
@@ -940,7 +940,7 @@ fn page_patches(job: &Job, strip: &Strip, position: usize) -> Result<Vec<Patch>,
 /// Which patch records can reach the page at `position`, decided from
 /// rectangles alone.
 ///
-/// A record's `bbox` is in the coordinate system of the page its `source_idx`
+/// A record's displayed bbox is in the coordinate system of the page its `source_idx`
 /// names, and a patch that spans a join is one whose bbox runs past that page's
 /// own rectangle. That is the whole of the representation: there is no separate
 /// "join-spanning" flag, and there does not need to be one, because the strip
@@ -956,8 +956,9 @@ fn intersecting_records<'a>(
         .iter()
         .filter_map(|record| {
             let anchor = job.project.strip.order.iter().position(|i| *i == record.source_idx)?;
-            let (x, y) = strip.to_strip(anchor, record.bbox.x, record.bbox.y)?;
-            let bbox = Rect::new(x, y, record.bbox.w, record.bbox.h);
+            let displayed = record.display_bbox();
+            let (x, y) = strip.to_strip(anchor, displayed.x, displayed.y)?;
+            let bbox = Rect::new(x, y, displayed.w, displayed.h);
             (bbox.x < page.right()
                 && bbox.right() > page.x
                 && bbox.y < page.bottom()
@@ -2222,6 +2223,23 @@ mod tests {
         assert_eq!(ids(0), ["across-the-join"]);
         assert_eq!(ids(1), ["across-the-join"], "the page it does not belong to");
         assert_eq!(ids(2), ["on-page-2"], "a patch two pages away was loaded for this one");
+    }
+
+    #[test]
+    fn export_selects_a_moved_or_rotated_patch_on_its_destination_page() {
+        for angle in [0.0, 90.0] {
+            let scratch = Scratch::new(if angle == 0.0 { "export-moved" } else { "export-rotated" });
+            let mut job = a_strip_job(&scratch, StripMode::Longstrip);
+            overhanging_fill(&mut job, 0, Rect::new(10, 10, 20, 10), 200);
+            job.project.patches[0].provenance.params_snapshot["layer"] =
+                serde_json::json!({"offsetY": 40, "rotation": angle});
+            let strip = strip_of(&job);
+            let patches = page_patches(&job, &strip, 1).unwrap();
+            assert_eq!(patches.len(), 1, "angle {angle} was skipped by export selection");
+            assert!(patches[0].mask.contains(20, 5));
+            let bounds = patches[0].mask.bounds;
+            assert_eq!(patches[0].pixels.sample((20 - bounds.x) as u32, (5 - bounds.y) as u32, 0), 200);
+        }
     }
 
     fn source_raster(job: &Job, index: usize) -> cleaner_core::image::Raster {

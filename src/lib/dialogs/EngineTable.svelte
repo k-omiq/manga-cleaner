@@ -44,8 +44,8 @@
           <input
             type="checkbox"
             id="{uid}-{engine.id}"
-            checked={engine.ready ? chosen[engine.id] === true : available}
-            disabled={!engine.ready}
+            checked={chosen[engine.id] === true}
+            disabled={!available}
             onchange={(event) => onchoose(engine.id, event.currentTarget.checked)}
           />
           <label for="{uid}-{engine.id}"><strong>{engine.name}</strong><small>{engine.noteKey ? t(engine.noteKey) : ''}</small></label>

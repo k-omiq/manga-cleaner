@@ -291,10 +291,9 @@ export function rerunRegionMask(region, ctx, options) {
 
   if (options.kind === 'reopenInTool') {
     // The tool that made it, with the mask left intact.
-    // Masks from the automatic pass reopen in Content-aware fill, which is
-    // the tool that can act on an existing mask.
+    // Masks from retired tools reopen in the AI mask brush.
     const toolCandidate = region.tool ?? current.provenance?.params_snapshot?.tool
-    const reopenTool = TOOLS[toolCandidate] ? toolCandidate : 'contentAwareFill'
+    const reopenTool = TOOLS[toolCandidate] && toolCandidate !== 'contentAwareFill' ? toolCandidate : 'aiMaskBrush'
     return {
       mask: current,
       reopenTool,

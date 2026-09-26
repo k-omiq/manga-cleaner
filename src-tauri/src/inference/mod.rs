@@ -1,6 +1,8 @@
 //! Cloud inference security, configuration, credential management, and grant policy.
 
 pub mod commands;
+pub mod usage;
+pub mod billing;
 pub mod analysis;
 pub mod config;
 pub mod consent;

@@ -40,6 +40,7 @@ from deploy.cloud.common.contract import (
     validate_worker_result,
 )
 from deploy.cloud.common.flux import FluxWorker, sampling_mismatch
+from deploy.cloud.common.analysis_seed import AnalysisUnavailable
 from deploy.cloud.common.handle_mapping import InMemoryHandleRegistry, JobRecord
 from deploy.cloud.common.jobs import (
     LocalJobBackend,
@@ -356,6 +357,8 @@ class CloudGateway:
             if len(response) > ANALYSIS_MAX_RESPONSE_BYTES:
                 return self._analysis_error(500, "inference_failed", "Analysis response exceeded limit", metadata["request_digest"])
             return 200, {"Content-Type": "application/json"}, response
+        except AnalysisUnavailable:
+            return self._analysis_error(503, "capability_unavailable", "Selected analysis graphs are unavailable", self._analysis_digest(metadata))
         except Exception as exc:
             logger.error("Analysis inference failed: %s", redact_text(str(exc)))
             return self._analysis_error(500, "inference_failed", "Analysis inference failed", self._analysis_digest(metadata))

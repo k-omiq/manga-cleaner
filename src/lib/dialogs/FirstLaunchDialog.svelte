@@ -79,7 +79,7 @@
 
   /** The download step's rows: what was already on disk is not a download. */
   const queue = $derived(firstLaunch.queue.filter((id) => !firstLaunch.plan?.files[id]?.installed))
-  const anyPausable = $derived(queue.some((id) => ['waiting', 'active'].includes(firstLaunch.status[id])))
+  const anyPausable = $derived(queue.some((id) => firstLaunch.status[id] === 'waiting' || (id !== 'samTs' && firstLaunch.status[id] === 'active')))
   const anyResumable = $derived(queue.some((id) => ['paused', 'failed'].includes(firstLaunch.status[id])))
   const allDone = $derived(queue.every((id) => firstLaunch.status[id] === 'done'))
 
@@ -134,7 +134,7 @@
         back: true,
         secondary: null,
         primary: {
-          label: `${t('onboarding.dependencies.start')} · ${t('models.value.size', { bytes: chosenBytes() })}`,
+          label: chosenBytes() > 0 ? `${t('onboarding.dependencies.start')} · ${t('models.value.size', { bytes: chosenBytes() })}` : t('onboarding.dependencies.start'),
           run: beginDownloads,
           enter: false,
           icon: 'download',

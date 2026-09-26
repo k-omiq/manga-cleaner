@@ -123,6 +123,13 @@ describe('cloud masks', () => {
 })
 
 describe('regionMenuSections', () => {
+  it('offers approval and available local models for a gated review item', () => {
+    const region = { id: 'c1-p001-r1', outcome: 'gate-skipped', mask: null }
+    expect(ids(regionMenuSections(region, { engines: { flux: false }, cloud: true }))).toEqual([
+      'approve', 'approve:fill', 'approve:denoise', 'approve:lama', 'delete',
+    ])
+  })
+
   it('offers only Delete for an approved component whose sidecar cannot be replaced safely', () => {
     const region = masked('fill')
     region.id = 'c1-p001-hreview-sam-00001-deadbeef'

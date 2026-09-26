@@ -345,6 +345,7 @@ describe('the two pipelines', () => {
     const answer = both()
     for (const model of [
       { id: 'balloonDetector', fileName: 'detector.onnx', bytes: BALLOON_BYTES, sha256: 'c5a1b2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1', kindKey: 'models.kind.balloonDetector' },
+      { id: 'fullRt', fileName: 'detector.onnx', bytes: 168_481_531, sha256: CAPS.fullRtFile.sha256, kindKey: 'models.kind.fullRt' },
       { id: 'scriptGate', fileName: 'osd_lstm.onnx', bytes: 3_722_314, sha256: 'b18e0c1479d9eb67394993098f7e1079c9a93ef6f7b0416ee333fccb865c6e72', kindKey: 'models.kind.scriptGate' },
       { id: 'scriptGateLabels', fileName: 'osd_labels.json', bytes: 1_163, sha256: 'a1888156b005065039c356e13a7bbef1ec454b45bf6aaf18c11f4a59b1ee35c5', kindKey: 'models.kind.scriptGateLabels' },
       { id: 'ocrEncoder', fileName: 'encoder_model.onnx', bytes: 343_454_249, sha256: '15fa8155fe9bc1a7d25d9bb353debaa4def033d0174e907dbd2dd6d995def85f', kindKey: 'models.kind.ocr' },
@@ -425,15 +426,10 @@ describe('the two pipelines', () => {
     expect(languagePicker(detection, 'ja').value).toBe('ctd-rtdetr')
   })
 
-  it('say what each engine still costs, beside a note that the ratings are provisional', async () => {
+  it('show the selected model combination and model download states', async () => {
     const detection = await open(both, 'pipelines.detection')
-    const table = detection.getByRole('table', { name: t('pipelines.detection') })
-    const state = (/** @type {string} */ name) =>
-      within(table).getByText(name).closest('[role="row"]')?.querySelector('.state')?.textContent?.trim()
-    // The base detector needs the text detector here, which is not installed.
-    await waitFor(() => expect(state('CTD + RT-DETR v2')).toBe(t('models.value.size', { bytes: 94_669_756 })))
-    expect(document.getElementById(/** @type {string} */ (table.getAttribute('aria-describedby')))?.textContent)
-      .toBe(t('pipelines.workflow.ratingsNote'))
+    expect(detection.getByText(t('settings.detection.selectedModels', { models: 'Comic Text Detector (CTD) + RT-DETR v2 small' }))).toBeTruthy()
+    await waitFor(() => expect(modelRow(detection, 'ctd').textContent).toContain(t('settings.models.status.missing')))
     cleanup()
 
     const cleaning = await open(both)
@@ -496,11 +492,11 @@ describe('the two pipelines', () => {
 
     await fireEvent.change(detection.getByRole('combobox', { name: t('pipelines.workflow.policy') }), { target: { value: 'all_text' } })
     expect(session.textPolicy).toBe('all_text')
-    await waitFor(() => expect(readiness().textContent).toContain(t('settings.detection.ready.allTextImport')))
-    expect(readiness().textContent).toContain(t('settings.detection.ready.allTextMissing', { bytes: BALLOON_BYTES }))
-    await fireEvent.click(within(readiness()).getByRole('button', { name: t('settings.detection.download', { bytes: BALLOON_BYTES }) }))
+    await waitFor(() => expect(readiness().textContent).toContain(t('settings.detection.ready.allTextMissing', { bytes: BALLOON_BYTES + 94_669_756 })))
+    await fireEvent.click(within(readiness()).getByRole('button', { name: t('settings.detection.download', { bytes: BALLOON_BYTES + 94_669_756 }) }))
     await waitFor(() => expect(downloadModel).toHaveBeenCalledWith({ id: 'balloonDetector' }))
-    expect(downloadModel).toHaveBeenCalledTimes(1)
+    expect(downloadModel).toHaveBeenCalledWith({ id: 'textDetector' })
+    expect(downloadModel).toHaveBeenCalledTimes(2)
     expect(downloadModelGroup).not.toHaveBeenCalled()
 
     // All-text reads no language and runs no rescue, so neither choice is drawn.
@@ -509,14 +505,11 @@ describe('the two pipelines', () => {
     expect(detection.getByText(t('settings.detection.languagesAllText'))).toBeTruthy()
   })
 
-  it('offer SAM-TS-L and the full RT-DETR graph as local imports, never as downloads', async () => {
+  it('offers SAM-TS-L import and the full RT-DETR graph download', async () => {
     const detection = await open(() => withModelGroups(), 'pipelines.detection')
-    for (const id of ['samTs', 'rtFull']) {
-      await waitFor(() => expect(modelRow(detection, id).textContent).toContain(t('settings.models.status.importToEnable')))
-      const row = within(modelRow(detection, id))
-      expect(row.getByRole('button', { name: t('settings.models.action.import') })).toBeTruthy()
-      expect(row.queryByRole('button', { name: t('settings.models.action.download') })).toBe(null)
-    }
+    await waitFor(() => expect(modelRow(detection, 'samTs').textContent).toContain(t('settings.models.status.importToEnable')))
+    expect(within(modelRow(detection, 'samTs')).getByRole('button', { name: t('settings.models.action.import') })).toBeTruthy()
+    await waitFor(() => expect(within(modelRow(detection, 'rtFull')).getByRole('button', { name: t('settings.models.action.download') })).toBeTruthy())
     cleanup()
 
     workflowCapabilities = { ...CAPS, samInstalled: true, samManaged: true, fullRtInstalled: true, fullRtManaged: true, fullRtRevision: 'abc123' }
@@ -526,7 +519,6 @@ describe('the two pipelines', () => {
     await fireEvent.click(sam.getByRole('button', { name: t('settings.models.action.verify') }))
     expect(verifySamTs).toHaveBeenCalled()
     await fireEvent.click(within(modelRow(imported, 'rtFull')).getByRole('button', { name: t('settings.models.details') }))
-    expect(modelRow(imported, 'rtFull').textContent).toContain(t('settings.models.revision', { revision: 'abc123' }))
     expect(modelRow(imported, 'rtFull').textContent).toContain(CAPS.fullRtFile.sha256)
   })
 
@@ -535,7 +527,7 @@ describe('the two pipelines', () => {
     const element = modelRow(detection, 'scriptGate')
     const gate = within(element)
     await waitFor(() => expect(element.textContent).toContain(t('settings.models.fileCount', { count: 2 })))
-    expect(gate.getByText(t('settings.models.groups.scriptGate'), { exact: false })).toBeTruthy()
+    expect(gate.getByText('ogkalu Image Script Identification')).toBeTruthy()
     await fireEvent.click(gate.getAllByRole('button', { name: t('settings.models.action.verify') })[0])
     expect(verifyModelGroup).toHaveBeenCalledWith({ id: 'scriptGate' })
 
@@ -629,8 +621,9 @@ describe('the two pipelines', () => {
 
     await waitFor(() => expect(row('FLUX.2 Klein 4B').textContent).toContain(t('pipelines.status.found')))
     expect(row('FLUX.2 Klein 4B').classList.contains('soon')).toBe(false)
-    expect(row('FLUX.2 Klein 9B').textContent).toContain(t('pipelines.status.needsHelper'))
-    expect(row('FLUX.2 Klein 9B').classList.contains('soon')).toBe(true)
+    expect(row('☁ FLUX.2 Klein 4B').textContent).toContain(t('pipelines.status.cloudSetup'))
+    expect(row('☁ FLUX.2 Klein 9B').textContent).toContain(t('pipelines.status.cloudSetup'))
+    expect(row('☁ FLUX.2 Klein 9B').classList.contains('soon')).toBe(true)
     expect(row('Big LaMa').textContent).toContain(t('pipelines.status.soon'))
     // The fallback model the helper chose is written, not only remembered.
     await waitFor(() => expect(writeSettings).toHaveBeenCalledWith(expect.objectContaining({ fluxModel: 'flux2-klein-4b' })))

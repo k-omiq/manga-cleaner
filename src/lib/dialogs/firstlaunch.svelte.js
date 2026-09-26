@@ -118,6 +118,12 @@ export function offerFirstLaunch(view, { force = false } = {}) {
   if (firstLaunch.open) return true
   if (!force && session.firstLaunchOffered) return false
   firstLaunch.plan = firstLaunchPlan(view)
+  firstLaunch.plan.files.samTs = {
+    id: 'samTs', labelKey: 'settings.detection.model.samTs', bytes: 0, installed: false,
+  }
+  Promise.resolve(getBackend().listWorkflowCapabilities?.()).then((caps) => {
+    if (firstLaunch.plan) firstLaunch.plan.files.samTs.installed = caps?.samInstalled === true
+  }).catch(() => {})
   firstLaunch.step = FIRST_LAUNCH_STEPS[0]
   firstLaunch.tokenDraft = ''
   firstLaunch.tokenFailed = false
@@ -215,13 +221,20 @@ export function chooseOcrRescue(enabled) {
  * machine, and a replay keeps whatever Settings chose.
  */
 function workflow() {
-  return { textPolicy: session.textPolicy, ocrRescue: session.ocrRescue }
+  return { textPolicy: session.textPolicy, ocrRescue: session.ocrRescue, detectorModels: session.detectorModels }
 }
 
 /** The files the current choices need, runtime first. @returns {string[]} */
 export function chosenFiles() {
   const plan = firstLaunch.plan
-  return plan ? neededFiles(plan, firstLaunch.detection, firstLaunch.cleaners, workflow()) : []
+  if (!plan) return []
+  const files = neededFiles(plan, firstLaunch.detection, firstLaunch.cleaners, workflow())
+  if (session.detectorModels.includes('samTs') &&
+      (session.textPolicy === 'all_text' || LANGUAGES.some((language) => firstLaunch.detection[language.id]))) {
+    if (plan.files[RUNTIME_ID] && !files.includes(RUNTIME_ID)) files.unshift(RUNTIME_ID)
+    files.push('samTs')
+  }
+  return files
 }
 
 /** Bytes the current choices still cost. */
@@ -285,6 +298,7 @@ export async function pauseFile(id) {
     return
   }
   if (status !== 'active') return
+  if (id === 'samTs') return
   pauseRequested.add(id)
   setStatus(id, 'paused')
   await getBackend().cancelDownload({ id })
@@ -366,7 +380,14 @@ async function run() {
       } else setStatus(id, 'active')
       try {
         if (groupId && groupMembers) await fetchGroup(backend, groupId, groupMembers)
-        else await fetchOne(backend, id)
+        else if (id === 'samTs') {
+          try {
+            await backend.installSamTs()
+            setStatus(id, 'done')
+          } catch (error) {
+            fail(id, String(error))
+          }
+        } else await fetchOne(backend, id)
       } finally {
         for (const member of groupMembers ?? [id]) pauseRequested.delete(member)
       }

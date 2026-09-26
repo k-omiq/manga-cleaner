@@ -55,6 +55,8 @@ const IMPLEMENTED = Object.freeze({
   getCloudSecretSummary: 'get_cloud_secret_summary',
   checkCloudConnection: 'check_cloud_connection',
   getCloudModelInfo: 'get_cloud_model_info',
+  getCloudUsage: 'get_cloud_usage',
+  getCloudBilling: 'get_cloud_billing',
   listRemoteAnalysisCapabilities: 'list_remote_analysis_capabilities',
   proposeRemoteAnalysis: 'propose_remote_analysis',
   confirmRemoteAnalysis: 'confirm_remote_analysis',
@@ -90,6 +92,7 @@ const IMPLEMENTED = Object.freeze({
   cleanAnyway: 'clean_anyway',
   sidecarAvailable: 'sidecar_available',
   listSidecarModels: 'list_sidecar_models',
+  installFluxHelper: 'install_flux_helper',
   runClean: 'run_clean',
   cancelRun: 'cancel_run',
   resumeJob: 'resume_job',
@@ -111,6 +114,7 @@ const IMPLEMENTED = Object.freeze({
   importFullRt: 'import_full_rt',
   removeFullRt: 'remove_full_rt',
   importSamTs: 'import_sam_ts',
+  installSamTs: 'install_sam_ts',
   removeSamTs: 'remove_sam_ts',
   verifySamTs: 'verify_sam_ts',
   analyzeCapabilities: 'analyze_capabilities',
@@ -148,6 +152,7 @@ export const SEAM_METHODS = Object.freeze([
   'exportChapter',
   'sidecarAvailable',
   'listSidecarModels',
+  'installFluxHelper',
   'readSettings',
   'writeSettings',
   'readInferenceConfig',
@@ -157,6 +162,8 @@ export const SEAM_METHODS = Object.freeze([
   'getCloudSecretSummary',
   'checkCloudConnection',
   'getCloudModelInfo',
+  'getCloudUsage',
+  'getCloudBilling',
   'listRemoteAnalysisCapabilities',
   'proposeRemoteAnalysis',
   'confirmRemoteAnalysis',
@@ -194,6 +201,7 @@ export const SEAM_METHODS = Object.freeze([
   'importFullRt',
   'removeFullRt',
   'importSamTs',
+  'installSamTs',
   'removeSamTs',
   'verifySamTs',
   'analyzeCapabilities',
@@ -323,6 +331,8 @@ export function createTauriBackend({ fallback, invoke, listen }) {
       call(IMPLEMENTED.getCloudSecretSummary, { provider, profileId, role }),
     checkCloudConnection: ({ provider, profileId }) =>
       call(IMPLEMENTED.checkCloudConnection, { provider, profileId }),
+    getCloudBilling: (spec) => call(IMPLEMENTED.getCloudBilling, spec),
+    getCloudUsage: (spec) => call(IMPLEMENTED.getCloudUsage, spec),
     getCloudModelInfo: ({ provider, profileId }) =>
       call(IMPLEMENTED.getCloudModelInfo, { provider, profileId }),
     listRemoteAnalysisCapabilities: ({ provider, profileId }) =>
@@ -426,6 +436,8 @@ export function createTauriBackend({ fallback, invoke, listen }) {
       }),
     sidecarAvailable: () => call(IMPLEMENTED.sidecarAvailable),
     listSidecarModels: () => call(IMPLEMENTED.listSidecarModels),
+    installFluxHelper: ({ backend, accelerator }) =>
+      call(IMPLEMENTED.installFluxHelper, { backend, accelerator }),
 
     // The loaded-models tab. `listLoadedModels` is a **poll**, so it takes no
     // argument and is deliberately the cheapest command in this table: it walks
@@ -484,6 +496,7 @@ export function createTauriBackend({ fallback, invoke, listen }) {
     importFullRt: ({ sourcePath }) => call(IMPLEMENTED.importFullRt, { sourcePath }),
     removeFullRt: () => call(IMPLEMENTED.removeFullRt),
     importSamTs: ({ sourceDir }) => call(IMPLEMENTED.importSamTs, { sourceDir }),
+    installSamTs: () => call(IMPLEMENTED.installSamTs),
     removeSamTs: () => call(IMPLEMENTED.removeSamTs),
     verifySamTs: () => call(IMPLEMENTED.verifySamTs),
     analyzeCapabilities: ({ sourcePath, workflow, rtProfile, rtBackend, samBackend, requestId }) => call(IMPLEMENTED.analyzeCapabilities, { sourcePath, workflow, rtProfile, rtBackend, samBackend, requestId: requestIdFor(requestId) }),

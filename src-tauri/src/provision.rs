@@ -71,6 +71,7 @@ pub const ERR_CONFIG_WRITE: &str = "ERR_CONFIG_WRITE";
 pub const ERR_CANCELLED: &str = "ERR_CANCELLED";
 
 pub const ALLOWLISTED_OPERATIONS: &[&str] = &[
+    "billing",
     "inspect",
     "plan",
     "apply",
@@ -1011,7 +1012,7 @@ pub async fn run_cloud_provisioner(
     crate::library::blocking(move || Ok(run_provisioner(&app, &op, &provider, params))).await
 }
 
-fn run_provisioner(
+pub(crate) fn run_provisioner(
     app: &tauri::AppHandle,
     op: &str,
     provider: &str,

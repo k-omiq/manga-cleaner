@@ -54,6 +54,7 @@ from provisioner.protocol import (
 from provisioner.redaction import GLOBAL_REGISTRY, redact_string
 
 from deploy.cloud.common.weights import SEED_STATE_KEY
+from deploy.cloud.common.manifest import MODEL_PROD_FLUX_9B, production_model
 from deploy.cloud.modal.settings import (
     DEFAULT_GPU,
     GATEWAY_FUNCTION,
@@ -325,7 +326,7 @@ class ModalDriver(BaseProviderDriver):
         )
 
     def normalize_options(self, options: Any) -> Dict[str, Any]:
-        return normalize_options(options, GPU_ALLOWLIST, DEFAULT_GPU)
+        return normalize_options(options, GPU_ALLOWLIST, DEFAULT_GPU, "L40S")
 
     def settings_for(self, installation_id: str, environment_name: str, options: Dict[str, Any]) -> ModalSettings:
         return ModalSettings.for_installation(
@@ -334,20 +335,29 @@ class ModalDriver(BaseProviderDriver):
             environment_name=environment_name,
             gpu=options["gpu"],
             idle_seconds=options["idle_seconds"],
+            model_id=options["model_id"],
+            analysis_models=tuple(options["analysis_models"]),
         )
 
     def plan(self, inspection: AccountInspectionResult, installation_id: str, options: Dict[str, Any]) -> DeploymentPlan:
         s = self.settings_for(installation_id, inspection.environment_name, options)
         gpu, idle = s.gpu, s.idle_seconds
+        model = production_model(s.model_id)
+        worker_memory = 24 if s.model_id == MODEL_PROD_FLUX_9B else 12
+        analysis_note = (
+            f" A separate {gpu} GPU analysis worker (at most 1 container, stops {idle} s after a request) "
+            "runs only for selected SAM-TS-L or RT-DETR analysis."
+        ) if s.analysis_models else ""
         resources = [
-            PlanResource("volume", s.volume_name, "Modal Volume holding the pinned FLUX.2 Klein weights (about 5.5 GB)."),
+            PlanResource("volume", s.volume_name, f"Modal Volume holding the pinned FLUX.2 Klein weights ({model.total_bytes / 1e9:.1f} GB)"
+                         + (" and selected analysis graphs." if s.analysis_models else ".")),
             PlanResource("dict", s.dict_name, "Modal Dict with job state, so status checks never start a GPU."),
             PlanResource(
                 "app",
                 s.app_name,
                 f"Modal App: a CPU gateway (0.25 CPU, 0.5 GiB) behind Modal proxy auth, a {gpu} GPU worker "
-                f"(2 CPU, 12 GiB, at most 1 container, stops {idle} s after the last render, 600 s per job) "
-                "and a CPU function that downloads the weights once.",
+                f"(2 CPU, {worker_memory} GiB, at most 1 container, stops {idle} s after the last render, 600 s per job) "
+                "and a CPU function that downloads the weights once." + analysis_note,
             ),
             PlanResource(
                 "proxy_token",
@@ -356,11 +366,13 @@ class ModalDriver(BaseProviderDriver):
             ),
         ]
         price = GPU_PRICE_PER_HOUR[gpu]
-        worker_hour = price + 2 * CPU_CORE_HOUR + 12 * MEMORY_GIB_HOUR
+        worker_hour = price + 2 * CPU_CORE_HOUR + worker_memory * MEMORY_GIB_HOUR
         cost = (
             f"Billed by Modal per second of use. A {gpu} worker costs about ${worker_hour:.2f} per hour while it runs "
-            f"({gpu} ${price:.2f}/h, 2 CPU cores at ${CPU_CORE_HOUR}/h each, 12 GiB at ${MEMORY_GIB_HOUR}/GiB/h), "
-            f"during each render and for {idle} s after it. The gateway runs only while it answers requests "
+            f"({gpu} ${price:.2f}/h, 2 CPU cores at ${CPU_CORE_HOUR}/h each, {worker_memory} GiB at ${MEMORY_GIB_HOUR}/GiB/h), "
+            f"during each render and for {idle} s after it."
+            + (f" Selected analysis also starts a separate {gpu} GPU worker on demand and keeps it warm {idle} s; it is billed at the same GPU rate." if s.analysis_models else "")
+            + " The gateway runs only while it answers requests "
             f"(0.25 CPU, 0.5 GiB). Storage for the weights volume is billed by Modal. Nothing runs while idle. "
             f"List prices on {PRICING_DATE}; check {PRICING_URL}."
         )
@@ -373,7 +385,7 @@ class ModalDriver(BaseProviderDriver):
             gpu_allowlist=GPU_ALLOWLIST,
             allocation={
                 "worker_cpu": 2.0,
-                "worker_memory_gib": 12,
+                "worker_memory_gib": worker_memory,
                 "gateway_cpu": 0.25,
                 "gateway_memory_gib": 0.5,
                 "max_containers": 1,
@@ -470,7 +482,7 @@ class ModalDriver(BaseProviderDriver):
         errors = session.sdk.exception
         journal = ctx.journal
         store, doc = self._seed_doc(session, s)
-        state, _, _ = read_seed_state(doc)
+        state, _, _ = read_seed_state(doc, s.model_id)
         if state == "done":
             return
         call = None
@@ -485,7 +497,7 @@ class ModalDriver(BaseProviderDriver):
         watch = SeedWatch(journal.get_state(SEED_INTENT_KEY), self._wall_clock, self._clock)
         while True:
             doc = store.get(SEED_STATE_KEY)
-            state, pct, problem = read_seed_state(doc)
+            state, pct, problem = read_seed_state(doc, s.model_id)
             if pct is not None and ctx.reporter is not None:
                 ctx.reporter.pct(pct)
             if state == "done":

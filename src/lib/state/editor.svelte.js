@@ -42,13 +42,12 @@ const AUTOSAVE_DEBOUNCE_MS = 250
 const HISTORY_RETRY_MS = 50
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-/** Tool ids, in the order the `1` to `6` shortcuts and the tool rail use. */
+/** Tool ids, in the order the `1` to `5` shortcuts and the tool rail use. */
 export const TOOLS = /** @type {const} */ ([
   'autoClean',
   'brush',
   'shapes',
   'aiMaskBrush',
-  'contentAwareFill',
   'cloneHeal',
 ])
 
@@ -62,7 +61,7 @@ export const TOOLS = /** @type {const} */ ([
  * for consent first, one request at a time
  * (`src/lib/editor/cloudflow.svelte.js`), and the run protocol has no step
  * that could ask, so a run that could reach the cloud would send pages
- * without it. The cloud stays reachable per region, from Content-aware fill
+ * without it. The cloud stays reachable per region, from the AI mask brush
  * and from a Layers row, each of which asks.
  *
  * If `runClean` ever grows a consent step, this constant is what gives way -
@@ -113,23 +112,10 @@ function defaultToolParams() {
       opacity: 100,
       flow: 100,
     },
-    // `mode` starts on the `fill` **engine** and not on `solid`, which is what
-    // Shapes did before it had the row: a drawn shape cleaned what was under
-    // it with rung 0. It is also the cheapest of the six - arithmetic over the
-    // page's own samples, no weights to have downloaded - so the tool cannot
-    // refuse the first shape somebody draws with it. `color` and `opacity` are
-    // kept beside it for the moment the user switches to `solid`, even though
-    // the tool window does not show them until then.
-    shapes: { shape: 'rect', mode: 'fill', color: '#ffffff', opacity: 100, feather: 0 },
-    // The AI mask brush's `engine` is a **rung named outright** and not a pick
-    // (`src/lib/editor/tools.js#MASK_ENGINES`), so it starts on the one rung
-    // that needs no weights at all: rung 0 is arithmetic over the page's own
-    // samples, it is instant, and it cannot be refused for a model this
-    // machine has not downloaded. The stroke's mask is the stroke itself, so a
-    // fill is the right answer for most of what this tool is reached for;
-    // anything the paper does not cover is one chip away, and the Layers row
-    // offers the same list again.
-    aiMaskBrush: { engine: 'fill', size: 36 },
+    // A new shape paints with a solid colour. Its outline is optional.
+    shapes: { shape: 'rect', mode: 'solid', color: '#ffffff', opacity: 100, outlineColor: '#000000', outlineWidth: 0, feather: 0 },
+    // The AI mask brush defaults to the local LaMa Manga model.
+    aiMaskBrush: { engine: 'lama', size: 36 },
     contentAwareFill: { fillMode: 'match-surround', engine: 'local' },
     cloneHeal: {
       size: 32,
@@ -1152,18 +1138,19 @@ export function reportFitScale(scale) {
 /**
  * Choose a tool. Selecting one also opens and raises the tool window - a tool
  * whose parameters are hidden behind a second action is a tool the user has to
- * pick twice. Both routes in (the rail and the `1` to `6` keys) come through
+ * pick twice. Both routes in (the rail and the `1` to `5` keys) come through
  * here, so neither has to remember.
  *
  * @param {string} tool
  */
 export function setTool(tool) {
+  if (tool === 'contentAwareFill') tool = 'aiMaskBrush'
   if (!TOOLS.includes(/** @type {any} */ (tool))) return
   editor.tool = tool
   openWindow('tool')
 }
 
-/** @param {number} slot - 1..6, as the number-key shortcuts number them */
+/** @param {number} slot - 1..5, as the number-key shortcuts number them */
 export function setToolBySlot(slot) {
   const tool = TOOLS[slot - 1]
   if (tool) setTool(tool)
@@ -1339,13 +1326,6 @@ export function stepReview(direction) {
  */
 export async function startRun(scope = 'page') {
   if (!editor.chapter || editor.run.active) return null
-  if (session.textPolicy === 'all_text') {
-    pushModal({
-      kind: 'workflowReview',
-      props: { chapterId: editor.chapter.id, pageIndex: editor.pageIndex },
-    })
-    return null
-  }
   const params = editor.toolParams.autoClean ?? {}
   const handle = await getBackend().runClean({
     scope,
@@ -1365,8 +1345,9 @@ export async function startRun(scope = 'page') {
     outsideBubbles: String(params.outsideBubbles ?? 'review'),
     bubbleColor: String(params.bubbleColor ?? '#ffffff'),
     detection: { ...session.detection },
+    detectorModels: [...session.detectorModels],
     geometryPolicy: 'legacy',
-    textPolicy: 'legacy_gate',
+    textPolicy: session.textPolicy,
     ocrRescue: session.ocrRescue,
   })
   return adoptRun(handle, scope)

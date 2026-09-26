@@ -36,6 +36,9 @@ REVISION_TEST_FLUX: str = "0123456789abcdef0123456789abcdef01234567"
 RECIPE_PROD_SDNQ: str = "mc-flux2-klein-edit-v1"
 MODEL_PROD_FLUX: str = "Disty0/FLUX.2-klein-4B-SDNQ-4bit-dynamic"
 REVISION_PROD_FLUX: str = "45e9cc76cb70f84473ce5c6c2e2282d0ef3c6ecd"
+MODEL_PROD_FLUX_9B: str = "Disty0/FLUX.2-klein-9B-SDNQ-4bit-dynamic-svd-r32"
+REVISION_PROD_FLUX_9B: str = "94ef5985edc982fa93f87df6e1c0faf94d9e9004"
+RECIPE_PROD_SDNQ_9B: str = "mc-flux2-klein-9b-edit-v1"
 
 # The prompt belongs to the recipe on the server and never travels on the wire.
 RECIPE_PROMPT: str = "Remove all text."
@@ -55,6 +58,7 @@ class PinnedSampling:
 # Wire values: guidance is sent times 100 (GUIDANCE 1.0 -> 100) and divided back on the server.
 PINNED_SAMPLING: Dict[str, PinnedSampling] = {
     RECIPE_PROD_SDNQ: PinnedSampling(seed=1, steps=4, guidance_scaled=100),
+    RECIPE_PROD_SDNQ_9B: PinnedSampling(seed=1, steps=4, guidance_scaled=100),
 }
 
 # Files of the pinned snapshot, exactly as the Hub lists them at REVISION_PROD_FLUX.
@@ -83,6 +87,61 @@ PROD_SNAPSHOT_FILES: Tuple[Tuple[str, int], ...] = (
     ("vae/diffusion_pytorch_model.safetensors", 168120878),
 )
 PROD_SNAPSHOT_TOTAL_BYTES: int = 5475930180
+
+# Pinned from the Hugging Face repository tree at REVISION_PROD_FLUX_9B.
+PROD_SNAPSHOT_9B_FILES: Tuple[Tuple[str, int], ...] = (
+    (".gitattributes", 1580),
+    ("README.md", 2367),
+    ("model_index.json", 498),
+    ("scheduler/scheduler_config.json", 486),
+    ("text_encoder/config.json", 15340),
+    ("text_encoder/generation_config.json", 218),
+    ("text_encoder/model-00001-of-00002.safetensors", 4988757288),
+    ("text_encoder/model-00002-of-00002.safetensors", 1748388808),
+    ("text_encoder/model.safetensors.index.json", 107995),
+    ("text_encoder/quantization_config.json", 13119),
+    ("tokenizer/added_tokens.json", 707),
+    ("tokenizer/chat_template.jinja", 4168),
+    ("tokenizer/merges.txt", 1671853),
+    ("tokenizer/special_tokens_map.json", 613),
+    ("tokenizer/tokenizer.json", 11422654),
+    ("tokenizer/tokenizer_config.json", 5404),
+    ("tokenizer/vocab.json", 2776833),
+    ("transformer/config.json", 9774),
+    ("transformer/diffusion_pytorch_model-00001-of-00002.safetensors", 4940866448),
+    ("transformer/diffusion_pytorch_model-00002-of-00002.safetensors", 743843232),
+    ("transformer/diffusion_pytorch_model.safetensors.index.json", 85737),
+    ("transformer/quantization_config.json", 8853),
+    ("vae/config.json", 925),
+    ("vae/diffusion_pytorch_model.safetensors", 168120878),
+)
+PROD_SNAPSHOT_9B_TOTAL_BYTES: int = 12606105778
+
+
+@dataclass(frozen=True)
+class ProductionModel:
+    model_id: str
+    revision: str
+    recipe_id: str
+    files: Tuple[Tuple[str, int], ...]
+    total_bytes: int
+    license: str
+
+
+PRODUCTION_MODELS: Dict[str, ProductionModel] = {
+    MODEL_PROD_FLUX: ProductionModel(MODEL_PROD_FLUX, REVISION_PROD_FLUX, RECIPE_PROD_SDNQ,
+                                      PROD_SNAPSHOT_FILES, PROD_SNAPSHOT_TOTAL_BYTES, "Apache-2.0"),
+    MODEL_PROD_FLUX_9B: ProductionModel(MODEL_PROD_FLUX_9B, REVISION_PROD_FLUX_9B,
+                                         RECIPE_PROD_SDNQ_9B, PROD_SNAPSHOT_9B_FILES,
+                                         PROD_SNAPSHOT_9B_TOTAL_BYTES, "FLUX non-commercial"),
+}
+
+
+def production_model(model_id: str = MODEL_PROD_FLUX) -> ProductionModel:
+    try:
+        return PRODUCTION_MODELS[model_id]
+    except KeyError:
+        raise ValueError(f"Unsupported cloud model: {model_id}") from None
 
 
 @dataclass(frozen=True)
@@ -153,6 +212,13 @@ PINNED_RECIPES: Dict[str, RenderRecipe] = {
         preprocessing_version=DEFAULT_PREPROCESSING_VERSION,
         model_id=MODEL_PROD_FLUX,
         model_revision=REVISION_PROD_FLUX,
+        native_mask_conditioning=False,
+    ),
+    RECIPE_PROD_SDNQ_9B: RenderRecipe(
+        recipe_id=RECIPE_PROD_SDNQ_9B,
+        preprocessing_version=DEFAULT_PREPROCESSING_VERSION,
+        model_id=MODEL_PROD_FLUX_9B,
+        model_revision=REVISION_PROD_FLUX_9B,
         native_mask_conditioning=False,
     ),
 }
@@ -283,6 +349,6 @@ def get_default_model_info(
     )
 
 
-def get_production_model_info(provider: str) -> ModelInfoResponse:
+def get_production_model_info(provider: str, model_id: str = MODEL_PROD_FLUX) -> ModelInfoResponse:
     """Model info a deployed gateway serves on GET /model-info."""
-    return get_default_model_info(provider, RECIPE_PROD_SDNQ, production_limits())
+    return get_default_model_info(provider, production_model(model_id).recipe_id, production_limits())

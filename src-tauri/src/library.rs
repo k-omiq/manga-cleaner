@@ -480,6 +480,7 @@ pub struct ApiMask {
     pub dependency_review: Option<&'static str>,
     pub cloud_outcome: Option<CloudOutcome>,
     pub provenance: ApiProvenance,
+    pub layer: cleaner_core::patch::LayerStyle,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -915,11 +916,14 @@ pub(crate) fn region_of_patch(record: &PatchRecord, page: &ApiPage) -> ApiRegion
     }
     let flags = review_flags(record.review_state.as_deref());
     let params = &record.provenance.params_snapshot;
+    let layer: cleaner_core::patch::LayerStyle = serde_json::from_value(params.get("layer").cloned().unwrap_or_default())
+        .unwrap_or_default();
+    let layer = layer.sanitized();
     ApiRegion {
         id: record.id.clone(),
         page_id: page.id.clone(),
         source_sha: page.source_sha.clone(),
-        bbox: percent_of(record.bbox, page.width, page.height),
+        bbox: percent_of(layer.display_bounds(record.bbox), page.width, page.height),
         // A hand mask and an automatic mask are identical in kind;
         // `source` adds one word and changes nothing else, so it
         // rides in the params snapshot rather than in a manifest field.
@@ -943,6 +947,7 @@ pub(crate) fn region_of_patch(record: &PatchRecord, page: &ApiPage) -> ApiRegion
             write_support_sha256: params.get("write_support_sha256")
                 .and_then(|value| value.as_str()).map(str::to_owned),
             region_id: record.id.clone(),
+            layer,
             // The manifest keeps one record per region id - a re-run replaces
             // it rather than appending - so a reopened job has exactly one
             // revision and it is the first one the session sees.
@@ -1628,6 +1633,39 @@ impl Library {
     }
 
     /* ---------- region-level edits ---------- */
+
+    /// Persist presentation settings without altering the immutable render
+    /// artifacts. `restoreRegion` calls this for both ordinary edits and undo.
+    pub fn set_layer_style(
+        &self,
+        region_id: &str,
+        style: cleaner_core::patch::LayerStyle,
+    ) -> Result<Option<(ApiRegion, String)>, LibraryError> {
+        let index = self.index()?;
+        let Some(chapter_id) = chapter_holding(&index, region_id) else { return Ok(None) };
+        let path = self.resolve_chapter(&chapter_id)?;
+        let _lock = crate::run::lock_job(&path);
+        let mut job = Job::open(&path).map_err(|e| LibraryError::Manifest {
+            path: path.clone(), detail: e.to_string(),
+        })?;
+        let Some(record) = job.project.patches.iter_mut().find(|r| r.id == region_id && r.visible) else {
+            return Ok(None);
+        };
+        let source_idx = record.source_idx;
+        let style = style.sanitized();
+        if !record.provenance.params_snapshot.is_object() {
+            record.provenance.params_snapshot = serde_json::json!({});
+        }
+        record.provenance.params_snapshot["layer"] = serde_json::to_value(style).unwrap_or_default();
+        job.flush().map_err(|e| LibraryError::Manifest {
+            path: path.clone(), detail: e.to_string(),
+        })?;
+        crate::underlay::refresh_dependencies(&mut job, region_id).map_err(|detail| LibraryError::Manifest {
+            path: path.clone(), detail,
+        })?;
+        invalidate_manifest_cache(&path);
+        Ok(region_and_status(&chapter_id, &job.project, source_idx, region_id))
+    }
 
     /// Turn one region's mask off or on, and answer with the region as the
     /// manifest now holds it - the seam's `deleteMask` and the restoring half
@@ -3023,16 +3061,23 @@ pub async fn restore_region(
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
     });
+    let layer = region.as_ref()
+        .and_then(|snapshot| snapshot.pointer("/mask/layer"))
+        .and_then(|value| serde_json::from_value::<cleaner_core::patch::LayerStyle>(value.clone()).ok());
     let edited = blocking(move || {
         let library = Library::for_app(&app)?;
         if wanted {
-            if let Some(revision) = revision {
-                return Ok(library.restore_text_shape_mask(&region_id, &revision)?);
+            let restored = if let Some(revision) = revision {
+                library.restore_text_shape_mask(&region_id, &revision)?
+            } else if let Some(revision) = legacy_revision {
+                library.restore_legacy_mask(&region_id, &revision)?
+            } else {
+                library.set_mask_visible(&region_id, true)?
+            };
+            if let Some(layer) = layer {
+                return Ok(library.set_layer_style(&region_id, layer)?.or(restored));
             }
-            if let Some(revision) = legacy_revision {
-                return Ok(library.restore_legacy_mask(&region_id, &revision)?);
-            }
-            return Ok(library.set_mask_visible(&region_id, true)?);
+            return Ok(restored);
         }
         // **"It was not there" is the soft delete, when there is a patch to
         // soften.** This is the redo of a `deleteMask` as often as it is the
@@ -4661,6 +4706,39 @@ mod tests {
         assert_eq!(undone[0].regions.len(), 1);
         assert!(undone[0].regions[0].mask.is_some());
         assert_eq!(undone[0].status, "cleaned");
+    }
+
+    #[test]
+    fn layer_style_survives_reopen_and_restores_previous_snapshot() {
+        let scratch = Scratch::new("layer-style-reopen");
+        let library = library(&scratch);
+        let project = a_project(&library, &scratch, 1);
+        let chapter = library.create_chapter(&project.id, "Ch 1", None, None)
+            .unwrap().created().unwrap();
+        let path = library.resolve_chapter(&chapter.id).unwrap();
+        let region_id = format!("{}-r0", page_id(&chapter.id, 0));
+        let original_bounds = Rect::new(8, 8, 8, 6);
+        let mut job = Job::open(&path).unwrap();
+        job.complete_region(0, &a_patch(&region_id, original_bounds, Engine::Paint), None).unwrap();
+        drop(job);
+
+        let moved = cleaner_core::patch::LayerStyle {
+            opacity: 42, offset_x: 20, offset_y: 12,
+            rotation: 90.0, locked: true,
+        };
+        let edited = library.set_layer_style(&region_id, moved).unwrap().unwrap().0;
+        assert_eq!(edited.mask.as_ref().unwrap().layer, moved);
+        let reopened = Job::open(&path).unwrap();
+        let patch = reopened.load_patch(&reopened.project.patches[0]).unwrap();
+        assert_eq!(patch.layer_style(), moved);
+        assert_ne!(patch.mask.bounds, original_bounds);
+        drop(reopened);
+
+        let restored = library.set_layer_style(&region_id, cleaner_core::patch::LayerStyle::default())
+            .unwrap().unwrap().0;
+        assert_eq!(restored.mask.as_ref().unwrap().layer.opacity, 100);
+        let reopened = Job::open(&path).unwrap();
+        assert_eq!(reopened.load_patch(&reopened.project.patches[0]).unwrap().mask.bounds, original_bounds);
     }
 
     /// The redo of a delete and the undo of a hand-drawn creation arrive as the

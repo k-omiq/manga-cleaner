@@ -63,6 +63,7 @@ from provisioner.protocol import (
     HelperRequest,
     HelperResponse,
     OP_APPLY,
+    OP_BILLING,
     OP_CLEANUP_APPLY,
     OP_CLEANUP_PLAN,
     OP_FORGET_CREDENTIAL,
@@ -84,6 +85,7 @@ from provisioner.redaction import GLOBAL_REGISTRY, is_sensitive_key, redact_stri
 # The desktop kills apply, resume and cleanup_apply after 30 minutes and every other
 # op after 60 seconds; the helper stops itself with a typed error before that.
 OP_BUDGET_SECONDS: Dict[str, float] = {
+    OP_BILLING: 50.0,
     OP_INSPECT: 50.0,
     OP_PLAN: 50.0,
     OP_APPLY: 27 * 60.0,
@@ -163,6 +165,7 @@ class ProvisioningController:
 
             handler = {
                 OP_INSPECT: self._handle_inspect,
+                OP_BILLING: self._handle_billing,
                 OP_PLAN: self._handle_plan,
                 OP_APPLY: self._handle_apply,
                 OP_RESUME: self._handle_resume,
@@ -253,6 +256,17 @@ class ProvisioningController:
         return session, inspection
 
     # ---------- inspect and plan ----------
+
+    def _handle_billing(self, req: HelperRequest, progress: Progress, deadline: Deadline) -> HelperResponse:
+        from contextlib import ExitStack
+        from provisioner.billing import modal_billing
+        if req.provider != PROVIDER_MODAL:
+            raise ProtocolError(ERR_PROVIDER_UNAVAILABLE, "Billing is currently available for Modal")
+        driver = self.get_driver(req.provider)
+        with ExitStack() as stack:
+            session, _ = self._inspect(driver, req, progress, deadline, stack)
+            result = modal_billing(session, req.params.get("cycle"))
+        return make_success_response(req.request_id, result)
 
     def _handle_inspect(self, req: HelperRequest, progress: Progress, deadline: Deadline) -> HelperResponse:
         from contextlib import ExitStack
@@ -427,13 +441,14 @@ class ProvisioningController:
 
         if req.params.get("forget_setup_credential", False) is True:
             journal.forget_setup_credential()
-        model = production_model()
+        model = production_model(ctx.options["model_id"])
         data = {
             "installation_id": rec.installation_id,
             "provider": rec.provider,
             "stage": rec.stage,
             "gpu": ctx.options["gpu"],
             "idle_seconds": ctx.options["idle_seconds"],
+            "analysis_models": ctx.options["analysis_models"],
             "model": model,
             "compatibility_status": rec.compatibility_status,
             "resources_created": [{"type": r.resource_type, "name": r.name} for r in rec.resources],

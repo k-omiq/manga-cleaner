@@ -18,16 +18,21 @@ from deploy.cloud.common.contract import (
 
 class AnalysisWorker:
     def __init__(self, graphs: Dict[str, List[str]], revisions: Dict[str, str],
-                 session_factory: Callable[[str], Any]):
+                 session_factory: Callable[[str], Any],
+                 verified_digests: Dict[str, str] | None = None):
         self.graphs = graphs
         self.revisions = revisions
         self.session_factory = session_factory
+        # A GPU runtime verifies graph files on load. Rehashing a 1.3 GB SAM
+        # encoder for every tile would dominate analysis; standalone workers
+        # retain the original per-request digest check when no cache is given.
+        self.verified_digests = verified_digests or {}
 
     def capabilities(self) -> Dict[str, Any]:
         return {
             "protocol_version": "1.0.0",
             "capabilities": [
-                {"capability": key, "graph_sha256s": [self._sha(path) for path in paths],
+                {"capability": key, "graph_sha256s": [self.verified_digests.get(path) or self._sha(path) for path in paths],
                  "model_revision": self.revisions[key]}
                 for key, paths in self.graphs.items() if key in (ANALYSIS_SAM, ANALYSIS_RT)
             ],
@@ -53,7 +58,7 @@ class AnalysisWorker:
             raise ContractValidationError("analysis model revision mismatch")
         started = time.monotonic()
         for path, expected in zip(paths, request["graph_sha256s"]):
-            if self._sha(path) != expected:
+            if (self.verified_digests.get(path) or self._sha(path)) != expected:
                 raise ContractValidationError("analysis graph SHA-256 mismatch")
         sessions = [self.session_factory(path) for path in paths]
         loaded = time.monotonic()

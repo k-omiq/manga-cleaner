@@ -97,7 +97,10 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use cleaner_core::accel::{self, Preference};
-use cleaner_core::detect::{Detector, build_regions_separated};
+use cleaner_core::detect::{DetBox, DetectedLanguage, Detection, Detector, Letterbox, Segmentation, build_regions_separated};
+use cleaner_core::balloon::BalloonClass;
+use cleaner_core::rt_regions::FullRegions;
+use cleaner_core::sam_ts;
 use cleaner_core::engines::{denoise, fill, lama};
 use cleaner_core::fit::{self, EdgeMap, Route};
 use cleaner_core::gate::{OutsideText, ScriptGate, Verdict};
@@ -328,6 +331,8 @@ pub(crate) fn engine_for(route: Route, ceiling: Engine) -> Option<Engine> {
 pub enum EnginePick {
     /// Rung 0 - paint the hole from the paper around it.
     Fill,
+    /// Rung 0 - paint the selected solid colour.
+    Solid,
     /// Rung 1 - the same fill with the page's grain put back.
     Denoise,
     /// Rung 2 - the inpainter.
@@ -338,7 +343,7 @@ impl EnginePick {
     /// The rung this pick starts a region on.
     fn engine(self) -> Engine {
         match self {
-            EnginePick::Fill => Engine::Fill,
+            EnginePick::Fill | EnginePick::Solid => Engine::Fill,
             EnginePick::Denoise => Engine::Denoise,
             EnginePick::Lama => Engine::Lama,
         }
@@ -390,6 +395,7 @@ impl Picks {
 fn pick_name(pick: EnginePick) -> &'static str {
     match pick {
         EnginePick::Fill => "fill",
+        EnginePick::Solid => "solid",
         EnginePick::Denoise => "denoise",
         EnginePick::Lama => "lama",
     }
@@ -405,6 +411,43 @@ pub struct RunSelection {
     zh: bool,
     ko: bool,
     ocr_rescue: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DetectorModels { ctd: bool, rt_small: bool, rt_full: bool, sam: bool }
+
+impl Default for DetectorModels {
+    fn default() -> Self { Self { ctd: true, rt_small: true, rt_full: false, sam: false } }
+}
+
+impl DetectorModels {
+    fn from_args(value: Option<&serde_json::Value>) -> Result<Self, String> {
+        let Some(value) = value else { return Ok(Self::default()) };
+        let ids = value.as_array().ok_or("detectorModels must be an array")?;
+        let mut models = Self { ctd: false, rt_small: false, rt_full: false, sam: false };
+        for id in ids {
+            match id.as_str() {
+                Some("ctd") => models.ctd = true,
+                Some("rtSmall") => models.rt_small = true,
+                Some("rtFull") => models.rt_full = true,
+                Some("samTs") => models.sam = true,
+                _ => return Err("Unsupported detection model".into()),
+            }
+        }
+        if !models.ctd && !models.rt_small && !models.rt_full && !models.sam {
+            return Err("Choose at least one detection model".into());
+        }
+        if models.rt_small && models.rt_full { return Err("Choose one RT-DETR profile".into()); }
+        Ok(models)
+    }
+
+    fn required(self, all_text: bool) -> Vec<&'static str> {
+        let mut files = Vec::new();
+        if self.ctd { files.push(DETECTOR); }
+        if self.rt_small { files.push(BALLOONS); }
+        if !all_text { files.extend([GATE_MODEL, GATE_LABELS]); }
+        files
+    }
 }
 
 impl Default for RunSelection {
@@ -482,6 +525,7 @@ pub(crate) fn parse_pick(name: Option<&str>) -> Option<EnginePick> {
     let name = name?;
     match name.strip_prefix("ladder.rung.").unwrap_or(name) {
         "fill" => Some(EnginePick::Fill),
+        "solid" => Some(EnginePick::Solid),
         "denoise" => Some(EnginePick::Denoise),
         "lama" | "redraw" | "inpaint" => Some(EnginePick::Lama),
         _ => None,
@@ -1028,6 +1072,12 @@ pub(crate) fn model_dir(app_data: Option<&Path>) -> Option<PathBuf> {
     model_search_paths(app_data).into_iter().find(|dir| models_ready(dir))
 }
 
+fn selected_model_dir(app_data: Option<&Path>, selection: DetectorModels, all_text: bool) -> Option<PathBuf> {
+    let required = selection.required(all_text);
+    model_search_paths(app_data).into_iter()
+        .find(|dir| required.iter().all(|name| dir.join(name).exists()))
+}
+
 /// Every session a run may need, and **not one of them opened until a page
 /// asks for it**.
 ///
@@ -1050,6 +1100,11 @@ pub struct Pipeline {
     detector: OnDemand<Detector>,
     balloons: OnDemand<cleaner_core::balloon::BalloonDetector>,
     gate: OnDemand<ScriptGate>,
+    detection_models: DetectorModels,
+    all_text: bool,
+    app_data: Option<PathBuf>,
+    full_rt: Option<FullRegions>,
+    sam: Option<sam_ts::SamTsSession>,
     engine_version: &'static str,
     rung2: Rung2,
     /// The pressure ladder, latched for the life of the pipeline. See
@@ -1481,6 +1536,12 @@ impl Pipeline {
         self.balloons.release_if_spent();
         self.gate.release_if_spent();
         self.rung2.release_if_spent();
+        if self.full_rt.as_ref().is_some_and(FullRegions::spent) {
+            self.full_rt = None;
+        }
+        if self.sam.as_ref().is_some_and(sam_ts::SamTsSession::spent) {
+            self.sam = None;
+        }
         // And what *nobody* is holding: a session parked by the last run or the
         // last region edit, whose grace has elapsed while this run was busy
         // with rungs it never needed.
@@ -1488,7 +1549,12 @@ impl Pipeline {
     }
 
     pub fn open(models: &Path, preference: Preference) -> Result<Pipeline, OpenError> {
-        for name in REQUIRED_MODELS {
+        Self::open_selected(models, preference, DetectorModels::default(), false, None)
+    }
+
+    fn open_selected(models: &Path, preference: Preference, detection_models: DetectorModels,
+        all_text: bool, app_data: Option<PathBuf>) -> Result<Pipeline, OpenError> {
+        for name in detection_models.required(all_text) {
             let path = models.join(name);
             if !path.exists() {
                 return Err(OpenError::MissingModel { path });
@@ -1503,6 +1569,11 @@ impl Pipeline {
                 open_balloons,
             ),
             gate: OnDemand::new(registry::Kind::ScriptGate, models, preference, open_gate_bare),
+            detection_models,
+            all_text,
+            app_data,
+            full_rt: None,
+            sam: None,
             engine_version: env!("CARGO_PKG_VERSION"),
             rung2: Rung2::new(models, preference),
             ladder: memory::Ladder::new(),
@@ -1527,7 +1598,7 @@ impl Pipeline {
         self
     }
 
-    /// The solid color to paint inside speech bubble regions when speech bubbles use the fill engine.
+    /// The chosen solid color for either speech bubble or outside text regions.
     pub fn with_bubble_color(mut self, color: Option<[u8; 3]>) -> Pipeline {
         self.bubble_color = color;
         self
@@ -1574,12 +1645,63 @@ impl Pipeline {
         }
         #[cfg(not(test))]
         let _ = segment;
-        let session = self.balloons.get()?;
-        let boxes = session.detect(crop);
-        let balloons = ran(boxes, &*session, &accel::BALLOON, &mut self.fault)?;
-        let session = self.detector.get()?;
-        let output = session.detect(crop);
-        let detection = ran(output, &*session, &accel::DETECTOR, &mut self.fault)?;
+        let mut balloons = if self.detection_models.rt_small {
+            let session = self.balloons.get()?;
+            let boxes = session.detect(crop);
+            ran(boxes, &*session, &accel::BALLOON, &mut self.fault)?
+        } else if self.detection_models.rt_full {
+            if self.full_rt.is_none() {
+                let app_data = self.app_data.as_deref().ok_or("App model directory unavailable")?;
+                let path = crate::model_workflows::full_rt_path(app_data)
+                    .ok_or("Full RT-DETR graph is not installed or failed SHA-256")?;
+                self.full_rt = Some(FullRegions::open_cpu(&path)?.0);
+            }
+            self.full_rt.as_mut().unwrap().detect_halves(crop)?
+        } else { Vec::new() };
+        let mut detection = if self.detection_models.ctd {
+            let session = self.detector.get()?;
+            let output = session.detect(crop);
+            ran(output, &*session, &accel::DETECTOR, &mut self.fault)?
+        } else {
+            Detection {
+                boxes: Vec::new(),
+                segmentation: Segmentation { width: crop.width, height: crop.height,
+                    levels: vec![0; crop.width as usize * crop.height as usize],
+                    fit: Letterbox::fit(crop.width, crop.height) },
+            }
+        };
+        if self.detection_models.sam {
+            if self.sam.is_none() {
+                let app_data = self.app_data.as_deref().ok_or("App model directory unavailable")?;
+                let dir = crate::model_workflows::graph_dir(app_data).ok_or("SAM-TS-L graphs are not installed")?;
+                cleaner_core::residency::evict_for_sam();
+                self.sam = Some(sam_ts::SamTsSession::open(&dir)?);
+            }
+            let mask = self.sam.as_mut().unwrap().infer(crop, &sam_ts::Cancellation::default())?.mask;
+            let evidence = cleaner_core::fusion::fuse(crop.width, crop.height, Some(&mask), &[], &[])?;
+            detection.segmentation.levels = mask;
+            for component in evidence.components {
+                if detection.boxes.iter().any(|item| item.rect.x < component.bounds.right()
+                    && item.rect.right() > component.bounds.x && item.rect.y < component.bounds.bottom()
+                    && item.rect.bottom() > component.bounds.y) { continue; }
+                detection.boxes.push(DetBox { rect: component.bounds, confidence: 1.0,
+                    language: DetectedLanguage::Japanese });
+            }
+        } else if !self.detection_models.ctd {
+            for region in &balloons {
+                if region.class == BalloonClass::Bubble { continue; }
+                detection.boxes.push(DetBox { rect: region.rect, confidence: region.score,
+                    language: DetectedLanguage::Japanese });
+                for y in region.rect.y.max(0) as u32..region.rect.bottom().min(crop.height as i64).max(0) as u32 {
+                    for x in region.rect.x.max(0) as u32..region.rect.right().min(crop.width as i64).max(0) as u32 {
+                        detection.segmentation.levels[y as usize * crop.width as usize + x as usize] = 255;
+                    }
+                }
+            }
+        }
+        // CTD-only has no bubble detector; page geometry can still answer the
+        // inside/outside question. Other combinations retain RT context.
+        if !self.detection_models.rt_small && !self.detection_models.rt_full { balloons.clear(); }
         Ok((balloons, detection))
     }
 
@@ -1594,6 +1716,7 @@ impl Pipeline {
         if let Some(vision) = self.test_vision {
             return Ok((vision.judge)(region));
         }
+        if self.all_text { return Ok(Verdict::OptedIn); }
         let session = self.gate.get()?;
         let reader_missing = self.selection.ocr_rescue && !session.has_reader();
         let judged = session.judge(crop, segmentation, region, detected, self.outside);
@@ -1776,11 +1899,15 @@ impl Cleaner for Pipeline {
         #[cfg(test)]
         let provider = if self.test_vision.is_some() {
             "test".to_owned()
+        } else if !self.detection_models.ctd {
+            "ort-cpu".to_owned()
         } else {
             format!("{:?}", self.detector.get()?.selection().accelerator).to_lowercase()
         };
         #[cfg(not(test))]
-        let provider = format!("{:?}", self.detector.get()?.selection().accelerator).to_lowercase();
+        let provider = if self.detection_models.ctd {
+            format!("{:?}", self.detector.get()?.selection().accelerator).to_lowercase()
+        } else { "ort-cpu".to_owned() };
         // Rule 4's engine-context term is a property of the rung that could
         // run, and the ceiling is what decides that.
         let engine_context = if rung(ceiling) >= rung(Engine::Lama) {
@@ -2034,7 +2161,7 @@ impl Cleaner for Pipeline {
                 // gate asked above and the only thing the two picks are told
                 // apart by.
                 let pick = self.picks.map(|picks| picks.for_region(inside));
-                let solid_color = if inside && pick == Some(EnginePick::Fill) {
+                let solid_color = if pick == Some(EnginePick::Solid) {
                     self.bubble_color
                 } else {
                     None
@@ -3386,6 +3513,28 @@ pub(crate) fn start_with_selection(
     bubble_color: Option<[u8; 3]>,
     selection: RunSelection,
     detection_snapshot: Option<serde_json::Value>,
+    detector_models: Option<&serde_json::Value>,
+    all_text: bool,
+) -> Result<RunHandle, String> {
+    let selected = DetectorModels::from_args(detector_models)?;
+    start_with_models(app, scope, chapter_id, page_index, engine_ceiling, picks, outside,
+        bubble_color, selection, detection_snapshot, selected, all_text)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_with_models(
+    app: &tauri::AppHandle,
+    scope: &str,
+    chapter_id: &str,
+    page_index: Option<u32>,
+    engine_ceiling: Option<String>,
+    picks: Picks,
+    outside: OutsideText,
+    bubble_color: Option<[u8; 3]>,
+    selection: RunSelection,
+    detection_snapshot: Option<serde_json::Value>,
+    detection_models: DetectorModels,
+    all_text: bool,
 ) -> Result<RunHandle, String> {
     if let Some(key) = selection.empty_notice() {
         events::notice(key, serde_json::json!({}), "warn");
@@ -3443,10 +3592,21 @@ pub(crate) fn start_with_selection(
     // is somewhere for the user to go, so the gap is closed the same way the
     // missing-runtime gap already was: a warning that names the remedy, and an
     // empty handle rather than a rejected promise.
-    let Some(models) = model_dir(app_data.as_deref()) else {
+    let Some(models) = selected_model_dir(app_data.as_deref(), detection_models, all_text) else {
         events::notice("notice.run.modelsMissing", serde_json::json!({}), "warn");
         return Ok(RunHandle { run_id: None, pages: Vec::new(), already_running: None });
     };
+    if detection_models.rt_full && app_data.as_deref()
+        .and_then(crate::model_workflows::full_rt_path).is_none() {
+        events::notice("notice.run.modelsMissing", serde_json::json!({ "model": "RT-DETR v2 full" }), "warn");
+        return Ok(RunHandle { run_id: None, pages: Vec::new(), already_running: None });
+    }
+    if detection_models.sam && app_data.as_deref()
+        .and_then(crate::model_workflows::graph_dir)
+        .is_none_or(|dir| crate::model_workflows::verify_graphs(&dir).is_err()) {
+        events::notice("notice.run.modelsMissing", serde_json::json!({ "model": "SAM-TS-L" }), "warn");
+        return Ok(RunHandle { run_id: None, pages: Vec::new(), already_running: None });
+    }
     // Read before the pipeline is opened, because the pipeline's sessions are
     // built here and the accelerator is a property of a session rather than of
     // a run. A setting read afterwards would take effect one run late.
@@ -3456,10 +3616,11 @@ pub(crate) fn start_with_selection(
     // variant rather than on the message: a second failure mode added
     // to `OpenError` will fail to compile here rather than falling into the
     // notice or out of it by the shape of its wording.
-    let pipeline = match Pipeline::open(&models, preference_from(&settings)) {
+    let pipeline = match Pipeline::open_selected(&models, preference_from(&settings),
+        detection_models, all_text, app_data.clone()) {
         Ok(pipeline) => pipeline
             .with_picks(picks)
-            .with_outside(outside)
+            .with_outside(if all_text { OutsideText::Clean } else { outside })
             .with_selection(selection)
             .with_bubble_color(bubble_color),
         Err(OpenError::MissingModel { .. }) => {
@@ -3539,7 +3700,13 @@ fn run_settings_snapshot(
     settings_snapshot["runScope"] = serde_json::json!(scope);
     settings_snapshot["runPageIndex"] = serde_json::json!(page_index);
     settings_snapshot["runGeometryPolicy"] = serde_json::json!("legacy");
-    settings_snapshot["runTextPolicy"] = serde_json::json!("legacy_gate");
+    settings_snapshot["runTextPolicy"] = serde_json::json!(if pipeline.all_text { "all_text" } else { "legacy_gate" });
+    settings_snapshot["runDetectorModels"] = serde_json::json!([
+        pipeline.detection_models.ctd.then_some("ctd"),
+        pipeline.detection_models.rt_small.then_some("rtSmall"),
+        pipeline.detection_models.rt_full.then_some("rtFull"),
+        pipeline.detection_models.sam.then_some("samTs"),
+    ].into_iter().flatten().collect::<Vec<_>>());
     settings_snapshot["runBubbleEngine"] = serde_json::json!(pick_name(pipeline.picks.unwrap_or_default().bubble));
     settings_snapshot["runOutsideEngine"] = serde_json::json!(pick_name(pipeline.picks.unwrap_or_default().outside));
     settings_snapshot["runOutsideBubbles"] = serde_json::json!(if pipeline.outside == OutsideText::Clean { "clean" } else { "review" });
@@ -3678,6 +3845,8 @@ fn release(finished: &Arc<(Mutex<bool>, Condvar)>) {
 struct CapturedRunPolicy {
     selection: RunSelection,
     detection: Option<serde_json::Value>,
+    detector_models: DetectorModels,
+    all_text: bool,
     engine_ceiling: Option<String>,
     scope: String,
     page_index: Option<u32>,
@@ -3690,15 +3859,16 @@ fn captured_run_policy(snapshot: &serde_json::Value) -> Result<CapturedRunPolicy
     if snapshot.get("runGeometryPolicy").and_then(|v| v.as_str())
         .is_some_and(|mode| mode != "legacy")
         || snapshot.get("runTextPolicy").and_then(|v| v.as_str())
-            .is_some_and(|policy| policy != "legacy_gate")
+            .is_some_and(|policy| !matches!(policy, "legacy_gate" | "all_text"))
     {
         return Err("This interrupted workflow cannot be resumed as legacy cleaning".into());
     }
     let detection = snapshot.get("runDetection").filter(|value| !value.is_null()).cloned();
-    let selection = RunSelection::from_args(
+    let all_text = snapshot.get("runTextPolicy").and_then(|v| v.as_str()) == Some("all_text");
+    let selection = if all_text { RunSelection::default() } else { RunSelection::from_args(
         detection.as_ref(),
         snapshot.get("runOcrRescue").and_then(|value| value.as_bool()),
-    )?;
+    )? };
     let scope = snapshot.get("runScope").and_then(|value| value.as_str()).unwrap_or("chapter");
     if !matches!(scope, "chapter" | "project" | "page") {
         return Err("This interrupted workflow has an unknown run scope".into());
@@ -3706,6 +3876,8 @@ fn captured_run_policy(snapshot: &serde_json::Value) -> Result<CapturedRunPolicy
     Ok(CapturedRunPolicy {
         selection,
         detection,
+        detector_models: DetectorModels::from_args(snapshot.get("runDetectorModels"))?,
+        all_text,
         engine_ceiling: snapshot.get("runEngineCeiling")
             .and_then(|value| value.as_str())
             .or_else(|| snapshot.get("engineCeiling").and_then(|value| value.as_str()))
@@ -3754,6 +3926,7 @@ pub async fn run_clean(
     outside_bubbles: Option<String>,
     bubble_color: Option<String>,
     detection: Option<serde_json::Value>,
+    detector_models: Option<serde_json::Value>,
     geometry_policy: Option<String>,
     text_policy: Option<String>,
     ocr_rescue: Option<bool>,
@@ -3762,14 +3935,16 @@ pub async fn run_clean(
         if !matches!(geometry_policy.as_deref(), None | Some("legacy")) {
             return Err("Text-shaped cleaning requires the prepared mask review workflow".to_owned());
         }
-        if !matches!(text_policy.as_deref(), None | Some("legacy_gate")) {
-            return Err("All-text cleaning requires the RT-DETR + SAM-TS review workflow".to_owned());
+        if !matches!(text_policy.as_deref(), None | Some("legacy_gate") | Some("all_text")) {
+            return Err("Unsupported text policy".to_owned());
         }
-        let selection = RunSelection::from_args(detection.as_ref(), ocr_rescue)?;
+        let all_text = text_policy.as_deref() == Some("all_text");
+        let selection = if all_text { RunSelection::default() } else { RunSelection::from_args(detection.as_ref(), ocr_rescue)? };
+        let selected_models = DetectorModels::from_args(detector_models.as_ref())?;
         let picks = Picks::from_args(bubble_engine.as_deref(), outside_engine.as_deref());
         let outside = OutsideText::from_arg(outside_bubbles.as_deref());
         let parsed_color = parse_color_hex(bubble_color.as_deref());
-        start_with_selection(
+        start_with_models(
             &app,
             scope.as_deref().unwrap_or("chapter"),
             &chapter_id,
@@ -3780,6 +3955,8 @@ pub async fn run_clean(
             parsed_color,
             selection,
             detection,
+            selected_models,
+            all_text,
         )
     })
     .await
@@ -3902,7 +4079,7 @@ pub async fn resume_job(
         // Resume the captured run policy. Defaults here would silently clean
         // languages skipped before an interruption.
         let policy = captured_run_policy(&run_snapshot)?;
-        let handle = start_with_selection(
+        let handle = start_with_models(
             &app,
             &policy.scope,
             &chapter_id,
@@ -3913,6 +4090,8 @@ pub async fn resume_job(
             policy.bubble_color,
             policy.selection,
             policy.detection,
+            policy.detector_models,
+            policy.all_text,
         )?;
         if !resume_started(&handle) { return Ok(None); }
         events::notice(

@@ -2,6 +2,8 @@
 
 Status: M4–M6 implementation review, 25 September 2026. This document describes the local boundary only. It does not authorize cloud detection, COO MTSv3, Qwen, or distribution of converted RT/SAM weights.
 
+Current implementation note, 26 September 2026: Settings and onboarding now support independent CTD, RT-DETR v2 (small or full), and SAM-TS-L choices in Auto clean as requested, with managed full RT download and local SAM export. The historical M5/M6 decisions and measurements below describe the earlier optional review path. They do not validate cleaning quality or exact graph reproduction on every operating system; no cross-platform quality promotion is implied.
+
 ## User workflow and write boundary
 
 Legacy Auto Clean remains the default for old and new projects. Its source-language choices are captured when a run starts and restored on resume; Skip holds that language's candidates, and Japanese OCR rescue is an explicit option. The script identifier cannot reliably separate Japanese kanji from Chinese Han, so a Han result remains eligible when either Japanese or Chinese is selected. A run with every language skipped performs no cleaning. Outside-bubble opt-in deliberately bypasses script reading; when only some languages are selected, such outside candidates are held for review because their language cannot be checked against Skip. With all languages selected, the opt-in cleans them.

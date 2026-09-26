@@ -243,6 +243,7 @@
  * @property {string|null} [maskQualityState] - a saved text-shaped result that still needs mask correction
  * @property {string|number|null} [textShapePatchRevision] - immutable text-shaped patch revision restored by history
  * @property {CloudOutcome|null} cloudOutcome - legacy; null on every mask made today
+ * @property {{opacity: number, offsetX: number, offsetY: number, rotation: number, locked: boolean}} [layer] - saved presentation settings; defaults to opaque, untransformed, unlocked
  * @property {Provenance} provenance
  */
 

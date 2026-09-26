@@ -175,8 +175,10 @@ class TestSubprocessEntrypoint(unittest.TestCase):
         self.assertEqual(report["ok"], HAS_SDKS, report)
         self.assertEqual(result.returncode, 0 if HAS_SDKS else 1)
         if HAS_SDKS:
-            self.assertEqual(report["modal_app"], ["Worker.*", "gateway", "seed_weights", "Worker"])
-            self.assertEqual(report["beam_app"], ["gateway", "render", "seed"])
+            self.assertEqual(report["modal_app"], [
+                "AnalysisGPU.*", "Worker.*", "gateway", "seed_weights", "AnalysisGPU", "Worker",
+            ])
+            self.assertEqual(report["beam_app"], ["analyze", "gateway", "render", "seed"])
 
 
 if __name__ == "__main__":

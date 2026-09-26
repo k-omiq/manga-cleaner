@@ -149,6 +149,113 @@ impl Patch {
     pub fn is_well_formed(&self) -> bool {
         self.pixels.width == self.mask.bounds.w && self.pixels.height == self.mask.bounds.h
     }
+
+    /// Presentation settings survive in the patch's provenance snapshot. Old
+    /// manifests have no `layer` field and render exactly as before.
+    pub fn layer_style(&self) -> LayerStyle {
+        LayerStyle::from_snapshot(&self.provenance.params_snapshot)
+    }
+
+    /// Move and rotate the saved pixels and masks together for every consumer
+    /// of `Job::load_patch`: tiles, underlays, flattened and layered exports.
+    pub fn presented(mut self) -> Self {
+        let style = self.layer_style();
+        if style.offset_x == 0 && style.offset_y == 0 && style.rotation == 0.0 {
+            return self;
+        }
+        let source = self.mask.bounds;
+        if source.w == 0 || source.h == 0 { return self; }
+        let cx = source.x as f64 + source.w as f64 / 2.0;
+        let cy = source.y as f64 + source.h as f64 / 2.0;
+        let angle = style.rotation.to_radians();
+        let (sin, cos) = angle.sin_cos();
+        let bounds = style.display_bounds(source);
+        let mut mask = crate::mask::Mask::empty(bounds);
+        let mut ink = crate::mask::Mask::empty(bounds);
+        let mut pixels = self.pixels.clone();
+        pixels.width = bounds.w;
+        pixels.height = bounds.h;
+        pixels.data = vec![0; crate::composite::blank_len(bounds.w, bounds.h, &self.pixels)];
+        let channels = pixels.mode.samples();
+        for y in 0..bounds.h {
+            for x in 0..bounds.w {
+                let world_x = bounds.x as f64 + x as f64 + 0.5 - style.offset_x as f64 - cx;
+                let world_y = bounds.y as f64 + y as f64 + 0.5 - style.offset_y as f64 - cy;
+                let sx = (cx + world_x * cos + world_y * sin).floor() as i64;
+                let sy = (cy - world_x * sin + world_y * cos).floor() as i64;
+                if self.mask.contains(sx, sy) {
+                    mask.set(bounds.x + x as i64, bounds.y + y as i64, true);
+                    let lx = (sx - source.x) as u32;
+                    let ly = (sy - source.y) as u32;
+                    for channel in 0..channels {
+                        pixels.set_sample(x, y, channel, self.pixels.sample(lx, ly, channel));
+                    }
+                }
+                if self.ink.contains(sx, sy) {
+                    ink.set(bounds.x + x as i64, bounds.y + y as i64, true);
+                }
+            }
+        }
+        self.mask = mask;
+        self.ink = ink;
+        self.pixels = pixels;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LayerStyle {
+    pub opacity: u8,
+    pub offset_x: i32,
+    pub offset_y: i32,
+    pub rotation: f64,
+    pub locked: bool,
+}
+
+impl Default for LayerStyle {
+    fn default() -> Self {
+        Self { opacity: 100, offset_x: 0, offset_y: 0, rotation: 0.0, locked: false }
+    }
+}
+
+impl LayerStyle {
+    pub fn from_snapshot(snapshot: &serde_json::Value) -> Self {
+        serde_json::from_value::<Self>(snapshot.get("layer").cloned().unwrap_or_default())
+            .unwrap_or_default()
+            .sanitized()
+    }
+
+    pub fn sanitized(mut self) -> Self {
+        self.opacity = self.opacity.min(100);
+        self.offset_x = self.offset_x.clamp(-10_000, 10_000);
+        self.offset_y = self.offset_y.clamp(-10_000, 10_000);
+        self.rotation = if self.rotation.is_finite() { self.rotation.clamp(-180.0, 180.0) } else { 0.0 };
+        self
+    }
+
+    pub fn display_bounds(self, source: crate::mask::Rect) -> crate::mask::Rect {
+        if self.offset_x == 0 && self.offset_y == 0 && self.rotation == 0.0 { return source; }
+        let cx = source.x as f64 + source.w as f64 / 2.0;
+        let cy = source.y as f64 + source.h as f64 / 2.0;
+        let (sin, cos) = self.rotation.to_radians().sin_cos();
+        let corners = [
+            (source.x as f64, source.y as f64),
+            (source.right() as f64, source.y as f64),
+            (source.x as f64, source.bottom() as f64),
+            (source.right() as f64, source.bottom() as f64),
+        ];
+        let transformed = corners.map(|(x, y)| {
+            let (dx, dy) = (x - cx, y - cy);
+            (cx + dx * cos - dy * sin + self.offset_x as f64,
+             cy + dx * sin + dy * cos + self.offset_y as f64)
+        });
+        let left = transformed.iter().map(|p| p.0).fold(f64::INFINITY, f64::min).floor() as i64;
+        let top = transformed.iter().map(|p| p.1).fold(f64::INFINITY, f64::min).floor() as i64;
+        let right = transformed.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max).ceil() as i64;
+        let bottom = transformed.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max).ceil() as i64;
+        crate::mask::Rect::new(left, top, (right - left) as u32, (bottom - top) as u32)
+    }
 }
 
 #[cfg(test)]

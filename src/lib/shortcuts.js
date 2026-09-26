@@ -127,7 +127,7 @@ export const HOLD_ORIGINAL_ID = 'view.holdOriginal'
 
 /** @type {Shortcut[]} */
 export const SHORTCUTS = [
-  /* ---- tools: 1–6, in tool-rail order --------------------------------- */
+  /* ---- tools: 1–5, in tool-rail order --------------------------------- */
   {
     id: 'tool.autoClean',
     group: 'tools',
@@ -165,22 +165,13 @@ export const SHORTCUTS = [
     run: (c) => c.selectToolSlot(4),
   },
   {
-    id: 'tool.contentAwareFill',
+    id: 'tool.cloneHeal',
     group: 'tools',
-    labelKey: 'tools.name.contentAwareFill',
+    labelKey: 'tools.name.cloneHeal',
     keys: ['5'],
     chord: ['5'],
     scope: 'editor',
     run: (c) => c.selectToolSlot(5),
-  },
-  {
-    id: 'tool.cloneHeal',
-    group: 'tools',
-    labelKey: 'tools.name.cloneHeal',
-    keys: ['6'],
-    chord: ['6'],
-    scope: 'editor',
-    run: (c) => c.selectToolSlot(6),
   },
 
   /* ---- view ------------------------------------------------------------ */

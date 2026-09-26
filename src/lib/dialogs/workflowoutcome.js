@@ -103,7 +103,7 @@ const RULES = [
   [/source geometry changed/i, { kind: 'sourceLimit', reason: 'geometry' }],
   [/tile PNG exceeds transfer limit/i, { kind: 'sourceLimit', reason: 'tile' }],
   [/20 MB|24 megapixel|review-preview limit|preview format is unsupported/i, { kind: 'sourceLimit' }],
-  [/Analysis request id|Choose Regions, Mask, or Text-shaped review|Choose the full tiled or installed small RT-DETR profile/i,
+  [/Analysis request id|Choose a supported detection model combination|Choose Regions, Mask, or Text-shaped review|Choose the full tiled or installed small RT-DETR profile/i,
     { kind: 'invalidRequest' }],
   [/Chapter source is missing|Chapter source path is not UTF-8/i, { kind: 'sourceUnreadable' }],
   [/Patch order is exhausted|Mask plan revision is exhausted/i, { kind: 'exhausted' }],
@@ -419,6 +419,7 @@ export function readinessKeyOf(capabilities, preset, { rtProfile, rtBackend, sam
   if (!capabilities || !preset) return null
   const runtime = runtimeState({ installed: capabilities.runtimeInstalled === true }, preset.needs, load)
   if (runtime !== 'installed' && runtime !== 'notNeeded') return RUNTIME_KEYS[runtime] ?? 'workflow.ready.runtime'
+  if (preset.needs.includes('ctd') && !capabilities.ctdInstalled) return 'workflow.ready.ctd'
   if (preset.needs.includes('rt')) {
     const installed = rtProfile === 'full-halves' ? capabilities.fullRtInstalled : capabilities.rtInstalled
     if (!installed) return 'workflow.ready.rt'

@@ -22,6 +22,8 @@ from deploy.cloud.common.deployment import (
     parse_gpu,
     parse_idle_seconds,
 )
+from deploy.cloud.common.manifest import MODEL_PROD_FLUX, production_model
+from deploy.cloud.common.analysis_seed import normalize_analysis_models
 
 GPU_ALLOWLIST = ("RTX4090", "A10G", "RTX5090")
 DEFAULT_GPU = "RTX4090"
@@ -32,7 +34,10 @@ ENV_MAP_NAME = "MC_BEAM_MAP"
 ENV_SECRET_NAME = "MC_BEAM_SECRET"
 ENV_GPU = "MC_BEAM_GPU"
 ENV_IDLE_SECONDS = "MC_BEAM_IDLE_SECONDS"
+ENV_MODEL_ID = "MC_BEAM_MODEL_ID"
+ENV_ANALYSIS_MODELS = "MC_BEAM_ANALYSIS_MODELS"
 ENV_WORKER_URL = "MC_BEAM_WORKER_URL"
+ENV_ANALYSIS_URL = "MC_BEAM_ANALYSIS_URL"
 ENV_GATEWAY_HOST = "MC_BEAM_GATEWAY_HOST"
 ENV_GATEWAY_PORT = "MC_BEAM_GATEWAY_PORT"
 
@@ -61,8 +66,11 @@ class BeamSettings:
     secret_name: str
     gpu: str
     idle_seconds: int
+    model_id: str = MODEL_PROD_FLUX
+    analysis_models: tuple[str, ...] = ()
     # Filled in after the worker is deployed; the gateway enqueues jobs there.
     worker_url: str = ""
+    analysis_url: str = ""
     gateway_host: str = DEFAULT_GATEWAY_HOST
     gateway_port: int = DEFAULT_GATEWAY_PORT
 
@@ -73,6 +81,8 @@ class BeamSettings:
         prefix: str,
         gpu: str = DEFAULT_GPU,
         idle_seconds: int = DEFAULT_IDLE_SECONDS,
+        model_id: str = MODEL_PROD_FLUX,
+        analysis_models: tuple[str, ...] = (),
         gateway_host: str = DEFAULT_GATEWAY_HOST,
         gateway_port: int = DEFAULT_GATEWAY_PORT,
     ) -> "BeamSettings":
@@ -84,6 +94,8 @@ class BeamSettings:
             secret_name=secret_name_for(prefix),
             gpu=parse_gpu(gpu, GPU_ALLOWLIST),
             idle_seconds=parse_idle_seconds(idle_seconds),
+            model_id=production_model(model_id).model_id,
+            analysis_models=normalize_analysis_models(analysis_models),
             gateway_host=gateway_host,
             gateway_port=int(gateway_port),
         )
@@ -101,13 +113,19 @@ class BeamSettings:
             secret_name=env.get(ENV_SECRET_NAME) or secret_name_for(prefix),
             gpu=parse_gpu(env.get(ENV_GPU) or DEFAULT_GPU, GPU_ALLOWLIST),
             idle_seconds=parse_idle_seconds(env.get(ENV_IDLE_SECONDS) or DEFAULT_IDLE_SECONDS),
+            model_id=production_model(env.get(ENV_MODEL_ID) or MODEL_PROD_FLUX).model_id,
+            analysis_models=normalize_analysis_models(tuple(filter(None, (env.get(ENV_ANALYSIS_MODELS) or "").split(",")))),
             worker_url=env.get(ENV_WORKER_URL) or "",
+            analysis_url=env.get(ENV_ANALYSIS_URL) or "",
             gateway_host=env.get(ENV_GATEWAY_HOST) or DEFAULT_GATEWAY_HOST,
             gateway_port=int(env.get(ENV_GATEWAY_PORT) or DEFAULT_GATEWAY_PORT),
         )
 
     def with_worker_url(self, worker_url: str) -> "BeamSettings":
         return replace(self, worker_url=worker_url)
+
+    def with_analysis_url(self, analysis_url: str) -> "BeamSettings":
+        return replace(self, analysis_url=analysis_url)
 
     def to_env(self) -> Dict[str, str]:
         """Variables for the deployments. Beam rejects empty values, so unset ones are left out."""
@@ -119,7 +137,10 @@ class BeamSettings:
             ENV_SECRET_NAME: self.secret_name,
             ENV_GPU: self.gpu,
             ENV_IDLE_SECONDS: str(self.idle_seconds),
+            ENV_MODEL_ID: self.model_id,
+            ENV_ANALYSIS_MODELS: ",".join(self.analysis_models),
             ENV_WORKER_URL: self.worker_url,
+            ENV_ANALYSIS_URL: self.analysis_url,
             ENV_GATEWAY_HOST: self.gateway_host,
             ENV_GATEWAY_PORT: str(self.gateway_port),
         }
@@ -143,8 +164,15 @@ class BeamSettings:
         return f"{self.prefix}-gateway"
 
     @property
+    def analysis_name(self) -> str:
+        return f"{self.prefix}-analysis"
+
+    @property
     def deployment_names(self) -> Dict[str, str]:
-        return {"seed": self.seed_name, "worker": self.worker_name, "gateway": self.gateway_name}
+        names = {"seed": self.seed_name, "worker": self.worker_name, "gateway": self.gateway_name}
+        if self.analysis_models:
+            names["analysis"] = self.analysis_name
+        return names
 
 
 def secret_name_for(prefix: str) -> str:

@@ -87,9 +87,12 @@ const NOTHING_RAN = new Set([
  * @typedef {Object} SetupOptions
  * @property {string} [gpu]
  * @property {number} [idle_seconds]
+ * @property {string} [model_id]
+ * @property {string[]} [analysis_models]
  */
 
 const GPU_NAME = /^[A-Za-z0-9_-]{1,32}$/
+const MODEL_ID = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]{1,100}$/
 
 /**
  * Only the two known choices, and only well-formed values of them: this is
@@ -102,9 +105,13 @@ export function cleanOptions(value) {
   /** @type {SetupOptions} */
   const options = {}
   if (!value || typeof value !== 'object') return options
-  const { gpu, idle_seconds: idle } = /** @type {Record<string, unknown>} */ (value)
+  const { gpu, idle_seconds: idle, model_id, analysis_models } = /** @type {Record<string, unknown>} */ (value)
   if (typeof gpu === 'string' && GPU_NAME.test(gpu)) options.gpu = gpu
   if (typeof idle === 'number' && Number.isInteger(idle) && idle >= 0 && idle <= 86_400) options.idle_seconds = idle
+  if (typeof model_id === 'string' && MODEL_ID.test(model_id)) options.model_id = model_id
+  if (Array.isArray(analysis_models) && analysis_models.length <= 2 &&
+      analysis_models.every((item) => item === 'text_mask_sam_ts@1' || item === 'text_regions_rt@1') &&
+      new Set(analysis_models).size === analysis_models.length) options.analysis_models = analysis_models
   return options
 }
 
@@ -504,14 +511,14 @@ export async function removeEndpoint(spec, backend = getBackend()) {
   const { [spec.profileId]: _removed, ...rest } = profiles
   const selected = config.selectedTarget
   const wasSelected = selected?.type === spec.provider && selected.profile_id === spec.profileId
+  // Native secret keys are bound to the profile's origin. Delete while that
+  // profile still exists; keep it accessible if credential removal fails.
+  for (const role of ['runtime', 'setup']) {
+    await backend.deleteCloudSecret({ provider: spec.provider, profileId: spec.profileId, role })
+  }
   await backend.writeInferenceConfig({
     config: { ...config, [key]: rest, selectedTarget: wasSelected ? { type: 'local' } : selected },
   })
-  try {
-    await backend.deleteCloudSecret({ provider: spec.provider, profileId: spec.profileId, role: 'runtime' })
-  } catch {
-    // A token left behind is bound to an endpoint that no longer exists.
-  }
   void refreshCloudReadiness(backend)
   return true
 }

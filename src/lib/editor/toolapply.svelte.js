@@ -16,7 +16,6 @@
  */
 
 import { getBackend } from '../api/backend.js'
-import { pushModal } from '../state/app.svelte.js'
 import { session } from '../state/session.svelte.js'
 import {
   adoptRun,
@@ -77,10 +76,6 @@ export async function applyActiveToolToRegion(regionId, extraParams) {
   const { region, pageIndex } = located
 
   const tool = editor.tool
-  if (tool === 'autoClean' && session.textPolicy === 'all_text') {
-    pushModal({ kind: 'workflowReview', props: { chapterId: chapter.id, pageIndex } })
-    return false
-  }
   const mergedParams = { ...$state.snapshot(editor.toolParams[tool] ?? {}), ...(extraParams ?? {}) }
   const points = extraParams?.points ?? (/** @type {any} */ (extraParams?.stroke)?.points)
   const paint = extraParams?.paint ?? (points ? paintParamsOf(tool, mergedParams, points) : null)
@@ -89,8 +84,9 @@ export async function applyActiveToolToRegion(regionId, extraParams) {
     ...(paint ? { paint } : {}),
     ...(tool === 'autoClean' ? {
       detection: $state.snapshot(session.detection),
+      detectorModels: [...session.detectorModels],
       geometryPolicy: 'legacy',
-      textPolicy: 'legacy_gate',
+      textPolicy: session.textPolicy,
       ocrRescue: session.ocrRescue === true,
     } : {}),
   }

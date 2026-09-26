@@ -68,7 +68,7 @@ describe('maskRows - unfiltered', () => {
     expect(row.deletable).toBe(true)
   })
 
-  it('puts fill mode, cloud cost and hand-drawn on the sub-line', () => {
+  it('keeps cloud cost on the sub-line without redundant layer details', () => {
     const cloud = mask({
       fillMode: 'reconstruct',
       provenance: {
@@ -79,9 +79,7 @@ describe('maskRows - unfiltered', () => {
     })
     const [row] = maskRows([region({ source: 'hand', mask: cloud })])
     expect(row.sub).toEqual([
-      { key: 'masks.fillMode.reconstruct' },
       { key: 'masks.value.cloudCost', params: { cost: 0.014 } },
-      { key: 'masks.origin.hand' },
     ])
   })
 
@@ -120,9 +118,10 @@ describe('maskRows - unfiltered', () => {
     const [row] = maskRows([region({ mask: remoteFlux })])
     expect(row.engine).toBe('cloud')
     expect(row.titleKey).toBe('ladder.rung.cloud')
-    expect(row.facts[0]).toEqual({ key: 'masks.provenance.engine', valueKey: 'ladder.rung.cloud' })
-    // The model its own record names, not the version the replaced patch carried.
-    expect(row.facts[1]).toEqual({ key: 'masks.provenance.modelVersion', value: 'flux-schnell' })
+    expect(row.modelId).toBe('flux-schnell')
+    expect(row.facts.map((fact) => fact.key)).toEqual([
+      'masks.provenance.model', 'masks.provenance.cloudCost', 'masks.provenance.cloudRequestId',
+    ])
     expect(row.reRunnable).toBe(true)
     expect(row.deletable).toBe(true)
     // subline does not contain fake zero cost
@@ -183,15 +182,9 @@ describe('maskRows - the review filter', () => {
 })
 
 describe('maskRow facts', () => {
-  it('formats provenance for display and records where the mask came from', () => {
+  it('omits redundant engine, model, fill, timing and origin facts', () => {
     const row = maskRow(region({ source: 'hand' }), false)
-    expect(row.facts).toEqual([
-      { key: 'masks.provenance.engine', valueKey: 'ladder.rung.fill' },
-      { key: 'masks.provenance.modelVersion', value: 'planar-1.4' },
-      { key: 'masks.provenance.fillMode', valueKey: 'masks.fillMode.matchSurround' },
-      { key: 'masks.provenance.elapsed', valueKey: 'masks.value.elapsed', params: { ms: 40 } },
-      { key: 'masks.provenance.origin', valueKey: 'masks.origin.hand' },
-    ])
+    expect(row.facts).toEqual([])
   })
 
   it('adds cost and request id for a cloud region, and the reason when flagged', () => {

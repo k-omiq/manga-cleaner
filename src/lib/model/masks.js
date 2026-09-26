@@ -67,12 +67,10 @@ export function orderMasks(masks) {
  * @returns {ProvenanceFact[]}
  */
 export function provenanceFacts(mask) {
-  const facts = [
-    { key: 'masks.provenance.engine', value: maskEngine(mask) },
-    { key: 'masks.provenance.modelVersion', value: mask.provenance.cloud?.model || mask.provenance.engine_version },
-    { key: 'masks.provenance.fillMode', value: mask.fillMode },
-    { key: 'masks.provenance.elapsed', value: mask.elapsedMs },
-  ]
+  const facts = []
+  const model = mask.provenance.cloud?.model ??
+    (mask.provenance.engine === 'flux' ? mask.provenance.params_snapshot?.flux_model : null)
+  if (model) facts.push({ key: 'masks.provenance.model', value: model })
   if (mask.provenance.cloud) {
     facts.push({ key: 'masks.provenance.cloudCost', value: mask.provenance.cloud.cost ?? null })
     if (mask.provenance.cloud.request_id) {
@@ -269,6 +267,13 @@ export function regionMenuSections(region, options = {}) {
   /** @type {RegionMenuSection[]} */
   const sections = []
 
+  if (!mask && region?.outcome === 'gate-skipped') {
+    sections.push({ id: 'approve', labelKey: null,
+      items: [{ id: 'approve', labelKey: 'masks.action.approve' }] })
+    sections.push({ id: 'engine', labelKey: 'masks.action.engine',
+      items: rowEngines(options.engines, { cloud: false })
+        .map((rung) => ({ id: `approve:${rung}`, labelKey: engineChoiceLabel(rung) })) })
+  }
   if (reRunnable(mask)) {
     sections.push({
       id: 'rerun',

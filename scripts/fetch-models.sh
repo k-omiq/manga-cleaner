@@ -73,6 +73,10 @@ fetch comic-text-and-bubble-detector-detector-v4-s_int8.onnx \
 	5fe9e4f576e49d4e7e8b0e029d6d3cdc252abd4694113e1cae120e62c931ea79 \
 	https://huggingface.co/ogkalu/comic-text-and-bubble-detector/resolve/main/detector-v4-s_int8.onnx
 
+fetch detector.onnx \
+	065744e91c0594ad8663aa8b870ce3fb27222942eded5a3cc388ce23421bd195 \
+	https://huggingface.co/ogkalu/comic-text-and-bubble-detector/resolve/16e8a622f91fabc6b5b65c96d32d1183f8843546/detector.onnx
+
 # The gate's rescue reader. Apache-2.0, three files, 460 MB, and
 # OPTIONAL: nothing in the application requires it, `open_gate` attaches it only
 # if all three are here, and a checkout without them gates exactly as it did

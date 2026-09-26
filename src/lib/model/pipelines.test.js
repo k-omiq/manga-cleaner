@@ -23,6 +23,7 @@ import {
   runtimeState,
   usedNow,
   workflowNeeds,
+  workflowForDetectorModels,
 } from './pipelines.js'
 
 const ALL = { ja: 'ctd-rtdetr', zh: 'ctd-rtdetr', ko: 'ctd-rtdetr' }
@@ -81,6 +82,18 @@ describe('what legacy filtering downloads', () => {
 })
 
 describe('what all-text review downloads', () => {
+  it('maps each valid model combination to the matching review preset', () => {
+    expect(workflowForDetectorModels(['ctd'])).toBe('ctd')
+    expect(workflowForDetectorModels(['rtFull'])).toBe('regions')
+    expect(workflowForDetectorModels(['samTs'])).toBe('mask')
+    expect(workflowForDetectorModels(['ctd', 'samTs'])).toBe('ctd_mask')
+    expect(workflowForDetectorModels(['ctd', 'rtFull', 'samTs'])).toBe('ctd_text_shape')
+  })
+  it('downloads only the selected detector models for automatic cleaning', () => {
+    expect(filesFor(ALL, {}, { textPolicy: ALL_TEXT_POLICY, detectorModels: ['ctd'] })).toEqual(['textDetector'])
+    expect(filesFor(ALL, {}, { textPolicy: ALL_TEXT_POLICY, detectorModels: ['rtFull'] })).toEqual(['fullRt'])
+    expect(workflowNeeds({ textPolicy: ALL_TEXT_POLICY, detectorModels: ['samTs'] })).toEqual(['samTs'])
+  })
   it('is the speech bubble finder alone: never the gate labels, never any manga-ocr file', () => {
     for (const ocrRescue of [false, true]) {
       for (const detection of [ALL, NONE, { ...ALL, ja: 'ctd-rtdetr-ocr' }]) {
@@ -93,7 +106,7 @@ describe('what all-text review downloads', () => {
   it('needs the SAM-TS-L graphs as an import, not a download', () => {
     expect(workflowNeeds({ textPolicy: ALL_TEXT_POLICY })).toEqual(['rtSmall', 'samTs'])
     expect(model('samTs')?.source).toBe('import')
-    expect(model('rtFull')?.source).toBe('import')
+    expect(model('rtFull')?.source).toBe('download')
     expect(model('samTs')?.files).toEqual([])
   })
 })

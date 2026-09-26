@@ -324,6 +324,8 @@ export const icons = {
     'M8 2.5h.01M13.5 5.5h.01M11.5 13.5h.01M3.5 12.5h.01M2.5 7.5h.01',
   ],
 
+  'shape-line': ['M2.5 12.5 13.5 3.5'],
+
   // Open book seen from the front.
   'book': [
     'M2.5 4.5c2-1 3.5-.8 5.5.3v7.7c-2-1-3.5-.8-5.5.3V4.5Z',

@@ -122,7 +122,7 @@
       : null,
   )
   const shapeStyle = $derived(
-    solidFill ? `fill: ${solidFill.color}; opacity: ${solidFill.opacity};` : undefined,
+    solidFill ? `fill: ${solidFill.color}; opacity: ${solidFill.opacity}; stroke: ${editor.toolParams.shapes?.outlineColor ?? '#000000'}; stroke-width: ${Math.max(0, Number(editor.toolParams.shapes?.outlineWidth ?? 0))}px;` : undefined,
   )
 </script>
 
@@ -160,7 +160,11 @@
       {/if}
     </g>
   {:else if bbox && !livePixels}
-    {#if active?.kind === 'ellipse'}
+    {#if active?.kind === 'line' && (active?.points.length ?? 0) >= 2}
+      <line class="shape" x1={active.points[0].x} y1={active.points[0].y}
+        x2={active.points.at(-1).x} y2={active.points.at(-1).y}
+        vector-effect="non-scaling-stroke" style="stroke: {solidFill?.color ?? 'var(--page-mark-line)'}; stroke-width: {Math.max(1, Number(editor.toolParams.shapes?.outlineWidth ?? 2))}px" />
+    {:else if active?.kind === 'ellipse'}
       <ellipse
         class="shape"
         cx={bbox.x + bbox.w / 2}
@@ -172,7 +176,7 @@
       />
     {:else if closed}
       <polygon class="shape" points={closed} vector-effect="non-scaling-stroke" style={shapeStyle} />
-    {:else if active?.kind !== 'lasso' && active?.kind !== 'polygon'}
+    {:else if active?.kind !== 'lasso' && active?.kind !== 'polygon' && active?.kind !== 'line'}
       <rect
         class="shape"
         x={bbox.x}

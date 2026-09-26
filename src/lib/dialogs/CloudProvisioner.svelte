@@ -145,6 +145,8 @@
     beamToken: `${uid}-beam-token`,
     help: `${uid}-help`,
     gpu: `${uid}-gpu`,
+    model: `${uid}-model`,
+    analysis: `${uid}-analysis`,
     idle: `${uid}-idle`,
   }
 
@@ -570,6 +572,27 @@
   )
   const gpu = $derived(typeof allocation.gpu === 'string' && GPU_NAME.test(allocation.gpu) ? allocation.gpu : null)
   const model = $derived(typeof allocation.model_id === 'string' ? allocation.model_id.slice(0, 120) : '')
+  const modelOptions = $derived(
+    (Array.isArray(allocation.model_options) ? allocation.model_options : [])
+      .filter((/** @type {any} */ item) => item && typeof item.model_id === 'string' &&
+        typeof item.label === 'string' && item.model_id.length <= 120 && item.label.length <= 80)
+      .map((/** @type {any} */ item) => ({ value: item.model_id, label: item.label,
+        requiredGpu: typeof item.required_gpu === 'string' && GPU_NAME.test(item.required_gpu) ? item.required_gpu : null })),
+  )
+  const analysisModels = $derived(
+    Array.isArray(allocation.analysis_models) ? allocation.analysis_models : [],
+  )
+  const analysisOptions = $derived(
+    (Array.isArray(allocation.analysis_options) ? allocation.analysis_options : [])
+      .filter((/** @type {any} */ item) => item &&
+        (item.capability === 'text_regions_rt@1' || item.capability === 'text_mask_sam_ts@1') &&
+        typeof item.label === 'string' && item.label.length <= 80),
+  )
+  const analysisGraphGb = $derived(
+    typeof allocation.analysis_graph_bytes === 'number' && allocation.analysis_graph_bytes > 0
+      ? (allocation.analysis_graph_bytes / 1e9).toFixed(1) : null,
+  )
+  const modelLicense = $derived(typeof allocation.model_license === 'string' ? allocation.model_license.slice(0, 80) : '')
   const idleSeconds = $derived(
     typeof allocation.idle_seconds === 'number' && Number.isInteger(allocation.idle_seconds) && allocation.idle_seconds > 0
       ? allocation.idle_seconds
@@ -1099,12 +1122,46 @@
         </li>
       {/each}
     </ul>
-    {#if model}
+    {#if modelOptions.length > 1}
+      <Field label={t('settings.cloud.setup.review.model')} layout="row" controlId={ids.model}>
+        {#snippet children()}
+          <Select
+            id={ids.model}
+            options={modelOptions}
+            value={model}
+            fit
+            disabled={planning}
+            onchange={(/** @type {string} */ value) => {
+              const selected = modelOptions.find((item) => item.value === value)
+              replan({ ...planOptions, model_id: value, ...(selected?.requiredGpu ? { gpu: selected.requiredGpu } : {}) })
+            }}
+          />
+        {/snippet}
+      </Field>
+    {:else if model}
       <div class="fixed">
         <span class="fixed-label">{t('settings.cloud.setup.review.model')}</span>
         <span class="mono">{model}</span>
       </div>
-      <p class="note">{t('settings.cloud.setup.review.modelNote')}</p>
+    {/if}
+    {#if model}<p class="note">{t('settings.cloud.setup.review.modelNote')}</p>{/if}
+    {#if modelLicense}<p class="note">{t('settings.cloud.setup.review.modelLicense', { license: modelLicense })}</p>{/if}
+    {#if analysisOptions.length > 0}
+      <fieldset class="analysis-models" disabled={planning}>
+        <legend id={ids.analysis}>{t('settings.cloud.setup.review.analysisModels')}</legend>
+        {#each analysisOptions as item (item.capability)}
+          <label>
+            <input type="checkbox" checked={analysisModels.includes(item.capability)}
+              onchange={(event) => replan({ ...planOptions,
+                analysis_models: event.currentTarget.checked
+                  ? [...analysisModels, item.capability]
+                  : analysisModels.filter((/** @type {string} */ capability) => capability !== item.capability),
+              })} />
+            <span>{item.label}</span>
+          </label>
+        {/each}
+        <p class="note">{t('settings.cloud.setup.review.analysisNote')}</p>
+      </fieldset>
     {/if}
     {#if gpuOptions.length > 0 || gpu || idleSeconds !== null}
       <div class="choices">
@@ -1145,6 +1202,7 @@
     {/if}
     <ul class="notes">
       <li>{t('settings.cloud.setup.review.weights', { size: weightsGb })}</li>
+      {#if analysisGraphGb}<li>{t('settings.cloud.setup.review.analysisWeights', { size: analysisGraphGb })}</li>{/if}
       <li>{t('settings.cloud.setup.review.costGpu', { providerKey: providerKey(provider) })}</li>
       <li>{t('settings.cloud.setup.review.costIdle')}</li>
       <li>
@@ -1487,6 +1545,17 @@
   .resource-label { color: var(--text) }
 
   .choices { display: grid; gap: var(--s-2) }
+  .analysis-models {
+    display: grid;
+    gap: var(--s-2);
+    margin: var(--s-2) 0;
+    padding: var(--s-3) 0 0;
+    border: 0;
+    border-top: 1px solid var(--line);
+  }
+  .analysis-models legend { padding: 0; color: var(--text) }
+  .analysis-models label { display: flex; gap: var(--s-2); align-items: center; cursor: pointer }
+  .analysis-models input { accent-color: var(--accent) }
   .fixed {
     display: flex;
     gap: var(--s-3);

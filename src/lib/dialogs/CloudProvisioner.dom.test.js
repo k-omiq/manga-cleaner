@@ -324,7 +324,10 @@ describe('setting up end to end on the mock backend', () => {
     expect(button(t('settings.cloud.setup.review.start')).disabled).toBe(true)
 
     await approveAndStart()
-    await heading('settings.cloud.setup.heading.done')
+    // Even with zero mock delays, apply yields across every progress step and
+    // endpoint save. A saturated full suite can take longer than the query's
+    // default one second while the checklist is legitimately still running.
+    await screen.findByRole('heading', { name: t('settings.cloud.setup.heading.done') }, { timeout: 10_000 })
 
     // Every IC-2 step reached the checklist, in the helper's order.
     expect(progress.filter((event) => event.state === 'done').map((event) => event.step)).toEqual(PROVISION_APPLY_STEPS)
@@ -359,6 +362,60 @@ describe('setting up end to end on the mock backend', () => {
       expect(where).not.toContain(MODAL.token_secret)
       expect(where).not.toContain(MODAL.token_id)
     }
+  }, 15_000)
+
+  it('replans with the selected 9B checkpoint and its required GPU', async () => {
+    const model4b = 'Disty0/FLUX.2-klein-4B-SDNQ-4bit-dynamic'
+    const model9b = 'Disty0/FLUX.2-klein-9B-SDNQ-4bit-dynamic-svd-r32'
+    const choices = [
+      { model_id: model4b, label: 'FLUX.2 Klein 4B (4-bit)', required_gpu: null },
+      { model_id: model9b, label: 'FLUX.2 Klein 9B (4-bit)', required_gpu: 'L40S' },
+    ]
+    const runner = scripted({
+      inspect: ok({ eligible: true }),
+      plan: (spec) => {
+        const data = planData({ gpu: spec.params.options?.gpu ?? 'L4' })
+        data.resource_allocation.model_id = spec.params.options?.model_id ?? model4b
+        data.resource_allocation.model_options = choices
+        data.resource_allocation.model_license = data.resource_allocation.model_id === model9b
+          ? 'FLUX non-commercial' : 'Apache-2.0'
+        return ok(data)
+      },
+    })
+    render(CloudProvisioner, { props: { inline: true, installationId: ID,
+      runCloudProvisioner: runner, backend: handBackend().backend } })
+    await connectModal()
+    const model = /** @type {HTMLSelectElement} */ (screen.getByLabelText(t('settings.cloud.setup.review.model')))
+    expect(model.value).toBe(model4b)
+    await fireEvent.change(model, { target: { value: model9b } })
+    await waitFor(() => expect(runner).toHaveBeenLastCalledWith({ op: 'plan', provider: 'modal',
+      params: { credentials: MODAL, installation_id: ID, options: { model_id: model9b, gpu: 'L40S' } } }))
+    expect(screen.getByText(t('settings.cloud.setup.review.modelLicense', { license: 'FLUX non-commercial' }))).toBeTruthy()
+  })
+
+  it('asks which cloud analysis graphs to install and replans each selection', async () => {
+    const runner = scripted({
+      inspect: ok({ eligible: true }),
+      plan: (spec) => {
+        const data = planData()
+        data.resource_allocation.analysis_models = spec.params.options?.analysis_models ?? []
+        data.resource_allocation.analysis_options = [
+          { capability: 'text_regions_rt@1', label: 'Full RT-DETR' },
+          { capability: 'text_mask_sam_ts@1', label: 'SAM-TS-L' },
+        ]
+        return ok(data)
+      },
+    })
+    render(CloudProvisioner, { props: { inline: true, installationId: ID,
+      runCloudProvisioner: runner, backend: handBackend().backend } })
+    await connectModal()
+    expect(screen.getByRole('group', { name: t('settings.cloud.setup.review.analysisModels') })).toBeTruthy()
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'SAM-TS-L' }))
+    await waitFor(() => expect(runner).toHaveBeenLastCalledWith({ op: 'plan', provider: 'modal',
+      params: { credentials: MODAL, installation_id: ID,
+        options: { analysis_models: ['text_mask_sam_ts@1'] } } }))
+    expect(screen.getByRole('checkbox', { name: 'SAM-TS-L' }).checked).toBe(true)
+    expect(screen.getByText(t('settings.cloud.setup.review.analysisNote'))).toBeTruthy()
   })
 
   it('for Beam, asks for the API key, offers Beam’s GPUs and says the endpoint uses that key', async () => {

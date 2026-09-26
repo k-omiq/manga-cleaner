@@ -21,9 +21,9 @@ from provisioner.protocol import ERR_EXECUTION_FAILED, ERR_EXECUTION_TIMEOUT, ER
 
 # deploy/ is plain Python with no provider SDK imports.
 from deploy.cloud.common.deployment import DEFAULT_IDLE_SECONDS, parse_gpu, parse_idle_seconds
+from deploy.cloud.common.manifest import MODEL_PROD_FLUX, MODEL_PROD_FLUX_9B, PRODUCTION_MODELS, production_model as production_model_spec
+from deploy.cloud.common.analysis_seed import GRAPH_FILES, normalize_analysis_models
 from deploy.cloud.common.manifest import (
-    PROD_SNAPSHOT_TOTAL_BYTES,
-    REVISION_PROD_FLUX,
     get_production_model_info,
 )
 
@@ -65,36 +65,45 @@ def normalize_options(
     options: Any,
     gpu_allowlist: Sequence[str],
     default_gpu: str,
+    gpu_for_9b: str,
 ) -> Dict[str, Any]:
-    """The approved knobs: `gpu` from the provider allowlist and `idle_seconds` 60..600."""
+    """Validate a deployable model, GPU, and scale-to-zero idle window."""
     if options is None:
         options = {}
     if not isinstance(options, dict):
         raise ProtocolError(ERR_VALIDATION, "Parameter 'options' must be an object")
-    unknown = set(options) - {"gpu", "idle_seconds"}
+    unknown = set(options) - {"gpu", "idle_seconds", "model_id", "analysis_models"}
     if unknown:
         raise ProtocolError(
             ERR_VALIDATION,
-            f"Unknown options: {sorted(unknown)}. Supported: gpu, idle_seconds",
+            f"Unknown options: {sorted(unknown)}. Supported: gpu, idle_seconds, model_id, analysis_models",
         )
     gpu = options.get("gpu")
     idle = options.get("idle_seconds")
+    model_id = options.get("model_id", MODEL_PROD_FLUX)
     try:
-        gpu = parse_gpu(default_gpu if gpu is None else gpu, tuple(gpu_allowlist))
+        if not isinstance(model_id, str) or model_id not in PRODUCTION_MODELS:
+            raise ValueError("model_id is not a supported cloud FLUX checkpoint")
+        gpu = parse_gpu((gpu_for_9b if model_id == MODEL_PROD_FLUX_9B else default_gpu) if gpu is None else gpu,
+                        tuple(gpu_allowlist))
+        if model_id == MODEL_PROD_FLUX_9B and gpu != gpu_for_9b:
+            raise ValueError(f"The 9B model requires {gpu_for_9b} for sufficient GPU memory")
         if isinstance(idle, bool) or (idle is not None and not isinstance(idle, int)):
             raise ValueError("idle_seconds must be a whole number of seconds")
         idle = parse_idle_seconds(DEFAULT_IDLE_SECONDS if idle is None else idle)
+        analysis_models = normalize_analysis_models(options.get("analysis_models"))
     except ValueError as exc:
         raise ProtocolError(
             ERR_VALIDATION,
             f"Invalid options: {exc}",
             actionable_guidance=f"Choose gpu from {', '.join(gpu_allowlist)} and idle_seconds from 60 to 600.",
         ) from None
-    return {"gpu": gpu, "idle_seconds": idle}
+    return {"gpu": gpu, "idle_seconds": idle, "model_id": model_id,
+            "analysis_models": list(analysis_models)}
 
 
-def production_model() -> Dict[str, str]:
-    info = get_production_model_info("modal")
+def production_model(model_id: str = MODEL_PROD_FLUX) -> Dict[str, str]:
+    info = get_production_model_info("modal", model_id)
     return {
         "model_id": info.model_id,
         "model_revision": info.model_revision,
@@ -103,12 +112,13 @@ def production_model() -> Dict[str, str]:
     }
 
 
-def read_seed_state(doc: Any) -> Tuple[str, Optional[int], str]:
+def read_seed_state(doc: Any, model_id: str = MODEL_PROD_FLUX) -> Tuple[str, Optional[int], str]:
     """(state, pct, problem) from the seeding status document the seed job publishes.
 
     state is running, done, failed, or unknown for a missing or foreign document.
     """
-    if not isinstance(doc, dict) or doc.get("model_revision") != REVISION_PROD_FLUX:
+    model = production_model_spec(model_id)
+    if not isinstance(doc, dict) or doc.get("model_revision") != model.revision:
         return "unknown", None, ""
     state = doc.get("state")
     if state == "done":
@@ -118,7 +128,7 @@ def read_seed_state(doc: Any) -> Tuple[str, Optional[int], str]:
         message = str(doc.get("message") or "")[:512]
         return "failed", None, f"{code}: {message}" if message else code
     if state == "running":
-        done, total = doc.get("bytes_done"), doc.get("bytes_total") or PROD_SNAPSHOT_TOTAL_BYTES
+        done, total = doc.get("bytes_done"), doc.get("bytes_total") or model.total_bytes
         if isinstance(done, int) and isinstance(total, int) and total > 0:
             return "running", max(0, min(99, done * 100 // total)), ""
         return "running", None, ""
@@ -303,14 +313,29 @@ def build_plan(
     notes: Sequence[str],
     cleanup_summary: Sequence[str],
 ) -> DeploymentPlan:
-    model = production_model()
+    model = production_model(options["model_id"])
+    selected_spec = production_model_spec(options["model_id"])
     resource_allocation = {
         "gpu": options["gpu"],
         "gpu_options": list(gpu_allowlist),
         "idle_seconds": options["idle_seconds"],
-        "model_weights_bytes": PROD_SNAPSHOT_TOTAL_BYTES,
+        "model_weights_bytes": selected_spec.total_bytes,
         "model_id": model["model_id"],
         "model_revision": model["model_revision"],
+        "analysis_models": options["analysis_models"],
+        "analysis_graph_bytes": sum(size for capability in options["analysis_models"]
+                                    for _, size, _ in GRAPH_FILES[capability]),
+        "analysis_options": [
+            {"capability": "text_regions_rt@1", "label": "Full RT-DETR"},
+            {"capability": "text_mask_sam_ts@1", "label": "SAM-TS-L"},
+        ],
+        "model_options": [
+            {"model_id": item.model_id, "label": "FLUX.2 Klein 9B (4-bit)" if item.model_id == MODEL_PROD_FLUX_9B else "FLUX.2 Klein 4B (4-bit)",
+             "weights_bytes": item.total_bytes, "license": item.license,
+             "required_gpu": ("L40S" if provider == "modal" else "RTX5090") if item.model_id == MODEL_PROD_FLUX_9B else None}
+            for item in PRODUCTION_MODELS.values()
+        ],
+        "model_license": selected_spec.license,
         **allocation,
     }
     resource_list = [r.to_dict() for r in resources]

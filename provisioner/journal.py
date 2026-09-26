@@ -132,7 +132,7 @@ def _check_state_value(key: str, value: Any) -> None:
 def _check_options(options: Any) -> Dict[str, Any]:
     if not isinstance(options, dict):
         raise ProtocolError(ERR_VALIDATION, "Field 'options' in journal must be a dictionary")
-    extra = set(options) - {"gpu", "idle_seconds"}
+    extra = set(options) - {"gpu", "idle_seconds", "model_id", "analysis_models"}
     if extra:
         raise ProtocolError(ERR_VALIDATION, f"Unknown options in journal: {sorted(extra)}")
     gpu = options.get("gpu")
@@ -141,6 +141,18 @@ def _check_options(options: Any) -> Dict[str, Any]:
     idle = options.get("idle_seconds")
     if idle is not None and (isinstance(idle, bool) or not isinstance(idle, int) or not 0 < idle <= 86400):
         raise ProtocolError(ERR_VALIDATION, "Invalid 'options.idle_seconds' in journal")
+    model_id = options.get("model_id")
+    if model_id is not None:
+        from deploy.cloud.common.manifest import PRODUCTION_MODELS
+        if not isinstance(model_id, str) or model_id not in PRODUCTION_MODELS:
+            raise ProtocolError(ERR_VALIDATION, "Invalid 'options.model_id' in journal")
+    analysis_models = options.get("analysis_models")
+    if analysis_models is not None:
+        from deploy.cloud.common.analysis_seed import normalize_analysis_models
+        try:
+            normalize_analysis_models(analysis_models)
+        except ValueError:
+            raise ProtocolError(ERR_VALIDATION, "Invalid 'options.analysis_models' in journal") from None
     return dict(options)
 
 
@@ -241,7 +253,7 @@ class InstallationRecord:
     created_at_utc: str = field(default_factory=_get_utc_now)
     updated_at_utc: str = field(default_factory=_get_utc_now)
     last_error: Optional[str] = None
-    # The approved gpu and idle_seconds; resume always uses these.
+    # The approved model, analysis graphs, gpu and idle_seconds; resume uses these.
     options: Dict[str, Any] = field(default_factory=dict)
     # Provider ids a later run needs (environment, call ids, URLs). Never secrets.
     provider_state: Dict[str, Any] = field(default_factory=dict)

@@ -314,7 +314,7 @@ pub fn parse_model_dir_name(name: &str) -> (String, String) {
     let mut base = name;
     let mut quant: Option<&str> = None;
 
-    for backend in ["-mflux", "-gguf", "-sdcpp", "-mlx"] {
+    for backend in ["-mflux", "-sdnq", "-gguf", "-sdcpp", "-mlx"] {
         if let Some(pos) = base.find(backend) {
             let (b, rest) = base.split_at(pos);
             base = b;
@@ -538,6 +538,7 @@ struct Plan {
     source: &'static str,
     tool: Option<String>,
     fill_mode: Option<&'static str>,
+    solid_color: Option<[u8; 3]>,
     /// The gate-skipped row this edit consumes, if it is cleaning one. It goes
     /// with the patch that replaces it, or the page would carry both a warning
     /// and the mask that answered it.
@@ -1337,7 +1338,10 @@ fn edit_with_bench_render(
         let verdict = quality::assess(page, &made.mask, &made.pixels, noise);
         (made, verdict)
     } else if plan.fill_mode == Some("solid") {
-        let pixels = cleaner_core::engines::fill::render_solid(page, &fitted);
+        let pixels = match plan.solid_color {
+            Some(color) => cleaner_core::engines::fill::render_solid_color(page, &fitted, color),
+            None => cleaner_core::engines::fill::render_solid(page, &fitted),
+        };
         let made = run::Made {
             engine: Engine::Fill,
             mask: fitted.mask.clone(),
@@ -1404,6 +1408,9 @@ fn edit_with_bench_render(
         made.tiles,
         &verdict,
     );
+    if made.engine == Engine::Flux {
+        snapshot["flux_model"] = serde_json::json!(bench.flux_model.as_deref().unwrap_or(FLUX_MODEL));
+    }
     snapshot["source"] = serde_json::json!(plan.source);
     snapshot["input_provenance"] = serde_json::json!({
         "version": 1, "input_sha256": input.digest, "predecessors_sha256": input.predecessors,
@@ -1421,6 +1428,9 @@ fn edit_with_bench_render(
     }
     if let Some(mode) = plan.fill_mode {
         snapshot["fill_mode"] = serde_json::json!(mode);
+    }
+    if let Some(layer) = existing.as_ref().and_then(|record| record.provenance.params_snapshot.get("layer")) {
+        snapshot["layer"] = layer.clone();
     }
 
     commit(
@@ -1820,6 +1830,7 @@ pub async fn apply_prepared_text_shape(
             source: "auto",
             tool: None,
             fill_mode: None,
+            solid_color: None,
             clears_untouched: false,
             paint: None,
             requested: None,
@@ -2139,6 +2150,7 @@ mod text_shape_boundary_tests {
             source: "auto",
             tool: None,
             fill_mode: None,
+            solid_color: None,
             clears_untouched: false,
             paint: None,
             requested: None,
@@ -2206,6 +2218,7 @@ mod text_shape_boundary_tests {
             source: "auto",
             tool: None,
             fill_mode: None,
+            solid_color: None,
             clears_untouched: false,
             paint: None,
             requested: None,
@@ -2331,14 +2344,14 @@ fn paint_patch(
     // A filled shape leaves here: it has no dabs to plan, no tip to stamp and
     // no spacing to walk. What it has is a mask and a colour, which is the
     // whole of the work.
-    if let PaintKind::Shape { color, shape } = &paint.kind {
+    if let PaintKind::Shape { color, shape, outline } = &paint.kind {
         return shape_patch(
             job,
             source_idx,
             page,
             shape,
             *color,
-            &paint.spec,
+            *outline,
             order,
             strip_context,
         );
@@ -2445,10 +2458,10 @@ fn paint_patch(
 /// are not on this path at all, and the two numbers that survive from the
 /// brush are `opacity` - the wash - and, through the mask, `feather`.
 ///
-/// The colour is blended against **what is already composited under this
-/// patch**, not against the source page: a semi-transparent shape over a
-/// cleaned balloon must read the cleaned balloon, or the paint would show the
-/// text the run took out.
+/// Shape pixels retain the chosen colour. Their uniform gesture opacity is a
+/// layer opacity, applied by the compositor at the destination. Baking the
+/// colour into the original underlay would carry that old background along
+/// when the user moves the shape.
 #[allow(clippy::too_many_arguments)]
 fn shape_patch(
     job: &Job,
@@ -2456,7 +2469,7 @@ fn shape_patch(
     page: &Raster,
     shape: &PaintedShape,
     color: [u8; 3],
-    spec: &cleaner_core::paint::BrushSpec,
+    outline: Option<([u8; 3], f64)>,
     order: u32,
     strip_context: Option<StripPaintContext<'_>>,
 ) -> Result<(run::Made, usize, Rect), &'static str> {
@@ -2478,23 +2491,28 @@ fn shape_patch(
         return Err("decline.reason.rungUnavailable");
     }
 
-    let alpha = (spec.opacity / 100.0).clamp(0.0, 1.0);
     let levels = solid_levels(page.mode, color);
+    let outline_levels = outline.map(|(color, _)| solid_levels(page.mode, color));
+    let points: Vec<(f64, f64)> = shape.points.iter().map(|point| (
+        point.x / 100.0 * page.width as f64,
+        point.y / 100.0 * page.height as f64,
+    )).collect();
     let top = (1u32 << page.depth.bits().min(16)) as f64 - 1.0;
     for y in 0..bounds.h {
         for x in 0..bounds.w {
             if !mask.contains(bounds.x + x as i64, bounds.y + y as i64) {
                 continue;
             }
-            for (channel, level) in levels.iter().enumerate() {
-                // `None` is the alpha channel, copied through rather than
-                // painted: every engine here treats alpha that way, and a
-                // fill that wrote it would be inventing transparency from a
-                // colour the user picked for the ink.
-                let Some(level) = level else { continue };
-                let below = pixels.sample(x, y, channel) as f64;
-                let value = (*level as f64 * alpha + below * (1.0 - alpha)).round();
-                pixels.set_sample(x, y, channel, value.clamp(0.0, top) as u16);
+            let edge = shape.kind != ShapeKind::Line && outline.is_some_and(|(_, width)| width > 0.0
+                && shape_edge_distance(shape.kind, &points,
+                    bounds.x as f64 + x as f64 + 0.5,
+                    bounds.y as f64 + y as f64 + 0.5) <= width);
+            let chosen = if edge { outline_levels.as_ref().unwrap_or(&levels) } else { &levels };
+            for (channel, level) in chosen.iter().enumerate() {
+                // Alpha is opaque in the stored patch, then layer opacity
+                // blends it with the destination. Keeping the old underlay's
+                // alpha here would move that old transparency with the shape.
+                pixels.set_sample(x, y, channel, level.unwrap_or(top as u16));
             }
         }
     }
@@ -2515,6 +2533,38 @@ fn shape_patch(
         0,
         bounds,
     ))
+}
+
+fn shape_edge_distance(kind: ShapeKind, points: &[(f64, f64)], x: f64, y: f64) -> f64 {
+    match kind {
+        ShapeKind::Rect => {
+            let x0 = points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+            let x1 = points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+            let y0 = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+            let y1 = points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+            [x - x0, x1 - x, y - y0, y1 - y].into_iter().map(f64::abs).fold(f64::INFINITY, f64::min)
+        }
+        ShapeKind::Ellipse => {
+            let x0 = points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+            let x1 = points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+            let y0 = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+            let y1 = points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+            let rx = ((x1 - x0) / 2.0).max(0.5);
+            let ry = ((y1 - y0) / 2.0).max(0.5);
+            let dx = x - (x0 + x1) / 2.0;
+            let dy = y - (y0 + y1) / 2.0;
+            let r = ((dx / rx).powi(2) + (dy / ry).powi(2)).sqrt();
+            if r <= f64::EPSILON { return rx.min(ry); }
+            // Convert radial distance to an approximate Euclidean normal
+            // distance at the corresponding point on the ellipse. This is
+            // exact on both axes and preserves a constant-width rim near the
+            // curve even when the radii differ greatly.
+            let normal = ((dx / (r * rx * rx)).powi(2) + (dy / (r * ry * ry)).powi(2)).sqrt();
+            (1.0 - r).abs() / normal
+        }
+        ShapeKind::Polygon => distance_to_outline(points, x, y),
+        ShapeKind::Line => distance_to_segment(points[0], points[1], x, y),
+    }
 }
 
 /// One sRGB colour as this page's own samples, channel by channel.
@@ -2755,8 +2805,11 @@ fn paint_snapshot(
             snapshot["color"] =
                 serde_json::json!(format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2]));
         }
-        PaintKind::Shape { color, ref shape } => {
+        PaintKind::Shape { color, ref shape, .. } => {
             snapshot["mode"] = serde_json::json!("solid");
+            snapshot["layer"] = serde_json::json!({
+                "opacity": spec.opacity.round().clamp(0.0, 100.0) as u8,
+            });
             snapshot["color"] =
                 serde_json::json!(format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2]));
             // The geometry, in the two numbers that say what was drawn: which
@@ -2767,6 +2820,7 @@ fn paint_snapshot(
                 ShapeKind::Rect => "rect",
                 ShapeKind::Ellipse => "ellipse",
                 ShapeKind::Polygon => "polygon",
+                ShapeKind::Line => "line",
             });
             snapshot["feather"] = serde_json::json!(shape.feather.clamp(0.0, MAX_FEATHER_PX));
             snapshot["vertices"] = serde_json::json!(shape.points.len());
@@ -2955,6 +3009,7 @@ enum ShapeKind {
     Rect,
     Ellipse,
     Polygon,
+    Line,
 }
 
 /// The most feather a shape may carry, in page pixels - **the tool window's own
@@ -2984,7 +3039,7 @@ const MAX_FEATHER_PX: f64 = 20.0;
 /// an engine may write, and every engine, the compositor and the export take it
 /// that way - so `feather` moves the boundary outwards rather than fading it.
 fn shape_mask(shape: &PaintedShape, width: u32, height: u32) -> Option<Mask> {
-    if shape.points.len() < 3 || width == 0 || height == 0 {
+    if shape.points.len() < if shape.kind == ShapeKind::Line { 2 } else { 3 } || width == 0 || height == 0 {
         return None;
     }
     let points: Vec<(f64, f64)> = shape
@@ -3000,7 +3055,7 @@ fn shape_mask(shape: &PaintedShape, width: u32, height: u32) -> Option<Mask> {
     if points.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
         return None;
     }
-    let feather = shape.feather.clamp(0.0, MAX_FEATHER_PX);
+    let feather = shape.feather.clamp(if shape.kind == ShapeKind::Line { 0.5 } else { 0.0 }, MAX_FEATHER_PX);
 
     let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
     for (x, y) in &points {
@@ -3051,6 +3106,7 @@ fn shape_mask(shape: &PaintedShape, width: u32, height: u32) -> Option<Mask> {
                     contains_point(&points, px, py)
                         || (feather > 0.0 && distance_to_outline(&points, px, py) <= feather)
                 }
+                ShapeKind::Line => distance_to_segment(points[0], points[1], px, py) <= feather,
             };
             if inside {
                 mask.set(x, y, true);
@@ -3058,6 +3114,13 @@ fn shape_mask(shape: &PaintedShape, width: u32, height: u32) -> Option<Mask> {
         }
     }
     (!mask.is_empty()).then_some(mask)
+}
+
+fn distance_to_segment(a: (f64, f64), b: (f64, f64), px: f64, py: f64) -> f64 {
+    let (ex, ey) = (b.0 - a.0, b.1 - a.1);
+    let length = ex * ex + ey * ey;
+    let t = if length > 0.0 { (((px - a.0) * ex + (py - a.1) * ey) / length).clamp(0.0, 1.0) } else { 0.0 };
+    ((px - a.0 - ex * t).powi(2) + (py - a.1 - ey * t).powi(2)).sqrt()
 }
 
 /// How far a point is from the nearest edge of a closed polygon, in pixels.
@@ -3147,7 +3210,7 @@ enum PaintKind {
     /// separates it from [`PaintKind::Brush`] is the coverage - a brush covers
     /// what its dabs swept, a shape covers its own outline - so the shape
     /// rides here instead of a dab list.
-    Shape { color: [u8; 3], shape: PaintedShape },
+    Shape { color: [u8; 3], shape: PaintedShape, outline: Option<([u8; 3], f64)> },
 }
 
 /// The paint half of a [`Plan`].
@@ -3291,6 +3354,10 @@ fn paint_plan(tool: &str, params: &serde_json::Value) -> Option<PaintPlan> {
                         .and_then(|v| v.as_str()),
                 ),
                 shape,
+                outline: number(params, "outlineWidth").filter(|width| *width > 0.0).map(|width| (
+                    colour_of(params.get("outlineColor").and_then(|v| v.as_str())),
+                    width.clamp(0.0, 30.0),
+                )),
             }
         }
         _ => return None,
@@ -3738,7 +3805,7 @@ pub async fn apply_tool(
                 return Ok(ApplyResult::of("not-found"));
             };
             if !matches!(string("geometryPolicy").as_deref(), None | Some("legacy"))
-                || !matches!(string("textPolicy").as_deref(), None | Some("legacy_gate"))
+                || !matches!(string("textPolicy").as_deref(), None | Some("legacy_gate") | Some("all_text"))
             {
                 return Ok(ApplyResult {
                     error_code: Some("use_text_shape_review"),
@@ -3746,10 +3813,11 @@ pub async fn apply_tool(
                 });
             }
             let detection = params.get("detection").filter(|value| !value.is_null()).cloned();
-            let selection = run::RunSelection::from_args(
+            let all_text = string("textPolicy").as_deref() == Some("all_text");
+            let selection = if all_text { run::RunSelection::default() } else { run::RunSelection::from_args(
                 detection.as_ref(),
                 params.get("ocrRescue").and_then(|value| value.as_bool()),
-            )?;
+            )? };
             let picks = Picks::from_args(
                 string("bubbleEngine").as_deref(),
                 string("outsideEngine").as_deref(),
@@ -3768,6 +3836,8 @@ pub async fn apply_tool(
                 run::parse_color_hex(string("bubbleColor").as_deref()),
                 selection,
                 detection,
+                params.get("detectorModels"),
+                all_text,
             )?;
             return Ok(ApplyResult {
                 run_id: handle.run_id,
@@ -3864,6 +3934,7 @@ pub async fn apply_tool(
             source: "hand",
             tool: Some(tool),
             fill_mode: Some(fill_mode_key(&fill_mode)),
+            solid_color: None,
             // Whether or not the mask came from the detector: a hand gesture
             // over a region the gate held back answers the warning as surely
             // as `cleanAnyway` does, and a page that kept both would show a
@@ -4043,6 +4114,7 @@ pub async fn create_region(
             source: "hand",
             tool: Some(tool),
             fill_mode: Some(fill_mode_key(&fill_mode)),
+            solid_color: None,
             clears_untouched: false,
             paint,
             requested: Some(rect),
@@ -4178,14 +4250,14 @@ fn rerun_mask_at(
 
     // The one kind that is not an edit: the mask is kept exactly as it is
     // and handed back to a tool. Maps mask origin to its tool and opens
-    // that tool instead, falling back to Content-aware fill when origin
+    // that tool instead, falling back to the AI mask brush when origin
     // is unknown.
     if kind == "reopenInTool" {
         let Some((region, page_status)) = current_region(&located, &region_id)? else {
             return Ok(None);
         };
         let tool = existing_tool(&located, &region_id)?;
-        let tool_name = tool.as_deref().unwrap_or("contentAwareFill");
+        let tool_name = tool.as_deref().unwrap_or("aiMaskBrush");
         let label_key = tool_label_key(tool_name);
         crate::events::notice(
             "notice.mask.reopened",
@@ -4200,7 +4272,7 @@ fn rerun_mask_at(
                 "shapes" => "shapes",
                 "aiMaskBrush" => "aiMaskBrush",
                 "cloneHeal" => "cloneHeal",
-                _ => "contentAwareFill",
+                _ => "aiMaskBrush",
             }),
             page_status,
         }));
@@ -4247,6 +4319,7 @@ fn rerun_mask_at(
         source: existing_source(&located, &region_id)?,
         tool: existing_tool(&located, &region_id)?,
         fill_mode,
+        solid_color: None,
         // **A re-run re-runs a rung, and a stroke is not one.** The
         // manifest keeps a painted patch's mask and pixels like any other's,
         // but nothing in the record replays the gesture - the dab list never
@@ -4330,7 +4403,7 @@ fn tool_label_key(tool: &str) -> &'static str {
         "shapes" => "tools.name.shapes",
         "aiMaskBrush" => "tools.name.aiMaskBrush",
         "cloneHeal" => "tools.name.cloneHeal",
-        _ => "tools.name.contentAwareFill",
+        _ => "tools.name.aiMaskBrush",
     }
 }
 
@@ -4479,7 +4552,9 @@ fn clean_anyway_at(
         );
     }
 
-    let plan = clean_anyway_plan(&located, region_id, engine)?;
+    let color = params.get("bubbleColor").or_else(|| params.get("color"))
+        .and_then(|value| value.as_str()).map(|value| colour_of(Some(value)));
+    let plan = clean_anyway_plan(&located, region_id, engine, color)?;
     match apply(&located, plan)? {
         Outcome::Cleaned(edited) => {
             crate::events::notice("notice.gate.cleanedAnyway", serde_json::json!({}), "info");
@@ -4501,6 +4576,7 @@ fn clean_anyway_plan(
     located: &Located,
     region_id: &str,
     engine: Option<&str>,
+    color: Option<[u8; 3]>,
 ) -> Result<Plan, String> {
     let geometry = existing_geometry(located, region_id)?;
     let reason = untouched_reason(located, region_id)?;
@@ -4513,7 +4589,8 @@ fn clean_anyway_plan(
         choice,
         source: "auto",
         tool: None,
-        fill_mode: None,
+        fill_mode: (engine == Some("solid")).then_some("solid"),
+        solid_color: color,
         // `cleanAnyway` answers the gate, which nothing painted ever met.
         paint: None,
         clears_untouched: true,
@@ -4605,6 +4682,7 @@ mod tests {
             source: "hand",
             tool: Some("aiMaskBrush".into()),
             fill_mode: None,
+            solid_color: None,
             clears_untouched: false,
             paint: None,
             requested: Some(bounds),
@@ -4752,6 +4830,26 @@ mod tests {
     }
 
     #[test]
+    fn gated_review_solid_choice_keeps_the_selected_color() {
+        let raw = cleaner_core::image::fixtures::by_name("l8").raster;
+        let (_root, library, located) = command_fixture("clean-anyway-solid", &raw);
+        let bounds = Rect::new(20, 20, 8, 8);
+        Job::open(&located.job_path).unwrap().leave_untouched(0, bounds,
+            "review.reason.gateSkippedLowConfidence").unwrap();
+        let region_id = untouched_id(&format!("{}-p001", located.chapter_id), bounds);
+        let mut called = false;
+        let _ = clean_anyway_at(&library, None, &region_id, Some("solid"),
+            serde_json::json!({"bubbleColor": "#ff8000"}), |_, plan| {
+                called = true;
+                assert_eq!(plan.fill_mode, Some("solid"));
+                assert_eq!(plan.solid_color, Some([255, 128, 0]));
+                assert_eq!(plan.choice, Choice::Ladder(Some(EnginePick::Solid)));
+                Ok(Outcome::NotFound)
+            }).unwrap();
+        assert!(called);
+    }
+
+    #[test]
     fn clone_source_dependency_tracks_visible_input_and_ignores_unrelated_change() {
         let mut raw = cleaner_core::image::fixtures::by_name("l8").raster;
         raw.width = 128;
@@ -4822,7 +4920,7 @@ mod tests {
         paint.tool = Some("shapes".into());
         paint.fill_mode = Some("solid");
         paint.paint = Some(PaintPlan {
-            kind: PaintKind::Shape { color: [255, 255, 255], shape: shape.clone() },
+            kind: PaintKind::Shape { color: [255, 255, 255], shape: shape.clone(), outline: None },
             points: Vec::new(),
             spec: cleaner_core::paint::BrushSpec::default(),
             alignment: "aligned",
@@ -4857,6 +4955,60 @@ mod tests {
             Some(&mut fake)).unwrap(), Outcome::Cleaned(_)));
         assert_eq!(seen, Some(visible));
         assert_ne!(seen, Some(raw.sample(point.0 as u32, point.1 as u32, 0)));
+    }
+
+    #[test]
+    fn moved_translucent_shape_blends_with_its_destination() {
+        let mut raw = cleaner_core::image::fixtures::by_name("l8").raster;
+        raw.width = 64;
+        raw.height = 32;
+        raw.data = (0..32).flat_map(|_| (0..64).map(|x| if x < 32 { 0 } else { 255 })).collect();
+        let (root, located) = edit_fixture("move-translucent-shape", &raw);
+        let bounds = Rect::new(8, 8, 16, 16);
+        let shape = PaintedShape {
+            kind: ShapeKind::Rect,
+            points: vec![
+                StrokePoint { x: 12.5, y: 25.0 }, StrokePoint { x: 37.5, y: 25.0 },
+                StrokePoint { x: 37.5, y: 75.0 }, StrokePoint { x: 12.5, y: 75.0 },
+            ],
+            feather: 0.0,
+        };
+        let mut plan = fixture_plan("shape", Geometry::Given(bounds), Engine::Fill, bounds);
+        plan.tool = Some("shapes".into());
+        plan.fill_mode = Some("solid");
+        plan.paint = Some(PaintPlan {
+            kind: PaintKind::Shape { color: [200, 200, 200], shape: shape.clone(), outline: None },
+            points: Vec::new(),
+            spec: cleaner_core::paint::BrushSpec { opacity: 50.0, ..Default::default() },
+            alignment: "aligned",
+        });
+        plan.drawn = Some(shape);
+        let mut bench = test_bench(&root);
+        assert!(matches!(edit_with_bench(&mut bench, Engine::Fill, &located, plan).unwrap(), Outcome::Cleaned(_)));
+
+        let mut job = Job::open(&located.job_path).unwrap();
+        let patch = job.load_patch(&job.project.patches[0]).unwrap();
+        assert_eq!(patch.layer_style().opacity, 50);
+        assert_eq!(patch.pixels.sample(8, 8, 0), 200, "shape stored its old dark background");
+        let before = cleaner_core::composite::composite(&raw, &[patch]).unwrap();
+        assert_eq!(before.sample(16, 16, 0), 100);
+
+        job.project.patches[0].provenance.params_snapshot["layer"]["offsetX"] = serde_json::json!(32);
+        job.flush().unwrap();
+        let moved = Job::open(&located.job_path).unwrap();
+        let patch = moved.load_patch(&moved.project.patches[0]).unwrap();
+        let after = cleaner_core::composite::composite(&raw, &[patch]).unwrap();
+        assert_eq!(after.sample(16, 16, 0), 0);
+        assert_eq!(after.sample(48, 16, 0), 228, "shape carried the old dark background");
+    }
+
+    #[test]
+    fn eccentric_ellipse_outline_keeps_pixel_width_at_both_axes() {
+        let points = [(0.0, 0.0), (200.0, 20.0)];
+        let distance = |x, y| shape_edge_distance(ShapeKind::Ellipse, &points, x, y);
+        assert!((distance(198.0, 10.0) - 2.0).abs() < 0.01);
+        assert!((distance(100.0, 2.0) - 2.0).abs() < 0.01);
+        assert!(distance(180.0, 10.0) > 19.0, "the long-axis tip became a twenty-pixel rim");
     }
 
     #[test]
@@ -4990,6 +5142,7 @@ mod tests {
             source: "hand",
             tool: Some("aiMaskBrush".into()),
             fill_mode: None,
+            solid_color: None,
             clears_untouched: false,
             paint: None,
             requested: Some(Rect::new(42, 40, 12, 6)),
@@ -5009,6 +5162,7 @@ mod tests {
             source: "hand",
             tool: Some("aiMaskBrush".into()),
             fill_mode: None,
+            solid_color: None,
             clears_untouched: false,
             paint: None,
             requested: Some(Rect::new(42, 40, 12, 6)),
@@ -5052,6 +5206,7 @@ mod tests {
             source: "hand",
             tool: Some("aiMaskBrush".into()),
             fill_mode: None,
+            solid_color: None,
             clears_untouched: false,
             paint: None,
             requested: Some(Rect::new(52, 38, 8, 8)),
@@ -5108,6 +5263,7 @@ mod tests {
             source: "hand",
             tool: Some("aiMaskBrush".into()),
             fill_mode: None,
+            solid_color: None,
             clears_untouched: false,
             paint: None,
             requested: Some(Rect::new(42, 40, 12, 6)),
@@ -5198,6 +5354,7 @@ mod tests {
             source: "hand",
             tool: Some("aiMaskBrush".into()),
             fill_mode: None,
+            solid_color: None,
             clears_untouched: false,
             paint: None,
             requested: Some(Rect::new(36, 36, 12, 12)),
@@ -5226,6 +5383,7 @@ mod tests {
             source: "hand",
             tool: Some("aiMaskBrush".into()),
             fill_mode: None,
+            solid_color: None,
             clears_untouched: false,
             paint: None,
             requested: Some(Rect::new(36, 38, 4, 5)),
@@ -5469,6 +5627,7 @@ mod tests {
             source: "auto",
             tool: None,
             fill_mode: None,
+            solid_color: None,
             clears_untouched: false,
             paint: None,
             requested: None,
@@ -5529,11 +5688,13 @@ mod tests {
             source: "hand",
             tool: Some("shapes".into()),
             fill_mode: Some("solid"),
+            solid_color: None,
             clears_untouched: false,
             paint: Some(PaintPlan {
                 kind: PaintKind::Shape {
                     color: [30, 30, 30],
                     shape: shape.clone(),
+                    outline: None,
                 },
                 points: Vec::new(),
                 spec: cleaner_core::paint::BrushSpec::default(),
@@ -5577,6 +5738,7 @@ mod tests {
             source: "hand",
             tool: Some("shapes".into()),
             fill_mode: Some("match-surround"),
+            solid_color: None,
             clears_untouched: false,
             paint: None,
             requested: Some(record.bbox),
@@ -5610,11 +5772,13 @@ mod tests {
             source: "hand",
             tool: Some("shapes".into()),
             fill_mode: Some("solid"),
+            solid_color: None,
             clears_untouched: false,
             paint: Some(PaintPlan {
                 kind: PaintKind::Shape {
                     color: [230, 230, 230],
                     shape: second_shape.clone(),
+                    outline: None,
                 },
                 points: Vec::new(),
                 spec: cleaner_core::paint::BrushSpec {
@@ -5678,8 +5842,8 @@ mod tests {
             "the older seam paint must be the sampled under-layer"
         );
         assert_eq!(
-            above, expected,
-            "page-two paint did not composite over the seam patch"
+            above, 230,
+            "page-two shape did not retain its chosen colour"
         );
 
         let cross_ai = Plan {
@@ -5690,6 +5854,7 @@ mod tests {
             source: "hand",
             tool: Some("aiMaskBrush".into()),
             fill_mode: None,
+            solid_color: None,
             clears_untouched: false,
             paint: None,
             requested: Some(Rect::new(27, 390, 10, 24)),
@@ -5747,7 +5912,7 @@ mod tests {
         };
         assert_eq!(
             at(32, 420),
-            above,
+            expected,
             "cloud crop must include the page-two predecessor"
         );
         assert_eq!(
@@ -6325,6 +6490,7 @@ mod tests {
             source: "hand",
             tool: Some(tool.to_owned()),
             fill_mode: None,
+            solid_color: None,
             clears_untouched: false,
             paint: Some(paint),
             requested: None,
@@ -6429,6 +6595,7 @@ mod tests {
         assert_eq!(snapshot["feather"], 4.0);
         assert_eq!(snapshot["vertices"], 3);
         assert_eq!(snapshot["brush"]["opacity"], 40.0);
+        assert_eq!(snapshot["layer"]["opacity"], 40);
         // Nothing was walked, and the field says so rather than being absent.
         assert_eq!(snapshot["dabs"], 0);
         assert!(
@@ -6639,6 +6806,16 @@ mod tests {
         assert!(mask.contains(400, 450), "the foot of the L");
         assert!(!mask.contains(400, 150), "the notch is not filled");
 
+        let line = PaintedShape {
+            kind: ShapeKind::Line,
+            points: vec![StrokePoint { x: 10.0, y: 10.0 }, StrokePoint { x: 50.0, y: 30.0 }],
+            feather: 2.0,
+        };
+        let mask = shape_mask(&line, 1000, 1000).expect("two vertices make a line");
+        assert!(mask.contains(300, 200));
+        assert!(!mask.contains(300, 210));
+        assert!(shape_edge_distance(ShapeKind::Rect, &[(100.0, 100.0), (500.0, 300.0)], 101.0, 200.0) < 2.0);
+
         // Nothing to fill is not a mask: the caller falls back to the box.
         let two = PaintedShape {
             kind: ShapeKind::Polygon,
@@ -6731,7 +6908,7 @@ mod tests {
             "painted": painted,
         });
         let plan = paint_plan("shapes", &params).expect("a solid shape is a paint plan");
-        let PaintKind::Shape { color, shape } = plan.kind else {
+        let PaintKind::Shape { color, shape, .. } = plan.kind else {
             panic!("not a filled shape")
         };
         assert_eq!(color, [0xff, 0x88, 0x00]);
@@ -6901,6 +7078,10 @@ mod tests {
 
     #[test]
     fn parse_model_dir_name_derives_correct_id_and_label() {
+        assert_eq!(
+            parse_model_dir_name("flux2-klein-4b-sdnq"),
+            ("flux2-klein-4b".to_string(), "FLUX.2 Klein 4B".to_string())
+        );
         assert_eq!(
             parse_model_dir_name("flux2-klein-4b-mflux-q4"),
             (

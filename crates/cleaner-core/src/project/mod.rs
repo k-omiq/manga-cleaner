@@ -224,6 +224,11 @@ fn is_legacy_geometry_policy(policy: &GeometryPolicy) -> bool {
 }
 
 impl PatchRecord {
+    /// Bounds after the saved layer move/rotation, without loading its pixels.
+    pub fn display_bbox(&self) -> Rect {
+        crate::patch::LayerStyle::from_snapshot(&self.provenance.params_snapshot).display_bounds(self.bbox)
+    }
+
     pub fn legacy_revision_id(&self) -> Option<String> {
         (self.geometry_policy == GeometryPolicy::Legacy)
             .then(|| revision_from_buffer_ref(&self.buffer_ref))
@@ -1676,7 +1681,7 @@ impl Job {
             order: record.order,
             visible: record.visible,
             provenance: record.provenance.clone(),
-        })
+        }.presented())
     }
 
     /// Re-verify every source. §6, and the reason it is a hash and not an

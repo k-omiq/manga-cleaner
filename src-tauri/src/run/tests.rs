@@ -1988,12 +1988,35 @@ fn a_run_id_cannot_collide_with_the_mocks() {
 #[test]
 fn every_command_is_async_and_so_never_runs_on_the_invoke_handlers_thread() {
     #[allow(clippy::type_complexity)]
-    fn check<A, B, C, D, E, F, G, H, I, J, K, L, M, R: std::future::Future>(_: fn(A, B, C, D, E, F, G, H, I, J, K, L, M) -> R) {}
+    fn check<A, B, C, D, E, F, G, H, I, J, K, L, M, N, R: std::future::Future>(_: fn(A, B, C, D, E, F, G, H, I, J, K, L, M, N) -> R) {}
     fn check1<A, R: std::future::Future>(_: fn(A) -> R) {}
     fn check3<A, B, C, R: std::future::Future>(_: fn(A, B, C) -> R) {}
     check(run_clean);
     check1(cancel_run);
     check3(resume_job);
+}
+
+#[test]
+fn detector_combinations_select_only_their_models() {
+    let cases = [
+        (serde_json::json!(["ctd"]), vec![DETECTOR]),
+        (serde_json::json!(["rtSmall"]), vec![BALLOONS]),
+        (serde_json::json!(["rtFull"]), vec![]),
+        (serde_json::json!(["samTs"]), vec![]),
+        (serde_json::json!(["ctd", "rtFull", "samTs"]), vec![DETECTOR]),
+    ];
+    for (choice, files) in cases {
+        let selected = DetectorModels::from_args(Some(&choice)).unwrap();
+        assert_eq!(selected.required(true), files);
+        assert_eq!(selected.required(false).last(), Some(&GATE_LABELS));
+    }
+    assert!(DetectorModels::from_args(Some(&serde_json::json!([]))).is_err());
+    assert!(DetectorModels::from_args(Some(&serde_json::json!(["rtSmall", "rtFull"]))).is_err());
+    assert!(DetectorModels::from_args(Some(&serde_json::json!(["unknown"]))).is_err());
+    let empty = Scratch::new("sam-only-no-legacy-weights");
+    let sam = DetectorModels::from_args(Some(&serde_json::json!(["samTs"]))).unwrap();
+    assert!(Pipeline::open_selected(&empty.join("."), Preference::CpuOnly, sam, true, None).is_ok());
+    assert!(Pipeline::open_selected(&empty.join("."), Preference::CpuOnly, sam, false, None).is_err());
 }
 
 #[test]

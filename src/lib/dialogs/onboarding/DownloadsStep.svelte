@@ -78,7 +78,7 @@
           <span class="status">{statusText(id)}</span>
           {#if status === 'done'}
             <span class="icon done" aria-hidden="true"><Icon name="check" size={14} /></span>
-          {:else}
+          {:else if id !== 'samTs' || status !== 'active'}
             <!-- One button through pause, resume and retry, so pressing it
                  keeps focus where it is instead of dropping it to the body. -->
             {@const action = ACTIONS[status === 'paused' || status === 'failed' ? status : 'running']}

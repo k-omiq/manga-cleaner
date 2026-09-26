@@ -40,6 +40,7 @@ ROOT = Path(__file__).resolve().parents[2]
 TARGETS = {
     "aarch64-apple-darwin": ("Darwin", "arm64"),
     "x86_64-pc-windows-msvc": ("Windows", "AMD64"),
+    "x86_64-unknown-linux-gnu": ("Linux", "x86_64"),
 }
 # Import packages collected with their submodules, data files and binaries.
 # betterproto is left to the analysis of beta9: its protoc plugin subpackage exits

@@ -581,7 +581,7 @@ pub fn store_cloud_secret(
     let key = SecretKey::new(provider, profile_id.clone(), origin_fp, role);
 
     let secret_val = match (provider, role) {
-        (CloudProvider::Modal, SecretRole::Runtime) => {
+        (CloudProvider::Modal, SecretRole::Runtime | SecretRole::Setup) if role == SecretRole::Runtime || token_id.is_some() => {
             let tid = token_id
                 .as_deref()
                 .map(str::trim)

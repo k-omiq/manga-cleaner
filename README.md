@@ -27,7 +27,7 @@ The rule is simple: use the lightest engine that does the job. Planar fill handl
 
 ## Install
 
-Download the installer from [cleaner.komiq.cc](https://cleaner.komiq.cc): a `.dmg` for macOS on Apple Silicon, a `-setup.exe` for Windows x64. Both are built by the release workflow, and the app updates itself from cryptographically signed manifests. The Windows installer is not yet Authenticode-signed, so SmartScreen warns the first time it is run; the release workflow signs it automatically as soon as a certificate is configured.
+Download the installer from [cleaner.komiq.cc](https://cleaner.komiq.cc): a `.dmg` for macOS on Apple Silicon, a `-setup.exe` for Windows x64, or an `.AppImage` or `.deb` for Linux x64. All are built by the release workflow, and the app updates itself from cryptographically signed manifests. The Windows installer is not yet Authenticode-signed, so SmartScreen warns the first time it is run; the release workflow signs it automatically as soon as a certificate is configured.
 
 Windows needs 10 version 1803 x64 or later, which is what WebView2, the Visual C++ 2015-2022 runtime and ONNX Runtime 1.28 each require on their own. The Visual C++ runtime is not something to install: the four libraries the ONNX Runtime imports outright ship beside the executable, where the loader finds them first.
 
@@ -35,7 +35,7 @@ Model weights and the runtime are not bundled, which keeps the installer small a
 
 The optional **Text-shaped review** analyzes a selected chapter page with RT-DETR and the exact Koharu SAM-TS-L model. Its all-text policy does not need script recognition or OCR. You review lettering components, source-pixel padding and corrections against the tinted write-support preview before applying any patch. Supervised writes are currently restricted to PNG pages on the measured Apple M5/WebGPU configuration; other sources and providers stay in review. The legacy workflow remains the default. See [local release evidence and known failures](docs/local-text-shape-release.md) for current limits and rollback behavior, and the [model workflow decisions and benchmarks](docs/model-workflow-benchmarks.md) for the earlier CPU, GPU and chapter measurements.
 
-Intel Macs (`x86_64`) are unsupported: ONNX Runtime 1.28.0 publishes no `osx-x86_64` archive. Linux `x86_64` has a GPU path (the WebGPU plugin, with CUDA flavours for NVIDIA) that has not been executed on real hardware; Linux `aarch64` is best effort and CPU only. Neither is part of the release workflow.
+Intel Macs (`x86_64`) are unsupported: ONNX Runtime 1.28.0 publishes no `osx-x86_64` archive. Linux `x86_64` has a release package and a GPU path (the WebGPU plugin, with CUDA flavours for NVIDIA) that has not been executed on real hardware; Linux `aarch64` is best effort and CPU only and is not part of the release workflow.
 
 ## Features
 

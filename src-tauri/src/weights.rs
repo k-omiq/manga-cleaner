@@ -265,6 +265,15 @@ pub const MODELS: &[ModelPackage] = &[
         kind_key: "models.kind.balloonDetector",
         required_by: &["autoClean"],
     },
+    ModelPackage {
+        id: "fullRt",
+        file_name: "detector.onnx",
+        url: "https://huggingface.co/ogkalu/comic-text-and-bubble-detector/resolve/16e8a622f91fabc6b5b65c96d32d1183f8843546/detector.onnx",
+        sha256: "065744e91c0594ad8663aa8b870ce3fb27222942eded5a3cc388ce23421bd195",
+        bytes: 168_481_531,
+        kind_key: "models.kind.fullRt",
+        required_by: &["review"],
+    },
     /* The gate's rescue reader: `manga-ocr`, Apache-2.0, exported
      * to ONNX by the same author as `lama-manga.onnx`.
      *
@@ -580,6 +589,20 @@ fn unpacked_bytes(archive: &Path, library_dir: &str) -> Option<u64> {
 /// truncated by a full disk, is not an installed model, and the size is the
 /// only check cheap enough to make every time the dialog opens.
 fn locate(model: &ModelPackage, app_data: Option<&Path>, writable: Option<&Path>) -> Option<(PathBuf, bool)> {
+    // The verified full RT import and managed download share this owned layout.
+    // Check it before generic search roots so Settings sees the same graph the
+    // workflow and automatic run use.
+    if model.id == "fullRt" {
+        if let Some(root) = app_data {
+            let dir = root.join("models/rtdetr-v2-full");
+            let path = dir.join(model.file_name);
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.is_file() && meta.len() == model.bytes {
+                    return Some((path, is_read_only(dir.as_path(), writable, &meta)));
+                }
+            }
+        }
+    }
     for dir in model_search_paths(app_data) {
         let path = dir.join(model.file_name);
         let Ok(meta) = std::fs::metadata(&path) else { continue };
@@ -1210,6 +1233,9 @@ fn plan_delete(found: Option<(PathBuf, bool)>) -> Result<PathBuf, DeleteOutcome>
 /// not a session, it is the library every session is built through, and
 /// deleting it evicts nothing - the sessions already loaded go on running
 /// against a library that is still mapped into the process.
+/// The full RT-DETR graph is also `None`: its session is owned only by the
+/// active pipeline and is never parked in `residency`. Evicting the small RT
+/// kind for its separate weight would free an unrelated model.
 fn resident_kind(id: &str) -> Option<registry::Kind> {
     Some(match id {
         "textDetector" => registry::Kind::TextDetector,
@@ -1449,7 +1475,7 @@ pub fn cancel_download(id: String) -> bool {
 /// decision this module already made. Which of the three things happened is
 /// [`DeleteOutcome`], because "no" was two facts under one boolean.
 ///
-/// **The session goes with the file.** A model already loaded was built from
+/// **A parked session goes with its file.** A model already loaded was built from
 /// bytes that are in memory and would go on working after its weights were
 /// deleted - a run started before the press finishing on an engine Settings
 /// says is not installed. So a successful delete evicts the kind the
@@ -3224,6 +3250,20 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[test]
+    fn imported_full_rt_is_visible_to_the_catalogue() {
+        let root = std::env::temp_dir().join(format!("mc-full-rt-locate-{}", std::process::id()));
+        let dir = root.join("models/rtdetr-v2-full");
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = MODELS.iter().find(|entry| entry.id == "fullRt").unwrap();
+        let path = dir.join(model.file_name);
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(model.bytes).unwrap();
+        let found = locate(model, Some(&root), Some(&root.join("models"))).unwrap();
+        assert_eq!(found.0, path);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// A `.part` whose digest does not match is deleted rather than published,
     /// and the failure names both digests. Driven through the same function a
     /// real download uses, against a file:// -free local check of the digest
@@ -3399,12 +3439,13 @@ mod tests {
         assert!(!residency::parked(kept));
     }
 
-    /// Every catalogue row is the bytes of exactly one loaded session, and the
-    /// runtime is the bytes of none - it is the library every session is built
-    /// *through*, and deleting it evicts nothing that is already mapped in.
+    /// Every parked catalogue session has a weight mapping. Full RT has only
+    /// a run-local session, so it has no parked kind to evict; the runtime is
+    /// also not a session.
     #[test]
     fn every_weight_names_the_session_it_would_evict() {
         for model in MODELS {
+            if model.id == "fullRt" { continue; }
             assert!(
                 resident_kind(model.id).is_some(),
                 "{}: nothing would be evicted when it is deleted",
@@ -3412,6 +3453,7 @@ mod tests {
             );
         }
         assert_eq!(resident_kind(RUNTIME_ID), None);
+        assert_eq!(resident_kind("fullRt"), None);
         assert_eq!(resident_kind("no-such-model"), None);
 
         // The two halves of the script gate are one session, and so are the
@@ -3424,14 +3466,14 @@ mod tests {
             assert_eq!(resident_kind(id), Some(registry::Kind::ScriptGate), "{id}");
         }
 
-        // And no two *unrelated* weights share a kind by accident: eight
+        // And no two *unrelated* parked weights share a kind by accident: eight
         // artefacts, four parked sessions (the reader is parked inside the
         // gate), and the two groupings above account for every file that is
         // not alone on its row.
         let kinds: std::collections::HashSet<_> =
             MODELS.iter().filter_map(|m| resident_kind(m.id)).collect();
         assert_eq!(kinds.len(), 4, "eight weights, four parked sessions, two shared");
-        assert_eq!(MODELS.len(), 8);
+        assert_eq!(MODELS.len(), 9);
     }
 
     /* -------------------------------------------------------------- */

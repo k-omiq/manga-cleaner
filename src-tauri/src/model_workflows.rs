@@ -3,13 +3,15 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::library::Library;
 use base64::Engine;
 use cleaner_core::accel::Preference;
-use cleaner_core::balloon::BalloonDetector;
+use cleaner_core::balloon::{BalloonBox, BalloonClass, BalloonDetector};
+use cleaner_core::detect::Detector;
 use cleaner_core::fusion::ReviewEvidence;
 use cleaner_core::image::Raster;
 use cleaner_core::mask::{Mask, Rect};
@@ -22,7 +24,7 @@ use cleaner_core::text_shape::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 struct Graph {
     name: &'static str,
@@ -53,6 +55,7 @@ const FULL_RT_REVISION: &str = "16e8a622f91fabc6b5b65c96d32d1183f8843546";
 // for the editor and decoded page; an unknown reading fails closed.
 const SAM_MIN_ROOM_BYTES: u64 = 10_000_000_000;
 static SAM_FILES: Mutex<()> = Mutex::new(());
+static SAM_INSTALL: Mutex<()> = Mutex::new(());
 
 const WRITE_SUPPORT_VERSION: &str = "mask-plan-support-v1";
 const RENDER_VERSION: &str = "bounded-ring-median-v1";
@@ -177,26 +180,23 @@ fn detector_bounds(evidence: &ReviewEvidence, component_id: &str) -> Option<Rect
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Workflow {
-    Regions,
-    Mask,
-    TextShape,
-}
+struct Workflow { ctd: bool, rt: bool, sam: bool }
 impl Workflow {
     fn parse(value: &str) -> Result<Self, String> {
         match value {
-            "regions" => Ok(Self::Regions),
-            "mask" => Ok(Self::Mask),
-            "text_shape" => Ok(Self::TextShape),
-            _ => Err("Choose Regions, Mask, or Text-shaped review".into()),
+            "regions" => Ok(Self { ctd: false, rt: true, sam: false }),
+            "mask" => Ok(Self { ctd: false, rt: false, sam: true }),
+            "text_shape" => Ok(Self { ctd: false, rt: true, sam: true }),
+            "ctd" => Ok(Self { ctd: true, rt: false, sam: false }),
+            "ctd_regions" => Ok(Self { ctd: true, rt: true, sam: false }),
+            "ctd_mask" => Ok(Self { ctd: true, rt: false, sam: true }),
+            "ctd_text_shape" => Ok(Self { ctd: true, rt: true, sam: true }),
+            _ => Err("Choose a supported detection model combination".into()),
         }
     }
-    fn rt(self) -> bool {
-        matches!(self, Self::Regions | Self::TextShape)
-    }
-    fn sam(self) -> bool {
-        matches!(self, Self::Mask | Self::TextShape)
-    }
+    fn ctd(self) -> bool { self.ctd }
+    fn rt(self) -> bool { self.rt }
+    fn sam(self) -> bool { self.sam }
 }
 
 fn digest(path: &Path) -> Result<String, String> {
@@ -274,7 +274,7 @@ fn qualified_webgpu_write_environment(app_data: &Path) -> bool {
         && sam_ts::built_in_webgpu_available()
 }
 
-fn verify_graphs(dir: &Path) -> Result<(), String> {
+pub(crate) fn verify_graphs(dir: &Path) -> Result<(), String> {
     for graph in GRAPHS {
         let path = dir.join(graph.name);
         let size = std::fs::metadata(&path)
@@ -295,7 +295,7 @@ fn verify_graphs(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn graph_dir(app_data: &Path) -> Option<PathBuf> {
+pub(crate) fn graph_dir(app_data: &Path) -> Option<PathBuf> {
     // An explicit developer path is read-only and never removed by the UI.
     if let Ok(path) = std::env::var("MANGA_CLEANER_SAM_TS") {
         let path = PathBuf::from(path);
@@ -338,10 +338,11 @@ fn full_rt_path_with(
     external
         .into_iter()
         .chain(std::iter::once(managed))
+        .chain(crate::run::model_search_paths(Some(app_data)).into_iter().map(|dir| dir.join(FULL_RT_NAME)))
         .find(|path| verified(path, FULL_RT_BYTES, FULL_RT_SHA256))
 }
 
-fn full_rt_path(app_data: &Path) -> Option<PathBuf> {
+pub(crate) fn full_rt_path(app_data: &Path) -> Option<PathBuf> {
     full_rt_path_with(app_data, |path, bytes, sha| {
         std::fs::metadata(path).is_ok_and(|meta| meta.len() == bytes)
             && digest(path).is_ok_and(|actual| actual == sha)
@@ -352,6 +353,7 @@ fn full_rt_path(app_data: &Path) -> Option<PathBuf> {
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowCapabilities {
     runtime_installed: bool,
+    ctd_installed: bool,
     rt_installed: bool,
     full_rt_installed: bool,
     full_rt_managed: bool,
@@ -399,8 +401,8 @@ fn sam_backends(
         platform: "all",
         qualified: false,
         available: runtime_installed && memory_ready,
-        selectable: runtime_installed && memory_ready && cfg!(target_os = "macos"),
-        note: "Native ONNX path on macOS matches 44/45 saved masks with Pillow RGB; page 27 differs by two pixels. Native JPEG decoding also differs. Windows and Linux need matching-hardware validation.",
+        selectable: runtime_installed && memory_ready,
+        note: "Native ONNX CPU analysis. Saved parity evidence is from macOS; other platforms remain review-only.",
     }];
     if cfg!(target_os = "macos") {
         rows.extend([
@@ -500,8 +502,8 @@ fn rt_backends(runtime_installed: bool) -> Vec<Backend> {
         platform: "all",
         qualified: cfg!(target_os = "macos"),
         available: runtime_installed,
-        selectable: runtime_installed && cfg!(target_os = "macos"),
-        note: "Native full FP32 tiled and existing small INT8 paths on macOS. Full path matched all 45 saved box lists; other systems need matching-hardware validation.",
+        selectable: runtime_installed,
+        note: "Native full FP32 tiled and small INT8 CPU paths. Saved parity evidence is from macOS.",
     }];
     if cfg!(target_os = "macos") {
         rows.extend([
@@ -592,6 +594,8 @@ fn workflow_capabilities_with_room(app_data: &Path, room: Option<u64>) -> Workfl
         });
     WorkflowCapabilities {
         runtime_installed,
+        ctd_installed: crate::run::model_search_paths(Some(app_data)).into_iter()
+            .any(|dir| dir.join(crate::run::DETECTOR).is_file()),
         rt_installed: rt_path_with(app_data, |path, bytes, sha| {
             cache.verified(path, bytes, sha)
         }).is_some(),
@@ -708,6 +712,100 @@ pub async fn verify_sam_ts(app: tauri::AppHandle) -> Result<bool, String> {
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+fn sam_bootstrap_source(app: &tauri::AppHandle, app_data: &Path) -> Result<PathBuf, String> {
+    let bundled = app.path().resource_dir().map_err(|e| e.to_string())?.join("sam-bootstrap");
+    if bundled.join("bootstrap.py").is_file() && bundled.join("export_mask.py").is_file() {
+        return Ok(bundled);
+    }
+    if cfg!(debug_assertions) {
+        let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        if checkout.join("sam-bootstrap/bootstrap.py").is_file() {
+            let target = app_data.join("models/.sam-ts-l-bootstrap/source");
+            std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+            for (from, to) in [
+                (checkout.join("sam-bootstrap/bootstrap.py"), "bootstrap.py"),
+                (checkout.join("spikes/sam-ts-l/export_mask.py"), "export_mask.py"),
+                (checkout.join("spikes/sam-ts-l/environment.txt"), "environment.txt"),
+                (checkout.join("spikes/sam-ts-l/fixtures/synthetic_page.png"), "synthetic_page.png"),
+            ] {
+                std::fs::copy(from, target.join(to)).map_err(|e| e.to_string())?;
+            }
+            return Ok(target);
+        }
+    }
+    Err("This app build does not include the SAM-TS-L exporter".into())
+}
+
+fn sam_uv() -> PathBuf {
+    let name = if cfg!(windows) { "manga-cleaner-uv.exe" } else { "manga-cleaner-uv" };
+    std::env::current_exe().ok()
+        .and_then(|path| path.parent().map(|dir| dir.join(name)))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("uv"))
+}
+
+fn sam_step(app: &tauri::AppHandle, name: &'static str, mut command: Command, root: &Path) -> Result<(), String> {
+    let _ = app.emit("sam-install://progress", serde_json::json!({"step": name, "state": "start"}));
+    let log = root.join(format!("{name}.log"));
+    let output = std::fs::File::create(&log).map_err(|e| e.to_string())?;
+    let mut child = command.stdin(Stdio::null()).stdout(Stdio::null())
+        .stderr(Stdio::from(output)).spawn()
+        .map_err(|e| format!("SAM-TS-L {name} could not start: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(2 * 60 * 60);
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            if status.success() {
+                let _ = app.emit("sam-install://progress", serde_json::json!({"step": name, "state": "done"}));
+                return Ok(());
+            }
+            let detail = std::fs::read_to_string(&log).unwrap_or_default();
+            let end = detail.chars().rev().take(600).collect::<String>().chars().rev().collect::<String>();
+            return Err(format!("SAM-TS-L {name} failed: {end}"));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("SAM-TS-L {name} timed out; retry to continue"));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[tauri::command]
+pub async fn install_sam_ts(app: tauri::AppHandle) -> Result<bool, String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    if graph_dir(&app_data).is_some_and(|dir| verify_graphs(&dir).is_ok()) { return Ok(true); }
+    let source = sam_bootstrap_source(&app, &app_data)?;
+    let staged = tauri::async_runtime::spawn_blocking({
+        let app = app.clone();
+        move || -> Result<PathBuf, String> {
+            let _install = SAM_INSTALL.lock().map_err(|e| e.to_string())?;
+            let root = app_data.join("models/.sam-ts-l-bootstrap");
+            std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+            let (managed, prefix) = crate::flux_install::managed_python(&app, &root, "3.12")?;
+            let uv = sam_uv();
+            let venv = root.join("venv");
+            let mut setup = Command::new(&uv);
+            setup.args(["venv", "--python", &managed]).arg(&venv).env("UV_NO_CONFIG", "1");
+            sam_step(&app, "environment", setup, &root)?;
+            let python = if cfg!(windows) { venv.join("Scripts/python.exe") } else { venv.join("bin/python") };
+            let mut dependencies = Command::new(&uv);
+            dependencies.args(["pip", "sync", "--python"]).arg(&python).arg(source.join("environment.txt"))
+                .env("UV_NO_CONFIG", "1");
+            sam_step(&app, "dependencies", dependencies, &root)?;
+            let mut bootstrap = Command::new(&python);
+            bootstrap.args(prefix).arg(source.join("bootstrap.py"))
+                .arg("--root").arg(&root).arg("--source").arg(&source);
+            sam_step(&app, "sources-export", bootstrap, &root)?;
+            let proof = root.join("proof");
+            verify_graphs(&proof)?;
+            let _ = app.emit("sam-install://progress", serde_json::json!({"step": "verify", "state": "done"}));
+            Ok(proof)
+        }
+    }).await.map_err(|e| e.to_string())??;
+    import_sam_ts(app, staged.to_string_lossy().into_owned()).await
 }
 
 #[tauri::command]
@@ -1652,12 +1750,6 @@ pub async fn analyze_capabilities(
     request_id: String,
 ) -> Result<Analysis, String> {
     let mode = Workflow::parse(&workflow)?;
-    if !cfg!(target_os = "macos") {
-        return Err(
-            "This analysis path requires matching-hardware qualification on this operating system"
-                .into(),
-        );
-    }
     if mode.rt() && rt_backend != "ort-cpu" {
         return Err(format!(
             "RT backend {rt_backend} is not qualified for this analysis path"
@@ -1696,7 +1788,7 @@ pub async fn analyze_capabilities(
         let mut sam_process_high_water_bytes = None;
         let mut sam_process_phys_footprint_bytes = None;
         let mut sam_sampled_metal_high_water_bytes = None;
-        let boxes = if mode.rt() {
+        let mut boxes = if mode.rt() {
             match rt_profile.as_str() {
                 "full-halves" => {
                     let path = full_rt_path(&app_data)
@@ -1728,6 +1820,23 @@ pub async fn analyze_capabilities(
         } else {
             Vec::new()
         };
+        cancel.check()?;
+        if mode.ctd() {
+            let path = crate::run::model_search_paths(Some(&app_data))
+                .into_iter()
+                .map(|dir| dir.join(crate::run::DETECTOR))
+                .find(|path| path.is_file())
+                .ok_or("Comic Text Detector graph is not installed")?;
+            let mut model = Detector::open(&path, Preference::CpuOnly).map_err(|e| e.to_string())?;
+            cancel.check()?;
+            let detection = model.detect(&page).map_err(|e| e.to_string())?;
+            cancel.check()?;
+            boxes.extend(detection.boxes.into_iter().map(|item| BalloonBox {
+                rect: item.rect,
+                class: BalloonClass::TextFree,
+                score: item.confidence,
+            }));
+        }
         cancel.check()?;
         let mask = if mode.sam() {
             cleaner_core::residency::evict_for_sam();
@@ -2139,15 +2248,23 @@ mod tests {
 
     #[test]
     fn each_workflow_opens_only_its_requested_models() {
-        assert_eq!((Workflow::Mask.rt(), Workflow::Mask.sam()), (false, true));
+        let mask = Workflow::parse("mask").unwrap();
+        assert_eq!((mask.ctd(), mask.rt(), mask.sam()), (false, false, true));
         assert_eq!(
-            (Workflow::Regions.rt(), Workflow::Regions.sam()),
+            (Workflow::parse("regions").unwrap().rt(), Workflow::parse("regions").unwrap().sam()),
             (true, false)
         );
         assert_eq!(
-            (Workflow::TextShape.rt(), Workflow::TextShape.sam()),
+            (Workflow::parse("text_shape").unwrap().rt(), Workflow::parse("text_shape").unwrap().sam()),
             (true, true)
         );
+        for (name, ctd, rt, sam) in [
+            ("ctd", true, false, false), ("ctd_regions", true, true, false),
+            ("ctd_mask", true, false, true), ("ctd_text_shape", true, true, true),
+        ] {
+            let workflow = Workflow::parse(name).unwrap();
+            assert_eq!((workflow.ctd(), workflow.rt(), workflow.sam()), (ctd, rt, sam));
+        }
         assert!(Workflow::parse("rtdetr-coo-samts").is_err());
         assert_eq!(source_mime(PNG_MAGIC).unwrap(), "image/png");
         assert_eq!(source_mime(&[0xff, 0xd8, 0xff]).unwrap(), "image/jpeg");

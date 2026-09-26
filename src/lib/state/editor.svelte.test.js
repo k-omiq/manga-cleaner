@@ -447,7 +447,7 @@ describe('tool parameters defaults', () => {
   it('initializes shapes with white color and feather 0', () => {
     expect(editor.toolParams.shapes).toMatchObject({
       shape: 'rect',
-      mode: 'fill',
+      mode: 'solid',
       color: '#ffffff',
       feather: 0,
     })
@@ -717,6 +717,7 @@ describe('startRun local engine ceiling boundary', () => {
         outsideBubbles: 'review',
         bubbleColor: '#ffffff',
         detection: { ...session.detection },
+        detectorModels: [...session.detectorModels],
         geometryPolicy: 'legacy',
         textPolicy: 'legacy_gate',
         ocrRescue: session.ocrRescue,
@@ -731,16 +732,17 @@ describe('startRun local engine ceiling boundary', () => {
     },
   )
 
-  it('routes all-text policy to chapter review without starting the legacy cleaner', async () => {
+  it('runs all-text automatic cleaning with the selected detection models', async () => {
     const previousPolicy = session.textPolicy
     session.textPolicy = 'all_text'
-    const runClean = vi.fn()
+    const runClean = vi.fn().mockResolvedValue({ runId: 'all-text-run', pages: [{ id: 'p0' }] })
     setBackend(/** @type {any} */ ({ runClean }))
     app.modals.length = 0
     try {
-      expect(await startRun()).toBeNull()
-      expect(runClean).not.toHaveBeenCalled()
-      expect(app.modals.at(-1)).toMatchObject({ kind: 'workflowReview', props: { chapterId: 'ch-test-1', pageIndex: 0 } })
+      expect(await startRun()).toBe('all-text-run')
+      expect(runClean).toHaveBeenCalledWith(expect.objectContaining({
+        textPolicy: 'all_text', detectorModels: [...session.detectorModels],
+      }))
     } finally {
       session.textPolicy = previousPolicy
       app.modals.length = 0

@@ -342,8 +342,9 @@ fn intersecting_records<'a>(
         .iter()
         .filter_map(|record| {
             let anchor = job.project.strip.order.iter().position(|i| *i == record.source_idx)?;
-            let (x, y) = strip.to_strip(anchor, record.bbox.x, record.bbox.y)?;
-            let bbox = Rect::new(x, y, record.bbox.w, record.bbox.h);
+            let displayed = record.display_bbox();
+            let (x, y) = strip.to_strip(anchor, displayed.x, displayed.y)?;
+            let bbox = Rect::new(x, y, displayed.w, displayed.h);
             (bbox.x < page.right()
                 && bbox.right() > page.x
                 && bbox.y < page.bottom()
@@ -1024,5 +1025,35 @@ mod tests {
         // Page 1 has the bottom part of the patch (y: 0..8)
         let page1 = decode(&render(job.path(), 1, Variant::Cleaned, None).unwrap()).unwrap();
         assert_eq!(page1.sample(15, 2, 0), 215, "page 1 did not render spanning patch");
+    }
+
+    #[test]
+    fn moved_or_rotated_patch_reaches_the_new_longstrip_page() {
+        for angle in [0.0, 90.0] {
+            let scratch = Scratch::new(if angle == 0.0 { "moved-join" } else { "rotated-join" });
+            let mut job = a_longstrip(&scratch, 2);
+            let bounds = Rect::new(10, 10, 20, 10);
+            let mut pixels = fixtures::by_name("l8").raster;
+            pixels.width = bounds.w;
+            pixels.height = bounds.h;
+            pixels.icc = None;
+            pixels.data = vec![215; (bounds.w * bounds.h) as usize];
+            job.complete_region(0, &Patch {
+                id: "moved".into(),
+                mask: Mask::filled(bounds), ink: Mask::filled(bounds), pixels,
+                order: 0, visible: true,
+                provenance: Provenance {
+                    engine: Engine::Fill, engine_version: "test".into(),
+                    model_sha256: None, execution_provider: "cpu".into(),
+                    params_snapshot: serde_json::json!({"layer": {"offsetY": 40, "rotation": angle}}),
+                    mask_sha256: "0".repeat(64), source_sha256: "0".repeat(64),
+                    cloud: None, created: 0,
+                },
+            }, None).unwrap();
+            let source = decode(&render(job.path(), 1, Variant::Source, None).unwrap()).unwrap();
+            let cleaned = decode(&render(job.path(), 1, Variant::Cleaned, None).unwrap()).unwrap();
+            assert_ne!(source.sample(20, 5, 0), 215);
+            assert_eq!(cleaned.sample(20, 5, 0), 215, "angle {angle} disappeared across the join");
+        }
     }
 }

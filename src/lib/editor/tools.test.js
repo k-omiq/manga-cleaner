@@ -137,40 +137,43 @@ describe('toolSpec', () => {
 })
 
 /**
- * **Shapes has a mode, and the mode is one list of six.** A drawn shape is
+ * **Shapes has a mode, and the mode is one list of three.** A drawn shape is
  * either paint - a colour the user picked, laid down flat - or a clean by one
- * of the five rungs, and it is never both. The two are alternatives rather
+ * of the two available redraw models, and it is never both. The alternatives
  * than settings of one another, which is why they share a row.
  *
- * The trap the naming has to stay clear of is that one of the five rungs is
- * itself called *Fill*: rung 0, the planar fill, which samples the paper and
- * lays down the tone it found. The solid option is `solid` and reads "Solid
- * colour", and nothing in the tool spells the two the same.
+ * Planar Fill and Denoise fill do not appear in this mode list; the solid
+ * option is `solid` and reads "Solid colour".
  */
 describe('the Shapes tool', () => {
   const shapes = toolSpec('shapes')
   /** @param {string} key */
   const param = (key) => shapes.params.find((candidate) => candidate.key === key)
 
-  it('still offers the four shapes', () => {
+  it('offers the four area shapes and a line', () => {
     expect(param('shape')?.options.map((option) => option.value)).toEqual([
       'rect',
       'ellipse',
       'lasso',
       'polygon',
+      'line',
     ])
   })
 
-  it('offers a solid colour and the same five engines a Layers row does', () => {
+  it('offers a solid colour and the two redraw models', () => {
     const mode = param('mode')
     expect(mode?.kind).toBe('choice')
-    expect(mode?.options.map((option) => option.value)).toEqual([SOLID, ...ROW_ENGINES])
-    // The AI mask brush's list, unchanged and under the same words - a user
-    // who learns "MI-GAN" on one canvas tool has learned it on the other.
+    expect(mode?.options.map((option) => option.value)).toEqual([SOLID, 'lama', 'flux'])
+    // The AI mask brush has the stronger two local models only.
     const brushEngines = toolSpec('aiMaskBrush').params.find((p) => p.key === 'engine')
     for (const rung of ROW_ENGINES) {
       const here = mode?.options.find((option) => option.value === rung)
       const there = brushEngines?.options.find((option) => option.value === rung)
+      if (rung === 'fill' || rung === 'denoise') {
+        expect(here).toBeUndefined()
+        expect(there).toBeUndefined()
+        continue
+      }
       expect(here?.labelKey).toBe(there?.labelKey)
       // Including rung 3a's gate, so the tool bar drops it on a machine
       // with no sidecar exactly as it does there.
@@ -204,12 +207,12 @@ describe('the Shapes tool', () => {
     }
   })
 
-  it('names the solid option something other than the fill engine', () => {
+  it('names the solid option and omits the fill engine', () => {
     const mode = param('mode')
     const solid = mode?.options.find((option) => option.value === SOLID)
     const fill = mode?.options.find((option) => option.value === 'fill')
     expect(solid?.labelKey).toBe('tools.option.modeSolid')
-    expect(solid?.labelKey).not.toBe(fill?.labelKey)
+    expect(fill).toBeUndefined()
   })
 
   it('carries a colour and an opacity, live only while the mode is solid', () => {
@@ -224,7 +227,7 @@ describe('the Shapes tool', () => {
 
   it('shows the colour only in solid mode, and the rest of the rows always', () => {
     const solid = activeParams(shapes, { mode: SOLID }).map((p) => p.key)
-    expect(solid).toEqual(['shape', 'mode', 'color', 'opacity', 'feather'])
+    expect(solid).toEqual(['shape', 'mode', 'color', 'opacity', 'outlineColor', 'outlineWidth', 'feather'])
 
     const engine = activeParams(shapes, { mode: 'lama' }).map((p) => p.key)
     expect(engine).toEqual(['shape', 'mode', 'feather'])
@@ -244,11 +247,11 @@ describe('the Shapes tool', () => {
   // A parameter with no predicate is live for every value, including none -
   // the filter must not drop the rows that never had a condition.
   it('leaves an unconditional row alone', () => {
-    expect(activeParams(toolSpec('autoClean'), { bubbleEngine: 'fill' }).map((p) => p.key)).toEqual([
+    expect(activeParams(toolSpec('autoClean'), { bubbleEngine: SOLID }).map((p) => p.key)).toEqual([
       'scope',
       'bubbleEngine',
-      'bubbleColor',
       'outsideEngine',
+      'bubbleColor',
       'outsideBubbles',
     ])
     expect(activeParams(toolSpec('autoClean'), { bubbleEngine: 'lama' }).map((p) => p.key)).toEqual([
@@ -257,6 +260,11 @@ describe('the Shapes tool', () => {
       'outsideEngine',
       'outsideBubbles',
     ])
+    expect(activeParams(toolSpec('autoClean'), { bubbleEngine: 'lama', outsideEngine: SOLID }).map((p) => p.key)).toEqual([
+      'scope', 'bubbleEngine', 'outsideEngine', 'bubbleColor', 'outsideBubbles',
+    ])
+    expect(toolSpec('autoClean').params.find((p) => p.key === 'outsideEngine')?.options.map((o) => o.value))
+      .toContain(SOLID)
   })
 })
 
@@ -285,7 +293,7 @@ describe('paramGroups', () => {
   })
 
   it('reads Auto clean as a scope, then models and the outside-bubble opt-in', () => {
-    expect(paramGroups(toolSpec('autoClean'), { bubbleEngine: 'fill' }).map((group) => [group.key, group.params.length]))
+    expect(paramGroups(toolSpec('autoClean'), { bubbleEngine: SOLID }).map((group) => [group.key, group.params.length]))
       .toEqual([
         ['scope', 1],
         ['engines', 4],
@@ -306,7 +314,7 @@ describe('paramGroups', () => {
     expect(engine[1].params.map((p) => p.key)).toEqual(['mode', 'feather'])
 
     const solid = paramGroups(toolSpec('shapes'), { mode: SOLID })
-    expect(solid[1].params.map((p) => p.key)).toEqual(['mode', 'color', 'opacity', 'feather'])
+    expect(solid[1].params.map((p) => p.key)).toEqual(['mode', 'color', 'opacity', 'outlineColor', 'outlineWidth', 'feather'])
   })
 })
 
@@ -523,14 +531,13 @@ describe('the icons and the short labels the bar draws a choice with', () => {
     }
   })
 
-  it('draws the five pictured choices as icons and the ladders as dropdowns', () => {
+  it('draws the four pictured choices as icons and the ladders as dropdowns', () => {
     const pictured = choices
       .filter(({ param }) => param.options.every((option) => option.icon))
       .map(({ id, param }) => `${id}.${param.key}`)
     expect(pictured).toEqual([
       'autoClean.scope',
       'shapes.shape',
-      'contentAwareFill.engine',
       'cloneHeal.alignment',
       'cloneHeal.mode',
     ])
@@ -548,7 +555,6 @@ describe('the icons and the short labels the bar draws a choice with', () => {
       ['autoClean.outsideEngine', 'tools.short.outsideText'],
       ['shapes.mode', 'tools.short.mode'],
       ['aiMaskBrush.engine', 'tools.short.cleanWith'],
-      ['contentAwareFill.fillMode', 'tools.short.fillMode'],
     ])
     // Never on a choice the bar draws as icons: there is no trigger to put it on.
     for (const { id, param } of choices) {

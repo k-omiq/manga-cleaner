@@ -68,6 +68,9 @@ url = "2"
 keyring = { version = "3", features = ["apple-native"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# Match the WebView2 types used by Tauri/Wry for native reload protection.
+webview2-com = "0.38"
+windows-core = "0.61"
 keyring = { version = "3", features = ["windows-native"] }
 # Two Windows facts this crate cannot get from `std`, both of which were being
 # guessed at or skipped before.

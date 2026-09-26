@@ -2,10 +2,12 @@
   import { isHighlighted, hover, select, undo, undoAvailable, undoLabelKey } from '../state/editor.svelte.js'
   import { rowEngines, engineChoiceLabel } from '../model/masks.js'
   import { capabilities } from '../state/capabilities.svelte.js'
-  import { cloudUsable } from '../state/cloud.svelte.js'
+  import { cloud, cloudUsable } from '../state/cloud.svelte.js'
+  import { session } from '../state/session.svelte.js'
+  import { currentCloudModelId, engineModelLabel } from '../model/model-names.js'
   import { actionHint } from './maskrows.js'
   import { menuPoint } from './gesture.js'
-  import { deleteRow, keepDependencyResult, rerunMask, runMaskAction } from './maskactions.svelte.js'
+  import { deleteRow, keepDependencyResult, rerunMask, runMaskAction, updateLayer } from './maskactions.svelte.js'
   import { Button, Disclosure, IconButton, Select } from '../ui/index.js'
   import { t } from '../i18n/index.js'
   import MaskFacts from './MaskFacts.svelte'
@@ -68,8 +70,10 @@
   // this layer in review, so its tooltip names what it would reverse.
   const undoKey = $derived(undoLabelKey())
   const undoHint = $derived(undoKey ? t('editor.action.undoCommand', { commandKey: undoKey }) : undefined)
-  const title = $derived(t(row.titleKey))
+  const title = $derived(engineModelLabel(row.engine, row.modelId, t(row.titleKey)))
   const sub = $derived(row.sub.map((part) => t(part.key, part.params)).join(' · '))
+  const layer = $derived(region.mask?.layer ?? { opacity: 100, offsetX: 0, offsetY: 0, rotation: 0, locked: false })
+  const shapeLayer = $derived(region.mask?.provenance?.params_snapshot?.tool === 'shapes' || region.tool === 'shapes')
 
   // What this machine can clean with now, and Cloud last while a cloud
   // endpoint is ready and allowed: left out otherwise, like a rung whose
@@ -82,7 +86,14 @@
   const offered = $derived(rowEngines(capabilities.engines, { cloud: cloudUsable() }))
   const engineOptions = $derived(
     (row.engine && !offered.includes(row.engine) ? [row.engine, ...offered] : offered).map(
-      (rung) => ({ value: rung, label: t(engineChoiceLabel(rung)) }),
+      (rung) => ({
+        value: rung,
+        label: engineModelLabel(rung,
+          rung === 'cloud'
+            ? currentCloudModelId(cloud) ?? (!cloudUsable() && row.engine === 'cloud' ? row.modelId : null)
+            : rung === 'flux' ? session.fluxModel || (row.engine === 'flux' ? row.modelId : null) || 'flux2-klein-4b' : null,
+          t(engineChoiceLabel(rung))),
+      }),
     ),
   )
 
@@ -222,6 +233,35 @@
 
     <MaskFacts facts={row.facts} />
 
+    {#if region.mask}
+      <div class="layer-style">
+        <label>{t('masks.action.opacity')} <output>{layer.opacity ?? 100}%</output>
+          <input type="range" min="0" max="100" step="1" value={layer.opacity ?? 100}
+            onchange={(event) => updateLayer(region, { opacity: Number(event.currentTarget.value) })} />
+        </label>
+        {#if shapeLayer}
+          <label class="lock"><input type="checkbox" checked={layer.locked ?? false}
+            onchange={(event) => updateLayer(region, { locked: event.currentTarget.checked })} />
+            {t('masks.action.locked')}
+          </label>
+          <div class="position">
+            <label>{t('masks.action.moveX')}
+              <input type="number" step="1" value={layer.offsetX ?? 0} disabled={layer.locked}
+                onchange={(event) => updateLayer(region, { offsetX: Number(event.currentTarget.value) })} />
+            </label>
+            <label>{t('masks.action.moveY')}
+              <input type="number" step="1" value={layer.offsetY ?? 0} disabled={layer.locked}
+                onchange={(event) => updateLayer(region, { offsetY: Number(event.currentTarget.value) })} />
+            </label>
+            <label>{t('masks.action.rotation')}
+              <input type="number" min="-180" max="180" step="1" value={layer.rotation ?? 0} disabled={layer.locked}
+                onchange={(event) => updateLayer(region, { rotation: Number(event.currentTarget.value) })} />
+            </label>
+          </div>
+        {/if}
+      </div>
+    {/if}
+
     {#if region.mask?.dependencyReview}
       <!-- The facts above end with why ("Flagged"); these are the three
            answers to it. Rebuild is Try again, so it says what Try again says. -->
@@ -331,6 +371,14 @@
     margin-top: 7px;
     font-size: 10.5px;
   }
+
+  .layer-style { display: grid; gap: 7px; margin-top: 8px; font-size: 10.5px; color: var(--t3) }
+  .layer-style label { display: grid; gap: 3px }
+  .layer-style output { color: var(--t2) }
+  .layer-style input[type='range'] { width: 100% }
+  .layer-style .lock { display: flex; align-items: center; gap: 6px }
+  .position { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px }
+  .position input { width: 100%; min-width: 0; color: var(--t1); background: var(--panel2); border: 1px solid var(--line); border-radius: 4px; padding: 3px }
 
   .pick-label {
     flex: none;

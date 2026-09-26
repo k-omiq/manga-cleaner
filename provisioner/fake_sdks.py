@@ -427,7 +427,7 @@ class FakeModalApp:
         self.cloud.record("App.deploy", name=name, environment_name=environment_name)
         if self.settings.volume_name not in self.cloud.volumes or self.settings.dict_name not in self.cloud.dicts:
             raise _ModalErrors.NotFoundError("the app references a volume or dict that does not exist")
-        self.cloud.apps[name] = {"functions": {"gateway", "seed_weights", "Worker"}, "gpu": self.settings.gpu}
+        self.cloud.apps[name] = {"functions": {"gateway", "seed_weights", "Worker", "AnalysisGPU"}, "gpu": self.settings.gpu}
         self.cloud.done("App.deploy")
         return SimpleNamespace(app_id="ap-fake")
 
@@ -782,6 +782,8 @@ class FakeBeamHandler:
             raise AssertionError("deploy needs the session channel")
         if self.handler == "gateway" and not self.env.get("MC_BEAM_WORKER_URL", "").startswith("https://"):
             raise AssertionError("the gateway is deployed with the worker URL")
+        if self.handler == "gateway" and self.env.get("MC_BEAM_ANALYSIS_MODELS") and not self.env.get("MC_BEAM_ANALYSIS_URL", "").startswith("https://"):
+            raise AssertionError("the gateway is deployed with the analysis GPU URL")
         if self.handler == "gateway" and self.env.get("MC_BEAM_SECRET") not in cloud.secrets:
             return {}, False
         cloud.record("deploy", name=name, handler=self.handler)
@@ -818,6 +820,7 @@ def beam_app_loader(cloud: FakeBeamCloud) -> Callable[[Any, Dict[str, str]], Any
         return SimpleNamespace(
             seed=FakeBeamHandler(cloud, env, stage_dir, "seed"),
             render=FakeBeamHandler(cloud, env, stage_dir, "render"),
+            analyze=FakeBeamHandler(cloud, env, stage_dir, "analyze"),
             gateway=FakeBeamHandler(cloud, env, stage_dir, "gateway"),
         )
 

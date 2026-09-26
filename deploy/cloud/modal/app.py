@@ -29,7 +29,9 @@ from deploy.cloud.common.deployment import (
     WORKER_STARTUP_TIMEOUT_SECONDS,
 )
 from deploy.cloud.common.manifest import get_production_model_info, production_limits
+from deploy.cloud.common.manifest import MODEL_PROD_FLUX_9B
 from deploy.cloud.common.weights import run_seed
+from deploy.cloud.common.analysis_seed import ANALYSIS_SAM, AnalysisUnavailable, VerifiedGraphCache, analysis_capabilities, run_analysis_seed
 from deploy.cloud.common.worker import WorkerRuntime
 from deploy.cloud.modal.backend import ModalDictStore, ModalWorkerDispatcher, worker_render
 from deploy.cloud.modal.settings import WEIGHTS_MOUNT, ModalSettings
@@ -50,10 +52,17 @@ GPU_REQUIREMENTS = (
     "numpy==2.4.6",
 )
 SEED_REQUIREMENTS = ("huggingface-hub==1.24.0",)
+SAM_EXPORT_REQUIREMENTS = (
+    "onnx==1.19.0", "onnx-ir==1.0.0", "onnxscript==0.5.6",
+    "numpy==2.3.3", "pillow==11.3.0", "safetensors==0.6.2",
+    "requests==2.34.2", "einops==0.8.1", "pyyaml==6.0.3",
+)
 
 # deploy/cloud/modal/app.py -> deploy/
 DEPLOY_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = DEPLOY_ROOT.parent
 REMOTE_DEPLOY_ROOT = "/root/deploy"  # /root is on PYTHONPATH in Modal containers
+ANALYSIS_SOURCE = "/root/analysis-source"
 
 _SHIPPED_DIRS = {("cloud", "common"), ("cloud", "modal")}
 
@@ -76,15 +85,30 @@ def _finish(image: modal.Image, extra_env: Dict[str, str] | None = None) -> moda
 
 gateway_image = _finish(modal.Image.debian_slim(python_version=PYTHON_VERSION))
 
+_seed_base = modal.Image.debian_slim(python_version=PYTHON_VERSION).pip_install(*SEED_REQUIREMENTS)
+if ANALYSIS_SAM in SETTINGS.analysis_models:
+    _seed_base = (_seed_base.pip_install(TORCH_REQUIREMENT, index_url=TORCH_INDEX_URL)
+                  .pip_install(*SAM_EXPORT_REQUIREMENTS))
 seed_image = _finish(
-    modal.Image.debian_slim(python_version=PYTHON_VERSION).pip_install(*SEED_REQUIREMENTS),
+    _seed_base,
     {"HF_HUB_DISABLE_TELEMETRY": "1", "HF_HUB_DISABLE_PROGRESS_BARS": "1"},
 )
+if ANALYSIS_SAM in SETTINGS.analysis_models:
+    seed_image = (seed_image
+        .add_local_file(REPO_ROOT / "sam-bootstrap/bootstrap.py", f"{ANALYSIS_SOURCE}/bootstrap.py")
+        .add_local_file(REPO_ROOT / "spikes/sam-ts-l/export_mask.py", f"{ANALYSIS_SOURCE}/export_mask.py")
+        .add_local_file(REPO_ROOT / "spikes/sam-ts-l/fixtures/synthetic_page.png", f"{ANALYSIS_SOURCE}/synthetic_page.png"))
 
 gpu_image = _finish(
     modal.Image.debian_slim(python_version=PYTHON_VERSION)
     .pip_install(TORCH_REQUIREMENT, index_url=TORCH_INDEX_URL)
     .pip_install(*GPU_REQUIREMENTS),
+    {"HF_HUB_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1"},
+)
+analysis_gpu_image = _finish(
+    modal.Image.debian_slim(python_version=PYTHON_VERSION)
+    .pip_install(TORCH_REQUIREMENT, index_url=TORCH_INDEX_URL)
+    .pip_install("onnxruntime-gpu==1.23.2", "numpy==2.4.6", "pillow==12.3.0"),
     {"HF_HUB_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1"},
 )
 
@@ -98,15 +122,58 @@ app = modal.App(SETTINGS.app_name, include_source=False)
     image=seed_image,
     volumes={WEIGHTS_MOUNT: weights_volume},
     cpu=2.0,
-    memory=4096,
-    timeout=SEED_TIMEOUT_SECONDS,
+    memory=24576 if ANALYSIS_SAM in SETTINGS.analysis_models else 4096,
+    timeout=SEED_TIMEOUT_SECONDS * (2 if ANALYSIS_SAM in SETTINGS.analysis_models else 1),
     max_containers=1,
 )
 def seed_weights() -> Dict[str, Any]:
     # Idempotent: a seeded volume returns at once and a partial download resumes.
     # run_seed retries internally, publishes progress to the job Dict for the
     # provisioner and returns failures as a typed result instead of raising.
-    return run_seed(WEIGHTS_MOUNT, ModalDictStore(jobs_dict), commit=weights_volume.commit)
+    store = ModalDictStore(jobs_dict)
+    analysis = run_analysis_seed(WEIGHTS_MOUNT, SETTINGS.analysis_models, ANALYSIS_SOURCE, store,
+                                 model_id=SETTINGS.model_id, commit=weights_volume.commit)
+    if analysis["status"] == "failed":
+        return analysis
+    return run_seed(WEIGHTS_MOUNT, store, commit=weights_volume.commit,
+                    model_id=SETTINGS.model_id)
+
+
+@app.cls(
+    image=analysis_gpu_image,
+    gpu=SETTINGS.gpu,
+    volumes={WEIGHTS_MOUNT: weights_volume},
+    cpu=2.0,
+    memory=24576 if ANALYSIS_SAM in SETTINGS.analysis_models else 12288,
+    timeout=180,
+    startup_timeout=180,
+    scaledown_window=SETTINGS.idle_seconds,
+    max_containers=1,
+)
+class AnalysisGPU:
+    @modal.enter()
+    def load(self) -> None:
+        from deploy.cloud.common.analysis_runtime import OnDemandAnalysis
+        self.runtime = OnDemandAnalysis(WEIGHTS_MOUNT, SETTINGS.analysis_models,
+                                        reload=weights_volume.reload)
+
+    @modal.method()
+    def analyze(self, metadata: Dict[str, Any], tile_png: bytes) -> Dict[str, Any]:
+        return self.runtime.analyze(metadata, tile_png)
+
+
+class ModalAnalysisProxy:
+    def __init__(self) -> None:
+        self._verified_graphs = VerifiedGraphCache()
+
+    def capabilities(self) -> Dict[str, Any]:
+        return analysis_capabilities(WEIGHTS_MOUNT, SETTINGS.analysis_models, weights_volume.reload,
+                                     cache=self._verified_graphs)
+
+    def analyze(self, metadata: Dict[str, Any], tile_png: bytes) -> Dict[str, Any]:
+        if metadata.get("capability") not in {item["capability"] for item in self.capabilities()["capabilities"]}:
+            raise AnalysisUnavailable("Selected analysis graph is not installed")
+        return AnalysisGPU().analyze.remote(metadata, tile_png)
 
 
 @app.cls(
@@ -114,7 +181,7 @@ def seed_weights() -> Dict[str, Any]:
     gpu=SETTINGS.gpu,
     volumes={WEIGHTS_MOUNT: weights_volume},
     cpu=2.0,
-    memory=12288,
+    memory=24576 if SETTINGS.model_id == MODEL_PROD_FLUX_9B else 12288,
     timeout=JOB_TIMEOUT_SECONDS,
     startup_timeout=WORKER_STARTUP_TIMEOUT_SECONDS,
     scaledown_window=SETTINGS.idle_seconds,
@@ -125,7 +192,8 @@ class Worker:
     def load(self) -> None:
         # A missing snapshot is reported per job, not raised here: the container stays
         # up and loads on its next job once the volume is seeded.
-        self.runtime = WorkerRuntime(WEIGHTS_MOUNT, reload=weights_volume.reload, marker_attempts=2)
+        self.runtime = WorkerRuntime(WEIGHTS_MOUNT, reload=weights_volume.reload, marker_attempts=2,
+                                     model_id=SETTINGS.model_id)
         self.runtime.load()
 
     @modal.method()
@@ -135,8 +203,10 @@ class Worker:
 
 @app.function(
     image=gateway_image,
+    volumes={WEIGHTS_MOUNT: weights_volume},
     cpu=0.25,
     memory=512,
+    timeout=420,
     max_containers=1,
 )
 @modal.concurrent(max_inputs=32)
@@ -155,9 +225,10 @@ def gateway():
     )
     gateway_app = CloudGateway(
         provider="modal",
-        model_info=get_production_model_info("modal"),
+        model_info=get_production_model_info("modal", SETTINGS.model_id),
         limits=limits,
         backend=DispatchJobBackend("modal", store, dispatcher, limits, clock=time.time),
+        analysis_worker=ModalAnalysisProxy(),
         trust_edge_auth=True,
     )
     return gateway_app.as_asgi_app()

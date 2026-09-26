@@ -412,9 +412,11 @@ export function createMockBackend(options = {}) {
    * `model_workflows.rs#analyze_capabilities` checks its request.
    */
   const analyzePage = ({ page, target, sourceMime, workflow, rtProfile, rtBackend, samBackend }) => {
-    const rt = workflow === 'regions' || workflow === 'text_shape'
-    const sam = workflow === 'mask' || workflow === 'text_shape'
-    if (!rt && !sam) throw new Error('Choose Regions, Mask, or Text-shaped review')
+    const ctd = ['ctd', 'ctd_regions', 'ctd_mask', 'ctd_text_shape'].includes(workflow)
+    const rt = ['regions', 'text_shape', 'ctd_regions', 'ctd_text_shape'].includes(workflow)
+    const sam = ['mask', 'text_shape', 'ctd_mask', 'ctd_text_shape'].includes(workflow)
+    if (!rt && !sam && !ctd) throw new Error('Choose a supported detection model combination')
+    if (ctd && state.missingModels.has('textDetector')) throw new Error('Comic Text Detector graph is not installed')
     if (rt && rtBackend !== 'ort-cpu') throw new Error(`RT backend ${rtBackend} is not qualified for this analysis path`)
     if (sam && !['ort-cpu', 'ort-webgpu'].includes(samBackend)) {
       throw new Error(`SAM backend ${samBackend} is unavailable for this analysis path`)
@@ -566,6 +568,7 @@ export function createMockBackend(options = {}) {
     outsideBubbles,
     bubbleColor,
     detection,
+    detectorModels,
     geometryPolicy,
     textPolicy,
     ocrRescue,
@@ -585,6 +588,7 @@ export function createMockBackend(options = {}) {
       outsideBubbles,
       bubbleColor,
       detection,
+      detectorModels,
       geometryPolicy,
       textPolicy,
       ocrRescue,
@@ -1227,6 +1231,12 @@ export function createMockBackend(options = {}) {
     const gpus = MOCK_PROVISION_GPUS[provider]
     const gpu = options.gpu ?? gpus.fallback
     const idleSeconds = options.idle_seconds ?? 120
+    const analysisModels = options.analysis_models ?? []
+    if (!Array.isArray(analysisModels) || analysisModels.length > 2 ||
+        analysisModels.some((item) => item !== 'text_mask_sam_ts@1' && item !== 'text_regions_rt@1') ||
+        new Set(analysisModels).size !== analysisModels.length) {
+      return { error: ['ERR_VALIDATION_ERROR', 'Choose SAM-TS-L, Full RT-DETR, or both'] }
+    }
     if (!gpus.options.includes(gpu)) {
       return { error: ['ERR_VALIDATION_ERROR', `GPU '${gpu}' is not offered for ${provider}`] }
     }
@@ -1245,6 +1255,7 @@ export function createMockBackend(options = {}) {
             { type: 'volume', name: `mc-weights-${installationId}`, purpose: 'Model weights' },
             { type: 'gateway', name: `mc-gateway-${installationId}`, purpose: 'Gateway' },
             { type: 'worker', name: `mc-worker-${installationId}`, purpose: 'GPU worker' },
+            ...(analysisModels.length ? [{ type: 'worker', name: `mc-analysis-${installationId}`, purpose: 'GPU analysis worker' }] : []),
           ]
     const plan = {
       plan_id: `plan-${provider}-${installationId}`,
@@ -1259,6 +1270,13 @@ export function createMockBackend(options = {}) {
         max_containers: 1,
         model_weights_bytes: MODEL_WEIGHTS_BYTES,
         model_id: PINNED_CLOUD_MODEL_ID,
+        analysis_models: [...analysisModels],
+        analysis_graph_bytes: analysisModels.reduce((total, item) => total +
+          (item === 'text_mask_sam_ts@1' ? 1_358_010_626 : 168_481_531), 0),
+        analysis_options: [
+          { capability: 'text_regions_rt@1', label: 'Full RT-DETR' },
+          { capability: 'text_mask_sam_ts@1', label: 'SAM-TS-L' },
+        ],
       },
       resources_to_create: resources,
       runtime_credential_kind: provider === 'modal' ? 'modal_proxy' : 'beam_bearer',
@@ -1368,6 +1386,7 @@ export function createMockBackend(options = {}) {
       endpoint_url: endpointUrl,
       gpu: installation.plan.resource_allocation.gpu,
       idle_seconds: installation.plan.resource_allocation.idle_seconds,
+      analysis_models: installation.plan.resource_allocation.analysis_models,
       model: {
         model_id: PINNED_CLOUD_MODEL_ID,
         model_revision: PINNED_CLOUD_MODEL_REVISION,
@@ -1785,6 +1804,7 @@ export function createMockBackend(options = {}) {
       outsideBubbles,
       bubbleColor,
       detection,
+      detectorModels,
       geometryPolicy,
       textPolicy,
       ocrRescue,
@@ -1799,6 +1819,11 @@ export function createMockBackend(options = {}) {
         outsideEngine,
         outsideBubbles,
         bubbleColor,
+        detection,
+        detectorModels,
+        geometryPolicy,
+        textPolicy,
+        ocrRescue,
       })
     },
 
@@ -2027,6 +2052,10 @@ export function createMockBackend(options = {}) {
     async listSidecarModels() {
       await delay(timing.method)
       return []
+    },
+
+    async installFluxHelper() {
+      throw new Error('Installing the FLUX helper requires the desktop app')
     },
 
     /**
@@ -2359,7 +2388,7 @@ export function createMockBackend(options = {}) {
       const { fullRt, sam } = review.models
       const backend = (id, note) => ({ id, platform: 'macOS', qualified: true, available: runtimeInstalled,
         selectable: runtimeInstalled, note })
-      return { runtimeInstalled, rtInstalled: !state.missingModels.has('balloonDetector'), fullRtInstalled: fullRt,
+      return { runtimeInstalled, ctdInstalled: !state.missingModels.has('textDetector'), rtInstalled: !state.missingModels.has('balloonDetector'), fullRtInstalled: fullRt,
         fullRtManaged: fullRt, fullRtRevision: '16e8a622f91fabc6b5b65c96d32d1183f8843546',
         fullRtFile: { name: 'detector.onnx', bytes: 168481531, sha256: '065744e91c0594ad8663aa8b870ce3fb27222942eded5a3cc388ce23421bd195' },
         samInstalled: sam, samMemoryReady: true, samManaged: sam,
@@ -2391,6 +2420,11 @@ export function createMockBackend(options = {}) {
     async importSamTs({ sourceDir } = {}) {
       await delay(timing.method)
       if (!sourceDir) throw new Error('SAM-TS graphs are not installed')
+      review.models.sam = true
+      return true
+    },
+    async installSamTs() {
+      await delay(timing.method)
       review.models.sam = true
       return true
     },
@@ -2739,6 +2773,12 @@ export function createMockBackend(options = {}) {
         profileId,
         latencyMs: 42,
       }
+    },
+
+    async getCloudBilling() { throw new Error("Billing is available in the desktop app") },
+
+    async getCloudUsage() {
+      return { month: { attempts: 0, reportedUsd: 0, unpricedAttempts: 0 }, session: { attempts: 0, reportedUsd: 0, unpricedAttempts: 0 }, unreadableAttempts: 0 }
     },
 
     async getCloudModelInfo({ provider, profileId }) {

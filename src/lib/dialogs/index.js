@@ -1,3 +1,4 @@
+import CloudBillingDialog from './CloudBillingDialog.svelte'
 /**
  * The dialog registry: modal `kind` → the component that draws it.
  *
@@ -35,6 +36,7 @@ import WorkflowReviewDialog from './WorkflowReviewDialog.svelte'
  */
 const DIALOGS = Object.assign(Object.create(null), homeDialogs, {
   settings: SettingsDialog,
+  cloudBilling: CloudBillingDialog,
   shortcuts: ShortcutsDialog,
   export: ExportDialog,
   formatConversion: FormatConversionDialog,

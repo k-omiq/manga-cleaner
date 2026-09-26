@@ -15,6 +15,7 @@ import json
 import platform
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,6 +30,7 @@ IMAGE_SIZE = 1024
 CHECKPOINT_SHA256 = "bcd9525291677f467f0603509a0ca3df35711b4e3417cefce8da6bfc97164f45"
 HF_REVISION = "5dd97423e0fbf2404264979136d47e8101144046"
 HI_SAM_REVISION = "69009434d4dba5541f228d8f5acb0754c333d417"
+HI_SAM_ARCHIVE_SHA256 = "f18fb049813f9b9319ac074449f4539fbe5b58f4e3f450ce331578d74bc3e327"
 OPSET = 17
 
 
@@ -200,6 +202,28 @@ def install_checkpoint_compatibility() -> None:
 def verify_hi_sam_source(hi_sam_root: Path) -> dict:
     """Reject a moved commit or modified tracked source before importing it."""
     root = hi_sam_root.resolve()
+    archive = root.parent / "Hi-SAM.zip"
+    if (root / ".pinned-revision").is_file() and archive.is_file():
+        if (root / ".pinned-revision").read_text().strip() != HI_SAM_REVISION:
+            raise ValueError("Hi-SAM source revision mismatch")
+        if (root / ".archive-sha256").read_text().strip() != HI_SAM_ARCHIVE_SHA256:
+            raise ValueError("Hi-SAM archive marker mismatch")
+        if sha256(archive) != HI_SAM_ARCHIVE_SHA256:
+            raise ValueError("Hi-SAM archive SHA-256 mismatch")
+        with zipfile.ZipFile(archive) as bundle:
+            for member in bundle.infolist():
+                if member.is_dir():
+                    continue
+                parts = Path(member.filename).parts
+                if len(parts) < 2 or parts[0] != f"Hi-SAM-{HI_SAM_REVISION}" or ".." in parts:
+                    raise ValueError("Unexpected Hi-SAM archive entry")
+                installed = root.joinpath(*parts[1:])
+                if not installed.is_file():
+                    raise ValueError(f"Hi-SAM source file is missing: {installed}")
+                if hashlib.sha256(bundle.read(member)).digest() != bytes.fromhex(sha256(installed)):
+                    raise ValueError(f"Hi-SAM source file differs from pinned archive: {installed}")
+        return {"root": str(root), "commit": HI_SAM_REVISION,
+                "archive_sha256": HI_SAM_ARCHIVE_SHA256, "tracked_tree_clean": True}
 
     def git(*arguments: str) -> str:
         try:

@@ -9,7 +9,7 @@
   } from '../state/editor.svelte.js'
   import { readingOrder, regionMarker } from './regions.js'
   import { menuPoint } from './gesture.js'
-  import { applyActiveToolToRegion } from './toolapply.svelte.js'
+  import { updateLayer } from './maskactions.svelte.js'
   import { t } from '../i18n/index.js'
   import RegionMenu from './RegionMenu.svelte'
 
@@ -89,6 +89,46 @@
    * @type {{x: number, y: number, region: import('../api/backend.js').ApiRegion} | null}
    */
   let menu = $state(null)
+  let drag = null
+  let dragPreview = $state(null)
+  let suppressClick = false
+
+  function shapeCanMove(region) {
+    return !!region?.mask && region.mask.provenance?.params_snapshot?.tool === 'shapes'
+      && !region.mask.layer?.locked
+  }
+
+  function startMove(event, region) {
+    if (event.button !== 0 || !shapeCanMove(region)) return
+    const box = layerEl?.getBoundingClientRect()
+    if (!box?.width || !box?.height) return
+    drag = { id: region.id, region, pointerId: event.pointerId,
+      x: event.clientX, y: event.clientY, width: box.width, height: box.height }
+    event.currentTarget.setPointerCapture?.(event.pointerId)
+  }
+
+  function moveShape(event) {
+    if (!drag || drag.pointerId !== event.pointerId) return
+    const dx = event.clientX - drag.x
+    const dy = event.clientY - drag.y
+    if (Math.hypot(dx, dy) <= 3) return
+    dragPreview = { id: drag.id, x: dx, y: dy }
+  }
+
+  function finishMove(event) {
+    if (!drag || drag.pointerId !== event.pointerId) return
+    const current = drag
+    const dx = event.clientX - current.x
+    const dy = event.clientY - current.y
+    drag = null
+    dragPreview = null
+    if (Math.hypot(dx, dy) <= 3) return
+    suppressClick = true
+    void updateLayer(current.region, {
+      offsetX: Math.round((current.region.mask.layer?.offsetX ?? 0) + dx / current.width * (page.width ?? 1600)),
+      offsetY: Math.round((current.region.mask.layer?.offsetY ?? 0) + dy / current.height * (page.height ?? 2400)),
+    })
+  }
 
   const marksVisible = $derived(editor.maskOverlay || editor.reviewFilter)
   const ordered = $derived(readingOrder(page.regions ?? [], readingDirection()))
@@ -158,24 +198,10 @@
     event.stopPropagation()
   }
 
-  /**
-   * A click on a region selects it. When the armed tool is Content-aware fill
-   * (a click-to-apply tool, not a drawing tool), it also applies the tool to
-   * the region.
-   *
-   * @param {string} regionId
-   */
+  /** Select a region without applying a cleaning tool. */
   function onRegionClick(regionId) {
+    if (suppressClick) { suppressClick = false; return }
     select(regionId)
-    if (editor.tool === 'contentAwareFill') {
-      // Started and not awaited, and `void` says so on purpose: a click handler
-      // has nothing to do with the answer, and the outline and the selection
-      // are already correct whichever way the apply goes. What made this safe
-      // is that `applyActiveToolToRegion` now reports its own failures and
-      // settles rather than rejecting - an unawaited promise that can reject is
-      // a failure with nowhere to land, which is exactly what this line was.
-      void applyActiveToolToRegion(regionId)
-    }
   }
 
   /**
@@ -242,7 +268,12 @@
       style:top="{marker.bbox.y}%"
       style:width="{marker.bbox.w}%"
       style:height="{marker.bbox.h}%"
+      style:transform={dragPreview?.id === marker.id ? `translate(${dragPreview.x}px, ${dragPreview.y}px)` : undefined}
       onkeydown={(event) => onkeydown(event, index)}
+      onpointerdown={(event) => startMove(event, (page.regions ?? []).find((region) => region.id === marker.id))}
+      onpointermove={moveShape}
+      onpointerup={finishMove}
+      onpointercancel={() => { drag = null; dragPreview = null }}
       onpointerenter={() => hover(marker.id)}
       onpointerleave={() => hover(null)}
       onfocus={() => hover(marker.id)}

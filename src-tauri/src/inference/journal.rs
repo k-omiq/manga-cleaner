@@ -72,6 +72,8 @@ fn is_false(value: &bool) -> bool { !*value }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnalysisAttemptRecord {
+    #[serde(default)]
+    pub created_at_ms: u64,
     pub schema_version: u32,
     pub proposal_id: String,
     pub provider: CloudProvider,
@@ -82,6 +84,10 @@ pub struct AnalysisAttemptRecord {
     pub total_tiles: usize,
     pub completed_tiles: usize,
     pub reported_cost_usd: Option<f64>,
+    /// Persisted before the first tile transport call. `None` means a legacy
+    /// record that did not track dispatch; usage treats that as uncertain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_submission_started: Option<bool>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub cancel_requested: bool,
     pub phase: AnalysisPhase,
@@ -1680,11 +1686,13 @@ mod tests {
         let scratch = TestDir::new("analysis_recovery");
         let journal = AnalysisJournal::new(scratch.path().to_path_buf());
         let mut record = AnalysisAttemptRecord {
+            created_at_ms: current_epoch_ms(),
             schema_version: ANALYSIS_JOURNAL_SCHEMA_VERSION,
             proposal_id: "proposal_1".into(), provider: CloudProvider::Modal,
             profile_id: "modal_1".into(), capability: cleaner_core::cloud_analysis_wire::SAM.into(),
             source_sha256: "a".repeat(64), underlay_sha256: "b".repeat(64),
             total_tiles: 2, completed_tiles: 0, reported_cost_usd: None,
+            tile_submission_started: Some(true),
             cancel_requested: false,
             phase: AnalysisPhase::SubmittedTile { index: 0 },
         };
@@ -1706,6 +1714,7 @@ mod tests {
         let scratch = TestDir::new("analysis_final_tile_recovery");
         let journal = AnalysisJournal::new(scratch.path().to_path_buf());
         let record = AnalysisAttemptRecord {
+            created_at_ms: current_epoch_ms(),
             schema_version: ANALYSIS_JOURNAL_SCHEMA_VERSION,
             proposal_id: "final_tile".into(),
             provider: CloudProvider::Modal,
@@ -1716,6 +1725,7 @@ mod tests {
             total_tiles: 1,
             completed_tiles: 1,
             reported_cost_usd: None,
+            tile_submission_started: Some(true),
             cancel_requested: false,
             phase: AnalysisPhase::ResultCachedTile { index: 0 },
         };
@@ -1731,19 +1741,23 @@ mod tests {
         let scratch = TestDir::new("analysis_legacy_cancel");
         let journal = AnalysisJournal::new(scratch.path().to_path_buf());
         let record = AnalysisAttemptRecord {
+            created_at_ms: current_epoch_ms(),
             schema_version: ANALYSIS_JOURNAL_SCHEMA_VERSION,
             proposal_id: "legacy_proposal".into(), provider: CloudProvider::Modal,
             profile_id: "modal_1".into(), capability: cleaner_core::cloud_analysis_wire::SAM.into(),
             source_sha256: "a".repeat(64), underlay_sha256: "b".repeat(64),
             total_tiles: 1, completed_tiles: 0, reported_cost_usd: None,
+            tile_submission_started: Some(false),
             cancel_requested: false, phase: AnalysisPhase::Proposed,
         };
         let mut legacy = serde_json::to_value(&record).unwrap();
         legacy.as_object_mut().unwrap().remove("cancel_requested");
+        legacy.as_object_mut().unwrap().remove("tile_submission_started");
         std::fs::create_dir_all(&journal.root).unwrap();
         std::fs::write(journal.path(&record.proposal_id).unwrap(), serde_json::to_vec(&legacy).unwrap()).unwrap();
         let loaded = journal.read(&record.proposal_id).unwrap();
         assert!(!loaded.cancel_requested);
+        assert_eq!(loaded.tile_submission_started, None);
         assert!(matches!(loaded.phase, AnalysisPhase::Proposed));
     }
 

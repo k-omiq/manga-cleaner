@@ -20,6 +20,9 @@
   import { session, installThemeSync, applyTheme, reconcileSettings } from './lib/state/session.svelte.js'
   import { loadCapabilities } from './lib/state/capabilities.svelte.js'
   import { startCloud } from './lib/state/cloud.svelte.js'
+  import CloudUsage from './lib/ui/CloudUsage.svelte'
+  import { installReloadGuard } from './lib/shell/reload-guard.js'
+  import { displayModelName } from './lib/model/model-names.js'
   import CloudJobStatus from './lib/editor/CloudJobStatus.svelte'
   import {
     loadedModels,
@@ -37,6 +40,7 @@
 
   // Follow `prefers-color-scheme` for the life of the app, not just at load.
   $effect(installThemeSync)
+  $effect(installReloadGuard)
   // Re-runs whenever the chosen theme or the OS preference changes.
   $effect(applyTheme)
 
@@ -145,7 +149,7 @@
   const loaded = $derived(
     loadedModels.models.map((model) => ({
       id: model.id,
-      name: t(model.kindKey),
+      name: model.modelName ? displayModelName(model.modelName) : t(model.kindKey),
       // A measured row says the number; every other row says about the number.
       // `basis` has been on the wire since the tab existed precisely so this
       // distinction could be drawn without re-deriving it here.
@@ -154,7 +158,7 @@
       }),
       device: t(model.deviceKey),
       unloading: model.unloading,
-      unloadLabel: t('models.action.unload', { nameKey: model.kindKey }),
+      unloadLabel: t('models.action.unload', { name: model.modelName ? displayModelName(model.modelName) : t(model.kindKey) }),
     }))
   )
 
@@ -197,6 +201,7 @@
      below the floating windows at `20 + rank`. -->
 <div class="corner" bind:clientHeight={panelHeight}>
   <CloudJobStatus />
+  <CloudUsage />
   <LoadedModels
     models={loaded}
     title={t('models.title')}

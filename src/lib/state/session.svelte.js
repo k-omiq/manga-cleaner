@@ -48,7 +48,7 @@ import {
   MIN_HEIGHT,
 } from '../model/windows.js'
 
-import { DEFAULT_DETECTOR, LANGUAGES, migrateDetectorChoice } from '../model/pipelines.js'
+import { DEFAULT_DETECTOR, DEFAULT_DETECTOR_MODELS, LANGUAGES, migrateDetectorChoice, normalizeDetectorModels } from '../model/pipelines.js'
 
 const STORAGE_KEY = 'session.v1'
 
@@ -122,6 +122,7 @@ function viewport() {
  * @property {boolean} firstLaunchOffered - whether the first-launch download offer has been made on this machine
  * @property {boolean} closeToTray - close control hides the window and keeps downloads running
  * @property {Record<string, string|null>} detection - the detector each source language uses, by language id; null skips the language
+ * @property {string[]} detectorModels - independent CTD, RT-DETR, and SAM-TS-L capabilities selected for detection
  * @property {'legacy_gate'|'all_text'} textPolicy - whether to use the legacy script gate or open no-recognition text-shaped review
  * @property {boolean} ocrRescue - whether the optional Japanese OCR rescue may run after an uncertain script decision
  * @property {Record<string, import('../shortcuts.js').Chord|null>} shortcuts - rebindings, by shortcut id; only the differences from the defaults
@@ -148,6 +149,7 @@ function defaults() {
     firstLaunchOffered: false,
     closeToTray: false,
     detection: defaultDetection(),
+    detectorModels: [...DEFAULT_DETECTOR_MODELS],
     textPolicy: 'legacy_gate',
     ocrRescue: false,
     shortcuts: {},
@@ -244,6 +246,7 @@ export function sanitizeSession(raw) {
     firstLaunchOffered: boolOr(record.firstLaunchOffered, base.firstLaunchOffered),
     closeToTray: boolOr(record.closeToTray, base.closeToTray),
     detection: sanitizeDetection(record.detection),
+    detectorModels: normalizeDetectorModels(record.detectorModels),
     textPolicy: /** @type {'legacy_gate'|'all_text'} */ (
       oneOf(record.textPolicy, TEXT_POLICIES, base.textPolicy)
     ),
@@ -322,6 +325,7 @@ function persistable() {
     firstLaunchOffered: session.firstLaunchOffered,
     closeToTray: session.closeToTray,
     detection: { ...session.detection },
+    detectorModels: [...session.detectorModels],
     textPolicy: session.textPolicy,
     ocrRescue: session.ocrRescue,
     shortcuts: shortcutOverrides(),
@@ -408,6 +412,12 @@ export function setDetection(language, detectorId) {
   if (detector === undefined) return
   session.detection = { ...session.detection, [language]: detector }
   if (ocrRescue) session.ocrRescue = true
+  save()
+}
+
+/** @param {string[]} models */
+export function setDetectorModels(models) {
+  session.detectorModels = normalizeDetectorModels(models)
   save()
 }
 

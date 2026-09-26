@@ -299,7 +299,7 @@ describe('handlesKeyNatively', () => {
   it('lets 1-6 through a focused picker and keeps the keys the picker answers', () => {
     const select = { tagName: 'SELECT' }
     expect(matchShortcut(press('1', { target: select }), editor)?.id).toBe('tool.autoClean')
-    expect(matchShortcut(press('6', { target: select }), editor)?.id).toBe('tool.cloneHeal')
+    expect(matchShortcut(press('5', { target: select }), editor)?.id).toBe('tool.cloneHeal')
     expect(matchShortcut(press('ArrowLeft', { target: select }), editor)).toBeNull()
     expect(matchShortcut(press('m', { target: select }), editor)).toBeNull()
   })

@@ -27,6 +27,7 @@ import {
   setCloseToTray,
   setCloudAllowed,
   setDetection,
+  setDetectorModels,
   setFluxModel,
   setOcrRescue,
   setSidecarPath,
@@ -161,6 +162,8 @@ function makeBackend() {
       return () => handlers.delete(handler)
     }),
     listModels: vi.fn(async () => view()),
+    listWorkflowCapabilities: vi.fn(async () => ({ samInstalled: false })),
+    installSamTs: vi.fn(async () => true),
     writeSettings: vi.fn(async () => ({})),
     downloadRuntime: vi.fn(async () => 'started'),
     downloadModel: vi.fn(async () => 'started'),
@@ -188,6 +191,7 @@ beforeEach(() => {
   for (const language of ['ja', 'zh', 'ko']) setDetection(language, 'ctd-rtdetr')
   setOcrRescue(false)
   setTextPolicy('legacy_gate')
+  setDetectorModels(['ctd', 'rtSmall'])
   session.firstLaunchOffered = false
   capabilities.sidecar = false
 })
@@ -412,20 +416,30 @@ describe('the pipelines', () => {
     const rendered = open('detection')
     expect(rendered.getByText(t('settings.detection.setupAllText'))).toBeTruthy()
     setFirstLaunchStep('dependencies')
-    // The runtime, the speech bubble finder and the redraw model.
+    // The stored CTD + small RT choice remains selected; all-text omits the gate and OCR.
     await waitFor(() =>
-      expect(rendered.getByText(t('onboarding.dependencies.total', { count: 3, bytes: RUNTIME_BYTES + 11 + REDRAW_BYTES }))).toBeTruthy(),
+      expect(rendered.getByText(t('onboarding.dependencies.total', { count: 4, bytes: RUNTIME_BYTES + 95 + 11 + REDRAW_BYTES }))).toBeTruthy(),
     )
   })
 
-  it('say where the text-shaped review is set up, and that the stars are provisional', async () => {
+  it('show the optional page review and provisional cleaner ratings', async () => {
     const rendered = open('detection')
     expect(rendered.getByText(t('settings.detection.setupReview'))).toBeTruthy()
     expect(rendered.queryByText(t('settings.detection.setupAllText'))).toBeNull()
-    expect(rendered.getByText(t('pipelines.workflow.ratingsNote'))).toBeTruthy()
     setFirstLaunchStep('cleaning')
     await waitFor(() => expect(rendered.getByRole('heading', { level: 1 }).textContent).toBe(t('onboarding.cleaning.heading')))
     expect(rendered.getByText(t('pipelines.workflow.ratingsNote'))).toBeTruthy()
+  })
+
+  it('installs a selected SAM-TS-L model during onboarding', async () => {
+    setDetectorModels(['samTs'])
+    setTextPolicy('all_text')
+    const rendered = open('detection', view({ runtimeInstalled: true }))
+    expect(rendered.getByRole('checkbox', { name: 'SAM-TS-L' }).checked).toBe(true)
+    firstLaunch.cleaners = { 'lama-manga': false }
+    startFirstLaunchDownloads()
+    await waitFor(() => expect(backend.installSamTs).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(firstLaunch.status.samTs).toBe('done'))
   })
 
   it('draw cleaners that cannot be fetched as disabled, and FLUX as the helper\'s', async () => {

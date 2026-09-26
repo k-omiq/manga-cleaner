@@ -104,6 +104,7 @@
     setAccelerator,
     setCloseToTray,
     setDetection,
+    setDetectorModels,
     setFluxBackend,
     setFluxModel,
     setOriginalView,
@@ -117,9 +118,8 @@
     ALL_TEXT_POLICY,
     CAPABILITIES,
     CLEANERS,
-    DETECTORS,
+    DETECTOR_MODEL_IDS,
     LANGUAGES,
-    detectorsFor,
     engineBytes,
     migrateDetectorChoice,
     model as pipelineModel,
@@ -127,6 +127,7 @@
     runtimeState,
     usedNow,
     workflowNeeds,
+    workflowForDetectorModels,
   } from '../model/pipelines.js'
   import EngineTable from './EngineTable.svelte'
   import WorkflowAnalysis from './WorkflowAnalysis.svelte'
@@ -793,7 +794,7 @@
   }
 
   /** The choices the workflow is computed from. */
-  const choices = $derived({ textPolicy: session.textPolicy, detection: session.detection, ocrRescue: session.ocrRescue })
+  const choices = $derived({ textPolicy: session.textPolicy, detection: session.detection, ocrRescue: session.ocrRescue, detectorModels: session.detectorModels })
   const allText = $derived(session.textPolicy === ALL_TEXT_POLICY)
   /** The logical models the selected workflow needs. */
   const needs = $derived(workflowNeeds(choices))
@@ -877,6 +878,7 @@
       lines.push(bytes > 0
         ? t('settings.detection.ready.legacyMissing', { bytes })
         : t('settings.detection.ready.legacy'))
+      if (importMissing) lines.push(t('settings.detection.ready.allTextImport'))
     } else {
       // The review refuses SAM graphs that failed their checksum, and SAM on
       // a computer without the free memory for it (`readinessKeyOf`), so the
@@ -917,6 +919,7 @@
       }
       for (const row of /** @type {any[]} */ (filesOf(entry))) if (!row.installed) await download(row.id)
     }
+    if (needs.includes('samTs') && workflowCaps?.samInstalled !== true) await installSamTs()
   }
 
   /**
@@ -964,6 +967,20 @@
       importFailures = { ...importFailures, [entry.id]: String(error) }
     } finally {
       importBusy = { ...importBusy, [entry.id]: false }
+      await refreshWorkflowCaps()
+    }
+  }
+
+  async function installSamTs() {
+    importBusy = { ...importBusy, samTs: true }
+    importFailures = without(importFailures, 'samTs')
+    try {
+      await getBackend().installSamTs()
+      samVerified = true
+    } catch (error) {
+      importFailures = { ...importFailures, samTs: String(error) }
+    } finally {
+      importBusy = { ...importBusy, samTs: false }
       await refreshWorkflowCaps()
     }
   }
@@ -1094,6 +1111,19 @@
   function choosePolicy(value) {
     setTextPolicy(/** @type {any} */ (value))
     if (value === ALL_TEXT_POLICY) reviewOpen = true
+  }
+
+  function chooseDetectorModel(id, checked) {
+    let models = session.detectorModels.filter((modelId) => modelId !== id)
+    if (checked) {
+      if (id === 'rtFull') models = models.filter((modelId) => modelId !== 'rtSmall')
+      if (id === 'rtSmall') models = models.filter((modelId) => modelId !== 'rtFull')
+      models.push(id)
+    }
+    if (models.length) {
+      setDetectorModels(models)
+      void loadCapabilities()
+    }
   }
 
   /** Which model rows have their file details open. @type {Record<string, boolean>} */
@@ -1538,6 +1568,43 @@
    * @type {string|null}
    */
   let sidecarDraft = $state(null)
+  let installingFlux = $state(false)
+  let fluxInstallStage = $state('')
+  let fluxInstallError = $state('')
+  let fluxAccelerator = $state('auto')
+  const fluxStageKey = $derived({
+    environment: 'settings.sidecar.stage.environment',
+    dependencies: 'settings.sidecar.stage.dependencies',
+    weights: 'settings.sidecar.stage.weights',
+    ready: 'settings.sidecar.stage.ready',
+  }[fluxInstallStage] ?? 'settings.sidecar.stage.environment')
+
+  async function installFlux() {
+    if (installingFlux) return
+    installingFlux = true
+    fluxInstallStage = 'environment'
+    fluxInstallError = ''
+    let unlisten = /** @type {null|(() => void)} */ (null)
+    try {
+      if (window.__TAURI_INTERNALS__) {
+        const { listen } = await import('@tauri-apps/api/event')
+        unlisten = await listen('flux-install://progress', (event) => {
+          const step = event.payload?.step
+          if (['environment', 'dependencies', 'weights', 'ready'].includes(step)) fluxInstallStage = step
+        })
+      }
+      await getBackend().installFluxHelper({ backend: session.fluxBackend, accelerator: fluxAccelerator })
+      setFluxModel('flux2-klein-4b')
+      await getBackend().writeSettings(backendSettingsPatch())
+      await loadCapabilities()
+      await loadModels()
+    } catch (error) {
+      fluxInstallError = error instanceof Error ? error.message : String(error)
+    } finally {
+      unlisten?.()
+      installingFlux = false
+    }
+  }
 
   function commitSidecar() {
     if (sidecarDraft === null) return
@@ -1627,7 +1694,7 @@
   /** @param {string} language */
   function detectorOptions(language) {
     return [
-      ...detectorsFor(language).map((engine) => ({ value: engine.id, label: engine.name })),
+      { value: 'ctd-rtdetr', label: t('pipelines.clean') },
       { value: SKIP, label: t('pipelines.skip') },
     ]
   }
@@ -1658,7 +1725,8 @@
    * @param {import('../model/pipelines.js').Engine} engine
    */
   function found(engine) {
-    return Boolean(engine.sidecar && sidecarModels.some((model) => model.id === engine.sidecar))
+    return Boolean(engine.sidecar === 'flux2-klein-4b' && capabilities.sidecar &&
+      sidecarModels.some((model) => model.id === engine.sidecar))
   }
 
   /**
@@ -1669,8 +1737,10 @@
    */
   function engineState(engine) {
     if (!engine.ready) {
+      if (engine.cloudModel) return t('pipelines.status.cloudSetup')
       if (found(engine)) return t('pipelines.status.found')
-      return engine.sidecar ? t('pipelines.status.needsHelper') : t('pipelines.status.soon')
+      if (engine.id === 'flux2-klein-4b') return t('pipelines.status.needsHelper')
+      return t('pipelines.status.soon')
     }
     if (!catalogue) return ''
     const bytes = engineBytes(engine, filesById)
@@ -1876,7 +1946,7 @@
   <li class="row model" class:excluded={view.kind === 'excluded'} id={rowId(entry.id)} data-model={entry.id}>
     <div class="row-text">
       <span class="row-name">
-        {t(entry.nameKey)}{#if entry.product}<span class="product">{entry.product}</span>{/if}
+        {entry.product ?? t(entry.nameKey)}
       </span>
       <span class="row-meta">
         {metaOf(view)}{#if needed}<span class="needed">{` · ${t('settings.models.status.neededNow')}`}</span>{/if}
@@ -1923,6 +1993,11 @@
         {/if}
       {:else if view.kind === 'import'}
         {#if !view.installed}
+          {#if entry.id === 'samTs'}
+            <Button size="sm" disabled={importBusy[entry.id]} onclick={installSamTs}>
+              {t('settings.models.action.install')}
+            </Button>
+          {/if}
           <Button size="sm" disabled={importBusy[entry.id] || !canImport(entry)} onclick={() => importModel(entry)}>
             {t('settings.models.action.import')}
           </Button>
@@ -2057,7 +2132,7 @@
         </span>
       {/snippet}
       <p class="line review-note">{t('settings.detection.review.note')}</p>
-      <WorkflowAnalysis />
+      <WorkflowAnalysis initialWorkflow={workflowForDetectorModels(session.detectorModels)} initialRtProfile={session.detectorModels.includes('rtFull') ? 'full-halves' : 'small-whole'} />
     </Disclosure>
   </div>
 {/snippet}
@@ -2179,6 +2254,7 @@
             />
           {/snippet}
         </Field>
+
         {#if backgroundError}<p class="error" role="alert">{t('settings.background.saveFailed')}</p>{/if}
 
         <Field label={t('settings.direction.label')} layout="row">
@@ -2317,6 +2393,20 @@
           {/snippet}
         </Field>
 
+        <fieldset class="detector-models">
+          <legend>Detection models</legend>
+          {#each DETECTOR_MODEL_IDS as id (id)}
+            <label>
+              <input type="checkbox" checked={session.detectorModels.includes(id)}
+                disabled={session.detectorModels.length === 1 && session.detectorModels.includes(id)}
+                onchange={(event) => chooseDetectorModel(id, event.currentTarget.checked)} />
+              {pipelineModel(id)?.product}
+            </label>
+          {/each}
+        </fieldset>
+
+        <p class="line">{t('settings.detection.selectedModels', { models: session.detectorModels.map((id) => pipelineModel(id)?.product).filter(Boolean).join(' + ') })}</p>
+
         <!-- Whether the selected workflow can run with what is here, from the
              same needs the downloads follow. -->
         {#if readiness}
@@ -2327,11 +2417,11 @@
             <p class="readiness-text" role="status">
               {#each readiness.lines as line (line)}<span>{line}</span>{/each}
             </p>
-            {#if readiness.toDownload.length > 0 || readiness.runtime === 'missing' || readiness.runtime === 'unloadable'}
+            {#if readiness.toDownload.length > 0 || (needs.includes('samTs') && workflowCaps?.samInstalled !== true) || readiness.runtime === 'missing' || readiness.runtime === 'unloadable'}
               <div class="readiness-actions">
-                {#if readiness.toDownload.length > 0}
+                {#if readiness.toDownload.length > 0 || (needs.includes('samTs') && workflowCaps?.samInstalled !== true)}
                   <Button size="sm" onclick={downloadNeeded}>
-                    {t('settings.detection.download', { bytes: readiness.missing })}
+                    {readiness.toDownload.length > 0 ? t('settings.detection.download', { bytes: readiness.missing }) : t('settings.models.action.install')}
                   </Button>
                 {/if}
                 <!-- The runtime has its build choice and its own row in
@@ -2367,7 +2457,6 @@
               </Field>
             {/each}
           </div>
-          <EngineTable engines={DETECTORS} label={t('pipelines.detection')} stateOf={engineState} />
         {:else}
           <p class="line">{t('settings.detection.languagesAllText')}</p>
         {/if}
@@ -2432,8 +2521,7 @@
           </Field>
         </div>
 
-        {#if capabilities.sidecar}
-          <Field label={t('settings.fluxBackend.label')} layout="row">
+        <Field label={t('settings.fluxBackend.label')} layout="row">
             {#snippet children({ labelId })}
               <Segmented
                 options={fluxBackends}
@@ -2445,7 +2533,33 @@
                 }}
               />
             {/snippet}
-          </Field>
+        </Field>
+
+        <Field label={t('settings.sidecar.accelerator')} layout="row" controlId="settings-flux-accelerator">
+          {#snippet children()}
+            <Select
+              id="settings-flux-accelerator"
+              options={[
+                { value: 'auto', label: t('settings.sidecar.acceleratorAuto') },
+                { value: 'cuda', label: 'NVIDIA CUDA' },
+                { value: 'xpu', label: 'Intel XPU' },
+                { value: 'mps', label: 'Apple Metal' },
+              ]}
+              value={fluxAccelerator}
+              disabled={installingFlux}
+              onchange={(value) => (fluxAccelerator = value)}
+            />
+          {/snippet}
+        </Field>
+        <div class="inline">
+          <Button onclick={installFlux} disabled={installingFlux}>
+            {installingFlux ? t('settings.sidecar.installing') : t('settings.sidecar.install')}
+          </Button>
+          {#if installingFlux}<span role="status">{t(fluxStageKey)}</span>{/if}
+        </div>
+        {#if fluxInstallError}<p class="line" role="alert">{t('settings.sidecar.installFailed', { detail: fluxInstallError })}</p>{/if}
+
+        {#if capabilities.sidecar}
 
           <Field label={t('settings.sidecarModel.label')} layout="row" controlId="settings-sidecar-model">
             {#snippet children()}
@@ -2925,11 +3039,6 @@
      full width under the name and the buttons. */
   .row.model { flex-wrap: wrap; align-items: flex-start }
   .row.model .row-actions { padding-top: 1px }
-  .product {
-    margin-left: var(--s-2);
-    font-size: 11px;
-    color: var(--t3);
-  }
   .row-role {
     font-size: 11px;
     line-height: 1.4;

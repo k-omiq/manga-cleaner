@@ -212,7 +212,7 @@ def self_check() -> Dict[str, Any]:
         settings = BeamSettings.for_installation("mc-selfcheck", "mc-selfcheck", gateway_host="127.0.0.1", gateway_port=9)
         with working_directory(str(stage_dir)):
             beam_app = import_staged_app(stage_dir, settings.with_worker_url("https://example.invalid").to_env())
-        report["beam_app"] = sorted(name for name in ("seed", "render", "gateway") if hasattr(getattr(beam_app, name), "deploy"))
+        report["beam_app"] = sorted(name for name in ("seed", "render", "analyze", "gateway") if hasattr(getattr(beam_app, name), "deploy"))
         report["beam_staged_files"] = sorted(str(p.relative_to(stage_dir)) for p in stage_dir.rglob("*.py"))
     finally:
         sdk.base.unset_channel()

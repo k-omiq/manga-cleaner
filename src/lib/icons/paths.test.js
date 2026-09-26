@@ -20,7 +20,7 @@ const REQUIRED = [
   'eyedropper',
   // The tool bar's glyphs: shape and mode choices drawn as icons, and the
   // bar's own controls.
-  'shape-rect', 'shape-ellipse', 'shape-lasso', 'shape-polygon',
+  'shape-rect', 'shape-ellipse', 'shape-line', 'shape-lasso', 'shape-polygon',
   'book', 'sliders', 'play', 'stop', 'link',
   'link-off', 'bandage',
   // Onboarding and Settings: ratings, and a download's pause.

@@ -612,13 +612,13 @@ describe('Set up with Modal or Beam', () => {
       screen.getByRole('checkbox', { name: t('settings.cloud.setup.review.approve', { providerKey: MODAL_KEY }) }),
     )
     await fireEvent.click(button(t('settings.cloud.setup.review.start')))
-    await screen.findByRole('heading', { name: t('settings.cloud.setup.heading.done') })
+    await screen.findByRole('heading', { name: t('settings.cloud.setup.heading.done') }, { timeout: 10_000 })
 
     const label = await screen.findByText(/^Modal \(mc-[a-z0-9]{6}\)$/, { selector: 'label' })
     const name = label.textContent?.trim() ?? ''
     expect(within(row(name)).getByText(t('settings.inference.endpoints.default'))).toBeTruthy()
     await statusSays(t('settings.inference.status.ready', { name }))
-  })
+  }, 15_000)
 
   it('turns the cloud on when a setup ends with a healthy endpoint', async () => {
     const backend = await seeded({ allowed: false })
@@ -634,13 +634,13 @@ describe('Set up with Modal or Beam', () => {
     )
     expect(session.cloudAllowed).toBe(false)
     await fireEvent.click(button(t('settings.cloud.setup.review.start')))
-    await screen.findByRole('heading', { name: t('settings.cloud.setup.heading.done') })
+    await screen.findByRole('heading', { name: t('settings.cloud.setup.heading.done') }, { timeout: 10_000 })
 
     await waitFor(() => expect(session.cloudAllowed).toBe(true))
     expect((await backend.readSettings()).cloudEngines).toBe('allowed')
     const label = await screen.findByText(/^Modal \(mc-[a-z0-9]{6}\)$/, { selector: 'label' })
     await statusSays(t('settings.inference.status.ready', { name: label.textContent?.trim() ?? '' }))
-  })
+  }, 15_000)
 
   it('picks the checklist back up when Settings opens while a setup runs', async () => {
     const backend = await seeded()

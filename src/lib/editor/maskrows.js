@@ -20,6 +20,7 @@ import {
 } from '../model/masks.js'
 import { needsReview, reviewList, reviewReason } from '../model/review.js'
 import { rungLabel } from '../model/ladder.js'
+import { knownModelName } from '../model/model-names.js'
 
 /**
  * @typedef {Object} Fact
@@ -37,6 +38,7 @@ import { rungLabel } from '../model/ladder.js'
  * @property {string} glyph - `▪` applied, `△` needs review, `!` declined, `○` not examined
  * @property {string} statusKey - the same status in words, for assistive tech
  * @property {string} titleKey - engine name, or what the row is when there is no mask
+ * @property {string|null} modelId - pinned cloud or recorded local FLUX model, when known
  * @property {Array<{key: string, params?: Object}>} sub - the sub-line, in parts
  * @property {string|null} reasonKey - why it needs review, if it does
  * @property {boolean} deletable - always; every row can be removed, warnings included
@@ -111,6 +113,8 @@ export function maskRow(region, filtered) {
     glyph: STATUS[status].glyph,
     statusKey: STATUS[status].statusKey,
     titleKey: titleKeyFor(region, mask),
+    modelId: mask?.provenance?.cloud?.model ??
+      (maskEngine(mask) === 'flux' ? mask?.provenance?.params_snapshot?.flux_model ?? null : null),
     sub: (filtered || !mask) && reasonKey ? [{ key: reasonKey }] : subLine(region, mask),
     reasonKey,
     // Every row, warnings included. A warning with no way off the list is a
@@ -158,14 +162,13 @@ function titleKeyFor(region, mask) {
  */
 function subLine(region, mask) {
   if (!mask) return [{ key: 'masks.sub.noMask' }]
-  const parts = [{ key: fillModeLabel(mask.fillMode) }]
+  const parts = []
   if (mask.maskQualityState) parts.push({ key: 'review.reason.maskNeedsCorrection' })
   if (mask.provenance.cloud) {
     if (typeof mask.provenance.cloud.cost === 'number' && Number.isFinite(mask.provenance.cloud.cost)) {
       parts.push({ key: 'masks.value.cloudCost', params: { cost: mask.provenance.cloud.cost } })
     }
   }
-  if (region.source === 'hand') parts.push({ key: 'masks.origin.hand' })
   return parts
 }
 
@@ -191,12 +194,6 @@ function factsFor(region, mask, reasonKey) {
           valueKey: region.detected ? 'masks.value.detectedYes' : 'masks.value.detectedNo',
         },
       ]
-  if (mask) {
-    facts.push({
-      key: 'masks.provenance.origin',
-      valueKey: region.source === 'hand' ? 'masks.origin.hand' : 'masks.origin.auto',
-    })
-  }
   if (reasonKey) facts.push({ key: 'masks.provenance.flagged', valueKey: reasonKey })
   return facts
 }
@@ -222,6 +219,8 @@ function displayFact(fact) {
       }
       // No cost came back with the render. Saying so beats a guessed one.
       return { key: fact.key, valueKey: 'masks.value.cloudCostUnknown' }
+    case 'masks.provenance.model':
+      return { key: fact.key, value: knownModelName(fact.value) ?? String(fact.value ?? '') }
     default:
       // A model version and a cloud request id are proper nouns; translating
       // them would be translating an identifier.

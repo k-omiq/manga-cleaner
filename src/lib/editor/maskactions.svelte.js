@@ -293,7 +293,7 @@ export async function rerunMask(region, kind, engine) {
       result.reopenTool ??
       region.tool ??
       region.mask?.provenance?.params_snapshot?.tool ??
-      'contentAwareFill'
+      'aiMaskBrush'
     setTool(reopenTool)
     return true
   }
@@ -329,18 +329,19 @@ export async function rerunMask(region, kind, engine) {
  * @param {import('../api/backend.js').ApiRegion} region
  * @returns {Promise<boolean>}
  */
-export async function cleanAnyway(region) {
+export async function cleanAnyway(region, chosenEngine) {
   const chapterId = editor.chapter?.id ?? null
   const before = snapshot(region)
   const params = /** @type {any} */ (editor.toolParams.autoClean ?? {})
-  const engine =
+  const engine = chosenEngine ?? (
     region.gateSkipCause === 'outside-bubble'
       ? (params.outsideEngine ?? 'lama')
-      : (params.bubbleEngine ?? 'fill')
+      : (params.bubbleEngine ?? 'fill'))
   /** @type {any} */
   let result
   try {
-    result = await getBackend().cleanAnyway({ regionId: region.id, engine })
+    result = await getBackend().cleanAnyway({ regionId: region.id, engine,
+      ...(engine === 'solid' ? { params: { bubbleColor: params.bubbleColor ?? '#ffffff' } } : {}) })
   } catch (error) {
     return reportRegionEditFailure(error)
   }
@@ -351,6 +352,58 @@ export async function cleanAnyway(region) {
     region: result.region,
     pageStatus: result.pageStatus,
   }, chapterId)
+  if (open) refreshPage(pageIndexOf(region.id))
+  return true
+}
+
+// Serialize per layer: a second control may fire before the first save has
+// replaced the region object that both controls currently hold.
+const layerUpdates = new Map()
+
+/** Save one layer's appearance through the same region snapshot seam as undo. */
+export function updateLayer(region, changes) {
+  if (!region?.mask) return Promise.resolve(false)
+  const chapterId = editor.chapter?.id ?? null
+  const key = JSON.stringify([chapterId, region.id])
+  const entry = layerUpdates.get(key) ?? { region, tail: Promise.resolve() }
+  const backend = getBackend()
+  const delta = { ...changes }
+  const saved = entry.tail.then(async () => {
+    const current = stillOpen(chapterId)
+      ? editor.chapter.pages.flatMap((page) => page.regions).find((item) => item.id === region.id)
+      : entry.region
+    if (!current?.mask) return false
+    return saveLayer(current, delta, chapterId, backend, entry)
+  })
+  entry.tail = saved.catch(() => false)
+  layerUpdates.set(key, entry)
+  const tail = entry.tail
+  return saved.finally(() => {
+    if (layerUpdates.get(key)?.tail === tail) layerUpdates.delete(key)
+  })
+}
+
+async function saveLayer(region, changes, chapterId, backend, entry) {
+  const before = snapshot(region)
+  const layer = {
+    opacity: 100, offsetX: 0, offsetY: 0, rotation: 0, locked: false,
+    ...(region.mask.layer ?? {}),
+    ...changes,
+  }
+  const wanted = /** @type {any} */ ($state.snapshot(region))
+  wanted.mask = { ...wanted.mask, layer }
+  let result
+  try {
+    result = await backend.restoreRegion({ regionId: region.id, region: wanted, pageStatus: before.pageStatus ?? undefined })
+  } catch (error) {
+    return reportRegionEditFailure(error)
+  }
+  if (!result) return false
+  entry.region = result
+  const open = stillOpen(chapterId)
+  if (open) replaceRegion(result, before.pageStatus ?? undefined)
+  recordEdit('masks.command.layerStyle', region.id, before,
+    { region: result, pageStatus: before.pageStatus }, chapterId)
   if (open) refreshPage(pageIndexOf(region.id))
   return true
 }
@@ -456,6 +509,8 @@ export async function runRegionMenuItem(id, region) {
   if (!region) return false
   if (id === 'retry') return rerunMask(region, 'retry')
   if (id === 'delete') return deleteRow(region)
+  if (id === 'approve') return cleanAnyway(region)
+  if (id.startsWith('approve:')) return cleanAnyway(region, id.slice('approve:'.length))
   if (id.startsWith('engine:')) return rerunMask(region, 'engine', id.slice('engine:'.length))
   return false
 }

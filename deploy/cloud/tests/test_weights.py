@@ -15,6 +15,10 @@ from deploy.cloud.common.manifest import (
     PROD_SNAPSHOT_FILES,
     PROD_SNAPSHOT_TOTAL_BYTES,
     REVISION_PROD_FLUX,
+    MODEL_PROD_FLUX_9B,
+    REVISION_PROD_FLUX_9B,
+    PROD_SNAPSHOT_9B_FILES,
+    PROD_SNAPSHOT_9B_TOTAL_BYTES,
 )
 from deploy.cloud.tests.support import silence_deploy_logs
 
@@ -102,6 +106,16 @@ class SeedSnapshotTest(unittest.TestCase):
         self.assertEqual(again["status"], "present")
         self.assertEqual(len(download.calls), 1, "a seeded volume never downloads again")
         self.assertEqual(commits, [1])
+
+    def test_9b_seed_uses_its_own_pin_marker_and_size(self) -> None:
+        download = FakeDownload(files=PROD_SNAPSHOT_9B_FILES)
+        result = weights.seed_snapshot(self.root, download, model_id=MODEL_PROD_FLUX_9B)
+        self.assertEqual(result["model_revision"], REVISION_PROD_FLUX_9B)
+        self.assertEqual(result["total_bytes"], PROD_SNAPSHOT_9B_TOTAL_BYTES)
+        self.assertEqual(download.calls[0]["repo_id"], MODEL_PROD_FLUX_9B)
+        self.assertEqual(download.calls[0]["revision"], REVISION_PROD_FLUX_9B)
+        self.assertTrue(weights.is_seeded(self.root, MODEL_PROD_FLUX_9B))
+        self.assertFalse(weights.is_seeded(self.root, MODEL_PROD_FLUX))
 
     def test_incomplete_download_leaves_no_marker(self) -> None:
         download = FakeDownload(files=PROD_SNAPSHOT_FILES[:-1])

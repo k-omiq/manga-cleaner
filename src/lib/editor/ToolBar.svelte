@@ -42,7 +42,7 @@
    */
   import { untrack } from 'svelte'
   import { session, raiseWindow, setWindowBox } from '../state/session.svelte.js'
-  import { capabilities } from '../state/capabilities.svelte.js'
+  import { capabilities, currentWorkflowAvailable } from '../state/capabilities.svelte.js'
   import { cloud, cloudUsable, openCloudSettings } from '../state/cloud.svelte.js'
   import {
     editor,
@@ -70,6 +70,7 @@
   } from '../ui/index.js'
   import Icon from '../icons/Icon.svelte'
   import { t } from '../i18n/index.js'
+  import { currentCloudModelId, engineModelLabel } from '../model/model-names.js'
 
   const spec = $derived(toolSpec(editor.tool))
   const values = $derived(editor.toolParams[spec.id] ?? {})
@@ -144,13 +145,19 @@
       // without them there is no control worth drawing - the remedy is one
       // press in Settings › Models, and a disabled option here would be an
       // explanation in the wrong window. Hidden rather than disabled.
-      .filter((option) => !option.engine || capabilities.engines[option.engine] !== false)
+      .filter((option) => option.value === values[param.key] || option === param.options[0] ||
+        !option.engine || capabilities.engines[option.engine] !== false)
       .map((option) => ({
         value: option.value,
-        label: t(option.labelKey),
+        label: option.cloud
+          ? engineModelLabel('cloud', currentCloudModelId(cloud), t(option.labelKey))
+          : option.value === 'flux'
+            ? engineModelLabel('flux', session.fluxModel || 'flux2-klein-4b', t(option.labelKey))
+            : t(option.labelKey),
         icon: option.icon,
-        disabled: option.cloud && !cloudUsable(),
-        title: option.cloud ? cloudNote() ?? undefined : undefined,
+        disabled: (option.cloud && !cloudUsable()) || (option.engine && capabilities.engines[option.engine] === false),
+        title: option.cloud ? cloudNote() ?? undefined :
+          option.engine && capabilities.engines[option.engine] === false ? t('tools.option.engineMissing') : undefined,
       }))
   }
 
@@ -182,6 +189,8 @@
    * @returns {string|null}
    */
   function gateNote(param) {
+    if (param.options.some((option) => option.value === values[param.key] && option.engine &&
+      capabilities.engines[option.engine] === false)) return t('tools.option.engineMissing')
     const gated = param.options.some((option) => option.cloud) && cloudNote()
     if (gated) return gated
     // Rung 3a's half of the same duty. `sidecarReasonKey` is null for the
@@ -225,8 +234,6 @@
   const actionLabel = $derived(
     running
       ? t('editor.action.cancelRun')
-      : session.textPolicy === 'all_text'
-        ? t('editor.action.reviewText')
       : values.scope === 'project'
         ? t('editor.action.runOnProject')
         : t('editor.action.runOnPage'),
@@ -266,9 +273,8 @@
    */
   const blockedKey = $derived.by(() => {
     if (!spec.runnable) return null
-    if (session.textPolicy === 'all_text') return null
     if (!capabilities.runtime) return 'editor.state.runtimeMissing'
-    return capabilities.autoClean ? null : 'editor.state.modelsMissing'
+    return currentWorkflowAvailable() ? null : 'editor.state.modelsMissing'
   })
 
   /**
@@ -388,7 +394,6 @@
   </span>
 
   {#key spec.id}
-    {#if session.textPolicy !== 'all_text'}
     {#each layout.groups as group, index (group.key ?? index)}
       <span class="rule" role="separator" aria-orientation="vertical"></span>
       <div class="group">
@@ -498,7 +503,6 @@
           {/each}
         </div>
       </Popover>
-    {/if}
     {/if}
 
     {#if spec.runnable}

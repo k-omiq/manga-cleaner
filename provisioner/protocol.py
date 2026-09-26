@@ -23,6 +23,7 @@ HELPER_PROTOCOL_VERSION = "1.0.0"
 MAX_REQUEST_BYTES = 64 * 1024  # 64 KiB envelope limit
 
 # Allowlisted Operations
+OP_BILLING = "billing"
 OP_INSPECT = "inspect"
 OP_PLAN = "plan"
 OP_APPLY = "apply"
@@ -33,6 +34,7 @@ OP_FORGET_CREDENTIAL = "forget_credential"
 OP_PROBE_COMPATIBILITY = "probe_compatibility"
 
 ALLOWLISTED_OPERATIONS: Set[str] = {
+    OP_BILLING,
     OP_INSPECT,
     OP_PLAN,
     OP_APPLY,

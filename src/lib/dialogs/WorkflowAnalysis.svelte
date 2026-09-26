@@ -35,7 +35,7 @@
   import WorkflowOutcome from './WorkflowOutcome.svelte'
   import { declineReasonOf, hitTest, isRemoteAnalysis, outcomeOf, readinessKeyOf, runtimeLoadOf } from './workflowoutcome.js'
 
-  let { chapterId = null, initialPageIndex = 0 } = $props()
+  let { chapterId = null, initialPageIndex = 0, initialWorkflow = null, initialRtProfile = null } = $props()
   const uid = $props.id()
 
   const PRESET_KEYS = {
@@ -64,10 +64,10 @@
    * @type {{state: 'checking'|'loaded'|'unchecked', reasonKey?: undefined}|{state: 'failed', reasonKey: string}}
    */
   let runtimeLoad = $state({ state: 'checking' })
-  let workflow = $state(untrack(() => chapterId ? 'text_shape' : 'regions'))
-  let rtProfile = $state('full-halves')
+  let workflow = $state(untrack(() => initialWorkflow ?? (chapterId ? 'text_shape' : 'regions')))
+  let rtProfile = $state(untrack(() => initialRtProfile ?? 'full-halves'))
   /** Set once the user picks a profile; readiness answers never move it after that. */
-  let rtProfileChosen = false
+  let rtProfileChosen = untrack(() => initialRtProfile !== null)
   let sourcePath = $state('')
   let rtBackend = $state('ort-cpu')
   let samBackend = $state('ort-cpu')
@@ -128,6 +128,7 @@
   const notReadyKey = $derived(readinessKeyOf(capabilities, preset, { rtProfile, rtBackend, samBackend, verified, load: runtimeLoad.state }))
   const canAnalyze = $derived(Boolean(capabilities && !busy && !analyzing && !cloudActive && !notReadyKey && (chapterId || sourcePath.trim())))
   const isRemote = $derived(isRemoteAnalysis(result))
+  let fullRtDownloading = $state(false)
   const declineReason = $derived(chapterId && result ? declineReasonOf(result, capabilities) : null)
   const componentHeld = $derived(Boolean(selectedComponent && !isRemote && !allowOutside && !selectedComponent.rtBubbleIds?.length))
   const componentCanWrite = $derived(Boolean(chapterId && selectedComponent && !isRemote && !componentHeld))
@@ -179,6 +180,12 @@
 
   onMount(() => {
     refresh().catch((cause) => { if (!destroyed) analysisOutcome = outcomeOf(cause, 'refresh') })
+    return getBackend().subscribe?.((event) => {
+      if (event.type === 'model-progress' && event.id === 'fullRt' && event.done) {
+        fullRtDownloading = false
+        refresh().catch((cause) => { if (!destroyed) analysisOutcome = outcomeOf(cause, 'refresh') })
+      }
+    })
   })
 
   onDestroy(() => {
@@ -212,6 +219,29 @@
     const path = await chooseOnnx({ title: t('workflow.dialog.rtFile') })
     if (!path) return
     await modelTask(async () => { await getBackend().importFullRt({ sourcePath: path }); await refresh() })
+  }
+
+  async function downloadFullRt() {
+    await modelTask(async () => {
+      fullRtDownloading = true
+      try {
+        const status = await getBackend().downloadModel({ id: 'fullRt' })
+        if (status === 'alreadyInstalled') {
+          fullRtDownloading = false
+          await refresh()
+        }
+      } catch (error) {
+        fullRtDownloading = false
+        throw error
+      }
+    })
+  }
+
+  async function installSam() {
+    await modelTask(async () => {
+      await getBackend().installSamTs()
+      await refresh()
+    })
   }
 
   async function choosePage() {
@@ -844,10 +874,12 @@
   </div>
 
   <div class="actions">
+    <Button disabled={busy || !!analyzing || fullRtDownloading || capabilities.fullRtInstalled} onclick={downloadFullRt}>{t('workflow.action.downloadFullRt')}</Button>
     <Button disabled={busy || !!analyzing} onclick={importFullRt}>{t('workflow.action.importFullRt')}</Button>
     {#if capabilities.fullRtManaged}
       <Button disabled={busy || !!analyzing} onclick={() => modelTask(async () => { await getBackend().removeFullRt(); await refresh() })}>{t('workflow.action.removeFullRt')}</Button>
     {/if}
+    <Button disabled={busy || !!analyzing || capabilities.samInstalled} onclick={installSam}>{t('workflow.action.installSam')}</Button>
     <Button disabled={busy || !!analyzing} onclick={importGraphs}>{t('workflow.action.importSam')}</Button>
     <Button disabled={busy || !!analyzing} onclick={() => modelTask(refresh, 'refresh')}>{t('workflow.action.refresh')}</Button>
     <Button disabled={busy || !!analyzing || !capabilities.samInstalled} onclick={() => modelTask(async () => { verified = await getBackend().verifySamTs() })}>{t('workflow.action.verifySam')}</Button>
@@ -888,14 +920,14 @@
 {#snippet rtChoices()}
   <label class="field">
     <span>{t('workflow.field.rtProfile')}</span>
-    <select bind:value={rtProfile} onchange={() => (rtProfileChosen = true)} disabled={workflow === 'mask' || !!analyzing}>
+    <select bind:value={rtProfile} onchange={() => (rtProfileChosen = true)} disabled={!preset?.needs.includes('rt') || !!analyzing}>
       <option value="full-halves">{t('workflow.rtProfile.full')}</option>
       <option value="small-whole">{t('workflow.rtProfile.small')}</option>
     </select>
   </label>
   <label class="field">
     <span>{t('workflow.field.rtBackend')}</span>
-    <select bind:value={rtBackend} disabled={workflow === 'mask' || !!analyzing}>
+    <select bind:value={rtBackend} disabled={!preset?.needs.includes('rt') || !!analyzing}>
       {#each capabilities.rtBackends as option (option.id)}
         <option value={option.id} disabled={!option.selectable}>{rtOptionLabel(option)}</option>
       {/each}
@@ -929,14 +961,14 @@
         <span>{t('workflow.field.workflow')}</span>
         <select bind:value={workflow} disabled={!!analyzing || cloudActive}>
           {#each WORKFLOW_PRESETS as entry (entry.id)}
-            <option value={entry.id}>{t(PRESET_KEYS[entry.id] ?? PRESET_KEYS.text_shape)}</option>
+            <option value={entry.id}>{PRESET_KEYS[entry.id] ? t(PRESET_KEYS[entry.id]) : entry.name}</option>
           {/each}
         </select>
       </label>
       {#if !chapterId}{@render rtChoices()}{/if}
       <label class="field">
         <span>{t('workflow.field.samBackend')}</span>
-        <select bind:value={samBackend} disabled={workflow === 'regions' || !!analyzing}>
+        <select bind:value={samBackend} disabled={!preset?.needs.includes('sam') || !!analyzing}>
           {#each capabilities.samBackends as option (option.id)}
             <option value={option.id} disabled={!option.selectable}>{samOptionLabel(option)}</option>
           {/each}

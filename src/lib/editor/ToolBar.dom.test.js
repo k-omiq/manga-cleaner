@@ -22,7 +22,7 @@
  */
 
 import { describe, expect, it, afterEach, vi } from 'vitest'
-import { render, cleanup, fireEvent } from '@testing-library/svelte'
+import { render, cleanup, fireEvent, within } from '@testing-library/svelte'
 import { tick } from 'svelte'
 import { TOOL_SPECS, activeParams, toolSpec } from './tools.js'
 import { t } from '../i18n/index.js'
@@ -85,7 +85,10 @@ vi.mock('../state/session.svelte.js', () => ({
   resetWindowBox: vi.fn(),
 }))
 
-vi.mock('../state/capabilities.svelte.js', () => ({ capabilities: stores.capabilities }))
+vi.mock('../state/capabilities.svelte.js', () => ({
+  capabilities: stores.capabilities,
+  currentWorkflowAvailable: () => stores.capabilities.autoClean,
+}))
 
 vi.mock('../state/cloud.svelte.js', () => ({
   cloud: stores.cloud,
@@ -169,6 +172,23 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 
+describe('Auto clean solid fill color', () => {
+  it('shows one shared color picker when either text class uses Solid', () => {
+    const spec = toolSpec('autoClean')
+    for (const overrides of [
+      { bubbleEngine: 'solid', outsideEngine: 'lama' },
+      { bubbleEngine: 'lama', outsideEngine: 'solid' },
+      { bubbleEngine: 'solid', outsideEngine: 'solid' },
+    ]) {
+      const { view } = mountTool(spec, overrides)
+      expect(view.getAllByLabelText(t('tools.param.bubbleColor'))).toHaveLength(1)
+      cleanup()
+    }
+    const { view } = mountTool(spec, { bubbleEngine: 'lama', outsideEngine: 'lama' })
+    expect(view.queryByLabelText(t('tools.param.bubbleColor'))).toBeNull()
+  })
+})
+
 describe('every tool draws the control each of its parameters asks for', () => {
   for (const spec of TOOL_SPECS) {
     it(`draws ${spec.id}'s parameters, each with a name of its own`, async () => {
@@ -225,7 +245,7 @@ describe('a change on any control writes that parameter, once', () => {
           expect(stores.setToolParam).toHaveBeenCalledWith(spec.id, param.key, next)
         } else if (param.kind === 'color') {
           await fireEvent.click(control)
-          const hexInput = view.getByLabelText(t('tools.color.hex'))
+          const hexInput = within(control.closest('.anchor')).getByLabelText(t('tools.color.hex'))
           await fireEvent.input(hexInput, { target: { value: '#123456' } })
           expect(stores.setToolParam).toHaveBeenCalledWith(spec.id, param.key, '#123456')
         } else {
@@ -349,30 +369,63 @@ describe('the eyedropper is drawn only where the platform has one', () => {
  * inside, so it sits beside the group on the bar.
  */
 describe('a gated option says what it is costing the user', () => {
-  it('disables the cloud engine and prints the reason beside the group', () => {
+  it('keeps a selected missing LaMa visible and disabled instead of selecting Cloud', async () => {
+    stores.capabilities.engines = { lama: false, flux: false }
     stores.session.cloudAllowed = false
     try {
-      const { view } = mountTool(toolSpec('contentAwareFill'))
-      const group = view.getByLabelText(t('tools.param.engine'))
-      const cells = [...group.querySelectorAll('[role="radio"]')]
-      expect(cells[1].getAttribute('aria-label')).toBe(t('tools.option.engineCloud'))
-      expect(/** @type {HTMLButtonElement} */ (cells[1]).disabled).toBe(true)
+      const spec = toolSpec('aiMaskBrush')
+      const { view, values } = mountTool(spec)
+      const trigger = controlFor(view, spec.params[0], values)
+      expect(trigger.textContent).toContain('LaMa')
+      await fireEvent.click(trigger)
+      expect(/** @type {HTMLButtonElement} */ (view.getByRole('menuitemradio', { name: 'LaMa Manga' })).disabled).toBe(true)
+      expect(view.getByText(t('tools.option.engineMissing'))).not.toBeNull()
+      expect(stores.setToolParam).not.toHaveBeenCalledWith('aiMaskBrush', 'engine', 'cloud')
+    } finally {
+      stores.capabilities.engines = {}
+      stores.session.cloudAllowed = true
+    }
+  })
+
+  it('names verified cloud and local FLUX models in the same brush list', async () => {
+    stores.session.fluxModel = 'flux2-klein-4b'
+    stores.cloud.readiness = {
+      target: { type: 'modal', profile_id: 'studio' },
+      profile: { modelId: 'Disty0/FLUX.2-klein-9B-SDNQ-4bit-dynamic-svd-r32' },
+    }
+    try {
+      const spec = toolSpec('aiMaskBrush')
+      const { view, values } = mountTool(spec)
+      await fireEvent.click(controlFor(view, spec.params[0], values))
+      expect(view.getByRole('menuitemradio', { name: 'FLUX.2 Klein 4B · Local' })).not.toBeNull()
+      expect(view.getByRole('menuitemradio', { name: '☁ FLUX.2 Klein 9B · Cloud' })).not.toBeNull()
+    } finally {
+      delete stores.session.fluxModel
+      delete stores.cloud.readiness
+    }
+  })
+
+  it('disables the cloud model inside the brush engine list when cloud is off', async () => {
+    stores.session.cloudAllowed = false
+    try {
+      const spec = toolSpec('aiMaskBrush')
+      const { view, values } = mountTool(spec)
+      await fireEvent.click(controlFor(view, spec.params[0], values))
+      expect(/** @type {HTMLButtonElement} */ (view.getByRole('menuitemradio', { name: /☁ Cloud/ })).disabled).toBe(true)
       expect(view.getByText(t('editor.state.cloudBlocked'))).not.toBeNull()
     } finally {
       stores.session.cloudAllowed = true
     }
   })
 
-  it('disables the cloud engine while no endpoint is set up, and offers the way to set one up', async () => {
+  it('disables the cloud model while no endpoint is set up, and explains why', async () => {
     stores.cloud.configured = false
     try {
-      const { view } = mountTool(toolSpec('contentAwareFill'))
-      const group = view.getByLabelText(t('tools.param.engine'))
-      const cells = [...group.querySelectorAll('[role="radio"]')]
-      expect(/** @type {HTMLButtonElement} */ (cells[1]).disabled).toBe(true)
+      const spec = toolSpec('aiMaskBrush')
+      const { view, values } = mountTool(spec)
+      await fireEvent.click(controlFor(view, spec.params[0], values))
+      expect(/** @type {HTMLButtonElement} */ (view.getByRole('menuitemradio', { name: /☁ Cloud/ })).disabled).toBe(true)
       expect(view.getByText(t('tools.option.engineCloudNotReady'))).not.toBeNull()
-      await fireEvent.click(view.getByRole('button', { name: t('tools.option.engineCloudSettings') }))
-      expect(stores.openCloudSettings).toHaveBeenCalledTimes(1)
     } finally {
       stores.cloud.configured = true
     }
@@ -408,6 +461,18 @@ describe('a gated option says what it is costing the user', () => {
 })
 
 describe('the run action', () => {
+  it('keeps an all-text run blocked while its selected model is missing', () => {
+    stores.session.textPolicy = 'all_text'
+    stores.capabilities.autoClean = false
+    try {
+      const { view } = mountTool(toolSpec('autoClean'))
+      expect(view.getByText(t('editor.state.modelsMissing'))).not.toBeNull()
+    } finally {
+      delete stores.session.textPolicy
+      stores.capabilities.autoClean = true
+    }
+  })
+
   it('is Auto clean’s alone', () => {
     const { view } = mountTool(toolSpec('autoClean'))
     expect(view.getByText(t('editor.action.runOnPage'))).not.toBeNull()

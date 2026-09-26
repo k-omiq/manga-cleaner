@@ -80,6 +80,7 @@ fn main() {
             "clean_anyway",
             "sidecar_available",
             "list_sidecar_models",
+            "install_flux_helper",
             "export_chapter",
             "subscribe_events",
             "unsubscribe_events",

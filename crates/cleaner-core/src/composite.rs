@@ -172,6 +172,10 @@ fn stamp(
 
     let bounds = patch.mask.bounds;
     let samples = page.mode.samples();
+    let opacity = f64::from(patch.layer_style().opacity) / 100.0;
+    if opacity <= 0.0 { return Ok(()); }
+    let mut palette_blends = std::collections::HashMap::new();
+    let top = (1u32 << page.depth.bits().min(16)) as f64 - 1.0;
     for y in bounds.y.max(window.y)..bounds.bottom().min(window.bottom()) {
         for x in bounds.x.max(window.x)..bounds.right().min(window.right()) {
             if !patch.mask.contains(x, y) {
@@ -182,12 +186,67 @@ fn stamp(
             }
             let (lx, ly) = ((x - bounds.x) as u32, (y - bounds.y) as u32);
             let (ox, oy) = ((x - window.x) as u32, (y - window.y) as u32);
+            if page.mode == ColorMode::Indexed && opacity < 1.0 {
+                let below = out.sample(ox, oy, 0);
+                let above = patch.pixels.sample(lx, ly, 0);
+                let value = *palette_blends.entry((below, above)).or_insert_with(|| {
+                    blend_palette_index(page, &patch.pixels, below, above, opacity)
+                });
+                out.set_sample(ox, oy, 0, value);
+                continue;
+            }
+            let alpha = page.mode.alpha_channel();
+            let (lower_alpha, upper_alpha) = alpha.map_or((top, top), |channel| (
+                out.sample(ox, oy, channel) as f64,
+                patch.pixels.sample(lx, ly, channel) as f64,
+            ));
+            let mixed_alpha = lower_alpha * (1.0 - opacity) + upper_alpha * opacity;
             for channel in 0..samples {
-                out.set_sample(ox, oy, channel, patch.pixels.sample(lx, ly, channel));
+                let value = patch.pixels.sample(lx, ly, channel);
+                if opacity >= 1.0 {
+                    out.set_sample(ox, oy, channel, value);
+                } else {
+                    let below = out.sample(ox, oy, channel) as f64;
+                    let mixed = if alpha.is_some() && alpha != Some(channel) && mixed_alpha > 0.0 {
+                        (below * lower_alpha * (1.0 - opacity) + value as f64 * upper_alpha * opacity) / mixed_alpha
+                    } else {
+                        below * (1.0 - opacity) + value as f64 * opacity
+                    };
+                    out.set_sample(ox, oy, channel, mixed.round().clamp(0.0, top) as u16);
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Palette positions have no numerical relationship to color. Blend the
+/// colors, then quantize to the existing palette so untouched pixels and the
+/// source's indexed format remain unchanged.
+fn blend_palette_index(page: &Raster, patch: &Raster, below: u16, above: u16, opacity: f64) -> u16 {
+    let Some(palette) = page.palette.as_deref() else { return below; };
+    let upper_palette = patch.palette.as_deref().unwrap_or(palette);
+    let color = |palette: &[u8], trns: Option<&[u8]>, index: u16| -> Option<[f64; 4]> {
+        let rgb = palette.get(index as usize * 3..index as usize * 3 + 3)?;
+        Some([rgb[0] as f64, rgb[1] as f64, rgb[2] as f64,
+            trns.and_then(|alpha| alpha.get(index as usize)).copied().unwrap_or(255) as f64])
+    };
+    let Some(lower) = color(palette, page.trns.as_deref(), below) else { return below; };
+    let Some(upper) = color(upper_palette, patch.trns.as_deref().or(page.trns.as_deref()), above) else { return below; };
+    let mixed_alpha = lower[3] * (1.0 - opacity) + upper[3] * opacity;
+    let target: [f64; 4] = std::array::from_fn(|i| {
+        if i < 3 && mixed_alpha > 0.0 {
+            (lower[i] * lower[3] * (1.0 - opacity) + upper[i] * upper[3] * opacity) / mixed_alpha
+        } else { lower[i] * (1.0 - opacity) + upper[i] * opacity }
+    });
+    (0..(palette.len() / 3).min(1usize << page.depth.bits()))
+        .map(|index| {
+            let candidate = color(palette, page.trns.as_deref(), index as u16).unwrap();
+            let distance: f64 = candidate.iter().zip(target).map(|(a, b)| (a - b).powi(2)).sum();
+            (index as u16, distance)
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map_or(below, |(index, _)| index)
 }
 
 /// Every pixel where two rasters of the same geometry differ.
@@ -309,6 +368,73 @@ mod tests {
             visible: true,
             provenance: provenance(),
         }
+    }
+
+    #[test]
+    fn translucent_layer_does_not_darken_over_transparent_pixels() {
+        let page = Raster {
+            width: 4, height: 4, mode: ColorMode::GrayAlpha, depth: BitDepth::Eight,
+            icc: None, trns: None, srgb_intent: None, palette: None,
+            data: vec![0; 32],
+        };
+        let mut patch = synthetic_patch(&page, Rect::new(0, 0, 4, 4));
+        patch.provenance.params_snapshot = serde_json::json!({"layer": {"opacity": 50}});
+        let result = composite(&page, &[patch]).unwrap();
+        assert_eq!(result.sample(1, 1, 0), 255);
+        assert_eq!(result.sample(1, 1, 1), 128);
+        assert_eq!(result.sample(0, 0, 1), 0);
+    }
+
+    #[test]
+    fn partial_opacity_blends_colors_instead_of_palette_positions() {
+        let page = Raster {
+            width: 4, height: 4, mode: ColorMode::Indexed, depth: BitDepth::Eight,
+            icc: None, trns: None, srgb_intent: None,
+            // A deliberately non-monotonic palette: index arithmetic would
+            // blend black (0) + white (2) into bright red (1), not gray (3).
+            palette: Some(vec![0, 0, 0, 255, 0, 0, 255, 255, 255, 128, 128, 128]),
+            data: vec![0; 16],
+        };
+        let mut patch = synthetic_patch(&page, Rect::new(0, 0, 4, 4));
+        patch.pixels.data.fill(2);
+        patch.provenance.params_snapshot = serde_json::json!({"layer": {"opacity": 50}});
+        let result = composite(&page, std::slice::from_ref(&patch)).unwrap();
+        assert_eq!(result.sample(1, 1, 0), 3);
+        assert_eq!(result.sample(0, 0, 0), 0);
+        assert_eq!(result.palette, page.palette);
+        let crop = composite_region(&page, &[patch], Rect::new(1, 1, 1, 1), None).unwrap();
+        assert_eq!(crop.sample(0, 0, 0), 3);
+    }
+
+    #[test]
+    fn saved_layer_transform_and_opacity_match_flattened_export() {
+        use crate::export::{export_page, Target};
+        use crate::image::{decode, encode, Format};
+        let page = fixtures::by_name("l8").raster;
+        let mut patch = synthetic_patch(&page, Rect::new(8, 8, 8, 6));
+        patch.provenance.params_snapshot = serde_json::json!({"layer": {
+            "opacity": 50, "offsetX": 20, "offsetY": 12,
+            "rotation": 90.0, "locked": true
+        }});
+        let presented = patch.presented();
+        assert_eq!(presented.layer_style().opacity, 50);
+        assert!(presented.layer_style().locked);
+        assert_ne!(presented.mask.bounds, Rect::new(8, 8, 8, 6));
+
+        let composed = composite(&page, std::slice::from_ref(&presented)).unwrap();
+        assert_eq!(composed.sample(10, 10, 0), page.sample(10, 10, 0));
+        let (x, y) = (presented.mask.bounds.x..presented.mask.bounds.right())
+            .flat_map(|x| (presented.mask.bounds.y..presented.mask.bounds.bottom()).map(move |y| (x, y)))
+            .find(|&(x, y)| presented.mask.contains(x, y)).unwrap();
+        let local = ((x - presented.mask.bounds.x) as u32, (y - presented.mask.bounds.y) as u32);
+        let expected = (page.sample(x as u32, y as u32, 0) as f64 * 0.5
+            + presented.pixels.sample(local.0, local.1, 0) as f64 * 0.5).round() as u16;
+        assert_eq!(composed.sample(x as u32, y as u32, 0), expected);
+
+        let source = encode(&page, Format::Png).unwrap();
+        let exported = export_page(&source, &[presented], Target::SameAsSource).unwrap();
+        let flattened = decode(&exported.bytes).unwrap();
+        assert_eq!(flattened.data, composed.data);
     }
 
     #[test]

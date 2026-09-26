@@ -115,15 +115,17 @@ two is on. Japanese can turn on the optional OCR rescue; it is off unless you ch
 will not open says so and goes on without it. With Outside bubbles set to clean and only some languages on, regions
 outside a balloon are held, because nothing checks their language.
 
-### Text-shaped review (optional)
+### Detection model combinations and page review
 
-A second, optional way to clean a page, for lettering that a box-shaped mask handles badly. It is off unless you set
-the workflow policy to **All text** in Settings, Detection, and it needs graphs you import yourself: the SAM-TS-L
-lettering model under **Shape the removal mask** (two ONNX graphs, local import only, never an app download), plus the
-region finder. It reads no language and opens neither the script checker nor the Japanese reader. The SFX finder is not
-part of this version.
+Settings and first-launch setup let you select Comic Text Detector (CTD), one RT-DETR v2 profile (small or full),
+SAM-TS-L, or any combination of these. The selected models drive Auto clean. Under **All text**, a run cleans found
+text across the page without the script checker or Japanese OCR reader; under **Legacy script filtering**, the source
+language Clean/Skip choices still apply. RT-only detection can produce broad region masks, so inspect results before
+export. The full RT-DETR graph is a managed download. SAM-TS-L setup downloads its pinned checkpoint and source,
+exports the two ONNX graphs locally, and verifies their hashes before installation. A local graph import remains
+available if automatic setup fails. COO SFX detection is not part of this version.
 
-The editor then offers **Text-shaped review** for the current page. The analysis finds regions and draws the lettering
+The editor also offers **Text-shaped review** for the current page. The analysis finds regions and draws the lettering
 pixels, and the review lists every component, including ones no region claimed, so nothing is dropped silently. The
 tinted area is the exact set of pixels a clean may change; the box around it only helps you find it. Padding (0 px by
 default, up to 64 px) grows that area evenly around the lettering, and add and remove brushes correct it; both are
@@ -392,10 +394,10 @@ cloud, and the local FLUX helper remains its own separate engine choice.
 
 Setting up a cloud GPU uses your own Modal or Beam account, which bills you directly. You can start from **Set up with
 Modal or Beam** on the Cloud tab, or from step 4 of the first-launch setup. After you paste a Modal token or Beam API
-key, the app presents a plan for approval showing the GPU type, idle timeout, cost notes, and the about 5.5 GB weight
-download into your account. Nothing is created until you approve it. A bundled helper then creates, in your account, a
-volume for the model weights (seeded on a CPU, never on the GPU), job storage, a GPU worker running the same FLUX.2
-Klein 4B recipe as the local helper, and a gateway that the provider opens only to calls carrying the endpoint's
+key, choose FLUX.2 Klein 4B or 9B and optional SAM-TS-L/RT-DETR analysis models. The app presents a plan for approval
+showing the GPU type, idle timeout, cost notes, and selected weight downloads. Nothing is created until you approve it.
+A bundled helper then creates, in your account, a volume for model weights (seeded on a CPU), job storage, an on-demand
+FLUX worker, a separate on-demand analysis worker when selected, and a gateway that the provider opens only to calls carrying the endpoint's
 credential; it checks the new endpoint, and the app saves it and selects it as your cloud GPU. For Modal, setup also
 creates an access token that can only call that endpoint, and your Modal token is not kept. Beam has no separate access
 token, so the endpoint is called with your own Beam API key. Either one is kept in the operating system's credential
@@ -406,8 +408,15 @@ stopped without redoing what is done. Removing an endpoint takes it off this com
 delete its cloud resources: then the app lists what will be deleted, including the model weights, and deletes only what
 this app created. You can also connect an existing public HTTPS endpoint by hand under **Connect an existing endpoint**.
 
-When enabled and an endpoint is ready, **Cloud** can be selected as the engine in Content-aware fill, or from a Layers
-row or region menu under **Clean with**, including **Try again** on a cloud region. Every cloud render asks first, every
+GPU workers scale to zero after the chosen idle timeout. Analysis capabilities appear only after the selected graphs
+pass size and SHA-256 verification. CTD remains local.
+
+The **Cloud cost** panel sits above memory reporting. It shows this device's recorded monthly and session charges,
+and marks missing prices or unreadable records as unknown. Optional Modal billing access shows workspace-wide metered
+usage before credits and the change since billing was connected; these provider updates can be delayed. Billing
+credentials are session-only unless saved explicitly, and **Disconnect billing and forget token** removes them.
+
+When enabled and an endpoint is ready, its FLUX model appears alongside local models, with a leading cloud icon, in the AI mask brush and Layers/region **Clean with** menus. **Try again** on a cloud region uses its cloud endpoint. Every cloud render asks first, every
 time, in a dialog ("Send this region to your cloud GPU?"): it states what is sent (a crop of a given size around the
 region and its mask, while the rest of the page and project stay local), the destination endpoint, and the cost billed
 by your provider. A confirmation allows that one render and nothing else, and nothing is sent without one.
@@ -451,8 +460,7 @@ chapter is open.
 | `2` | Brush |
 | `3` | Shapes |
 | `4` | AI mask brush |
-| `5` | Content-aware fill |
-| `6` | Clone / heal |
+| `5` | Clone / heal |
 | `O` (held) | Show the original while held |
 | `Shift`+`O` | Pin the original on |
 | `M` | Mask overlay |

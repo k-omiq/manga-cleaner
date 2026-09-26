@@ -30,6 +30,7 @@ import { draft, beginDraft, resetDraftState } from './draft.svelte.js'
 import { commitDraft } from './drawing.svelte.js'
 import { deleteRow } from './maskactions.svelte.js'
 import { applyActiveToolToRegion } from './toolapply.svelte.js'
+import { setDetectorModels, setTextPolicy } from '../state/session.svelte.js'
 import { requestCloudConsent, runCloudJob } from './cloudflow.svelte.js'
 
 /** A page holding whatever regions a case needs. */
@@ -1154,6 +1155,32 @@ describe('content-aware fill on region click', () => {
     expect(spec.tool).toBe('contentAwareFill')
     expect(spec.regionId).toBe('r1')
     expect(editor.selectionId).toBe('r1')
+  })
+})
+
+describe('Auto clean on an existing region', () => {
+  afterEach(() => {
+    setDetectorModels(['ctd', 'rtSmall'])
+    setTextPolicy('legacy_gate')
+    setBackend(null)
+    editor.chapter = null
+  })
+
+  it('passes the selected all-text detector combination into the run', async () => {
+    editor.tool = 'autoClean'
+    editor.chapter = chapterWith([{ id: 'r1', pageId: 'c1-p001', bbox: { x: 10, y: 10, w: 20, h: 20 },
+      detected: true, outcome: 'unclean' }])
+    setDetectorModels(['samTs', 'rtFull'])
+    setTextPolicy('all_text')
+    const adapter = backend()
+    setBackend(/** @type {any} */ (adapter))
+
+    await applyActiveToolToRegion('r1')
+    expect(adapter.applyTool).toHaveBeenCalledWith(expect.objectContaining({
+      tool: 'autoClean', params: expect.objectContaining({
+        detectorModels: ['rtFull', 'samTs'], textPolicy: 'all_text',
+      }),
+    }))
   })
 })
 

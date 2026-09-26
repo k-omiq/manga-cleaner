@@ -47,6 +47,7 @@ pub struct LoadedModel {
     pub id: u64,
     /// e.g. `models.kind.inpainter`.
     pub kind_key: &'static str,
+    pub model_name: Option<String>,
     /// Roughly how much memory it is holding. See `basis`.
     pub bytes: u64,
     /// How `bytes` was arrived at: `measured`, `weights` or `reported`. The
@@ -76,6 +77,7 @@ fn row(loaded: registry::Loaded) -> LoadedModel {
     LoadedModel {
         id: loaded.id,
         kind_key: loaded.kind.label_key(),
+        model_name: loaded.model_name,
         bytes: loaded.bytes,
         basis: basis_key(loaded.basis),
         device_key: loaded.device.label_key,

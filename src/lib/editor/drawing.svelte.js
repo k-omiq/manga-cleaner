@@ -190,6 +190,21 @@ export function paintedShape(spec) {
   if (!box) return null
   const feather = Math.max(0, Number((spec.params ?? paramsOf(spec.tool)).feather ?? 0) || 0)
 
+  if (spec.kind === 'line') {
+    const points = (spec.points?.length ?? 0) >= 2
+      ? spec.points.filter((point) => point && Number.isFinite(point.x) && Number.isFinite(point.y))
+      : [
+          { x: box.x, y: box.y },
+          { x: box.x + box.w, y: box.y + box.h },
+        ]
+    if (points.length < 2) return null
+    return {
+      kind: 'line',
+      points: [place(points[0]), place(points.at(-1))],
+      feather: Math.max(0.5, Number(spec.params?.outlineWidth ?? 2) / 2),
+    }
+  }
+
   // A rectangle and an ellipse are their box: the drag says two corners, and
   // the keyboard route says a rectangle outright. The corners travel anyway,
   // so one payload describes all four shapes and the backend has one parser.

@@ -87,6 +87,11 @@ class DeploymentKnobsTest(unittest.TestCase):
 
 
 class ModalSettingsTest(unittest.TestCase):
+    def test_selected_analysis_models_round_trip_without_gpu_start(self) -> None:
+        settings = ModalSettings.for_installation("mc-a", "mc-a", analysis_models=("text_regions_rt@1", "text_mask_sam_ts@1"))
+        self.assertEqual(settings.analysis_models, ("text_mask_sam_ts@1", "text_regions_rt@1"))
+        self.assertEqual(ModalSettings.from_env(settings.to_env()), settings)
+
     def test_names_and_env_round_trip(self) -> None:
         settings = ModalSettings.for_installation("mc-ab12cd", "mc-ab12cd", gpu="a10", idle_seconds=300)
         self.assertEqual(
@@ -108,6 +113,12 @@ class ModalSettingsTest(unittest.TestCase):
 
 
 class BeamSettingsTest(unittest.TestCase):
+    def test_selected_analysis_worker_has_its_own_deployment_and_url(self) -> None:
+        settings = BeamSettings.for_installation("mc-a", "mc-a", analysis_models=("text_regions_rt@1",))
+        self.assertEqual(settings.deployment_names["analysis"], "mc-a-analysis")
+        linked = settings.with_analysis_url("https://example.invalid/analysis")
+        self.assertEqual(BeamSettings.from_env(linked.to_env()), linked)
+
     def test_names_and_env_round_trip(self) -> None:
         settings = BeamSettings.for_installation("mc-ab12cd", "mc-ab12cd", gpu="a10g", idle_seconds=90)
         self.assertEqual(
@@ -162,6 +173,10 @@ class BeamStagingTest(unittest.TestCase):
                     "deploy/cloud/beam/backend.py",
                     "deploy/cloud/beam/routes.py",
                     "deploy/cloud/beam/settings.py",
+                    "deploy/cloud/beam/analysis_backend.py",
+                    "analysis-source/bootstrap.py",
+                    "analysis-source/export_mask.py",
+                    "analysis-source/synthetic_page.png",
                 ]
                 + common
             )
@@ -250,9 +265,23 @@ class ModalAppImportTest(unittest.TestCase):
             functions = sorted(app.registered_functions)
             classes = sorted(app.registered_classes)
         self.assertEqual(app.name, "mc-ab12cd")
-        self.assertEqual(functions, ["Worker.*", "gateway", "seed_weights"])
-        self.assertEqual(classes, ["Worker"])
+        self.assertEqual(functions, ["AnalysisGPU.*", "Worker.*", "gateway", "seed_weights"])
+        self.assertEqual(classes, ["AnalysisGPU", "Worker"])
         self.assertEqual(self.module.SETTINGS, self.settings)
+
+    def test_selected_analysis_capability_is_baked_into_modal_app(self) -> None:
+        settings = ModalSettings.for_installation("mc-rt", "mc-rt", analysis_models=("text_regions_rt@1", "text_mask_sam_ts@1"))
+        env = {**settings.to_env(), "MODAL_CONFIG_PATH": str(Path(self._tmp.name) / "absent.toml"),
+               "MODAL_SERVER_URL": "http://127.0.0.1:9"}
+        sys.modules.pop("deploy.cloud.modal.app", None)
+        with patched_environ(env), warnings.catch_warnings():
+            warnings.simplefilter("error")
+            selected = importlib.import_module("deploy.cloud.modal.app")
+        self.assertEqual(selected.SETTINGS.analysis_models, ("text_mask_sam_ts@1", "text_regions_rt@1"))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.assertIn("AnalysisGPU", selected.app.registered_classes)
+        self.assertEqual(selected.AnalysisGPU.__name__, "AnalysisGPU")
 
     def test_only_the_deploy_sources_are_uploaded(self) -> None:
         shipped = self.module._not_shipped
@@ -310,19 +339,22 @@ class BeamAppImportTest(unittest.TestCase):
         cls._tmp.cleanup()
 
     def test_handlers(self) -> None:
-        seed, render, gateway = (getattr(self.module, name).parent for name in ("seed", "render", "gateway"))
+        seed, render, analyze, gateway = (getattr(self.module, name).parent for name in ("seed", "render", "analyze", "gateway"))
         self.assertEqual((seed.name, render.name, gateway.name), ("mc-ab12cd-seed", "mc-ab12cd-worker", "mc-ab12cd-gateway"))
+        self.assertEqual(analyze.name, "mc-ab12cd-analysis")
         self.assertEqual(render.gpu, "RTX5090")
+        self.assertEqual(analyze.gpu, "RTX5090")
         self.assertFalse(seed.gpu)
         self.assertFalse(gateway.gpu)
         self.assertEqual((render.keep_warm_seconds, render.task_policy.max_retries), (180, 0))
         self.assertEqual((render.task_policy.timeout, seed.task_policy.timeout), (600, 3600))
-        self.assertTrue(all(h.authorized for h in (seed, render, gateway)))
+        self.assertEqual((analyze.task_policy.timeout, analyze.task_policy.max_retries), (180, 0))
+        self.assertEqual(analyze.on_start, "mc_beam_app:load_analysis_worker")
+        self.assertTrue(all(h.authorized for h in (seed, render, analyze, gateway)))
         self.assertEqual(render.on_start, "mc_beam_app:load_worker")
         self.assertEqual([s.name for s in gateway.secrets], ["MC_MC_AB12CD_TOKEN"])
-        for handler in (seed, render):
+        for handler in (seed, render, analyze, gateway):
             self.assertEqual([(v.name, v.mount_path) for v in handler.volumes], [("mc-ab12cd-weights", "./weights")])
-        self.assertEqual(gateway.volumes, [])
         self.assertIn("MC_BEAM_GPU=RTX5090", gateway.env)
 
     def test_gpu_image_pins(self) -> None:

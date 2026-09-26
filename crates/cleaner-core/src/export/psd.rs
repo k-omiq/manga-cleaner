@@ -437,6 +437,7 @@ struct Layer<'a> {
     channels: Vec<Channel<'a>>,
     mask: Option<&'a Mask>,
     hidden: bool,
+    opacity: u8,
     /// `lsct` kind, for a group or a divider.
     section: Option<u32>,
 }
@@ -451,6 +452,7 @@ fn layers_of<'a>(doc: &Document<'a>) -> Vec<Layer<'a>> {
         Rect::new(0, 0, page.width, page.height),
         None,
         false,
+        255,
     )];
     if doc.regions.is_empty() {
         return layers;
@@ -467,6 +469,7 @@ fn layers_of<'a>(doc: &Document<'a>) -> Vec<Layer<'a>> {
             region.mask.bounds,
             Some(&region.mask),
             !region.visible,
+            ((u16::from(region.layer_style().opacity) * 255 + 50) / 100) as u8,
         ));
     }
     layers.push(empty_layer(
@@ -497,6 +500,7 @@ fn pixel_layer<'a>(
     rect: Rect,
     mask: Option<&'a Mask>,
     hidden: bool,
+    opacity: u8,
 ) -> Layer<'a> {
     let mut channels: Vec<Channel<'a>> = channel_ids(raster.mode)
         .into_iter()
@@ -518,6 +522,7 @@ fn pixel_layer<'a>(
         channels,
         mask,
         hidden,
+        opacity,
         section: None,
     }
 }
@@ -541,6 +546,7 @@ fn empty_layer<'a>(name: String, mode: ColorMode, section: u32) -> Layer<'a> {
             .collect(),
         mask: None,
         hidden: false,
+        opacity: 255,
         section: Some(section),
     }
 }
@@ -560,7 +566,7 @@ fn record(layer: &Layer, depth: BitDepth) -> Result<Vec<u8>, ExportError> {
     } else {
         b"norm"
     });
-    r.push(255); // opacity
+    r.push(layer.opacity);
     r.push(0); // clipping: base
     let mut flags = FLAG_HAS_BIT4;
     if layer.hidden {

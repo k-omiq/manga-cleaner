@@ -125,6 +125,33 @@ export const en = {
     // half of each sentence here is the same guarantee `notice.cloud.blocked`
     // makes, so it says nothing is sent, not merely that cloud is off.
     cloud: {
+    usage: {
+      title: 'Cloud cost',
+      connectTitle: 'Connect Modal billing',
+      connectHelp: 'Use a Modal API token with permission to read billing. It is kept only for this app session unless you choose the system keychain. Endpoint proxy tokens cannot read billing.',
+      tokenId: 'Modal API token ID',
+      tokenSecret: 'Modal API token secret',
+      remember: 'Remember in the system keychain',
+      connect: 'Connect Modal billing',
+      disconnect: 'Disconnect billing and forget token',
+      disconnectFailed: 'Could not remove the billing token. Try again before removing this endpoint.',
+      connecting: 'Connecting…',
+      connectFailed: 'Could not connect to Modal billing. Check the token permissions and try again.',
+      workspace: 'Modal workspace: {name}',
+      workspaceMonth: 'Metered this month (UTC)',
+      billingChange: 'Since billing connected',
+      billingScope: 'Workspace-wide metered usage before credits. The change since connection follows delayed provider updates and can include earlier activity.',
+      billingFailed: 'Modal billing is unavailable. Check API token permissions and connectivity.',
+      month: 'This month',
+      session: 'This session',
+      unreported: 'Not reported',
+      unavailable: 'Usage is unavailable. Retrying…',
+      loading: 'Loading usage…',
+      requests: '{month} requests this month · {session} this session',
+      unpriced: 'Price not reported: {month} this month · {session} this session.',
+      incomplete: 'Some saved attempts could not be counted.',
+      scope: 'Reported charges for this app on this device. Provider storage, idle GPU time, and other account usage may add charges. Session starts when the app launches.',
+    },
       label: 'Cloud GPU',
       descriptionOff: 'Off. Nothing from your pages is sent to a cloud provider. Turn it on and set up a GPU on the Cloud tab.',
       descriptionOn: 'On. Each cloud render asks first and says what it sends. The switch and your endpoints are on the Cloud tab.',
@@ -172,7 +199,11 @@ export const en = {
           lead: 'Setup will create these in your {providerKey} account:',
           workspace: 'Workspace',
           model: 'Cloud model',
-          modelNote: 'This version supports this cloud model. Choose the GPU and idle time below before you approve setup.',
+          modelNote: 'Choose the cloud model, GPU and idle time before you approve setup. Changing the model downloads a separate checkpoint.',
+          modelLicense: 'Model license: {license}. Check its terms before using it for your work.',
+          analysisModels: 'Cloud analysis models',
+          analysisNote: 'Select Full RT-DETR, SAM-TS-L, or both for cloud review. CTD runs locally. Setup installs selected graphs; GPU analysis starts only when requested.',
+          analysisWeights: 'Selected analysis graphs add about {size} GB of stored data. SAM-TS-L also uses CPU time to export its graphs during setup.',
           gpu: 'GPU',
           idle: 'Stay on after a render',
           idleOption: {
@@ -313,6 +344,17 @@ export const en = {
       label: 'Folder',
       chooserTitle: 'AI redraw (FLUX) folder',
       notFound: 'No engine found in this folder.',
+      install: 'Install FLUX helper and 4B model',
+      installing: 'Installing FLUX…',
+      installFailed: 'FLUX setup failed: {detail}',
+      accelerator: 'GPU runtime for installation',
+      acceleratorAuto: 'Automatic',
+      stage: {
+        environment: 'Creating the helper environment…',
+        dependencies: 'Installing the model runtime…',
+        weights: 'Downloading model weights…',
+        ready: 'Finishing setup…',
+      },
     },
     fluxBackend: {
       label: 'Backend',
@@ -332,13 +374,14 @@ export const en = {
     // the lines that describe the same choice.
     detection: {
       languages: 'Source languages',
-      languagesAllText: 'Source-language choices apply only to legacy filtering. All-text review does not read the language.',
+      languagesAllText: 'All-text cleaning applies the selected detection models across the page; source language does not limit it.',
+      selectedModels: 'Selected combination: {models}',
       download: 'Download {bytes:memory}',
       capability: {
         findRegions: 'Find regions',
         findRegionsNote: 'Locate lettering and speech bubbles on the page.',
         shapeMask: 'Shape the removal mask',
-        shapeMaskNote: 'Turn found lettering into the exact pixels a clean may change. Only the optional text-shaped review uses it.',
+        shapeMaskNote: 'SAM-TS-L draws a lettering mask for automatic cleaning or page review when selected.',
         sfx: 'Optional SFX finder',
         sfxNote: 'Would group sound effects drawn outside speech bubbles. Not part of this version.',
         japanese: 'Optional Japanese filtering and rescue',
@@ -351,13 +394,13 @@ export const en = {
         coo: 'SFX finder',
       },
       role: {
-        ctd: 'Finds lettering for legacy cleaning.',
-        rtSmall: 'Finds speech bubbles for legacy cleaning, and regions for the review’s small whole-page profile.',
-        rtFull: 'Optional. Finds regions for the review’s full two-tile profile. Local import only, never an app download.',
-        samTs: 'Draws lettering pixels for the text-shaped review, with no OCR. Local import only, never an app download.',
+        ctd: 'Finds lettering for automatic cleaning and page review.',
+        rtSmall: 'Finds speech bubbles and text regions for automatic cleaning and page review.',
+        rtFull: 'Finds larger page regions with the full two-tile profile. Downloaded when selected.',
+        samTs: 'Draws lettering pixels for automatic cleaning and page review, with no OCR. Setup downloads and exports its graphs locally.',
         coo: 'Excluded. Its published terms do not clear redistribution or commercial use, so the app has no download, import or run path for it.',
-        scriptGate: 'Keeps legacy cleaning to the languages you choose. All-text review never opens it.',
-        mangaOcr: 'Reads Japanese the script filter could not decide on. Never needed for cleaning.',
+        scriptGate: 'Keeps legacy cleaning to the source languages you choose. All-text cleaning does not use it.',
+        mangaOcr: 'Optionally resolves uncertain Japanese script decisions during legacy cleaning.',
       },
       // Under the OCR rescue switch, only while it is on and cannot run.
       rescue: {
@@ -370,12 +413,12 @@ export const en = {
         nothing: 'Every language is skipped, so legacy cleaning removes nothing.',
         legacy: 'Legacy cleaning has every model it needs.',
         legacyMissing: 'Legacy cleaning needs {bytes:memory} of downloads before it can run.',
-        allText: 'Text-shaped review has every model it needs. Auto clean opens it from the editor.',
-        allTextMissing: 'Text-shaped review needs {bytes:memory} of downloads.',
-        allTextImport: 'Text-shaped review needs the SAM-TS-L graphs. Import them under Shape the removal mask.',
-        allTextSamMismatch: 'The SAM-TS-L graphs failed their checksum, so text-shaped review cannot use them. Import them again under Shape the removal mask.',
+        allText: 'All-text automatic cleaning has every selected detection model it needs.',
+        allTextMissing: 'All-text cleaning needs {bytes:memory} of downloads.',
+        allTextImport: 'All-text cleaning needs SAM-TS-L graphs. Install them under Shape the removal mask.',
+        allTextSamMismatch: 'The SAM-TS-L graphs failed their checksum. Install them again under Shape the removal mask.',
         // Free memory changes, so this says what to do rather than what is missing.
-        allTextMemory: 'SAM-TS-L needs about 10 GB of free memory, and this computer has less free right now. Close other apps, then open the review.',
+        allTextMemory: 'SAM-TS-L needs about 10 GB of free memory, and this computer has less free right now. Close other apps before cleaning or reviewing.',
         // After the line above, so "it" is the workflow that line names. A
         // native run refuses to start without the runtime, so the row is not
         // complete while one of these shows.
@@ -393,7 +436,7 @@ export const en = {
       review: {
         summary: 'Text-shaped review',
         optional: 'Optional mode',
-        note: 'Analyses one page with RT-DETR and SAM-TS-L and writes only the pixels you approve. Legacy cleaning stays the default.',
+        note: 'Analyses one page with the selected detection models. Any component write still needs explicit approval and qualified write support.',
       },
       sam: {
         memory: 'Needs about 10 GB of free memory to run.',
@@ -403,8 +446,8 @@ export const en = {
         chooserTitle: 'The pinned full RT-DETR v2 detector.onnx',
       },
       // Setup's detection step.
-      setupReview: 'The optional text-shaped review is set up later, in Settings > Detection, by importing its model graphs.',
-      setupAllText: 'Automatic cleaning is set to all-text review. These choices apply when you switch back to legacy filtering in Settings.',
+      setupReview: 'The selected models also support optional page review in Settings > Detection.',
+      setupAllText: 'Automatic cleaning will use this model combination across the page, without source-language filtering.',
     },
     cleaning: {
       capability: {
@@ -448,13 +491,13 @@ export const en = {
       remove: {
         keep: 'Keep',
         inUse: 'Automatic cleaning uses it now.',
-        ctd: 'Delete the text finder? Legacy automatic cleaning stops working until you download it again.',
-        rtSmall: 'Delete the speech bubble finder? Legacy automatic cleaning and the text-shaped review’s small whole-page profile stop working until you download it again.',
-        rtFull: 'Delete the imported full region finder? The text-shaped review’s full two-tile profile stops working until you import it again.',
-        samTs: 'Delete the imported SAM-TS-L graphs? The text-shaped review cannot draw lettering masks until you import them again.',
+        ctd: 'Delete Comic Text Detector (CTD)? Any selected cleaning or review combination that uses it stops until you download it again.',
+        rtSmall: 'Delete RT-DETR v2 small? Any selected cleaning or review combination that uses it stops until you download it again.',
+        rtFull: 'Delete RT-DETR v2 full? Any selected cleaning or review combination that uses it stops until you download it again.',
+        samTs: 'Delete SAM-TS-L graphs? Any selected cleaning or review combination that uses them stops until you install them again.',
         scriptGate: 'Delete script filtering, both files? Legacy automatic cleaning stops working until you download it again. The speech bubble finder is kept.',
         mangaOcr: 'Delete the Japanese OCR rescue, all three files? Legacy cleaning keeps running without the rescue. The speech bubble finder is kept.',
-        lama: 'Delete the redraw model? LaMa redraw stops working until you download it again.',
+        lama: 'Delete LaMa Manga? LaMa Manga cleaning stops working until you download it again.',
         // Not `other`: that name would read the block as plural forms.
         file: 'Delete {name}? Anything that needs it stops working until you download it again.',
       },
@@ -491,6 +534,7 @@ export const en = {
       },
       action: {
         download: 'Download',
+        install: 'Install automatically',
         cancel: 'Cancel',
         delete: 'Delete',
         // Throws away the unfinished download the line above reports, and
@@ -1051,7 +1095,6 @@ export const en = {
       runOnPage: 'Run on page',
       runOnProject: 'Run on project',
       textShapeReview: 'Text-shaped review',
-      reviewText: 'Review text masks',
       cancelRun: 'Cancel run',
     },
     readout: {
@@ -1429,29 +1472,30 @@ export const en = {
     // the reader came here worried about.
     title: 'Using memory now',
     kind: {
-      textDetector: 'Text finder',
-      balloonDetector: 'Speech bubble finder',
-      scriptGate: 'Language checker',
+      textDetector: 'Comic Text Detector (CTD)',
+      balloonDetector: 'RT-DETR v2',
+      fullRt: 'RT-DETR v2 full',
+      scriptGate: 'ogkalu Image Script Identification',
       // Its labels ship as a second file and the two must match: a gate with
       // the wrong labels is not a gate. Named separately because Settings
       // lists one row per *file*, and a row with no name is a row nobody can
       // decide about.
-      scriptGateLabels: 'Language checker labels',
+      scriptGateLabels: 'Image Script Identification labels',
       // The gate's rescue reader. Named for what it does rather
       // than for what it is: it reads the Japanese in a balloon the language
       // checker could not make out, so that an ordinary line of dialogue is
       // cleaned instead of landing in review. Three files, three rows in
       // Settings, one name between them plus two that say which part - the
       // same shape the language checker and its labels have.
-      ocr: 'Japanese text reader',
-      ocrDecoder: 'Japanese text reader, second part',
-      ocrVocab: 'Japanese text reader characters',
+      ocr: 'Manga OCR',
+      ocrDecoder: 'Manga OCR decoder',
+      ocrVocab: 'Manga OCR vocabulary',
       // Rung 2. "Redraw" is the word the tools already use for what an
       // inpainter does to the paper under the text.
-      inpainter: 'Redraw model',
+      inpainter: 'LaMa Manga',
       // Rung 3a, which is a separate program on the machine and is the only
       // row that can be holding several gigabytes.
-      sidecar: 'AI redraw helper',
+      sidecar: 'FLUX',
     },
     value: {
       // `{bytes:memory}` - see `FORMATS.memory` in src/lib/i18n/index.js.
@@ -1472,7 +1516,7 @@ export const en = {
     action: {
       // A per-row button, so the name of what is being closed is in the label
       // rather than only in the row above it.
-      unload: 'Free the memory {nameKey} is using',
+      unload: 'Free the memory {name} is using',
     },
     hint: {
     },
@@ -1492,6 +1536,7 @@ export const en = {
   pipelines: {
     detection: 'Detection',
     cleaning: 'Cleaning',
+    clean: 'Clean',
     language: {
       ja: 'Japanese',
       zh: 'Chinese',
@@ -1503,18 +1548,19 @@ export const en = {
     workflow: {
       policy: 'Automatic cleaning text policy',
       legacyGate: 'Legacy script filtering',
-      allText: 'All text · open text-shaped review',
+      allText: 'All text · automatic cleaning',
       // Under the policy picker, one per policy.
-      policyDescriptionLegacy: 'Legacy filtering finds lettering with CTD and RT-DETR, and a script filter keeps the removal to the languages you choose below.',
-      policyDescriptionAllText: 'All text uses local RT-DETR and SAM-TS review with no recognition. Each component requires exact write-support approval.',
+      policyDescriptionLegacy: 'The selected detection models find text and regions; script filtering keeps removal to the languages you choose below.',
+      policyDescriptionAllText: 'The selected detection models clean found text across the page without language filtering. Review remains available when you want to approve regions.',
       ocrRescue: 'Use optional Japanese OCR rescue',
-      ocrRescueDescription: 'Only rescues uncertain Japanese script decisions in legacy filtering. It never runs in all-text review.',
+      ocrRescueDescription: 'Only rescues uncertain Japanese script decisions in legacy filtering. It never runs in all-text cleaning.',
       ratingsNote: 'Engine ratings are provisional estimates, not measurements from one shared benchmark.',
     },
     cleaner: {
       lamaManga: 'Fast redraw tuned for manga tone',
       bigLama: 'Larger LaMa for wide areas',
       flux: 'AI redraw through the FLUX helper',
+      fluxCloud: 'AI redraw on your cloud GPU',
       qwen: 'Instruction-based image editing',
     },
     column: {
@@ -1533,9 +1579,10 @@ export const en = {
       // A FLUX model the helper lists: nothing to download here.
       found: 'Via helper',
       needsHelper: 'Needs helper',
+      cloudSetup: 'Available in cloud setup',
     },
     skip: 'Skip',
-    detectorFor: 'Detector for {language}',
+    detectorFor: 'Clean {language}',
   },
   onboarding: {
     title: 'Set up Manga Cleaner',
@@ -1576,7 +1623,7 @@ export const en = {
     },
     detection: {
       heading: 'Detection',
-      body: 'Choose a detector for each language. Skip a language to skip its files.',
+      body: 'Choose the detection models above, then choose which source languages to clean. Skip a language to leave it untouched.',
     },
     cleaning: {
       heading: 'Cleaning',
@@ -1662,7 +1709,7 @@ export const en = {
     rung: {
       fill: 'Planar fill',
       denoise: 'Denoise',
-      lama: 'manga-LaMa',
+      lama: 'LaMa Manga',
       // The optional rung 3a. Never bundled, never
       // on the default path - but a patch it produced still names it, so a
       // project made on a machine with the sidecar reads correctly on one
@@ -1722,10 +1769,6 @@ export const en = {
     sub: {
       noMask: 'nothing applied',
     },
-    origin: {
-      hand: 'hand',
-      auto: 'automatic',
-    },
     fillMode: {
       matchSurround: 'Match surround',
       reconstruct: 'Reconstruct',
@@ -1733,12 +1776,11 @@ export const en = {
     },
     provenance: {
       engine: 'Engine',
-      modelVersion: 'Model',
+      model: 'Model',
       fillMode: 'Fill',
       elapsed: 'Elapsed',
       cloudCost: 'Cost',
       cloudRequestId: 'Request',
-      origin: 'Origin',
       flagged: 'Flagged',
       applied: 'Applied',
       detected: 'Detected',
@@ -1763,7 +1805,7 @@ export const en = {
     engineChoice: {
       fill: 'Fill',
       denoise: 'Denoise fill',
-      lama: 'LaMa',
+      lama: 'LaMa Manga',
       // Rung 3a, offered only where the sidecar is
       // actually installed - `rowEngines` in `src/lib/model/masks.js`.
       flux: 'FLUX',
@@ -1792,6 +1834,12 @@ export const en = {
       engineHint: 'Replace this layer using another engine, from the layers below it',
       showOnPage: 'Show on page',
       cleanAnyway: 'Clean anyway',
+      approve: 'Approve and clean',
+      opacity: 'Layer opacity',
+      locked: 'Lock position',
+      moveX: 'Move horizontally (px)',
+      moveY: 'Move vertically (px)',
+      rotation: 'Rotation (degrees)',
     },
     menu: {
       // The right-click menu's own name, for a screen reader announcing it.
@@ -1808,6 +1856,7 @@ export const en = {
       deleteRegion: 'a region dismissed',
       rerunMask: 'a mask re-run',
       cleanAnyway: 'a gate-skipped region cleaned',
+      layerStyle: 'layer appearance changed',
     },
   },
 
@@ -1833,7 +1882,6 @@ export const en = {
       brush: 'drag to paint',
       shapes: 'drag on the page',
       aiMaskBrush: 'stroke over text',
-      contentAwareFill: 'click a mask',
       // `{cloneSourceModifier}` is a context param, not one this call site
       // passes: the tool bar renders `t(spec.hintKey)` over a key the tool
       // table chose, and the modifier is a preference. See `provideContextParam`.
@@ -1861,12 +1909,11 @@ export const en = {
       outsideText: 'Outside',
       cleanWith: 'Clean with',
       mode: 'Mode',
-      fillMode: 'Fill',
     },
     param: {
       scope: 'Scope',
       bubbleText: 'Speech bubble text',
-      bubbleColor: 'Bubble fill color',
+      bubbleColor: 'Solid fill color',
       outsideText: 'Text outside bubbles',
       // Whether Auto clean touches text outside bubbles at all. The row above
       // names the engine; this one is the opt-in the pipeline design always described
@@ -1880,9 +1927,9 @@ export const en = {
       opacity: 'Opacity',
       flow: 'Flow',
       shape: 'Shape',
+      outlineColor: 'Outline color',
+      outlineWidth: 'Outline width',
       feather: 'Feather',
-      fillMode: 'Fill mode',
-      engine: 'Engine',
       // The AI mask brush's engine row. Deliberately `masks.action.engine`'s
       // words rather than `engine` above: the row on a Layers entry and the
       // chips on the canvas offer the same list of engines under the same
@@ -1933,11 +1980,12 @@ export const en = {
       ellipse: 'Ellipse',
       lasso: 'Lasso',
       polygon: 'Polygon',
-      engineLocal: 'Local',
+      line: 'Line',
       engineCloud: 'Cloud',
       // Beside the Cloud engine while it cannot be chosen, with the one
       // button that fixes it.
       engineCloudNotReady: 'No cloud GPU is ready. Set one up in Settings.',
+      engineMissing: 'This model is not installed. Download it in Settings › Models.',
       engineCloudSettings: 'Open Cloud settings',
       // There is no `engineFill` / `engineRedraw` pair any more. Auto clean's
       // two rows named a *family* - "Fill", "Redraw" - and the user ruled that
@@ -2457,8 +2505,10 @@ export const en = {
       apply: 'Apply approved component',
       choosePage: 'Choose page',
       importFullRt: 'Import full RT graph',
+      downloadFullRt: 'Download full RT graph',
       removeFullRt: 'Remove full RT graph',
       importSam: 'Import SAM graphs',
+      installSam: 'Install SAM graphs automatically',
       removeSam: 'Remove SAM graphs',
       verifySam: 'Verify SAM graphs',
       refresh: 'Refresh readiness',
@@ -2666,6 +2716,7 @@ export const en = {
       runtimeChecking: 'Checking that ONNX Runtime loads on this computer…',
       runtimeUnchecked: 'Could not check that ONNX Runtime loads on this computer. Press Refresh readiness under Models and backends to check again.',
       rt: 'The RT-DETR graph for this layout is not installed. Import it under Models and backends.',
+      ctd: 'Comic Text Detector is not installed. Download it under Detection models.',
       sam: 'SAM-TS-L is not installed. Import both graphs under Models and backends.',
       samUnverified: 'SAM-TS-L is not verified yet. Verify it under Models and backends.',
       memory: 'SAM needs about 10 GB of free memory.',

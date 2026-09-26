@@ -80,6 +80,7 @@ from deploy.cloud.beam.settings import (
 )
 from deploy.cloud.beam.stage import stage_app
 from deploy.cloud.common.weights import SEED_STATE_KEY
+from deploy.cloud.common.manifest import MODEL_PROD_FLUX_9B, production_model
 
 PRICING_URL = "https://beam.cloud/pricing"
 # USD per hour, list price on PRICING_DATE. Beam lists no price for A10G and RTX5090.
@@ -361,7 +362,7 @@ class BeamDriver(BaseProviderDriver):
         )
 
     def normalize_options(self, options: Any) -> Dict[str, Any]:
-        return normalize_options(options, GPU_ALLOWLIST, DEFAULT_GPU)
+        return normalize_options(options, GPU_ALLOWLIST, DEFAULT_GPU, "RTX5090")
 
     def settings_for(self, installation_id: str, options: Dict[str, Any]) -> BeamSettings:
         host, port = gateway_address()
@@ -370,6 +371,8 @@ class BeamDriver(BaseProviderDriver):
             installation_prefix(installation_id),
             gpu=options["gpu"],
             idle_seconds=options["idle_seconds"],
+            model_id=options["model_id"],
+            analysis_models=tuple(options["analysis_models"]),
             gateway_host=host,
             gateway_port=port,
         )
@@ -377,32 +380,43 @@ class BeamDriver(BaseProviderDriver):
     def plan(self, inspection: AccountInspectionResult, installation_id: str, options: Dict[str, Any]) -> DeploymentPlan:
         s = self.settings_for(installation_id, options)
         gpu, idle = s.gpu, s.idle_seconds
+        model = production_model(s.model_id)
+        worker_memory = 24 if s.model_id == MODEL_PROD_FLUX_9B else 12
         resources = [
-            PlanResource("volume", s.volume_name, "Beam volume holding the pinned FLUX.2 Klein weights (about 5.5 GB)."),
+            PlanResource("volume", s.volume_name, f"Beam volume holding the pinned FLUX.2 Klein weights ({model.total_bytes / 1e9:.1f} GB)"
+                         + (" and selected analysis graphs." if s.analysis_models else ".")),
             PlanResource("dict", s.map_name, "Beam map with job state, so status checks never start a GPU."),
             PlanResource(
                 "secret",
                 s.secret_name,
                 "Beam secret holding your Beam API key, which the gateway uses to queue GPU jobs.",
             ),
-            PlanResource("worker", s.seed_name, "CPU task queue (2 CPU, 4 GiB) that downloads the weights once."),
+            PlanResource("worker", s.seed_name,
+                         f"CPU task queue (2 CPU, {24 if 'text_mask_sam_ts@1' in s.analysis_models else 4} GiB) that installs pinned model weights and selected analysis graphs once."),
             PlanResource(
                 "worker",
                 s.worker_name,
-                f"{gpu} GPU task queue (1 CPU, 12 GiB, at most 1 container, stays warm {idle} s after the last render, 600 s per job).",
+                f"{gpu} GPU task queue (1 CPU, {worker_memory} GiB, at most 1 container, stays warm {idle} s after the last render, 600 s per job).",
             ),
             PlanResource("gateway", s.gateway_name, "CPU web endpoint (0.5 CPU, 1 GiB) that needs a Beam API key."),
         ]
+        if s.analysis_models:
+            resources.insert(-1, PlanResource(
+                "worker", s.analysis_name,
+                f"{gpu} GPU analysis task queue (at most 1 container, scales to zero after {idle} s).",
+            ))
         price = GPU_PRICE_PER_HOUR.get(gpu)
         if price is not None:
             gpu_text = (
-                f"A {gpu} worker costs about ${price + GPU_CPU_CORE_HOUR + 12 * GPU_MEMORY_GIB_HOUR:.2f} per hour while it runs "
-                f"({gpu} ${price:.2f}/h, 1 CPU core ${GPU_CPU_CORE_HOUR}/h, 12 GiB at ${GPU_MEMORY_GIB_HOUR}/GiB/h)"
+                f"A {gpu} worker costs about ${price + GPU_CPU_CORE_HOUR + worker_memory * GPU_MEMORY_GIB_HOUR:.2f} per hour while it runs "
+                f"({gpu} ${price:.2f}/h, 1 CPU core ${GPU_CPU_CORE_HOUR}/h, {worker_memory} GiB at ${GPU_MEMORY_GIB_HOUR}/GiB/h)"
             )
         else:
             gpu_text = f"The {gpu} worker is billed by Beam at its current rate while it runs"
         cost = (
             f"Billed by Beam per second of use. {gpu_text}, during each render and for {idle} s after it. "
+            + (f"Selected analysis also starts a separate {gpu} GPU task queue on demand and keeps it warm {idle} s; it is billed at the same GPU rate. " if s.analysis_models else "")
+            +
             f"The gateway runs while it answers requests and stays warm 120 s after the last one "
             f"(0.5 CPU at ${CPU_CORE_HOUR}/h per core, 1 GiB at ${MEMORY_GIB_HOUR}/GiB/h). "
             f"Storage for the weights volume is billed by Beam. List prices on {PRICING_DATE}; check {PRICING_URL}."
@@ -416,7 +430,7 @@ class BeamDriver(BaseProviderDriver):
             gpu_allowlist=GPU_ALLOWLIST,
             allocation={
                 "worker_cpu": 1.0,
-                "worker_memory_gib": 12,
+                "worker_memory_gib": worker_memory,
                 "gateway_cpu": 0.5,
                 "gateway_memory_gib": 1,
                 "max_containers": 1,
@@ -432,7 +446,7 @@ class BeamDriver(BaseProviderDriver):
                 "The weights download once on a CPU container; setup waits for it.",
             ],
             cleanup_summary=[
-                f"Stop and delete the deployments {s.gateway_name}, {s.worker_name} and {s.seed_name}",
+                f"Stop and delete the deployments {', '.join(s.deployment_names.values())}",
                 f"Delete the secret {s.secret_name}",
                 f"Delete the job state in the map {s.map_name}",
                 f"Delete the volume {s.volume_name} and the weights in it",
@@ -604,12 +618,17 @@ class BeamDriver(BaseProviderDriver):
         # Building the task queue images (the GPU one carries torch) is the long part.
         journal.record_resource(s.seed_name, "worker", s.seed_name, STAGE_DEPLOYING)
         journal.record_resource(s.worker_name, "worker", s.worker_name, STAGE_DEPLOYING)
+        if s.analysis_models:
+            journal.record_resource(s.analysis_name, "worker", s.analysis_name, STAGE_DEPLOYING)
         seed = self._deploy(session, ctx.deadline, s, "seed", s.seed_name)
         journal.set_state(seed_url=seed["invoke_url"], seed_deployment_id=seed["deployment_id"])
         if ctx.reporter is not None:
             ctx.reporter.pct(50)
         worker = self._deploy(session, ctx.deadline, s, "render", s.worker_name)
         journal.set_state(worker_url=worker["invoke_url"], worker_deployment_id=worker["deployment_id"])
+        if s.analysis_models:
+            analysis = self._deploy(session, ctx.deadline, s, "analyze", s.analysis_name)
+            journal.set_state(analysis_url=analysis["invoke_url"], analysis_deployment_id=analysis["deployment_id"])
 
     def _step_deploy(self, session: BeamSession, ctx: StepContext, s: BeamSettings) -> None:
         journal = ctx.journal
@@ -617,7 +636,12 @@ class BeamDriver(BaseProviderDriver):
         if not worker_url:
             raise ProtocolError(ERR_EXECUTION_FAILED, "The GPU worker URL is missing from the journal")
         journal.record_resource(s.gateway_name, "gateway", s.gateway_name, STAGE_DEPLOYING)
-        gateway = self._deploy(session, ctx.deadline, s.with_worker_url(worker_url), "gateway", s.gateway_name)
+        analysis_url = journal.get_state("analysis_url") if s.analysis_models else ""
+        if s.analysis_models and not analysis_url:
+            raise ProtocolError(ERR_EXECUTION_FAILED, "The analysis GPU worker URL is missing from the journal")
+        gateway = self._deploy(session, ctx.deadline,
+                               s.with_worker_url(worker_url).with_analysis_url(analysis_url),
+                               "gateway", s.gateway_name)
         journal.set_state(gateway_url=gateway["invoke_url"], gateway_deployment_id=gateway["deployment_id"])
 
     def _task_status(self, session: BeamSession, deadline: Deadline, task_id: str) -> Optional[str]:
@@ -671,7 +695,7 @@ class BeamDriver(BaseProviderDriver):
 
     def _step_weights(self, session: BeamSession, ctx: StepContext, s: BeamSettings) -> None:
         journal = ctx.journal
-        state, _, _ = read_seed_state(self._seed_doc(session, ctx, s))
+        state, _, _ = read_seed_state(self._seed_doc(session, ctx, s), s.model_id)
         if state == "done":
             return
         task_id = journal.get_state("seed_task_id")
@@ -687,7 +711,7 @@ class BeamDriver(BaseProviderDriver):
         watch = SeedWatch(journal.get_state(SEED_INTENT_KEY), self._wall_clock, self._clock)
         while True:
             doc = self._seed_doc(session, ctx, s)
-            state, pct, problem = read_seed_state(doc)
+            state, pct, problem = read_seed_state(doc, s.model_id)
             if pct is not None and ctx.reporter is not None:
                 ctx.reporter.pct(pct)
             if state == "done":
@@ -700,7 +724,7 @@ class BeamDriver(BaseProviderDriver):
             watch.observe(doc if state == "running" else None)
             if task_state == "COMPLETE":
                 # The task writes done before it ends; read again to rule out a stale read.
-                if read_seed_state(self._seed_doc(session, ctx, s))[0] == "done":
+                if read_seed_state(self._seed_doc(session, ctx, s), s.model_id)[0] == "done":
                     return
                 gone = True
             else:

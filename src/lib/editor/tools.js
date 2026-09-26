@@ -236,7 +236,8 @@ const ENGINES = ROW_ENGINES.filter((rung) => rung !== 'flux').map((rung) => ({
 }))
 
 /**
- * The engines the AI mask brush may be pointed at, weakest first.
+ * The shared engine options, weakest first. Drawing tools select the redraw
+ * models from this list, while Layers can still offer all four engines.
  *
  * **The Layers row's own list and the Layers row's own words** - `ROW_ENGINES`
  * and `engineChoiceLabel` from `src/lib/model/masks.js`, not a second list
@@ -246,8 +247,8 @@ const ENGINES = ROW_ENGINES.filter((rung) => rung !== 'flux').map((rung) => ({
  *
  * Unlike `ENGINES` above these are **rungs named outright, not picks**: what
  * `src-tauri/src/region.rs#named_rung` reads from `params.engine`, and it runs
- * that rung rather than starting there. This row offers all four rungs; Auto
- * clean's two offer the three local ones, because `ENGINES` above drops `flux`
+ * that rung rather than starting there. Auto clean's two choices offer the
+ * three local ones, because `ENGINES` above drops `flux`
  * from a run nobody is watching. The difference between naming a rung and
  * picking one is what a run does after the first patch - Auto clean escalates
  * past a declined rung, a named one is committed as it came out.
@@ -277,7 +278,7 @@ const MASK_ENGINES = ROW_ENGINES.map((rung) => ({
  * It is not called `fill`, and the distance between the two words is the whole
  * reason it has a name at all: `fill` is rung 0, the *planar fill* engine,
  * which samples the paper around the mask and lays down the tone it found -
- * and it is one of the four engine options beside this one. `solid` covers the shape
+ * and is deliberately absent from the shape picker. `solid` covers the shape
  * in the colour the user picked, which is a different act with a different
  * outcome. The label says "Solid colour" for the same reason.
  */
@@ -296,12 +297,12 @@ export function isSolidFill(values) {
  *
  * One row rather than two, because the two are alternatives rather than
  * settings of one another - a shape is either paint or a clean, never both -
- * and a second row would be a control that is dead half the time. The engines
- * are `MASK_ENGINES` unchanged, so Shapes, the AI mask brush and a Layers
- * row's picker all offer the same four rungs under the same four words, and
- * `ToolBar.svelte` gates rung 3a here exactly as it does there.
+ * and a second row would be a control that is dead half the time. Shapes
+ * offer LaMa Manga and available FLUX alongside Solid; Fill and Denoise fill
+ * are not useful modes for a drawn shape.
  */
-const SHAPE_MODES = [{ value: SOLID, labelKey: 'tools.option.modeSolid' }, ...MASK_ENGINES]
+const BRUSH_ENGINES = MASK_ENGINES.filter((option) => option.value !== 'fill' && option.value !== 'denoise')
+const SHAPE_MODES = [{ value: SOLID, labelKey: 'tools.option.modeSolid' }, ...BRUSH_ENGINES]
 
 /** @type {ToolSpec[]} */
 export const TOOL_SPECS = [
@@ -327,12 +328,18 @@ export const TOOL_SPECS = [
       // to `runClean` and are applied per region by whether the region is
       // inside a balloon.
       ...section('engines', [
-        choice('bubbleEngine', 'tools.param.bubbleText', ENGINES, 'tools.short.bubbleText'),
+        choice('bubbleEngine', 'tools.param.bubbleText', [
+          ...ENGINES,
+          { value: SOLID, labelKey: 'tools.option.modeSolid' },
+        ], 'tools.short.bubbleText'),
+        choice('outsideEngine', 'tools.param.outsideText', [
+          ...ENGINES,
+          { value: SOLID, labelKey: 'tools.option.modeSolid' },
+        ], 'tools.short.outsideText'),
         onlyWhen(
           color('bubbleColor', 'tools.param.bubbleColor', '#ffffff'),
-          (values) => (values?.bubbleEngine ?? 'fill') === 'fill',
+          (values) => values?.bubbleEngine === SOLID || values?.outsideEngine === SOLID,
         ),
-        choice('outsideEngine', 'tools.param.outsideText', ENGINES, 'tools.short.outsideText'),
         // The pipeline's own rule: text outside a balloon is "cleaned only if
         // the user opts in". This is the opt-in. Off, the run
         // holds that text for review under "text outside a speech bubble" and
@@ -354,7 +361,7 @@ export const TOOL_SPECS = [
       // equivalent. Rather than grow the run protocol, the user ruled that a
       // batch run is local-only: an unbounded batch of renders on a GPU the
       // user pays for is the hardest kind to consent to meaningfully, and the
-      // cloud stays reachable per region through Content-aware fill and a
+      // cloud stays reachable per region through the AI mask brush and a
       // Layers row, each of which asks. `startRun` pins the ceiling to
       // LOCAL_CEILING, so this is enforced where the sending happens, not
       // merely unoffered here. With the cloud rung gone the row held one
@@ -403,6 +410,7 @@ export const TOOL_SPECS = [
           { value: 'ellipse', labelKey: 'tools.option.ellipse', icon: 'shape-ellipse' },
           { value: 'lasso', labelKey: 'tools.option.lasso', icon: 'shape-lasso' },
           { value: 'polygon', labelKey: 'tools.option.polygon', icon: 'shape-polygon' },
+          { value: 'line', labelKey: 'tools.option.line', icon: 'shape-line' },
         ]),
       ]),
       // What the shape *does*. Shapes used to have no such row and always
@@ -418,6 +426,8 @@ export const TOOL_SPECS = [
         // a wash as well as a cover. Meaningless for the engine modes, which
         // replace what is under them outright.
         onlyWhen(range('opacity', 'tools.param.opacity', 0, 100, 5, '%'), isSolidFill),
+        onlyWhen(color('outlineColor', 'tools.param.outlineColor', '#000000'), isSolidFill),
+        onlyWhen(range('outlineWidth', 'tools.param.outlineWidth', 0, 30, 1, 'px'), isSolidFill),
         range('feather', 'tools.param.feather', 0, 20, 1, 'px'),
       ]),
     ],
@@ -440,7 +450,7 @@ export const TOOL_SPECS = [
       // that cannot change what happens is worse than no control.
       ...section('engines', [
         choice('engine', 'tools.param.cleanWith', [
-          ...MASK_ENGINES,
+          ...BRUSH_ENGINES,
           { value: 'cloud', labelKey: 'tools.option.engineCloud', cloud: true },
         ], 'tools.short.cleanWith'),
       ]),
@@ -449,33 +459,8 @@ export const TOOL_SPECS = [
     runnable: false,
   },
   {
-    id: 'contentAwareFill',
-    slot: 5,
-    nameKey: 'tools.name.contentAwareFill',
-    hintKey: 'tools.hint.contentAwareFill',
-    params: [
-      ...section('fill', [
-        choice(
-          'fillMode',
-          'tools.param.fillMode',
-          [
-            { value: 'match-surround', labelKey: 'masks.fillMode.matchSurround' },
-            { value: 'reconstruct', labelKey: 'masks.fillMode.reconstruct' },
-            { value: 'solid', labelKey: 'masks.fillMode.solid' },
-          ],
-          'tools.short.fillMode',
-        ),
-        choice('engine', 'tools.param.engine', [
-          { value: 'local', labelKey: 'tools.option.engineLocal', icon: 'cpu' },
-          { value: 'cloud', labelKey: 'tools.option.engineCloud', cloud: true, icon: 'cloud' },
-        ]),
-      ]),
-    ],
-    runnable: false,
-  },
-  {
     id: 'cloneHeal',
-    slot: 6,
+    slot: 5,
     nameKey: 'tools.name.cloneHeal',
     hintKey: 'tools.hint.cloneHeal',
     params: [
@@ -506,7 +491,6 @@ export const TOOL_ICONS = /** @type {Record<string, string>} */ ({
   brush: 'brush',
   shapes: 'shapes',
   aiMaskBrush: 'wand',
-  contentAwareFill: 'droplet',
   cloneHeal: 'stamp',
 })
 
@@ -523,10 +507,7 @@ export function toolSpec(id) {
  * The tools whose gesture on the page is a **drag**, and which therefore need
  * a drawing surface over the sheet.
  *
- * Auto clean and Content-aware fill are not here on purpose: Auto clean runs a
- * queue and Content-aware fill fills an *existing* mask, so both act on a
- * region that is already there and both are a click on it. The
- * drawing surface would only take that click away from them.
+ * Auto clean is not here: it runs a queue rather than drawing a gesture.
  */
 export const DRAWING_TOOLS = /** @type {const} */ ([
   'brush',
@@ -556,6 +537,8 @@ export function isDrawingTool(id) {
  * @returns {boolean}
  */
 export function toolSpendsCloud(id, params = {}) {
+  // Retained only for replaying existing cloud operation intents.
+  if (id === 'contentAwareFill') return params.engine === 'cloud'
   const spec = TOOL_SPECS.find((candidate) => candidate.id === id)
   if (!spec) return false
   return spec.params.some(

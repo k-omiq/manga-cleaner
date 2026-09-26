@@ -302,11 +302,13 @@ pub(crate) fn propose<G: AnalysisGateway>(
             crate::inference::consent::DEFAULT_PROPOSAL_TTL.as_millis() as u64),
     };
     let record = AnalysisAttemptRecord {
+        created_at_ms: issued_at_ms,
         schema_version: ANALYSIS_JOURNAL_SCHEMA_VERSION,
         proposal_id: proposal.proposal_id.clone(), provider, profile_id: proposal.profile_id.clone(),
         capability: proposal.capability.clone(), source_sha256: proposal.source_page_sha256.clone(),
         underlay_sha256: proposal.underlay_sha256.clone(), total_tiles: proposal.tiles.len(),
-        completed_tiles: 0, reported_cost_usd: None, cancel_requested: false,
+        completed_tiles: 0, reported_cost_usd: None,
+        tile_submission_started: Some(false), cancel_requested: false,
         phase: AnalysisPhase::Proposed,
     };
     let epoch = GrantService::global().get_profile_epoch(provider, &proposal.profile_id);
@@ -447,6 +449,7 @@ pub(crate) fn confirm_and_run<G: AnalysisGateway>(
                 let cache = proposals().lock().map_err(|e| e.to_string())?;
                 require_active(&cancel)?;
                 record.phase = AnalysisPhase::SubmittedTile { index };
+                record.tile_submission_started = Some(true);
                 journal.write(&record).map_err(|e| e.to_string())?;
                 drop(cache);
             }
@@ -823,7 +826,9 @@ mod tests {
         assert_eq!(confirm_and_run(&approved.proposal_id, true, true, &gateway, &journal, |_| {}).err().unwrap(),
             AnalysisFlowError::Cancelled.to_string());
         assert_eq!(gateway.submissions.load(Ordering::SeqCst), 0);
-        assert!(matches!(journal.read(&approved.proposal_id).unwrap().phase, AnalysisPhase::Cancelled));
+        let record = journal.read(&approved.proposal_id).unwrap();
+        assert!(matches!(record.phase, AnalysisPhase::Cancelled));
+        assert_eq!(record.tile_submission_started, Some(false));
     }
 
     #[test]
@@ -841,6 +846,7 @@ mod tests {
         let record = journal.read(&approved.proposal_id).unwrap();
         assert!(matches!(record.phase, AnalysisPhase::Cancelled));
         assert_eq!(record.completed_tiles, 1);
+        assert_eq!(record.tile_submission_started, Some(true));
     }
 
     #[test]
@@ -888,7 +894,9 @@ mod tests {
             assert_eq!(run.join().unwrap().err().unwrap(), "analysis_cancelled");
         });
         assert_eq!(gateway.submissions.load(Ordering::SeqCst), 0);
-        assert!(matches!(journal.read(&id).unwrap().phase, AnalysisPhase::Cancelled));
+        let record = journal.read(&id).unwrap();
+        assert!(matches!(record.phase, AnalysisPhase::Cancelled));
+        assert_eq!(record.tile_submission_started, Some(false));
     }
 
     #[test]
@@ -931,6 +939,7 @@ mod tests {
         assert!(record.cancel_requested);
         assert!(matches!(record.phase, AnalysisPhase::Cancelled));
         assert_eq!(record.completed_tiles, 1);
+        assert_eq!(record.tile_submission_started, Some(true));
     }
 
     #[test]
@@ -943,6 +952,7 @@ mod tests {
         let record = journal.read(&approved.proposal_id).unwrap();
         assert!(record.cancel_requested);
         assert!(matches!(record.phase, AnalysisPhase::Cancelled));
+        assert_eq!(record.tile_submission_started, Some(false));
         assert_eq!(gateway.submissions.load(Ordering::SeqCst), 0);
     }
 

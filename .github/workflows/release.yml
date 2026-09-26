@@ -1,6 +1,7 @@
 name: Release
 
-# Builds installers for mac (apple silicon) and windows, then publishes them
+# Builds installers for macOS (Apple Silicon), Windows x64, and Linux x64,
+# then publishes them
 # plus latest.json to the R2 bucket behind https://cleaner.komiq.cc via
 # the publish worker at https://cleaner-publish.komiq.cc.
 # Installed apps poll that URL and offer the update in-app.
@@ -112,6 +113,9 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             platform: windows-x86_64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -122,6 +126,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Install Linux desktop build dependencies
+        if: startsWith(matrix.platform, 'linux-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libdbus-1-dev build-essential curl wget file patchelf
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -143,6 +152,12 @@ jobs:
       - name: Freeze and smoke-test cloud setup helper
         shell: bash
         run: python .github/scripts/build-cloud-provisioner.py '${{ matrix.target }}'
+
+      - name: Bundle managed Python installer for FLUX
+        shell: bash
+        run: |
+          python -m pip install uv==0.12.19
+          python .github/scripts/stage-flux-python.py '${{ matrix.target }}'
 
       # The ONNX Runtime the application downloads on first launch imports
       # MSVCP140.dll, MSVCP140_1.dll, VCRUNTIME140.dll and VCRUNTIME140_1.dll
@@ -230,6 +245,7 @@ jobs:
           HELPER="target/${{ matrix.target }}/release/bundle/macos/Manga Cleaner.app/Contents/MacOS/manga-cleaner-provisioner"
           test -x "$HELPER"
           "$HELPER" --self-check | python3 -c 'import json,sys; assert json.load(sys.stdin)["ok"] is True'
+          test -x "target/${{ matrix.target }}/release/bundle/macos/Manga Cleaner.app/Contents/MacOS/manga-cleaner-uv"
       - name: Verify cloud helper inside Windows installer
         if: startsWith(matrix.platform, 'windows-')
         shell: pwsh
@@ -241,9 +257,22 @@ jobs:
           if (-not $sevenZip) { $sevenZip = Join-Path $env:ProgramFiles '7-Zip/7z.exe' }
           if (-not (Test-Path $sevenZip)) { throw '7-Zip is required to inspect the NSIS installer' }
           $listing = & $sevenZip l -slt $installer.FullName
-          if ($LASTEXITCODE -ne 0 -or -not ($listing | Select-String -Quiet 'Path = .*manga-cleaner-provisioner\.exe$')) {
-            throw 'The Windows installer does not contain manga-cleaner-provisioner.exe'
+          if ($LASTEXITCODE -ne 0 -or -not ($listing | Select-String -Quiet 'Path = .*manga-cleaner-provisioner\.exe$') -or -not ($listing | Select-String -Quiet 'Path = .*manga-cleaner-uv\.exe$')) {
+            throw 'The Windows installer does not contain both setup helpers'
           }
+      - name: Verify cloud helper inside Linux package
+        if: startsWith(matrix.platform, 'linux-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          HELPER="src-tauri/binaries/manga-cleaner-provisioner-${{ matrix.target }}"
+          test -x "$HELPER"
+          "$HELPER" --self-check | python3 -c 'import json,sys; assert json.load(sys.stdin)["ok"] is True'
+          DEB=$(find "target/${{ matrix.target }}/release/bundle/deb" -maxdepth 1 -name '*.deb' -print -quit)
+          test -n "$DEB"
+          DEB_CONTENTS=$(dpkg-deb --contents "$DEB")
+          grep -q '/manga-cleaner-provisioner$' <<< "$DEB_CONTENTS"
+          grep -q '/manga-cleaner-uv$' <<< "$DEB_CONTENTS"
       - name: Collect updater artifacts
         shell: bash
         # Renamed to MangaCleaner_<version>_<platform>.<ext>: the platform tag keeps
@@ -278,6 +307,13 @@ jobs:
               SRC=$(ls "$BUNDLE"/nsis/*-setup.exe)
               cp "$SRC" "$OUT/$PREFIX-setup.exe"
               cp "$SRC.sig" "$OUT/$PREFIX-setup.exe.sig"
+              ;;
+            linux-*)
+              SRC=$(ls "$BUNDLE"/appimage/*.AppImage)
+              cp "$SRC" "$OUT/$PREFIX.AppImage"
+              cp "$SRC.sig" "$OUT/$PREFIX.AppImage.sig"
+              DEB=$(ls "$BUNDLE"/deb/*.deb)
+              cp "$DEB" "$OUT/$PREFIX.deb"
               ;;
           esac
           ls -la "$OUT"
@@ -352,8 +388,9 @@ jobs:
                   "url": f"{base}/{remote}",
               }
               uploads.append((artifact, remote))
-              for extra in glob.glob(pdir + "/*.dmg"):
-                  uploads.append((extra, f"releases/v{version}/{os.path.basename(extra)}"))
+              for extension in ("dmg", "deb"):
+                  for extra in glob.glob(pdir + f"/*.{extension}"):
+                      uploads.append((extra, f"releases/v{version}/{os.path.basename(extra)}"))
           out = {
               "version": version,
               "notes": os.environ.get("RELEASE_NOTES", "").strip(),

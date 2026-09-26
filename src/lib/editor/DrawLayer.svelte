@@ -240,7 +240,7 @@
       markMoved()
     }
 
-    if (active.kind === 'rect' || active.kind === 'ellipse') {
+    if (active.kind === 'rect' || active.kind === 'ellipse' || active.kind === 'line') {
       // Shift is the constraint every drawing application binds it to: a
       // square, and therefore a circle. Held rather than latched, so it can be
       // pressed and released mid-drag and the box follows.
@@ -249,6 +249,7 @@
           ? squareBetween(active.points[0], point)
           : strip ? stripRectBetween(active.points[0], point) : rectBetween(active.points[0], point),
       )
+      if (active.kind === 'line') active.points = [active.points[0], point]
       return
     }
     if (shouldStamp(active.points.at(-1) ?? null, point, radius, Number(params.spacing ?? 12))) {
@@ -260,8 +261,12 @@
   /** @param {PointerEvent} event */
   function onpointerup(event) {
     if (pointerId === null) return
-    releasePointer()
     const point = at(event)
+    if (point && active?.kind === 'line') {
+      active.points = [active.points[0], point]
+      setDraftBbox(strip ? stripRectBetween(active.points[0], point) : rectBetween(active.points[0], point))
+    }
+    releasePointer()
     const moved = active?.moved === true
     if (!moved) {
       clearDraft()
@@ -461,7 +466,7 @@
     committing = false
     beginDraft({
       tool,
-      kind: tool === 'shapes' && shape === 'ellipse' ? 'ellipse' : 'rect',
+      kind: tool === 'shapes' && (shape === 'ellipse' || shape === 'line') ? shape : 'rect',
       pageId: page.id,
       points: [],
       bbox: centredBbox(Math.max(KEY_DRAFT.w, MIN_SPAN), Math.max(KEY_DRAFT.h, MIN_SPAN)),

@@ -19,12 +19,6 @@ describe('DrawLayer focus and scroll safety', () => {
     expect(source).toMatch(/element\.focus\(\s*\{\s*preventScroll:\s*true\s*\}\s*\)/)
   })
 
-  it('invokes applyActiveToolToRegion on region click when tool is contentAwareFill in RegionLayer', () => {
-    const filePath = resolve(import.meta.dirname, 'RegionLayer.svelte')
-    const source = readFileSync(filePath, 'utf-8')
-    expect(source).toMatch(/editor\.tool\s*===\s*'contentAwareFill'/)
-    expect(source).toMatch(/applyActiveToolToRegion\(regionId\)/)
-  })
 
   it('keeps viewport scroll position unchanged when an AI mask brush stroke creates and selects a region', async () => {
     editor.chapter = {

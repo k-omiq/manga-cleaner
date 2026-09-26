@@ -21,7 +21,7 @@ import { getBackend } from '../api/backend.js'
 import { cloudAttemptId } from '../api/attempt.js'
 import { notify, pushModal } from '../state/app.svelte.js'
 import { session } from '../state/session.svelte.js'
-import { refreshCloudReadiness, settleCloudJob, trackCloudJob } from '../state/cloud.svelte.js'
+import { cloud, refreshCloudReadiness, settleCloudJob, trackCloudJob } from '../state/cloud.svelte.js'
 import { toolSpendsCloud } from './tools.js'
 
 /**
@@ -134,6 +134,8 @@ export async function requestCloudConsent(request, backend = getBackend()) {
   let proposal
   try {
     const model = await backend.getCloudModelInfo({ provider: target.type, profileId: target.profile_id })
+    cloud.model = { id: model.pinnedModelId, provider: target.type, profileId: target.profile_id,
+      updatedAtMs: readiness.profile.updatedAtMs ?? null }
     recipe = {
       recipe_id: model.pinnedRecipeId,
       preprocessing_version: model.preprocessingVersion,

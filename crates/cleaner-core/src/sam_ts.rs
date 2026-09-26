@@ -234,75 +234,139 @@ pub fn infer_cpu(page: &Raster, graph_dir: &Path) -> Result<Inference, String> {
     infer_cpu_cancellable(page, graph_dir, &Cancellation::default())
 }
 
-pub fn infer_cpu_cancellable(page: &Raster, graph_dir: &Path, cancel: &Cancellation) -> Result<Inference, String> {
-    cancel.check()?;
-    let started = Instant::now();
-    let mut encoder = ort::session::Session::builder()
-        .map_err(|e| e.to_string())?
-        .with_intra_threads(4)
-        .map_err(|e| e.to_string())?
-        .commit_from_file(graph_dir.join(ENCODER))
-        .map_err(|e| format!("SAM-TS encoder: {e}"))?;
-    let mut load = started.elapsed();
-    let started = Instant::now();
-    let prepared = prepare(page)?;
-    let prepare_time = started.elapsed();
-    cancel.check()?;
-    let options = cancel.options()?;
-    let input = ort::value::Tensor::from_array(([1usize, 3, SIDE, SIDE], prepared.chw.clone()))
-        .map_err(|e| e.to_string())?;
-    let started = Instant::now();
-    let embedding = encoder
-        .run_with_options(ort::inputs!["prepared_rgb" => input], &options)
-        .map_err(|e| if cancel.check().is_err() { "analysis cancelled".into() } else { format!("SAM-TS encoder inference: {e}") })?;
-    cancel.check()?;
-    let (_, values) = embedding["embedding"]
-        .try_extract_tensor::<f32>()
-        .map_err(|e| format!("SAM-TS embedding: {e}"))?;
-    if values.len() != 256 * 64 * 64 || values.iter().any(|v| !v.is_finite()) {
-        return Err("SAM-TS encoder output shape or values are invalid".into());
+pub fn infer_cpu_cancellable(
+    page: &Raster,
+    graph_dir: &Path,
+    cancel: &Cancellation,
+) -> Result<Inference, String> {
+    SamTsSession::open_cancellable(graph_dir, cancel)?.infer(page, cancel)
+}
+
+/// One CPU encoder/head pair for a run. The lease lives with both ORT sessions,
+/// so the loaded-models row disappears as soon as the owner drops this value.
+/// Pinned graph SHA-256 checks belong to the caller's installation boundary;
+/// a run should perform those once before opening this session.
+pub struct SamTsSession {
+    encoder: ort::session::Session,
+    head: ort::session::Session,
+    first_load: Option<Duration>,
+    lease: crate::registry::Lease,
+}
+
+impl SamTsSession {
+    pub fn open(graph_dir: &Path) -> Result<Self, String> {
+        Self::open_cancellable(graph_dir, &Cancellation::default())
     }
-    let embedding_values = values.to_vec();
-    let encoder_time = started.elapsed();
-    drop(embedding);
-    drop(encoder);
-    cancel.check()?;
-    let started = Instant::now();
-    let mut head = ort::session::Session::builder()
-        .map_err(|e| e.to_string())?
-        .with_intra_threads(4)
-        .map_err(|e| e.to_string())?
-        .commit_from_file(graph_dir.join(HEAD))
-        .map_err(|e| format!("SAM-TS text head: {e}"))?;
-    load += started.elapsed();
-    let input = ort::value::Tensor::from_array(([1usize, 256, 64, 64], embedding_values))
-        .map_err(|e| e.to_string())?;
-    let started = Instant::now();
-    let output = head
-        .run_with_options(ort::inputs!["embedding" => input], &options)
-        .map_err(|e| if cancel.check().is_err() { "analysis cancelled".into() } else { format!("SAM-TS text-head inference: {e}") })?;
-    cancel.check()?;
-    let (_, logits) = output["high_res_logits"]
-        .try_extract_tensor::<f32>()
-        .map_err(|e| format!("SAM-TS logits: {e}"))?;
-    let head_time = started.elapsed();
-    let started = Instant::now();
-    let mask = restore(logits, &prepared)?;
-    cancel.check()?;
-    let restore_time = started.elapsed();
-    Ok(Inference {
-        mask,
-        load,
-        prepare: prepare_time,
-        encoder: encoder_time,
-        head: head_time,
-        restore: restore_time,
-        webgpu_nodes: None,
-        cpu_fallback_nodes: None,
-        process_high_water_bytes: process_high_water_bytes(),
-        process_phys_footprint_bytes: process_phys_footprint_bytes(),
-        sampled_metal_high_water_bytes: None,
-    })
+
+    pub fn open_cancellable(graph_dir: &Path, cancel: &Cancellation) -> Result<Self, String> {
+        cancel.check()?;
+        let started = Instant::now();
+        let encoder = ort::session::Session::builder()
+            .map_err(|e| e.to_string())?
+            .with_intra_threads(4)
+            .map_err(|e| e.to_string())?
+            .commit_from_file(graph_dir.join(ENCODER))
+            .map_err(|e| format!("SAM-TS encoder: {e}"))?;
+        cancel.check()?;
+        let head = ort::session::Session::builder()
+            .map_err(|e| e.to_string())?
+            .with_intra_threads(4)
+            .map_err(|e| e.to_string())?
+            .commit_from_file(graph_dir.join(HEAD))
+            .map_err(|e| format!("SAM-TS text head: {e}"))?;
+        cancel.check()?;
+        let first_load = Some(started.elapsed());
+        let lease = crate::registry::register_named(
+            crate::registry::Kind::TextDetector,
+            crate::registry::Footprint::weights_of(&[
+                &graph_dir.join(ENCODER),
+                &graph_dir.join(HEAD),
+            ]),
+            crate::registry::Device::accelerator(crate::accel::Accelerator::Cpu),
+            Some("SAM-TS-L".into()),
+        );
+        Ok(Self {
+            encoder,
+            head,
+            first_load,
+            lease,
+        })
+    }
+
+    /// Honor unload requests at a segment boundary. The caller owns that safe
+    /// point and may drop this value, then reopen it if a later segment needs it.
+    pub fn spent(&self) -> bool {
+        self.lease.spent()
+    }
+
+    pub fn infer(&mut self, page: &Raster, cancel: &Cancellation) -> Result<Inference, String> {
+        cancel.check()?;
+        self.lease.touch();
+        let started = Instant::now();
+        let prepared = prepare(page)?;
+        let prepare_time = started.elapsed();
+        cancel.check()?;
+        let options = cancel.options()?;
+        let input = ort::value::Tensor::from_array(([1usize, 3, SIDE, SIDE], prepared.chw.clone()))
+            .map_err(|e| e.to_string())?;
+        let started = Instant::now();
+        let embedding = self
+            .encoder
+            .run_with_options(ort::inputs!["prepared_rgb" => input], &options)
+            .map_err(|e| {
+                if cancel.check().is_err() {
+                    "analysis cancelled".into()
+                } else {
+                    format!("SAM-TS encoder inference: {e}")
+                }
+            })?;
+        cancel.check()?;
+        let (_, values) = embedding["embedding"]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| format!("SAM-TS embedding: {e}"))?;
+        if values.len() != 256 * 64 * 64 || values.iter().any(|v| !v.is_finite()) {
+            return Err("SAM-TS encoder output shape or values are invalid".into());
+        }
+        let embedding_values = values.to_vec();
+        let encoder_time = started.elapsed();
+        drop(embedding);
+        cancel.check()?;
+        let input = ort::value::Tensor::from_array(([1usize, 256, 64, 64], embedding_values))
+            .map_err(|e| e.to_string())?;
+        let started = Instant::now();
+        let output = self
+            .head
+            .run_with_options(ort::inputs!["embedding" => input], &options)
+            .map_err(|e| {
+                if cancel.check().is_err() {
+                    "analysis cancelled".into()
+                } else {
+                    format!("SAM-TS text-head inference: {e}")
+                }
+            })?;
+        cancel.check()?;
+        let (_, logits) = output["high_res_logits"]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| format!("SAM-TS logits: {e}"))?;
+        let head_time = started.elapsed();
+        let started = Instant::now();
+        let mask = restore(logits, &prepared)?;
+        cancel.check()?;
+        let restore_time = started.elapsed();
+        Ok(Inference {
+            mask,
+            load: self.first_load.take().unwrap_or_default(),
+            prepare: prepare_time,
+            encoder: encoder_time,
+            head: head_time,
+            restore: restore_time,
+            webgpu_nodes: None,
+            cpu_fallback_nodes: None,
+            process_high_water_bytes: process_high_water_bytes(),
+            process_phys_footprint_bytes: process_phys_footprint_bytes(),
+            sampled_metal_high_water_bytes: None,
+        })
+    }
 }
 
 /// Whether the loaded runtime exposes a built-in WebGPU EP with a device.

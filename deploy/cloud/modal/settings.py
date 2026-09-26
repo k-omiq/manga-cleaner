@@ -19,6 +19,8 @@ from deploy.cloud.common.deployment import (
     parse_gpu,
     parse_idle_seconds,
 )
+from deploy.cloud.common.manifest import MODEL_PROD_FLUX, production_model
+from deploy.cloud.common.analysis_seed import normalize_analysis_models
 
 GPU_ALLOWLIST = ("L4", "A10", "L40S")
 DEFAULT_GPU = "L4"
@@ -29,6 +31,8 @@ ENV_DICT_NAME = "MC_MODAL_DICT"
 ENV_ENVIRONMENT = "MC_MODAL_ENVIRONMENT"
 ENV_GPU = "MC_MODAL_GPU"
 ENV_IDLE_SECONDS = "MC_MODAL_IDLE_SECONDS"
+ENV_MODEL_ID = "MC_MODAL_MODEL_ID"
+ENV_ANALYSIS_MODELS = "MC_MODAL_ANALYSIS_MODELS"
 
 # Object names inside the app; the provisioner looks these up after deploying.
 GATEWAY_FUNCTION = "gateway"
@@ -48,6 +52,8 @@ class ModalSettings:
     environment_name: str
     gpu: str
     idle_seconds: int
+    model_id: str = MODEL_PROD_FLUX
+    analysis_models: tuple[str, ...] = ()
 
     @classmethod
     def for_installation(
@@ -57,6 +63,8 @@ class ModalSettings:
         environment_name: str = "",
         gpu: str = DEFAULT_GPU,
         idle_seconds: int = DEFAULT_IDLE_SECONDS,
+        model_id: str = MODEL_PROD_FLUX,
+        analysis_models: tuple[str, ...] = (),
     ) -> "ModalSettings":
         return cls(
             installation_id=installation_id,
@@ -66,6 +74,8 @@ class ModalSettings:
             environment_name=environment_name,
             gpu=parse_gpu(gpu, GPU_ALLOWLIST),
             idle_seconds=parse_idle_seconds(idle_seconds),
+            model_id=production_model(model_id).model_id,
+            analysis_models=normalize_analysis_models(analysis_models),
         )
 
     @classmethod
@@ -81,6 +91,8 @@ class ModalSettings:
             environment_name=env.get(ENV_ENVIRONMENT) or "",
             gpu=parse_gpu(env.get(ENV_GPU) or DEFAULT_GPU, GPU_ALLOWLIST),
             idle_seconds=parse_idle_seconds(env.get(ENV_IDLE_SECONDS) or DEFAULT_IDLE_SECONDS),
+            model_id=production_model(env.get(ENV_MODEL_ID) or MODEL_PROD_FLUX).model_id,
+            analysis_models=normalize_analysis_models(tuple(filter(None, (env.get(ENV_ANALYSIS_MODELS) or "").split(",")))),
         )
 
     def to_env(self) -> Dict[str, str]:
@@ -92,6 +104,8 @@ class ModalSettings:
             ENV_ENVIRONMENT: self.environment_name,
             ENV_GPU: self.gpu,
             ENV_IDLE_SECONDS: str(self.idle_seconds),
+            ENV_MODEL_ID: self.model_id,
+            ENV_ANALYSIS_MODELS: ",".join(self.analysis_models),
         }
 
     @property

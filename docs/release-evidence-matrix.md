@@ -10,6 +10,16 @@ Labels: **Tested** means run on that combination with recorded evidence. **Tests
 integration tests with fakes or synthetic input, no live run. **Unknown** means not run; no claim is made.
 **Unsupported** means the app refuses it by design.
 
+## 26 September implementation checks
+
+The onboarding/editor follow-up adds detector combinations, managed FLUX/SAM setup, cloud model selection and usage reporting, and editable layer styles. The release workflow now also targets Linux x64; this supersedes the older packaging statements below, without promoting their hardware evidence labels.
+
+Verification on the macOS development host: 1,468 frontend tests, the production frontend build, the full Rust workspace suite (excluding the memory spike), and strict Clippy passed. The pinned provider SDK environment passed 211 cloud tests and 141 provisioner tests; both local bootstrap suites passed three offline tests each. A browser mock walkthrough covered model selection, tool defaults, layer controls, and reload prevention.
+
+GPT-6 Sol implementers and GPT-6 Luna xhigh reviewers handled the changes. Confirmed review issues were fixed before the final test runs. The requested e-swarm review additionally identified repeated gateway graph hashing, now covered by file/marker invalidation regressions. The e-swarm editor/usage and detection/helper reviews reported no further actionable defects. Review claims were checked against the implementation before applying fixes. Linux release collection and publishing were also exercised with synthetic AppImage/signature/Debian fixtures.
+
+This pass did not run a paid GPU deployment, download the full FLUX models, build Windows/Linux release packages, or validate exact SAM export reproduction on those operating systems. Cloud usage reports known app charges and explicitly marks missing prices; optional Modal workspace billing is delayed provider data, with session change measured since billing was connected.
+
 ## Local pipeline and models
 
 | Combination | Label | Evidence | App behaviour that matches it |
@@ -25,7 +35,7 @@ integration tests with fakes or synthetic input, no live run. **Unknown** means 
 | SAM-TS-L, other Macs, Windows, Linux | Unknown | No hardware | Review may run where the runtime loads; no write |
 | Text-shaped review on long strips | Unsupported | Analysis requires a paginated chapter | Refused with a named outcome |
 | COO MTSv3 SFX finder | Unsupported | [model-rights-decision.md](model-rights-decision.md) | Not offered anywhere |
-| RT-DETR and SAM hosted downloads or bundling | Unsupported | Rights chain not reviewed | Local hash-pinned import only |
+| Full RT-DETR managed download and local SAM export | Implemented, release rights unreviewed | Hash-pinned artifact and source acquisition; no Windows/Linux export validation yet | Do not treat availability as redistribution clearance |
 
 ## Interface and packaging
 

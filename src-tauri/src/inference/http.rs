@@ -665,6 +665,9 @@ impl CloudHttpClient {
         let body = serde_json::to_vec(&envelope).map_err(|_| HttpTransportError::WireValidation)?;
         if body.len() > 8_000_000 { return Err(HttpTransportError::BodySizeLimitExceeded); }
         let req = self.client.post(self.analysis_url("analyze"))
+            // A scale-to-zero GPU may need a cold start before its first ONNX
+            // tile. Keep the regular control/job calls at their 30 s bound.
+            .timeout(Duration::from_secs(450))
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json")
             .body(body);

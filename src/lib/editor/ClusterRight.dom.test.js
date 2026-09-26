@@ -75,7 +75,9 @@ it('holds the review while no chapter is loaded', async () => {
 it('names the review dialog by its own title', async () => {
   session.textPolicy = 'all_text'
   editor.chapter = /** @type {any} */ ({ id: 'ch-1', pages: [], review: [] })
-  setBackend(/** @type {any} */ (new Proxy({}, { get: () => async () => { throw new Error('not in this test') } })))
+  setBackend(/** @type {any} */ (new Proxy({}, { get: (_, key) => key === 'subscribe'
+    ? () => () => {}
+    : async () => { throw new Error('not in this test') } })))
   const screen = render(ClusterRight)
   const host = render(ModalHost)
   await fireEvent.click(screen.getByRole('button', { name: t('editor.action.textShapeReview') }))

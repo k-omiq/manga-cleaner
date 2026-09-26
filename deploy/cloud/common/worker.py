@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 from deploy.cloud.common.contract import ContractValidationError, JobRequestMetadata, ServiceLimits
 from deploy.cloud.common.flux import SdnqFluxRunner, WorkerRenderError, render_job
 from deploy.cloud.common.jobs import WorkerOutcome, job_key, run_key
-from deploy.cloud.common.manifest import production_limits
+from deploy.cloud.common.manifest import MODEL_PROD_FLUX, production_limits
 from deploy.cloud.common.redact import redact_text
 from deploy.cloud.common.weights import WeightsError, require_snapshot
 
@@ -93,6 +93,7 @@ class WorkerRuntime:
         marker_delay_seconds: float = 0.0,
         sleep: Callable[[float], Any] = time.sleep,
         analysis_worker: Optional[Any] = None,
+        model_id: str = MODEL_PROD_FLUX,
     ):
         self.weights_root = weights_root
         self.reload = reload
@@ -103,6 +104,7 @@ class WorkerRuntime:
         self.sleep = sleep
         self.runner: Any = None
         self.analysis_worker = analysis_worker
+        self.model_id = model_id
         self.load_error: Optional[Tuple[str, str]] = None
 
     def load(self) -> bool:
@@ -116,6 +118,7 @@ class WorkerRuntime:
                 attempts=self.marker_attempts,
                 delay_seconds=self.marker_delay_seconds,
                 sleep=self.sleep,
+                model_id=self.model_id,
             )
             runner = self.runner_factory(str(snapshot))
             runner.load()

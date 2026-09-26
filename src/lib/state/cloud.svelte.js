@@ -26,6 +26,7 @@ import { getBackend, readCloudReadiness } from '../api/backend.js'
 import { notify, pushModal } from './app.svelte.js'
 import { editor, replaceRegion } from './editor.svelte.js'
 import { backendSettingsPatch, session, setCloudAllowed } from './session.svelte.js'
+import { currentCloudModelId } from '../model/model-names.js'
 
 /**
  * A render the status element shows.
@@ -157,6 +158,8 @@ export const cloud = $state({
   lastCommitAt: 0,
   /** @type {import('../api/backend.js').CloudRecoveryReport|null} */
   recovery: null,
+  /** Model metadata read for the current endpoint during a consent proposal. */
+  model: null,
 })
 
 /* ------------------------------------------------------------------ */
@@ -164,6 +167,34 @@ export const cloud = $state({
 /* ------------------------------------------------------------------ */
 
 let readinessSeq = 0
+let modelEpoch = 0
+const modelFetches = new Map()
+
+function modelTargetKey(readiness) {
+  const target = readiness?.target
+  if (!target || !readiness?.profile) return null
+  return `${target.type}:${target.profile_id}:${readiness.profile.updatedAtMs ?? ''}:${readiness.profile.endpointUrl ?? ''}`
+}
+
+/** Read only endpoint metadata; a failed lookup leaves the ordinary Cloud label. */
+function refreshCloudModel(readiness, backend) {
+  const key = modelTargetKey(readiness)
+  if (!session.cloudAllowed || !readiness.allowed || !readiness.configured || !key || currentCloudModelId(cloud)) return
+  if (modelFetches.has(key)) return
+  const epoch = modelEpoch
+  const target = readiness.target
+  const promise = Promise.resolve()
+    .then(() => backend.getCloudModelInfo({ provider: target.type, profileId: target.profile_id }))
+    .then((info) => {
+      if (epoch !== modelEpoch || modelTargetKey(cloud.readiness) !== key || !session.cloudAllowed) return
+      if (typeof info?.pinnedModelId !== 'string' || !info.pinnedModelId) return
+      cloud.model = { id: info.pinnedModelId, provider: target.type, profileId: target.profile_id,
+        updatedAtMs: readiness.profile.updatedAtMs ?? null }
+    })
+    .catch(() => {})
+    .finally(() => { if (modelFetches.get(key) === promise) modelFetches.delete(key) })
+  modelFetches.set(key, promise)
+}
 
 /**
  * Read readiness again. Overlapping reads keep only the newest answer.
@@ -178,6 +209,8 @@ export async function refreshCloudReadiness(backend = getBackend()) {
   if (mine === readinessSeq) {
     cloud.readiness = verdict
     cloud.checked = true
+    if (!currentCloudModelId(cloud)) cloud.model = null
+    refreshCloudModel(verdict, backend)
   }
   return verdict
 }
@@ -266,6 +299,8 @@ export function startCloud(backend = getBackend()) {
 
 /** Undo `startCloud`. For tests, and for nothing else. */
 export function stopCloud() {
+  modelEpoch += 1
+  modelFetches.clear()
   const run = started
   started = null
   if (run) {
@@ -280,6 +315,7 @@ export function stopCloud() {
   cloud.checked = false
   cloud.lastCommitAt = 0
   cloud.recovery = null
+  cloud.model = null
 }
 
 /**

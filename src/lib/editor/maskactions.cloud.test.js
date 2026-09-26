@@ -15,7 +15,7 @@ import { app, clearNotices, closeAllModals, closeModal } from '../state/app.svel
 import { stopCloud } from '../state/cloud.svelte.js'
 import { editor } from '../state/editor.svelte.js'
 import { setCloudAllowed } from '../state/session.svelte.js'
-import { cleanAnyway, rerunMask, runRegionMenuItem } from './maskactions.svelte.js'
+import { cleanAnyway, rerunMask, runRegionMenuItem, updateLayer } from './maskactions.svelte.js'
 
 const ZERO = { method: 0, openChapter: 0, export: 0, cloud: 0, provision: 0, region: 0, pageTail: 0, noticeStagger: 0 }
 const CHAPTER = 'tsuki-to-hane-ch107'
@@ -134,6 +134,27 @@ async function answerConsent(action) {
 }
 
 describe('the cloud from the Layers panel', () => {
+  it('preserves rapid layer changes while the first save is pending', async () => {
+    const { backend, regionId } = await opened()
+    const original = backend.restoreRegion.bind(backend)
+    let release
+    const pending = new Promise((resolve) => { release = resolve })
+    const save = vi.spyOn(backend, 'restoreRegion').mockImplementationOnce(async (args) => {
+      await pending
+      return original(args)
+    })
+    const stale = current(regionId)
+    const opacity = updateLayer(stale, { opacity: 45 })
+    const move = updateLayer(stale, { offsetX: 12 })
+    await vi.waitFor(() => expect(save).toHaveBeenCalledTimes(1))
+    release()
+    expect(await opacity).toBe(true)
+    expect(await move).toBe(true)
+    expect(save).toHaveBeenCalledTimes(2)
+    expect(save.mock.calls[1][0].region.mask.layer).toMatchObject({ opacity: 45, offsetX: 12 })
+    expect(current(regionId).mask.layer).toMatchObject({ opacity: 45, offsetX: 12 })
+  })
+
   it('cleans with Cloud only after consent, and lands the render as one undoable edit', async () => {
     const { backend, regionId } = await opened()
     const prepare = vi.spyOn(backend, 'prepareCloudConsent')

@@ -50,6 +50,7 @@ export const ALL_TEXT_POLICY = 'all_text'
  * @property {string[]} files - catalogue ids it needs
  * @property {string[]} [languages] - detection only: which languages it serves
  * @property {string} [sidecar] - cleaning only: the sidecar model directory it runs from
+ * @property {string} [cloudModel] - cleaning only: offered through cloud setup, never downloaded here
  * @property {boolean} ready
  * @property {{efficiency: number, light: number}} rating
  */
@@ -102,9 +103,27 @@ export function migrateDetectorChoice(language, value) {
     : { detector: undefined, ocrRescue: false }
 }
 
-/** Independent, read-only model analysis. Legacy clean-time detector choices
- * above retain their defaults until prepared mask write support is complete. */
+/** The review preset corresponding to a selected detection combination. */
+export function workflowForDetectorModels(value) {
+  const selected = normalizeDetectorModels(value)
+  const ctd = selected.includes('ctd')
+  const rt = selected.includes('rtSmall') || selected.includes('rtFull')
+  const sam = selected.includes('samTs')
+  if (ctd && rt && sam) return 'ctd_text_shape'
+  if (ctd && rt) return 'ctd_regions'
+  if (ctd && sam) return 'ctd_mask'
+  if (rt && sam) return 'text_shape'
+  if (ctd) return 'ctd'
+  if (rt) return 'regions'
+  return 'mask'
+}
+
+/** Independent model analysis presets; a selected combination chooses the initial one. */
 export const WORKFLOW_PRESETS = Object.freeze([
+  { id: 'ctd', name: 'Comic Text Detector (CTD)', needs: ['ctd'], description: 'CTD text boxes' },
+  { id: 'ctd_regions', name: 'CTD + RT-DETR v2', needs: ['ctd', 'rt'], description: 'CTD text with RT-DETR regions' },
+  { id: 'ctd_mask', name: 'CTD + SAM-TS-L', needs: ['ctd', 'sam'], description: 'CTD text with SAM lettering pixels' },
+  { id: 'ctd_text_shape', name: 'CTD + RT-DETR v2 + SAM-TS-L', needs: ['ctd', 'rt', 'sam'], description: 'All three detection models' },
   { id: 'regions', name: 'Regions only', needs: ['rt'], description: 'RT-DETR text and bubble boxes' },
   { id: 'mask', name: 'Mask only', needs: ['sam'], description: 'SAM-TS-L lettering pixels, without RT-DETR or OCR' },
   { id: 'text_shape', name: 'Text-shaped review', needs: ['rt', 'sam'], description: 'RT-DETR context with the unchanged SAM mask' },
@@ -117,7 +136,8 @@ export const CLEANERS = Object.freeze([
   { id: 'lama-manga', name: 'LaMa Manga', noteKey: 'pipelines.cleaner.lamaManga', files: ['inpainter'], ready: true, rating: { efficiency: 4, light: 4 } },
   { id: 'big-lama', name: 'Big LaMa', noteKey: 'pipelines.cleaner.bigLama', files: [], ready: false, rating: { efficiency: 3, light: 3 } },
   { id: 'flux2-klein-4b', name: 'FLUX.2 Klein 4B', noteKey: 'pipelines.cleaner.flux', files: [], sidecar: 'flux2-klein-4b', ready: false, rating: { efficiency: 3, light: 2 } },
-  { id: 'flux2-klein-9b', name: 'FLUX.2 Klein 9B', noteKey: 'pipelines.cleaner.flux', files: [], sidecar: 'flux2-klein-9b', ready: false, rating: { efficiency: 2, light: 1 } },
+  { id: 'flux2-klein-4b-cloud', name: '☁ FLUX.2 Klein 4B', noteKey: 'pipelines.cleaner.fluxCloud', files: [], cloudModel: 'flux2-klein-4b', ready: false, rating: { efficiency: 3, light: 2 } },
+  { id: 'flux2-klein-9b', name: '☁ FLUX.2 Klein 9B', noteKey: 'pipelines.cleaner.fluxCloud', files: [], cloudModel: 'flux2-klein-9b', ready: false, rating: { efficiency: 2, light: 1 } },
   { id: 'flux1-schnell', name: 'FLUX.1 [schnell]', noteKey: 'pipelines.cleaner.flux', files: [], sidecar: 'flux1-schnell', ready: false, rating: { efficiency: 3, light: 1 } },
   { id: 'flux1-dev', name: 'FLUX.1 [dev]', noteKey: 'pipelines.cleaner.flux', files: [], sidecar: 'flux1-dev', ready: false, rating: { efficiency: 2, light: 1 } },
   { id: 'qwen-image-edit-2511', name: 'Qwen-Image-Edit-2511', noteKey: 'pipelines.cleaner.qwen', files: [], ready: false, rating: { efficiency: 2, light: 1 } },
@@ -125,6 +145,19 @@ export const CLEANERS = Object.freeze([
 
 /** The detector a language starts on. */
 export const DEFAULT_DETECTOR = 'ctd-rtdetr'
+
+/** Independent detection capabilities. RT-DETR has two mutually exclusive profiles. */
+export const DETECTOR_MODEL_IDS = Object.freeze(['ctd', 'rtSmall', 'rtFull', 'samTs'])
+export const DEFAULT_DETECTOR_MODELS = Object.freeze(['ctd', 'rtSmall'])
+
+/** Validate a persisted or incoming combination without silently enabling models. */
+export function normalizeDetectorModels(value) {
+  if (!Array.isArray(value)) return [...DEFAULT_DETECTOR_MODELS]
+  const selected = [...new Set(value)]
+  if (!selected.length || selected.some((id) => !DETECTOR_MODEL_IDS.includes(id))) return [...DEFAULT_DETECTOR_MODELS]
+  if (selected.includes('rtSmall') && selected.includes('rtFull')) return [...DEFAULT_DETECTOR_MODELS]
+  return DETECTOR_MODEL_IDS.filter((id) => selected.includes(id))
+}
 
 /**
  * The ready detectors a language can use, in table order.
@@ -192,7 +225,14 @@ export function rescueRuns(detection, ocrRescue) {
  * @param {{textPolicy?: string, detection?: Record<string, string|null>|null, ocrRescue?: boolean}} [choices]
  * @returns {string[]} logical model ids (`MODELS`)
  */
-export function workflowNeeds({ textPolicy = LEGACY_POLICY, detection = null, ocrRescue = false } = {}) {
+export function workflowNeeds({ textPolicy = LEGACY_POLICY, detection = null, ocrRescue = false, detectorModels = null } = {}) {
+  if (detectorModels) {
+    const selected = normalizeDetectorModels(detectorModels)
+    const cleaned = LANGUAGES.some((language) => chosenDetector(detection, language.id))
+    if (!cleaned && textPolicy !== ALL_TEXT_POLICY) return []
+    return [...selected, ...(textPolicy === LEGACY_POLICY ? ['scriptGate'] : []),
+      ...(textPolicy === LEGACY_POLICY && rescueRuns(detection, ocrRescue) ? ['mangaOcr'] : [])]
+  }
   if (textPolicy === ALL_TEXT_POLICY) return ['rtSmall', 'samTs']
   const cleaned = LANGUAGES.some((language) => chosenDetector(detection, language.id))
   if (!cleaned) return []
@@ -250,9 +290,13 @@ export function runtimeState(runtime, needs, load) {
  * @param {{textPolicy?: string, ocrRescue?: boolean}} [options] - the policy (legacy by default) and the rescue switch
  * @returns {string[]}
  */
-export function filesFor(detection, cleaners, { textPolicy = LEGACY_POLICY, ocrRescue = false } = {}) {
+export function filesFor(detection, cleaners, { textPolicy = LEGACY_POLICY, ocrRescue = false, detectorModels = null } = {}) {
   const ids = new Set()
-  if (textPolicy === ALL_TEXT_POLICY) {
+  if (detectorModels) {
+    for (const id of workflowNeeds({ textPolicy, detection, ocrRescue, detectorModels })) {
+      for (const file of model(id)?.files ?? []) ids.add(file)
+    }
+  } else if (textPolicy === ALL_TEXT_POLICY) {
     for (const file of model('rtSmall')?.files ?? []) ids.add(file)
   } else {
     for (const language of LANGUAGES) {
@@ -304,7 +348,7 @@ export const MODELS = Object.freeze([
   {
     id: 'ctd',
     nameKey: 'models.kind.textDetector',
-    product: 'CTD',
+    product: 'Comic Text Detector (CTD)',
     source: 'download',
     files: ['textDetector'],
     group: null,
@@ -329,10 +373,10 @@ export const MODELS = Object.freeze([
     id: 'rtFull',
     nameKey: 'settings.detection.model.rtFull',
     product: 'RT-DETR v2 full',
-    source: 'import',
-    files: [],
+    source: 'download',
+    files: ['fullRt'],
     group: null,
-    importId: 'fullRt',
+    importId: null,
     disables: ['reviewFull'],
     roleKey: 'settings.detection.role.rtFull',
     removeKey: 'settings.models.remove.rtFull',
@@ -364,7 +408,7 @@ export const MODELS = Object.freeze([
   {
     id: 'scriptGate',
     nameKey: 'settings.models.groups.scriptGate',
-    product: null,
+    product: 'ogkalu Image Script Identification',
     source: 'download',
     files: [...SCRIPT_GATE_FILES],
     group: 'scriptGate',
@@ -376,7 +420,7 @@ export const MODELS = Object.freeze([
   {
     id: 'mangaOcr',
     nameKey: 'settings.models.groups.mangaOcr',
-    product: 'manga-ocr',
+    product: 'Manga OCR',
     source: 'download',
     files: [...OCR_FILES],
     group: 'mangaOcr',

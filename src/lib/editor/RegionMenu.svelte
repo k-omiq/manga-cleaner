@@ -1,7 +1,9 @@
 <script>
   import { regionMenuSections } from '../model/masks.js'
   import { capabilities } from '../state/capabilities.svelte.js'
-  import { cloudUsable } from '../state/cloud.svelte.js'
+  import { cloud, cloudUsable } from '../state/cloud.svelte.js'
+  import { session } from '../state/session.svelte.js'
+  import { currentCloudModelId, engineModelLabel } from '../model/model-names.js'
   import { runRegionMenuItem } from './maskactions.svelte.js'
   import { ContextMenu } from '../ui/index.js'
   import { t } from '../i18n/index.js'
@@ -40,7 +42,13 @@
           label: section.labelKey ? t(section.labelKey) : null,
           items: section.items.map((item) => ({
             id: item.id,
-            label: t(item.labelKey),
+            label: item.id.startsWith('engine:') || item.id.startsWith('approve:')
+              ? engineModelLabel(item.id.split(':')[1],
+                item.id.endsWith(':cloud') ? currentCloudModelId(cloud) ??
+                  (!cloudUsable() ? at?.region?.mask?.provenance?.cloud?.model : null) :
+                  item.id.endsWith(':flux') ? session.fluxModel || 'flux2-klein-4b' : null,
+                t(item.labelKey))
+              : t(item.labelKey),
             icon: item.icon,
             selected: item.selected,
           })),

@@ -10,6 +10,7 @@ mod about;
 mod diagnostics;
 mod events;
 mod exporting;
+mod flux_install;
 mod history;
 pub mod inference;
 mod library;
@@ -22,6 +23,7 @@ mod settings;
 mod tile;
 mod underlay;
 mod weights;
+mod webview_lock;
 
 /// The tray icon's id, so close-to-tray can check the icon exists.
 const TRAY_ID: &str = "main";
@@ -36,6 +38,8 @@ pub fn run() {
             show_main(app)
         }))
         .setup(|app| {
+            inference::usage::start_session();
+            webview_lock::install(app.handle());
             use tauri::{
                 menu::{Menu, MenuItem},
                 tray::TrayIconBuilder,
@@ -136,6 +140,8 @@ pub fn run() {
             inference::commands::get_cloud_secret_summary,
             inference::commands::check_cloud_connection,
             inference::commands::get_cloud_model_info,
+            inference::usage::get_cloud_usage,
+            inference::billing::get_cloud_billing,
             inference::commands::prepare_cloud_consent,
             inference::commands::confirm_cloud_consent,
             inference::commands::submit_cloud_attempt,
@@ -171,6 +177,7 @@ pub fn run() {
             region::clean_anyway,
             region::sidecar_available,
             region::list_sidecar_models,
+            flux_install::install_flux_helper,
             exporting::export_chapter,
             events::subscribe_events,
             events::unsubscribe_events,
@@ -181,6 +188,7 @@ pub fn run() {
             model_workflows::import_full_rt,
             model_workflows::remove_full_rt,
             model_workflows::import_sam_ts,
+            model_workflows::install_sam_ts,
             model_workflows::remove_sam_ts,
             model_workflows::verify_sam_ts,
             model_workflows::analyze_capabilities,

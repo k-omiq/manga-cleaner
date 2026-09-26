@@ -20,7 +20,7 @@ from unittest import mock
 
 from provisioner.beam_driver import BeamDriver, load_plain
 from provisioner.controller import ProvisioningController
-from provisioner.driver_base import SEED_INTENT_KEY, SEED_STALE_SECONDS, SEED_START_GRACE_SECONDS
+from provisioner.driver_base import SEED_INTENT_KEY, SEED_STALE_SECONDS, SEED_START_GRACE_SECONDS, read_seed_state
 from provisioner.fake_sdks import (
     FakeBeamCloud,
     FakeModalCloud,
@@ -33,8 +33,20 @@ from provisioner.modal_driver import TOKEN_CREATE_INTENT_KEY, ModalDriver
 from provisioner.progress import STATES, STEPS
 from provisioner.protocol import HELPER_PROTOCOL_VERSION
 
-from deploy.cloud.common.manifest import PROD_SNAPSHOT_TOTAL_BYTES
+from deploy.cloud.common.manifest import MODEL_PROD_FLUX_9B, PROD_SNAPSHOT_9B_TOTAL_BYTES, PROD_SNAPSHOT_TOTAL_BYTES
 from deploy.cloud.common.weights import seed_state
+
+
+class SeedStateModelTest(unittest.TestCase):
+    def test_9b_seed_status_uses_its_own_revision_and_size(self):
+        running = seed_state("running", PROD_SNAPSHOT_9B_TOTAL_BYTES // 2,
+                             now=5.0, model_id=MODEL_PROD_FLUX_9B)
+        self.assertEqual(read_seed_state(running, MODEL_PROD_FLUX_9B), ("running", 50, ""))
+        self.assertEqual(read_seed_state(running)[0], "unknown")
+        done = seed_state("done", PROD_SNAPSHOT_9B_TOTAL_BYTES,
+                          now=6.0, model_id=MODEL_PROD_FLUX_9B)
+        self.assertEqual(read_seed_state(done, MODEL_PROD_FLUX_9B), ("done", 100, ""))
+
 
 IC1_KEYS = {
     "installation_id",
@@ -45,6 +57,7 @@ IC1_KEYS = {
     "gpu",
     "idle_seconds",
     "model",
+    "analysis_models",
     "compatibility_status",
     "resources_created",
     "setup_credential_forgotten",
@@ -261,6 +274,35 @@ class ProviderCases:
                 "plan", {"credentials": self.h.credentials, "installation_id": "mc-ab12cd", "options": bad}
             )
             self.assertEqual(response["error"]["code"], "ERR_VALIDATION_ERROR", bad)
+
+    def test_9b_plan_pins_larger_gpu_and_separate_checkpoint(self) -> None:
+        required_gpu = "L40S" if self.provider == "modal" else "RTX5090"
+        plan = self.h.plan(options={"model_id": MODEL_PROD_FLUX_9B})
+        allocation = plan["resource_allocation"]
+        self.assertEqual(allocation["gpu"], required_gpu)
+        self.assertEqual(allocation["model_id"], MODEL_PROD_FLUX_9B)
+        self.assertEqual(allocation["model_weights_bytes"], PROD_SNAPSHOT_9B_TOTAL_BYTES)
+        self.assertEqual(allocation["worker_memory_gib"], 24)
+        self.assertEqual(allocation["model_license"], "FLUX non-commercial")
+        self.assertNotEqual(plan["plan_hash"], self.h.plan()["plan_hash"])
+        rejected, _ = self.h.request("plan", {"credentials": self.h.credentials,
+            "installation_id": "mc-ab12cd", "options": {"model_id": MODEL_PROD_FLUX_9B, "gpu": self.default_gpu}})
+        self.assertEqual(rejected["error"]["code"], "ERR_VALIDATION_ERROR")
+
+    def test_selected_analysis_graphs_change_the_plan_and_apply(self) -> None:
+        chosen = ["text_regions_rt@1", "text_mask_sam_ts@1"]
+        options = {"analysis_models": chosen}
+        plan = self.h.plan(options=options)
+        self.assertEqual(plan["resource_allocation"]["analysis_models"], ["text_mask_sam_ts@1", "text_regions_rt@1"])
+        self.assertNotEqual(plan["plan_hash"], self.h.plan()["plan_hash"])
+        if self.provider == "beam":
+            self.assertIn("mc-ab12cd-analysis", [item["name"] for item in plan["resources_to_create"]])
+        response = self.h.apply(options=options)
+        self.assertTrue(response["success"], response)
+        self.assertEqual(response["data"]["analysis_models"], ["text_mask_sam_ts@1", "text_regions_rt@1"])
+        if self.provider == "beam":
+            deployed = [entry for entry in self.h.cloud.calls if entry[0] == "deploy"]
+            self.assertTrue(any(entry[1].get("handler") == "analyze" for entry in deployed))
 
     # ---------- apply ----------
 
