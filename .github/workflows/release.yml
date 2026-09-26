@@ -277,10 +277,19 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $installer = Get-ChildItem "target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
+          if (-not $installer) { throw 'The NSIS installer is missing' }
           $destination = Join-Path $env:RUNNER_TEMP 'Manga Café smoke'
+          function Invoke-Nsis([string] $filePath, [string] $arguments) {
+            $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = $filePath
+            $startInfo.Arguments = $arguments
+            $startInfo.UseShellExecute = $false
+            $process = [System.Diagnostics.Process]::Start($startInfo)
+            $process.WaitForExit()
+            if ($process.ExitCode -ne 0) { throw "NSIS exited $($process.ExitCode): $filePath" }
+          }
           function Install-App {
-            & $installer.FullName '/S' "/D=$destination"
-            if ($LASTEXITCODE -ne 0) { throw "NSIS install exited $LASTEXITCODE" }
+            Invoke-Nsis $installer.FullName "/S /D=$destination"
             $app = Get-ChildItem $destination -File -Filter '*.exe' | Where-Object { $_.Name -notmatch 'provisioner|uv|uninstall' } | Select-Object -First 1
             if (-not $app) { throw 'The installed app executable is missing' }
             foreach ($name in @('manga-cleaner-provisioner.exe', 'manga-cleaner-uv.exe')) {
@@ -291,8 +300,7 @@ jobs:
           function Uninstall-App([string] $app) {
             $uninstaller = Get-ChildItem $destination -File -Filter '*uninstall*.exe' | Select-Object -First 1
             if (-not $uninstaller) { throw 'The NSIS uninstaller is missing' }
-            & $uninstaller.FullName '/S'
-            if ($LASTEXITCODE -ne 0) { throw "NSIS uninstall exited $LASTEXITCODE" }
+            Invoke-Nsis $uninstaller.FullName '/S'
             for ($attempt = 0; $attempt -lt 30 -and (Test-Path $app); $attempt++) { Start-Sleep -Seconds 1 }
             if (Test-Path $app) { throw 'The app executable remains after uninstall' }
           }
