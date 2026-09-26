@@ -630,6 +630,7 @@ export const en = {
       modelHelp: 'Each local model can inherit the global choice or use its own backend. Changes apply to the next inference session.',
       modelLabel: 'Local backend for {model}',
       predicted: 'Next session: {backend}',
+      refused: '{backend} is unavailable for this model: {reason}. The next run will stop until you choose another backend.',
       unavailableForModel: '{model} cannot use {backend}: {reason}. Choose a supported backend in Performance.',
       cloudReview: '☁ Cloud GPU: SAM-TS-L and RT-DETR v2 full can analyze pages from the editor’s Review screen. Cloud analysis is review only; Auto clean stays local.',
       saveFailed: 'Could not save the model backend. Try again.',

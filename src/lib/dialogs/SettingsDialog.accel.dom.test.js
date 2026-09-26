@@ -37,7 +37,7 @@ it('shows the native model capability matrix and persists a backend choice for t
   }
   setBackend(/** @type {any} */ ({
     listModels: vi.fn(async () => null),
-    listAccelerators: vi.fn(async () => accelerators),
+    listAccelerators: vi.fn(async () => structuredClone(accelerators)),
     listSidecarModels: vi.fn(async () => []),
     sidecarAvailable: vi.fn(async () => ({ available: false, reasonKey: null })),
     about: vi.fn(async () => ({ appVersion: 'test', facts: [] })),
@@ -59,4 +59,11 @@ it('shows the native model capability matrix and persists a backend choice for t
     modelAccelerators: { samTs: 'webgpu' },
   })))
   expect(session.modelAccelerators.samTs).toBe('webgpu')
+
+  accelerators.models[0].preference = 'cuda'
+  accelerators.models[0].declinedKey = 'accel.declined.unavailable'
+  accelerators.models[0].declinedId = 'cuda'
+  await fireEvent.change(picker, { target: { value: 'auto' } })
+  await waitFor(() => expect(rendered.getByText(/The next run will stop until you choose another backend/)).not.toBeNull())
+  expect(rendered.queryByText('Next session: CPU')).toBeNull()
 })

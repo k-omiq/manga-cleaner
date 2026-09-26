@@ -1551,6 +1551,10 @@
    * @param {{modelKey: string, labelKey: string, noteKey: string|null, declinedKey: string|null, declinedId: string|null, neededBytes: number|null, roomBytes: number|null}} row
    */
   function placementOf(row) {
+    if (row.declinedKey && row.preference !== 'auto') {
+      const wanted = row.declinedId ? t(`accel.${row.declinedId}`) : t(`accel.${row.preference}`)
+      return t('settings.accel.refused', { backend: wanted, reason: t(row.declinedKey) })
+    }
     const parts = [t(row.labelKey)]
     if (row.noteKey) parts.push(t(row.noteKey))
     if (row.declinedKey) {
