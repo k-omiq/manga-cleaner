@@ -52,6 +52,15 @@ SDK_METADATA = ("modal", "beam-client", "beta9", "betterproto-beta9")
 # Third-party packages the deploy tree imports on the desktop. Anything else it
 # imports (torch, diffusers, huggingface_hub, ...) runs only inside the containers.
 DESKTOP_THIRD_PARTY = {"modal", "beam", "beta9", "starlette"}
+# Modal attaches these files to the SAM seed image from the helper process.
+# They must exist beside the frozen deploy tree at runtime, not only in a
+# developer checkout. The self-check imports the SAM-enabled app and catches
+# missing files before an installer is built.
+ANALYSIS_SOURCE_FILES = (
+    ("sam-bootstrap/bootstrap.py", "sam-bootstrap"),
+    ("spikes/sam-ts-l/export_mask.py", "spikes/sam-ts-l"),
+    ("spikes/sam-ts-l/fixtures/synthetic_page.png", "spikes/sam-ts-l/fixtures"),
+)
 IC2_LINE = re.compile(r'^\{"mc_progress":1,"op":"[a-z_]+","step":"[a-z]+","state":"(start|done|fail|skip)","pct":(null|\d{1,3})\}$')
 SMOKE_TIMEOUT_SECONDS = 120
 
@@ -136,6 +145,8 @@ def freeze(target: str, dist: Path, work: Path) -> Path:
         "--paths", str(ROOT),
         "--add-data", f"{stage_deploy_tree(work)}{os.pathsep}deploy",
     ]
+    for source, destination in ANALYSIS_SOURCE_FILES:
+        command += ["--add-data", f"{ROOT / source}{os.pathsep}{destination}"]
     for package in SDK_PACKAGES:
         command += ["--collect-all", package]
     for distribution in SDK_METADATA:
