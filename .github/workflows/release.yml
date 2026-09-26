@@ -271,6 +271,43 @@ jobs:
             }
           }
           if (-not (Test-Path "$($installer.FullName).sig")) { throw 'NSIS updater signature is missing' }
+      - name: Smoke-test Windows install and reinstall
+        if: startsWith(matrix.platform, 'windows-') && inputs.validate_only == true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Get-ChildItem "target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
+          $destination = Join-Path $env:RUNNER_TEMP 'Manga Café smoke'
+          function Install-App {
+            & $installer.FullName '/S' "/D=$destination"
+            if ($LASTEXITCODE -ne 0) { throw "NSIS install exited $LASTEXITCODE" }
+            $app = Get-ChildItem $destination -File -Filter '*.exe' | Where-Object { $_.Name -notmatch 'provisioner|uv|uninstall' } | Select-Object -First 1
+            if (-not $app) { throw 'The installed app executable is missing' }
+            foreach ($name in @('manga-cleaner-provisioner.exe', 'manga-cleaner-uv.exe')) {
+              if (-not (Test-Path (Join-Path $destination $name))) { throw "The installed app is missing $name" }
+            }
+            return $app.FullName
+          }
+          function Uninstall-App([string] $app) {
+            $uninstaller = Get-ChildItem $destination -File -Filter '*uninstall*.exe' | Select-Object -First 1
+            if (-not $uninstaller) { throw 'The NSIS uninstaller is missing' }
+            & $uninstaller.FullName '/S'
+            if ($LASTEXITCODE -ne 0) { throw "NSIS uninstall exited $LASTEXITCODE" }
+            for ($attempt = 0; $attempt -lt 30 -and (Test-Path $app); $attempt++) { Start-Sleep -Seconds 1 }
+            if (Test-Path $app) { throw 'The app executable remains after uninstall' }
+          }
+          $app = Install-App
+          $oldPath = $env:PATH
+          try {
+            $env:PATH = "$env:WINDIR\System32;$env:WINDIR"
+            $selfCheck = & (Join-Path $destination 'manga-cleaner-provisioner.exe') '--self-check' | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or -not $selfCheck.ok) { throw 'Installed provisioner self-check failed without developer tools on PATH' }
+            & (Join-Path $destination 'manga-cleaner-uv.exe') '--version'
+            if ($LASTEXITCODE -ne 0) { throw 'Installed managed Python helper did not run' }
+          } finally { $env:PATH = $oldPath }
+          Uninstall-App $app
+          $app = Install-App
+          Uninstall-App $app
       - name: Verify Linux packages and bundled setup helpers
         if: startsWith(matrix.platform, 'linux-')
         shell: bash
