@@ -2508,6 +2508,7 @@ export const en = {
     backend: {
       cpu: 'CPU',
       webgpu: 'WebGPU',
+      autoSettings: 'Automatic · uses Performance settings',
       canWrite: '{name} · can write',
       reviewOnly: '{name} · review only',
       unavailable: '{name} · unavailable',

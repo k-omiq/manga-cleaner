@@ -261,6 +261,7 @@ describe('readinessKeyOf', () => {
 
   it('is null when the workflow can run', () => {
     expect(readinessKeyOf(caps, both, choice)).toBeNull()
+    expect(readinessKeyOf(caps, both, { ...choice, rtBackend: 'auto', samBackend: 'auto' })).toBeNull()
   })
 
   it('names the missing piece', () => {

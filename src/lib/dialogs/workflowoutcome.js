@@ -423,13 +423,13 @@ export function readinessKeyOf(capabilities, preset, { rtProfile, rtBackend, sam
   if (preset.needs.includes('rt')) {
     const installed = rtProfile === 'full-halves' ? capabilities.fullRtInstalled : capabilities.rtInstalled
     if (!installed) return 'workflow.ready.rt'
-    if (!capabilities.rtBackends?.some((entry) => entry.id === rtBackend && entry.selectable)) return 'workflow.ready.backend'
+    if (rtBackend !== 'auto' && !capabilities.rtBackends?.some((entry) => entry.id === rtBackend && entry.selectable)) return 'workflow.ready.backend'
   }
   if (preset.needs.includes('sam')) {
     if (!capabilities.samInstalled) return 'workflow.ready.sam'
     if (verified !== true) return 'workflow.ready.samUnverified'
     if (!capabilities.samMemoryReady) return 'workflow.ready.memory'
-    if (!capabilities.samBackends?.some((entry) => entry.id === samBackend && entry.selectable)) return 'workflow.ready.backend'
+    if (samBackend !== 'auto' && !capabilities.samBackends?.some((entry) => entry.id === samBackend && entry.selectable)) return 'workflow.ready.backend'
   }
   return null
 }

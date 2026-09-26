@@ -135,7 +135,7 @@
         <Select id="onboarding-backend-{row.id}" label={t('settings.accel.modelLabel', { model: modelName(row) })}
           options={backendChoices(row)} value={session.modelAccelerators[row.id] ?? 'inherit'}
           onchange={(value) => chooseModelBackend(row.id, value)} />
-        {#if row.id === 'samTs' || row.id === 'rtSmall' || row.id === 'rtFull'}
+        {#if row.id === 'samTs' || row.id === 'rtFull'}
           <span class="sub">{t('settings.accel.cloudReview')}</span>
         {/if}
       </div>

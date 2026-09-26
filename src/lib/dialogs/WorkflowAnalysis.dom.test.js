@@ -103,7 +103,7 @@ it('allows mask-only analysis with no RT model or OCR and names the selected SAM
   await fireEvent.input(screen.getByLabelText('Source page'), { target: { value: '/tmp/page.png' } })
   await fireEvent.click(screen.getByRole('button', { name: 'Analyze for review' }))
   await waitFor(() => expect(analyze).toHaveBeenCalledWith({ sourcePath: '/tmp/page.png', workflow: 'mask',
-    rtProfile: 'full-halves', rtBackend: 'ort-cpu', samBackend: 'ort-cpu', requestId: expect.stringMatching(/^review-/) }))
+    rtProfile: 'full-halves', rtBackend: 'auto', samBackend: 'auto', requestId: expect.stringMatching(/^review-/) }))
 })
 
 it('enables regions without SAM and keeps COO unavailable', async () => {
@@ -116,6 +116,27 @@ it('enables regions without SAM and keeps COO unavailable', async () => {
   await fireEvent.input(screen.getByLabelText('Source page'), { target: { value: '/tmp/page.png' } })
   await fireEvent.click(screen.getByRole('button', { name: 'Analyze for review' }))
   await waitFor(() => expect(analyze).toHaveBeenCalledWith(expect.objectContaining({ workflow: 'regions', rtProfile: 'full-halves' })))
+})
+
+it('uses the selected RT model matrix to disable an incompatible explicit backend', async () => {
+  setBackend(/** @type {any} */ ({
+    ...LOADS,
+    listWorkflowCapabilities: async () => capabilities({
+      fullRtInstalled: true, rtInstalled: true,
+      rtBackends: [...cpu(), { id: 'ort-webgpu', platform: 'macOS', qualified: false,
+        available: true, selectable: true, note: 'Candidate provider' }],
+    }),
+    listAccelerators: async () => ({ models: [
+      { id: 'rtFull', backendStatus: [{ id: 'ort-webgpu', supported: false, available: false }] },
+      { id: 'rtSmall', backendStatus: [{ id: 'ort-webgpu', supported: true, available: true }] },
+    ] }),
+  }))
+  const screen = render(WorkflowAnalysis)
+  const profile = await screen.findByLabelText('RT model and page layout')
+  const backend = screen.getByLabelText('RT backend')
+  await waitFor(() => expect([...backend.options].find((option) => option.value === 'ort-webgpu')?.disabled).toBe(true))
+  await fireEvent.change(profile, { target: { value: 'small-whole' } })
+  await waitFor(() => expect([...backend.options].find((option) => option.value === 'ort-webgpu')?.disabled).toBe(false))
 })
 
 it('says what is missing instead of only disabling Analyze', async () => {
@@ -175,7 +196,7 @@ it('analyzes the selected chapter page and requires exact corrected-W approval f
   await waitFor(() => expect(screen.getByText('SHA-256 verified')).toBeTruthy())
   await fireEvent.click(screen.getByRole('button', { name: 'Analyze for review' }))
   await waitFor(() => expect(analyze).toHaveBeenCalledWith({ chapterId, pageIndex: 0, workflow: 'text_shape',
-    rtProfile: 'full-halves', rtBackend: 'ort-cpu', samBackend: 'ort-cpu', requestId: expect.stringMatching(/^review-/) }))
+    rtProfile: 'full-halves', rtBackend: 'auto', samBackend: 'auto', requestId: expect.stringMatching(/^review-/) }))
   await fireEvent.click(await screen.findByRole('button', { name: /sam-00001/ }))
   await fireEvent.change(screen.getByLabelText('Padding in source pixels'), { target: { value: '3' } })
   await fireEvent.change(screen.getByLabelText('Mask correction mode'), { target: { value: 'add' } })
@@ -545,7 +566,7 @@ it('shows cloud evidence in the same review, labelled, and never prepares or app
   expect(screen.container.querySelector('canvas[data-tint="evidence"]')).toBeTruthy()
   expect(loadedImages).toContain('data:image/png;base64,CC')
   expect(screen.queryByText('W, will be written')).toBeNull()
-  expect(screen.getByText('SAM text mask on Studio A100, Modal')).toBeTruthy()
+  expect(screen.getByText('☁ SAM-TS-L on Studio A100, Modal')).toBeTruthy()
 })
 
 it('renders cloud evidence with no components and no page image', async () => {

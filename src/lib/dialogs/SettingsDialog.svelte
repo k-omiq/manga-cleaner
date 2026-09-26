@@ -2826,7 +2826,7 @@
                 <div class="row-text">
                   <span class="row-name">{modelDisplayName(row)}</span>
                   <span class="row-meta">{t('settings.accel.predicted', { backend: placementOf(row) })}</span>
-                  {#if row.id === 'samTs' || row.id === 'rtSmall' || row.id === 'rtFull'}
+                  {#if row.id === 'samTs' || row.id === 'rtFull'}
                     <span class="row-meta">{t('settings.accel.cloudReview')}</span>
                   {/if}
                   {#if row.backendStatus}

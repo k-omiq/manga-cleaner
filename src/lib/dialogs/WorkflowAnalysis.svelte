@@ -56,6 +56,7 @@
   const MAX_TINT_PIXELS = 16 * 1024 * 1024
 
   let capabilities = $state(null)
+  let modelBackendRows = $state(null)
   /**
    * Whether the installed runtime loads, as `diagnostics` answers it. Asked
    * after every readiness read that finds the runtime, until it has loaded:
@@ -69,8 +70,10 @@
   /** Set once the user picks a profile; readiness answers never move it after that. */
   let rtProfileChosen = untrack(() => initialRtProfile !== null)
   let sourcePath = $state('')
-  let rtBackend = $state('ort-cpu')
-  let samBackend = $state('ort-cpu')
+  // Native Review resolves `auto` against the saved preference for the
+  // selected RT graph or SAM model. A choice here overrides that run only.
+  let rtBackend = $state('auto')
+  let samBackend = $state('auto')
   let result = $state(null)
   let focus = $state(null)
   let busy = $state(false)
@@ -125,7 +128,10 @@
   const selectedBounds = $derived(selectedComponent?.bounds ?? selectedRegion?.bounds ?? null)
   const chapterPages = $derived(editor.chapter?.id === chapterId ? (editor.chapter.pages ?? []) : [])
   const pageNumber = $derived(chapterPages.find((page) => page.index === pageIndex)?.number ?? pageIndex + 1)
-  const notReadyKey = $derived(readinessKeyOf(capabilities, preset, { rtProfile, rtBackend, samBackend, verified, load: runtimeLoad.state }))
+  const notReadyKey = $derived(
+    readinessKeyOf(capabilities, preset, { rtProfile, rtBackend, samBackend, verified, load: runtimeLoad.state }) ??
+    (preset?.needs.includes('rt') && rtBackend !== 'auto' && !rtBackendSelectable(rtBackend) ? 'workflow.ready.backend' : null)
+  )
   const canAnalyze = $derived(Boolean(capabilities && !busy && !analyzing && !cloudActive && !notReadyKey && (chapterId || sourcePath.trim())))
   const isRemote = $derived(isRemoteAnalysis(result))
   let fullRtDownloading = $state(false)
@@ -158,6 +164,9 @@
   async function refresh() {
     const next = await getBackend().listWorkflowCapabilities()
     capabilities = next
+    // The workflow capability list spans both RT graphs. The per-model matrix
+    // decides whether an explicit backend can run the selected graph.
+    modelBackendRows = await getBackend().listAccelerators?.().then((value) => value.models ?? null).catch(() => null) ?? null
     // Settings asks for the small RT-DETR only while the full graph is not
     // imported, so until the user picks, start on the profile that is here.
     if (!rtProfileChosen) rtProfile = !next.fullRtInstalled && next.rtInstalled ? 'small-whole' : 'full-halves'
@@ -798,9 +807,23 @@
   function percent(value, total) { return `${value / total * 100}%` }
 
   function backendName(id) {
+    if (id === 'auto') return t('settings.accel.auto')
     if (id === 'ort-cpu') return t('workflow.backend.cpu')
     if (id === 'ort-webgpu') return t('workflow.backend.webgpu')
+    if (id === 'ort-coreml') return t('accel.coreml')
+    if (id === 'ort-directml') return t('accel.directml')
+    if (id === 'ort-cuda') return t('accel.cuda')
     return id
+  }
+
+  function rtBackendSelectable(id) {
+    const modelId = rtProfile === 'small-whole' ? 'rtSmall' : 'rtFull'
+    const status = modelBackendRows?.find((row) => row.id === modelId)?.backendStatus?.find((entry) => entry.id === id)
+    if (status) return status.supported && status.available
+    // Older native builds may lack the per-model matrix. Neither shipped RT
+    // graph has a strict WebGPU session, so do not invite that selection.
+    if (id === 'ort-webgpu') return false
+    return capabilities?.rtBackends?.some((entry) => entry.id === id && entry.selectable) ?? false
   }
 
   function samOptionLabel(option) {
@@ -928,8 +951,9 @@
   <label class="field">
     <span>{t('workflow.field.rtBackend')}</span>
     <select bind:value={rtBackend} disabled={!preset?.needs.includes('rt') || !!analyzing}>
+      <option value="auto">{t('workflow.backend.autoSettings')}</option>
       {#each capabilities.rtBackends as option (option.id)}
-        <option value={option.id} disabled={!option.selectable}>{rtOptionLabel(option)}</option>
+        <option value={option.id} disabled={!rtBackendSelectable(option.id)}>{rtOptionLabel({ ...option, selectable: rtBackendSelectable(option.id) })}</option>
       {/each}
     </select>
   </label>
@@ -969,6 +993,7 @@
       <label class="field">
         <span>{t('workflow.field.samBackend')}</span>
         <select bind:value={samBackend} disabled={!preset?.needs.includes('sam') || !!analyzing}>
+          <option value="auto">{t('workflow.backend.autoSettings')}</option>
           {#each capabilities.samBackends as option (option.id)}
             <option value={option.id} disabled={!option.selectable}>{samOptionLabel(option)}</option>
           {/each}
