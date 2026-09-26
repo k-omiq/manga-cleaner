@@ -2821,7 +2821,7 @@
           <h3 class="sub">{t('settings.accel.models')}</h3>
           <p class="line">{t('settings.accel.modelHelp')}</p>
           <ul class="rows">
-            {#each accelerators.models as row (row.modelKey)}
+            {#each accelerators.models as row (row.id)}
               <li class="row">
                 <div class="row-text">
                   <span class="row-name">{modelDisplayName(row)}</span>
