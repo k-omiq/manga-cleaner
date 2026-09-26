@@ -102,6 +102,7 @@
     backendSettingsPatch,
     session,
     setAccelerator,
+    setModelAccelerator,
     setCloseToTray,
     setDetection,
     setDetectorModels,
@@ -904,8 +905,21 @@
     if (runtime === 'unloadable') {
       lines.push(t('settings.detection.ready.runtimeUnloadable', { reasonKey: runtimeLoad.reasonKey ?? 'diagnostics.runtime.unloadable' }))
     } else if (!runtimeReady) lines.push(t(RUNTIME_LINES[runtime]))
+    let backendBlocked = false
+    for (const id of needs) {
+      const placement = accelerators?.models.find((model) => model.id === id)
+      if (!placement || placement.preference === 'auto') continue
+      const status = placement.backendStatus?.find((entry) => entry.id === placement.preference)
+      if (status?.available) continue
+      backendBlocked = true
+      lines.push(t('settings.accel.unavailableForModel', {
+        model: placement.modelName ?? pipelineModel(id)?.product ?? id,
+        backend: t(`accel.${placement.preference}`),
+        reason: t(status?.reasonKey ?? 'settings.accel.state.unsupported'),
+      }))
+    }
     const missing = toDownload.reduce((sum, entry) => sum + (viewOf(entry).missingBytes ?? 0), 0)
-    const complete = bytes === 0 && !importMissing && !samHeld && (!allText || Boolean(workflowCaps)) && runtimeReady
+    const complete = bytes === 0 && !importMissing && !samHeld && !backendBlocked && (!allText || Boolean(workflowCaps)) && runtimeReady
     return { lines, toDownload, missing, fetching, complete, runtime }
   })
 
@@ -1425,7 +1439,7 @@
    */
   let accelAsked = false
   $effect(() => {
-    if (active !== 'performance') return
+    if (active !== 'performance' && !(active === 'detection' && runtimeLoad.state === 'loaded')) return
     untrack(() => {
       if (accelAsked && !accelFailure) return
       accelAsked = true
@@ -1555,6 +1569,56 @@
     setAccelerator(id)
     await push()
     await refreshAccelerators()
+  }
+
+  let modelAccelFailure = $state(false)
+
+  /** The native capability matrix is the source of selectable backends. */
+  function modelBackendChoices(row) {
+    const inherited = session.accelerator === 'auto'
+      ? t('settings.accel.auto')
+      : t(`accel.${session.accelerator}`)
+    const choices = [
+      { value: 'inherit', label: t('settings.accel.inherit', { backend: inherited }) },
+      { value: 'auto', label: t('settings.accel.auto') },
+    ]
+    for (const status of row.backendStatus ?? []) {
+      const provider = accelerators?.providers.find((entry) => entry.id === status.id)
+      const name = provider ? t(provider.labelKey) : status.id
+      const level = status.verified ? 'verified'
+        : status.available ? 'available'
+          : status.installed ? 'installed'
+            : status.supported ? 'supported' : 'unsupported'
+      const note = status.reasonKey ? t(status.reasonKey) : t(`settings.accel.state.${level}`)
+      choices.push({
+        value: status.id,
+        label: `${name} · ${note}`,
+        disabled: !status.supported || !status.available,
+        title: note,
+      })
+    }
+    const saved = session.modelAccelerators[row.id]
+    if (saved && !choices.some((choice) => choice.value === saved)) {
+      choices.push({ value: saved, label: t('settings.accel.saved', { id: saved }) })
+    }
+    return choices
+  }
+
+  async function chooseModelAccelerator(modelId, id) {
+    const before = session.modelAccelerators[modelId] ?? 'inherit'
+    modelAccelFailure = false
+    setModelAccelerator(modelId, id)
+    try {
+      await push()
+      await refreshAccelerators()
+    } catch {
+      setModelAccelerator(modelId, before)
+      modelAccelFailure = true
+    }
+  }
+
+  function modelDisplayName(row) {
+    return row.modelName ?? pipelineModel(row.id)?.product ?? (row.id === 'inpainter' ? CLEANERS[0].name : t(row.modelKey))
   }
 
   let choosing = $state(false)
@@ -2734,15 +2798,41 @@
         {#if accelFailure}
           <p class="line">{t('settings.accel.unreadable')}</p>
         {/if}
+        {#if modelAccelFailure}
+          <p class="line failed" role="alert">{t('settings.accel.saveFailed')}</p>
+        {/if}
 
         {#if accelerators && accelerators.models.length > 0}
+          <h3 class="sub">{t('settings.accel.models')}</h3>
+          <p class="line">{t('settings.accel.modelHelp')}</p>
           <ul class="rows">
             {#each accelerators.models as row (row.modelKey)}
               <li class="row">
                 <div class="row-text">
-                  <span class="row-name">{t(row.modelKey)}</span>
-                  <span class="row-meta">{placementOf(row)}</span>
+                  <span class="row-name">{modelDisplayName(row)}</span>
+                  <span class="row-meta">{t('settings.accel.predicted', { backend: placementOf(row) })}</span>
+                  {#if row.id === 'samTs' || row.id === 'rtSmall' || row.id === 'rtFull'}
+                    <span class="row-meta">{t('settings.accel.cloudReview')}</span>
+                  {/if}
+                  {#if row.backendStatus}
+                    <span class="row-meta">{row.backendStatus.map((status) => {
+                      const name = accelerators.providers.find((provider) => provider.id === status.id)?.labelKey
+                      const level = status.verified ? 'verified' : status.available ? 'available' : status.installed ? 'installed' : status.supported ? 'supported' : 'unsupported'
+                      return `${name ? t(name) : status.id}: ${t(`settings.accel.state.${level}`)}`
+                    }).join(' · ')}</span>
+                  {/if}
                 </div>
+                {#if row.id}
+                  <div class="model-backend-choice">
+                    <Select
+                      id="settings-model-backend-{row.id}"
+                      label={t('settings.accel.modelLabel', { model: modelDisplayName(row) })}
+                      options={modelBackendChoices(row)}
+                      value={session.modelAccelerators[row.id] ?? 'inherit'}
+                      onchange={(value) => chooseModelAccelerator(row.id, value)}
+                    />
+                  </div>
+                {/if}
               </li>
             {/each}
           </ul>
@@ -2938,6 +3028,11 @@
   .pick { width: 15rem; max-width: 100% }
 
   .accel { margin-top: var(--s-6) }
+  .model-backend-choice { width: min(17rem, 45%); flex: none }
+  @media (max-width: 640px) {
+    .model-backend-choice { width: 100% }
+    .row:has(.model-backend-choice) { flex-wrap: wrap }
+  }
 
   /* One row is a name and a meta line on the left and its buttons on the
      right, with the hairline every row on this screen uses. */

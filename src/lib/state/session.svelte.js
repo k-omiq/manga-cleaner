@@ -48,7 +48,7 @@ import {
   MIN_HEIGHT,
 } from '../model/windows.js'
 
-import { DEFAULT_DETECTOR, DEFAULT_DETECTOR_MODELS, LANGUAGES, migrateDetectorChoice, normalizeDetectorModels } from '../model/pipelines.js'
+import { DEFAULT_DETECTOR, DEFAULT_DETECTOR_MODELS, DETECTOR_MODEL_IDS, LANGUAGES, migrateDetectorChoice, normalizeDetectorModels } from '../model/pipelines.js'
 
 const STORAGE_KEY = 'session.v1'
 
@@ -81,6 +81,19 @@ export const TEXT_POLICIES = /** @type {const} */ (['legacy_gate', 'all_text'])
  * every open and a control that fails is worse than a control that is absent.
  */
 export const FLUX_BACKENDS = /** @type {const} */ (['auto', 'mflux', 'sdnq'])
+export const MODEL_ACCELERATOR_IDS = Object.freeze([...DETECTOR_MODEL_IDS, 'inpainter'])
+
+/** Preserve only known model overrides. A provider id is validated by the backend at use time. */
+export function sanitizeModelAccelerators(raw) {
+  const stored = plainObject(raw)
+  /** @type {Record<string, string>} */
+  const result = {}
+  for (const id of MODEL_ACCELERATOR_IDS) {
+    const value = stored[id]
+    if (typeof value === 'string' && /^[a-z][a-z0-9]{0,31}$/.test(value)) result[id] = value
+  }
+  return result
+}
 
 export { WINDOW_IDS }
 
@@ -118,6 +131,7 @@ function viewport() {
  * @property {string} fluxModel
  * @property {'auto'|'mflux'|'sdnq'} fluxBackend
  * @property {string} accelerator - `auto`, `cpu`, or an execution provider id; see `setAccelerator`
+ * @property {Record<string, string>} modelAccelerators - local per-model overrides; absent models inherit `accelerator`
  * @property {'alt'|'meta'|'control'|'shift'} cloneSourceModifier - held while clicking to set Clone / heal's source; see `setCloneSourceModifier`
  * @property {boolean} firstLaunchOffered - whether the first-launch download offer has been made on this machine
  * @property {boolean} closeToTray - close control hides the window and keeps downloads running
@@ -145,6 +159,7 @@ function defaults() {
     fluxModel: '',
     fluxBackend: 'auto',
     accelerator: 'auto',
+    modelAccelerators: {},
     cloneSourceModifier: DEFAULT_POINTER_MODIFIER,
     firstLaunchOffered: false,
     closeToTray: false,
@@ -235,6 +250,7 @@ export function sanitizeSession(raw) {
     // unusable one with a reason rather than silently substituting. A closed
     // list here would drop a provider a newer runtime added.
     accelerator: typeof record.accelerator === 'string' ? record.accelerator : base.accelerator,
+    modelAccelerators: sanitizeModelAccelerators(record.modelAccelerators),
     // The shortcut module owns this vocabulary, the same way it owns the chord
     // one: anything that is not one of the four modifiers a pointer event can
     // carry falls back to the modifier this gesture has always used.
@@ -321,6 +337,7 @@ function persistable() {
     fluxModel: session.fluxModel,
     fluxBackend: session.fluxBackend,
     accelerator: session.accelerator,
+    modelAccelerators: { ...session.modelAccelerators },
     cloneSourceModifier: session.cloneSourceModifier,
     firstLaunchOffered: session.firstLaunchOffered,
     closeToTray: session.closeToTray,
@@ -550,6 +567,17 @@ export function setFluxBackend(backend) {
  */
 export function setAccelerator(id) {
   session.accelerator = typeof id === 'string' && id ? id : 'auto'
+  save()
+}
+
+/** An absent override follows the global choice; `inherit` clears it. */
+export function setModelAccelerator(modelId, id) {
+  if (!MODEL_ACCELERATOR_IDS.includes(modelId)) return
+  const next = { ...session.modelAccelerators }
+  if (id === 'inherit') delete next[modelId]
+  else if (typeof id === 'string' && /^[a-z][a-z0-9]{0,31}$/.test(id)) next[modelId] = id
+  else return
+  session.modelAccelerators = next
   save()
 }
 
@@ -837,6 +865,10 @@ export function adoptBackendSettings(settings) {
   if (record.accelerator !== undefined) {
     setAccelerator(typeof record.accelerator === 'string' ? record.accelerator : 'auto')
   }
+  if (record.modelAccelerators !== undefined) {
+    session.modelAccelerators = sanitizeModelAccelerators(record.modelAccelerators)
+    save()
+  }
   if (record.shortcuts !== undefined) {
     setShortcutOverrides(record.shortcuts)
     syncShortcuts()
@@ -853,7 +885,7 @@ export function adoptBackendSettings(settings) {
  * object) where a flattened `shortcuts.tool.brush` family would leave stale
  * entries behind forever.
  *
- * @returns {{theme: string, readingDirection: string, cloudEngines: 'allowed'|'blocked', originalView: string, sidecarPath: string, fluxModel: string, fluxBackend: string, accelerator: string, shortcuts: Record<string, import('../shortcuts.js').Chord|null>}}
+ * @returns {{theme: string, readingDirection: string, cloudEngines: 'allowed'|'blocked', originalView: string, sidecarPath: string, fluxModel: string, fluxBackend: string, accelerator: string, modelAccelerators: Record<string,string>, shortcuts: Record<string, import('../shortcuts.js').Chord|null>}}
  */
 export function backendSettingsPatch() {
   return {
@@ -866,6 +898,7 @@ export function backendSettingsPatch() {
     fluxModel: session.fluxModel,
     fluxBackend: session.fluxBackend,
     accelerator: session.accelerator,
+    modelAccelerators: { ...session.modelAccelerators },
     shortcuts: shortcutOverrides(),
   }
 }

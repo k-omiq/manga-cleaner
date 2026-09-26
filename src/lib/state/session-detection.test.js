@@ -9,7 +9,9 @@ import {
   TEXT_POLICIES,
   sanitizeSession,
   session,
+  backendSettingsPatch,
   setDetection,
+  setModelAccelerator,
   setOcrRescue,
   setTextPolicy,
 } from './session.svelte.js'
@@ -18,6 +20,7 @@ afterEach(() => {
   for (const language of ['ja', 'zh', 'ko']) setDetection(language, 'ctd-rtdetr')
   setOcrRescue(false)
   setTextPolicy('legacy_gate')
+  for (const id of ['ctd', 'rtSmall', 'rtFull', 'samTs', 'inpainter']) setModelAccelerator(id, 'inherit')
 })
 
 describe('a stored detection map', () => {
@@ -67,5 +70,20 @@ describe('the text policy', () => {
     expect(session.textPolicy).toBe('all_text')
     expect(sanitizeSession({ textPolicy: 'all_text' }).textPolicy).toBe('all_text')
     expect(sanitizeSession({ textPolicy: 'other' }).textPolicy).toBe('legacy_gate')
+  })
+})
+
+describe('local model backend overrides', () => {
+  it('persists a model choice through the backend patch and clears it to inherit', () => {
+    setModelAccelerator('samTs', 'cpu')
+    expect(session.modelAccelerators).toEqual({ samTs: 'cpu' })
+    expect(backendSettingsPatch().modelAccelerators).toEqual({ samTs: 'cpu' })
+    setModelAccelerator('samTs', 'inherit')
+    expect(backendSettingsPatch().modelAccelerators).toEqual({})
+  })
+
+  it('drops unknown model keys and malformed provider ids from persisted state', () => {
+    expect(sanitizeSession({ modelAccelerators: { samTs: 'cpu', invented: 'cuda', ctd: '$(bad)' } }).modelAccelerators)
+      .toEqual({ samTs: 'cpu' })
   })
 })

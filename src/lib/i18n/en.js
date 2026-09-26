@@ -622,6 +622,21 @@ export const en = {
     accel: {
       label: 'Graphics acceleration',
       auto: 'Automatic',
+      inherit: 'Use global default ({backend})',
+      models: 'Model execution',
+      modelHelp: 'Each local model can inherit the global choice or use its own backend. Changes apply to the next inference session.',
+      modelLabel: 'Local backend for {model}',
+      predicted: 'Next session: {backend}',
+      unavailableForModel: '{model} cannot use {backend}: {reason}. Choose a supported backend in Performance.',
+      cloudReview: '☁ Cloud GPU is available through explicit Review analysis only. Auto clean stays local.',
+      saveFailed: 'Could not save the model backend. Try again.',
+      state: {
+        supported: 'supported; install the runtime or dependency',
+        installed: 'installed; check the device or dependency',
+        available: 'available; execution has not been verified',
+        verified: 'verified by inference',
+        unsupported: 'unsupported for this model',
+      },
       // The picker with nothing in it. `listAccelerators` is the engine runtime
       // being asked what this machine can run a model on, so a rejection is
       // almost always the runtime itself failing to load - and the runtime's

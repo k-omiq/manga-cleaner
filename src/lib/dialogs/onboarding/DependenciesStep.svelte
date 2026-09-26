@@ -10,8 +10,11 @@
    * builds need a toolkit installed by hand, which is said here.
    */
   import { t } from '../../i18n/index.js'
+  import { Select } from '../../ui/index.js'
+  import { getBackend } from '../../api/backend.js'
   import { capabilities } from '../../state/capabilities.svelte.js'
-  import { CLEANERS } from '../../model/pipelines.js'
+  import { backendSettingsPatch, session, setModelAccelerator } from '../../state/session.svelte.js'
+  import { CLEANERS, model } from '../../model/pipelines.js'
   import { RUNTIME_ID, runtimeReady } from '../firstlaunch.js'
   import {
     chosenBytes,
@@ -72,6 +75,45 @@
     return names.length ? names.join(', ') : t('onboarding.dependencies.cpuOnly')
   })
 
+  let backendSaveFailed = $state(false)
+  const selectedModels = $derived(new Set([...session.detectorModels, 'inpainter']))
+  const modelRows = $derived((firstLaunch.accelerators?.models ?? []).filter((row) => selectedModels.has(row.id)))
+
+  function modelName(row) {
+    return row.modelName ?? model(row.id)?.product ?? (row.id === 'inpainter' ? CLEANERS[0].name : t(row.modelKey))
+  }
+
+  function backendChoices(row) {
+    const choices = [
+      { value: 'inherit', label: t('settings.accel.inherit', { backend: t(session.accelerator === 'auto' ? 'settings.accel.auto' : `accel.${session.accelerator}`) }) },
+      { value: 'auto', label: t('settings.accel.auto') },
+    ]
+    for (const status of row.backendStatus ?? []) {
+      const provider = firstLaunch.accelerators?.providers.find((entry) => entry.id === status.id)
+      const name = provider ? t(provider.labelKey) : status.id
+      const level = status.verified ? 'verified' : status.available ? 'available' : status.installed ? 'installed' : status.supported ? 'supported' : 'unsupported'
+      choices.push({
+        value: status.id,
+        label: `${name} · ${status.reasonKey ? t(status.reasonKey) : t(`settings.accel.state.${level}`)}`,
+        disabled: !status.supported || !status.available,
+      })
+    }
+    return choices
+  }
+
+  async function chooseModelBackend(modelId, id) {
+    const before = session.modelAccelerators[modelId] ?? 'inherit'
+    backendSaveFailed = false
+    setModelAccelerator(modelId, id)
+    try {
+      await getBackend().writeSettings(backendSettingsPatch())
+      firstLaunch.accelerators = await getBackend().listAccelerators()
+    } catch {
+      setModelAccelerator(modelId, before)
+      backendSaveFailed = true
+    }
+  }
+
   /** @param {string} id */
   function stateOf(id) {
     const row = plan?.files[id]
@@ -81,6 +123,25 @@
 </script>
 
 <p class="lead">{t('onboarding.dependencies.body', { platform: platformName })}</p>
+
+{#if modelRows.length}
+  <h2 class="group">{t('settings.accel.models')}</h2>
+  <p class="lead">{t('settings.accel.modelHelp')}</p>
+  {#if backendSaveFailed}<p class="need" role="alert">{t('settings.accel.saveFailed')}</p>{/if}
+  <div class="model-backends">
+    {#each modelRows as row (row.id)}
+      <div class="model-backend">
+        <label for="onboarding-backend-{row.id}">{modelName(row)}</label>
+        <Select id="onboarding-backend-{row.id}" label={t('settings.accel.modelLabel', { model: modelName(row) })}
+          options={backendChoices(row)} value={session.modelAccelerators[row.id] ?? 'inherit'}
+          onchange={(value) => chooseModelBackend(row.id, value)} />
+        {#if row.id === 'samTs' || row.id === 'rtSmall' || row.id === 'rtFull'}
+          <span class="sub">{t('settings.accel.cloudReview')}</span>
+        {/if}
+      </div>
+    {/each}
+  </div>
+{/if}
 
 <dl class="rows">
   <div class="row">
@@ -135,4 +196,8 @@
   .need { display: block; margin-top: var(--s-1); max-width: 40ch; color: var(--warn) }
   .group { margin: var(--s-6) 0 var(--s-2); font-size: 11px; font-weight: 600; color: var(--t3) }
   .total { margin: 0; color: var(--t2); font-size: 12px }
+  .model-backends { display: grid; gap: var(--s-3); margin-bottom: var(--s-6) }
+  .model-backend { display: grid; grid-template-columns: minmax(125px, 1fr) minmax(0, 2fr); gap: var(--s-2) var(--s-5); align-items: center }
+  .model-backend .sub { grid-column: 1 / -1; margin: 0 }
+  @media (max-width: 620px) { .model-backend { grid-template-columns: 1fr } }
 </style>

@@ -555,7 +555,7 @@ import { createTauriBackend, isTauri } from './tauri.js'
  * @typedef {Object} Accelerators
  * @property {string} preference - `auto`, `cpu`, or a provider id
  * @property {Array<{id: string, labelKey: string, available: boolean, reasonKey: string|null, measured: boolean, active: boolean, selected: boolean}>} providers
- * @property {Array<{modelKey: string, acceleratorId: string, labelKey: string, noteKey: string|null, declinedKey: string|null, declinedId: string|null, neededBytes: number|null, roomBytes: number|null}>} models
+ * @property {Array<{id: string, modelName: string, modelKey: string, preference: string, supportedIds: string[], backendStatus: Array<{id: string, supported: boolean, installed: boolean, available: boolean, verified: boolean, reasonKey: string|null}>, acceleratorId: string, labelKey: string, noteKey: string|null, declinedKey: string|null, declinedId: string|null, neededBytes: number|null, roomBytes: number|null}>} models
  */
 
 /**
