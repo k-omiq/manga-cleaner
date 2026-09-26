@@ -69,8 +69,6 @@ function decorateWanderingMoon(project, ctx) {
   // Text the auto pass never found - the AI mask brush's fallback case, not a
   // review cause and not queueable. See `markUndetected`.
   markUndetected(chapter.pages[4], 2, ctx)
-  chapter.pages[8].status = 'skipped'
-  chapter.pages[8].skipReason = 'input.skipReason.truncatedJpeg'
   project.interruptedJob = { chapterId: chapter.id, pageIndex: 7 }
 }
 
@@ -102,10 +100,6 @@ const PROJECT_SPECS = Object.freeze([
         prefix: 'wm',
         fill: 'none',
         lastOpened: HOURS_AGO_2,
-        inputReports: [
-          { key: 'notice.input.junkSkipped', params: { count: 2 }, tone: 'info' },
-          { key: 'notice.input.duplicateBasename', params: { file: 'wm014' }, tone: 'warn' },
-        ],
       },
       { number: 11, name: 'Grey Tide', pages: 22, prefix: 'wm', fill: 'all', lastOpened: DAYS_AGO_3 },
       { number: 10, name: 'Nightfall', pages: 20, prefix: 'wm', fill: 'all', lastOpened: LAST_WEEK },

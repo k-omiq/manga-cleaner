@@ -1364,7 +1364,6 @@ export const en = {
   // read by a user deciding whether the file matters.
   input: {
     skipReason: {
-      truncatedJpeg: 'the file is a truncated JPEG',
       notAnImage: 'it is not an image this reads',
       headerUnreadable: 'its header does not parse',
       // The truncated-scan case §2 singles out: the header parsed and the
@@ -2244,7 +2243,7 @@ export const en = {
         one: '1 junk entry skipped.',
         other: '{count} junk entries skipped.',
       },
-      duplicateBasename: '{file} exists with two extensions, so neither was guessed at.',
+      duplicateBasename: 'Multiple files named {file} have different extensions. All distinct images were kept.',
       // Not a refusal: these pages are in the chapter. The sentence says what
       // was done and to how many, because the editor works on the PNGs from
       // here on and the originals are still where they were.
