@@ -332,7 +332,6 @@ fn verified_model(id: &str, accelerator: Accelerator, measured_host: bool) -> bo
         (id, accelerator),
         ("ctd", Accelerator::WebGpu)
             | ("samTs", Accelerator::WebGpu)
-            | ("inpainter", Accelerator::WebGpu)
     )
 }
 
@@ -641,6 +640,15 @@ mod tests {
         assert_eq!(small.accelerator_id, "cpu");
         assert_eq!(small.declined_id, Some("coreml"));
         assert!(!small.backend_status.iter().find(|row| row.id == "coreml").unwrap().supported);
+    }
+
+    #[test]
+    fn webgpu_verification_requires_strict_model_assignment_evidence() {
+        assert!(verified_model("ctd", Accelerator::WebGpu, true));
+        assert!(verified_model("samTs", Accelerator::WebGpu, true));
+        // Earlier LaMa timings did not establish full graph assignment under
+        // the new strict forced-provider contract.
+        assert!(!verified_model("inpainter", Accelerator::WebGpu, true));
     }
 
     /// A click that arrives after the model has gone is not a failure.
