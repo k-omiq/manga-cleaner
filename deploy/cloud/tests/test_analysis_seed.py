@@ -5,6 +5,7 @@ import hashlib
 import base64
 import io
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,7 +17,7 @@ from deploy.cloud.common.api import CloudGateway
 from PIL import Image
 from deploy.cloud.common.analysis_seed import (
     AnalysisUnavailable, analysis_capabilities, installed_graphs, normalize_analysis_models,
-    run_analysis_seed, seed_analysis_graphs,
+    run_analysis_seed, sam_head_export_sha256, seed_analysis_graphs,
 )
 from deploy.cloud.beam.analysis_backend import BeamAnalysisProxy, beam_analysis_task
 from deploy.cloud.beam.backend import BeamMapStore
@@ -38,6 +39,17 @@ class MemoryMap:
 
 
 class AnalysisSeedCases(unittest.TestCase):
+    def test_sam_head_export_uses_only_verified_platform_pins(self):
+        self.assertEqual(
+            sam_head_export_sha256("darwin"),
+            "a2c63ccf54e2e692a281cffd4dcda648f252ae6649dc7d23d0203e5868685281",
+        )
+        self.assertEqual(
+            sam_head_export_sha256("linux"),
+            "d9431cf1828bbbf70db26f438f5b5777783729dbf7cac5f20cd2b14057125bd2",
+        )
+        self.assertEqual(sam_head_export_sha256("win32"), sam_head_export_sha256("darwin"))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -87,6 +99,18 @@ class AnalysisSeedCases(unittest.TestCase):
         self.assertEqual({item["capability"] for item in analysis_capabilities(self.root, [ANALYSIS_RT, ANALYSIS_SAM])["capabilities"]}, {ANALYSIS_RT})
         (self.root / "analysis/rtdetr-v2-full/detector.onnx").write_bytes(b"Detector")  # same size, wrong SHA
         self.assertEqual(analysis_capabilities(self.root, [ANALYSIS_RT])["capabilities"], [])
+
+    def test_rt_download_keeps_hub_local_dir_off_the_volume(self):
+        def mounted_download(**kwargs):
+            if Path(kwargs["local_dir"]).is_relative_to(self.root):
+                raise shutil.SameFileError("Modal volume mount and backing path are the same file")
+            return self._download(**kwargs)
+
+        result = seed_analysis_graphs(
+            self.root, [ANALYSIS_RT], self.source, hf_download=mounted_download,
+        )
+        self.assertEqual(result["status"], "seeded")
+        self.assertEqual(len(analysis_capabilities(self.root, [ANALYSIS_RT])["capabilities"]), 1)
 
     def test_selected_sam_and_rt_use_verified_graphs_and_idempotent_markers(self):
         result = seed_analysis_graphs(self.root, [ANALYSIS_RT, ANALYSIS_SAM], self.source,

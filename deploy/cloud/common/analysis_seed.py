@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -25,12 +26,29 @@ from deploy.cloud.common.redact import redact_text
 SAM_REVISION = "5dd97423e0fbf2404264979136d47e8101144046"
 RT_REVISION = "16e8a622f91fabc6b5b65c96d32d1183f8843546"
 RT_REPO = "ogkalu/comic-text-and-bubble-detector"
+# The head export embeds a derived positional encoding. PyTorch 2.13.0
+# produces different ONNX bytes on macOS arm64 and Linux x86_64, even though
+# the checkpoint, graph structure, graph size, and fixed-input mask agree.
+# Keep each observed package hash pinned; never accept an arbitrary export.
+SAM_HEAD_SHA256_MAC = "a2c63ccf54e2e692a281cffd4dcda648f252ae6649dc7d23d0203e5868685281"
+SAM_HEAD_SHA256_LINUX = "d9431cf1828bbbf70db26f438f5b5777783729dbf7cac5f20cd2b14057125bd2"
+
+
+def sam_head_export_sha256(platform: str) -> str:
+    if platform == "linux":
+        return SAM_HEAD_SHA256_LINUX
+    # The helper also imports this module on Windows before deploying the
+    # Linux image. Windows does not run this exporter; the remote import
+    # selects its own Linux pin.
+    return SAM_HEAD_SHA256_MAC
+
+
 GRAPH_FILES = {
     ANALYSIS_SAM: (
         ("koharu_samts_encoder.onnx", 1_335_305_985,
          "9b3a32f9018008cfd2c7a5b1a7eb6e20822ba43eab58918863f74ac62ecbafbe"),
         ("koharu_samts_text_head.onnx", 22_704_641,
-         "a2c63ccf54e2e692a281cffd4dcda648f252ae6649dc7d23d0203e5868685281"),
+         sam_head_export_sha256(sys.platform)),
     ),
     ANALYSIS_RT: (("detector.onnx", 168_481_531,
                    "065744e91c0594ad8663aa8b870ce3fb27222942eded5a3cc388ce23421bd195"),),
@@ -202,10 +220,17 @@ def seed_analysis_graphs(root: str | os.PathLike[str], selected: Iterable[str],
         stage = volume / "analysis" / ".staging" / DIRECTORIES[capability]
         stage.mkdir(parents=True, exist_ok=True)
         if capability == ANALYSIS_RT:
-            downloaded = Path(hf_download(repo_id=RT_REPO, filename="detector.onnx",
-                                          revision=RT_REVISION, local_dir=str(stage)))
-            if downloaded != stage / "detector.onnx":
-                shutil.copyfile(downloaded, stage / "detector.onnx")
+            target = stage / "detector.onnx"
+            name, size, sha = GRAPH_FILES[capability][0]
+            if not target.is_file() or target.stat().st_size != size or _digest(target) != sha:
+                # Hugging Face's local_dir copy can resolve Modal's volume
+                # mount to its backing path and then copy the file onto itself.
+                # Download outside the volume and publish the verified copy.
+                with tempfile.TemporaryDirectory(prefix="mc-rt-download-") as download_dir:
+                    downloaded = Path(hf_download(repo_id=RT_REPO, filename=name,
+                                                  revision=RT_REVISION, local_dir=download_dir))
+                    if not target.exists() or not os.path.samefile(downloaded, target):
+                        shutil.copyfile(downloaded, target)
             _publish(volume, capability, stage)
         else:
             bootstrap = source / "bootstrap.py"

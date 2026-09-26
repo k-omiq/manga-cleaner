@@ -54,6 +54,8 @@ from provisioner.protocol import (
 from provisioner.redaction import GLOBAL_REGISTRY, redact_string
 
 from deploy.cloud.common.weights import SEED_STATE_KEY
+from deploy.cloud.common.contract import ANALYSIS_SAM
+from deploy.cloud.common.deployment import SEED_TIMEOUT_SECONDS
 from deploy.cloud.common.manifest import MODEL_PROD_FLUX_9B, production_model
 from deploy.cloud.modal.settings import (
     DEFAULT_GPU,
@@ -344,6 +346,9 @@ class ModalDriver(BaseProviderDriver):
         gpu, idle = s.gpu, s.idle_seconds
         model = production_model(s.model_id)
         worker_memory = 24 if s.model_id == MODEL_PROD_FLUX_9B else 12
+        seed_memory = 24 if ANALYSIS_SAM in s.analysis_models else 4
+        seed_timeout = SEED_TIMEOUT_SECONDS * (2 if ANALYSIS_SAM in s.analysis_models else 1)
+        seed_hour = 2 * CPU_CORE_HOUR + seed_memory * MEMORY_GIB_HOUR
         analysis_note = (
             f" A separate {gpu} GPU analysis worker (at most 1 container, stops {idle} s after a request) "
             "runs only for selected SAM-TS-L or RT-DETR analysis."
@@ -357,7 +362,7 @@ class ModalDriver(BaseProviderDriver):
                 s.app_name,
                 f"Modal App: a CPU gateway (0.25 CPU, 0.5 GiB) behind Modal proxy auth, a {gpu} GPU worker "
                 f"(2 CPU, {worker_memory} GiB, at most 1 container, stops {idle} s after the last render, 600 s per job) "
-                "and a CPU function that downloads the weights once." + analysis_note,
+                f"and a seed function (2 CPU, {seed_memory} GiB, up to {seed_timeout // 3600} h per attempt) that downloads the weights." + analysis_note,
             ),
             PlanResource(
                 "proxy_token",
@@ -373,7 +378,9 @@ class ModalDriver(BaseProviderDriver):
             f"during each render and for {idle} s after it."
             + (f" Selected analysis also starts a separate {gpu} GPU worker on demand and keeps it warm {idle} s; it is billed at the same GPU rate." if s.analysis_models else "")
             + " The gateway runs only while it answers requests "
-            f"(0.25 CPU, 0.5 GiB). Storage for the weights volume is billed by Modal. Nothing runs while idle. "
+            f"(0.25 CPU, 0.5 GiB). Initial seeding and any retries use 2 CPU and {seed_memory} GiB "
+            f"for up to {seed_timeout // 3600} h per attempt, about ${seed_hour:.2f}/h while active. "
+            "Storage for the weights volume is billed by Modal. Nothing runs while idle. "
             f"List prices on {PRICING_DATE}; check {PRICING_URL}."
         )
         return build_plan(
@@ -388,6 +395,9 @@ class ModalDriver(BaseProviderDriver):
                 "worker_memory_gib": worker_memory,
                 "gateway_cpu": 0.25,
                 "gateway_memory_gib": 0.5,
+                "seed_cpu": 2.0,
+                "seed_memory_gib": seed_memory,
+                "seed_timeout_seconds": seed_timeout,
                 "max_containers": 1,
                 "job_timeout_seconds": 600,
                 "environment": inspection.environment_name,
@@ -400,7 +410,7 @@ class ModalDriver(BaseProviderDriver):
             ],
             cost=cost,
             notes=[
-                "The weights download once on a CPU container (2 CPU, 4 GiB); setup waits for it.",
+                f"The weights download on a seed container (2 CPU, {seed_memory} GiB, up to {seed_timeout // 3600} h per attempt); setup waits for it. Failed attempts can incur additional cost.",
                 "A render starts the GPU worker; a cold start loads 5.5 GB of weights first.",
             ],
             cleanup_summary=[

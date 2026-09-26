@@ -1060,6 +1060,7 @@ impl CloudHttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
 
     #[test]
     fn analysis_unauthorized_rejection_preserves_status() {
@@ -1597,5 +1598,53 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    /// Manual live transport probe. The caller supplies secrets only in the
+    /// child process environment; this test prints no credential material.
+    #[test]
+    #[ignore = "requires MC_LIVE_MODAL_ENDPOINT, MC_LIVE_MODAL_TOKEN_ID and MC_LIVE_MODAL_TOKEN_SECRET"]
+    fn live_modal_native_control_and_analysis_capabilities() {
+        let endpoint = std::env::var("MC_LIVE_MODAL_ENDPOINT").expect("live endpoint");
+        let token_id = std::env::var("MC_LIVE_MODAL_TOKEN_ID").expect("live token id");
+        let token_secret = std::env::var("MC_LIVE_MODAL_TOKEN_SECRET").expect("live token secret");
+        let target = CloudEndpointTarget::new(CloudProvider::Modal, "mc-live-probe", &endpoint)
+            .expect("valid live Modal endpoint");
+        let credential = BoundRuntimeCredential::new(
+            &target,
+            RuntimeCredential::ModalProxy {
+                token_id,
+                token_secret: SecretValue::new(&token_secret),
+            },
+        ).expect("bound Modal credential");
+        let client = CloudHttpClient::new(target, credential).expect("native transport");
+        let health = client.get_health().expect("authenticated health");
+        assert_eq!(health.status, "ok");
+        let model = client.get_model_info().expect("pinned model info");
+        assert!(model.model_id.contains("FLUX.2-klein"));
+        let analysis = client.get_analysis_capabilities().expect("analysis capabilities");
+        assert!(analysis.capabilities.iter().any(|item| item.capability == "text_mask_sam_ts@1"));
+        assert!(analysis.capabilities.iter().any(|item| item.capability == "text_regions_rt@1"));
+        let rt = analysis.capabilities.iter().find(|item| item.capability == "text_regions_rt@1")
+            .expect("RT capability");
+        let tile_png = include_bytes!("../../../deploy/cloud/fixtures/tiny_image.png");
+        let mut request = AnalysisRequest {
+            protocol_version: cleaner_core::cloud_analysis_wire::VERSION.into(),
+            capability: rt.capability.clone(),
+            graph_sha256s: rt.graph_sha256s.clone(),
+            model_revision: rt.model_revision.clone(),
+            tile_id: "native-rt-probe".into(),
+            tile_rect: cleaner_core::cloud_analysis_wire::TileRect {
+                x: 0, y: 0, width: 16, height: 16,
+            },
+            tile_png_sha256: format!("{:x}", sha2::Sha256::digest(tile_png)),
+            source_page_sha256: format!("{:x}", sha2::Sha256::digest(tile_png)),
+            request_digest: String::new(),
+        };
+        request.request_digest = request.digest().expect("request digest");
+        let result = client.submit_analysis_tile(&request, tile_png).expect("native RT tile");
+        assert_eq!(result.capability, rt.capability);
+        println!("native Modal control passed: {} and {} analysis capabilities",
+            model.model_id, analysis.capabilities.len());
     }
 }

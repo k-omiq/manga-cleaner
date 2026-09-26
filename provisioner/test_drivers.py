@@ -595,6 +595,22 @@ class ModalDriverTest(ProviderCases, unittest.TestCase):
     kill_points = ["Volume.objects.create", "Dict.objects.create", "App.deploy", "Function.spawn"]
     mutating = {"Volume.objects.create", "Dict.objects.create", "App.deploy", "Function.spawn", "proxy_tokens.create"}
 
+    def test_seed_allocation_and_cost_disclose_sam_memory_and_retry_window(self) -> None:
+        for selected, memory, timeout, hourly in (
+            ([], 4, 3600, "$0.13/h"),
+            (["text_regions_rt@1"], 4, 3600, "$0.13/h"),
+            (["text_mask_sam_ts@1"], 24, 7200, "$0.29/h"),
+        ):
+            with self.subTest(analysis_models=selected):
+                plan = self.h.plan(options={"analysis_models": selected})
+                allocation = plan["resource_allocation"]
+                self.assertEqual((allocation["seed_cpu"], allocation["seed_memory_gib"],
+                                  allocation["seed_timeout_seconds"]), (2.0, memory, timeout))
+                self.assertIn(f"2 CPU and {memory} GiB", plan["estimated_monthly_cost"])
+                self.assertIn(hourly, plan["estimated_monthly_cost"])
+                self.assertIn("any retries", plan["estimated_monthly_cost"])
+                self.assertIn(f"{memory} GiB", plan["notes"][0])
+
     def check_runtime_credential(self, credential: Dict[str, str], reissued_from: Optional[Dict[str, str]] = None) -> None:
         self.assertEqual(set(credential), {"kind", "token_id", "token_secret"})
         self.assertEqual(credential["kind"], "modal_proxy")

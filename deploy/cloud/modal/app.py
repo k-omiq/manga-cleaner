@@ -83,7 +83,11 @@ def _finish(image: modal.Image, extra_env: Dict[str, str] | None = None) -> moda
     return image.env(env).add_local_dir(DEPLOY_ROOT, REMOTE_DEPLOY_ROOT, ignore=_not_shipped)
 
 
-gateway_image = _finish(modal.Image.debian_slim(python_version=PYTHON_VERSION))
+# The gateway validates decoded analysis PNGs before it dispatches a GPU tile.
+# Keep Pillow in this CPU image as well as in the analysis worker image.
+gateway_image = _finish(
+    modal.Image.debian_slim(python_version=PYTHON_VERSION).pip_install("pillow==12.3.0")
+)
 
 _seed_base = modal.Image.debian_slim(python_version=PYTHON_VERSION).pip_install(*SEED_REQUIREMENTS)
 if ANALYSIS_SAM in SETTINGS.analysis_models:
